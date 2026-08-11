@@ -8,6 +8,7 @@ pub const risk_state = @import("risk/state_machine.zig");
 pub const admission = @import("risk/admission.zig");
 pub const orders = @import("execution/orders.zig");
 pub const planner = @import("execution/planner.zig");
+pub const okx_trade = @import("execution/okx_trade.zig");
 pub const proposal = @import("agent/proposal.zig");
 pub const events = @import("core/events.zig");
 pub const redaction = @import("observability/redaction.zig");

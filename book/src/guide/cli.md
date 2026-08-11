@@ -5,7 +5,9 @@
 ## 用法
 
 ```text
-alphabound [--config PATH] [--self-check] [--version] [--ticks N] [--agent-once] [--agent-stats]
+alphabound [--config PATH] [--self-check] [--version] [--ticks N]
+           [--agent-once] [--agent-stats]
+           [--control pause|resume|reconcile|cancel-all|flatten|shutdown|status]
 ```
 
 无参或非法参数时打印 usage 并以非零退出。
@@ -20,6 +22,7 @@ alphabound [--config PATH] [--self-check] [--version] [--ticks N] [--agent-once]
 | `--ticks N` | 否 | 有界运行：完成 N 次成功行情 tick 后走优雅退出。冒烟 / CI / 演示用 |
 | `--agent-once` | 否 | READY 后强制一轮 Agent（shadow 只审计，需 `LLM_*`） |
 | `--agent-stats` | 否 | 打印 agent_runs 有效率与 tool_calls 计数后退出 |
+| `--control CMD` | 否 | 本机管理（写控制文件后退出，不启 daemon）。见 [Admin control](admin-control.md) |
 
 ## 退出码
 
@@ -75,6 +78,12 @@ set -a && source ./secrets.env && set +a
 | `SIGTERM` / `SIGINT` | 置位停止标志 → 结束当前 tick → 落 `SHUTDOWN_CLEAN` → 关 DB / web |
 | `SIGKILL` | 无法处理；依赖 systemd `Restart=` + 下次启动重新对账（fail-closed） |
 
-## 管理命令（规划）
+## 管理命令
 
-设计要求 pause / resume / reconcile / cancel-all / flatten / safe-shutdown 走**本机 CLI 或 Unix socket**，不走公网 HTTP。当前版本以进程信号 + 配置模式为主；管理 socket 随 Phase 3 补齐，本手册届时更新子命令表。
+设计要求 pause / resume / reconcile / cancel-all / flatten / safe-shutdown 走**本机 CLI**（控制文件），不走公网 HTTP。详见 [Admin control](admin-control.md)。
+
+Gate 2 阈值快照（daemon 已在跑时）：
+
+```bash
+./scripts/gate2-report.sh
+```

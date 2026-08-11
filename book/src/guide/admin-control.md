@@ -8,6 +8,8 @@ AlphaBound 管理命令**不走网络**：CLI 写入 DB 同目录控制文件，
 ./zig-out/bin/alphabound --config config/local.toml --control pause
 ./zig-out/bin/alphabound --config config/local.toml --control resume
 ./zig-out/bin/alphabound --config config/local.toml --control reconcile
+./zig-out/bin/alphabound --config config/local.toml --control cancel-all
+./zig-out/bin/alphabound --config config/local.toml --control flatten
 ./zig-out/bin/alphabound --config config/local.toml --control shutdown
 ./zig-out/bin/alphabound --config config/local.toml --control status
 ```
@@ -17,6 +19,8 @@ AlphaBound 管理命令**不走网络**：CLI 写入 DB 同目录控制文件，
 | `pause` | 停止 agent 决策环；行情/风险/对账继续 |
 | `resume` | 恢复 agent |
 | `reconcile` | 立即触发一次私有 REST 余额对账 |
+| `cancel-all` | 取消开放订单。Shadow：只记审计事件；**Demo**（`OKX_SIMULATED=1`）：拉 pending 并逐笔 `cancel-order` |
+| `flatten` | 操作员退出：`risk_trigger=exit_trigger` → 倾向 `FLATTENING`，事件 `ADMIN_FLATTEN` |
 | `shutdown` | 等价安全停机（与 SIGTERM 相同排空路径） |
 | `status` | 读 `*.control.state`（daemon 写入） |
 

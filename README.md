@@ -8,7 +8,7 @@
 
 | | |
 |---|---|
-| **现在能做什么** | Shadow 模式：接 OKX 行情、调 LLM 出提案、写审计与记忆、看 Dashboard —— **不下单** |
+| **现在能做什么** | **Shadow**（默认）：行情 + LLM 提案 + 风险准入审计 + Dashboard，**不下单**。**Demo**（需模拟盘密钥）：准入通过后可在 OKX 模拟盘下市价单 |
 | **实验范围** | OKX `BTC-USDT` 现货 · 设计目标约 100 USDT 实验资金 |
 | **硬边界** | 相对历史高水位（HWM）约 **10%** 最大回撤（工程目标，非绝对保证） |
 | **技术栈** | Zig 0.16.0 · SQLite WAL · systemd · 单文件嵌入式 Dashboard |
@@ -189,11 +189,11 @@ Phase 0 可行性  →  1 只读观察  →  2 Shadow（不下单）  →  3 Dem
                          ▲ 你在这里附近（闭环已通，长稳与 Demo 闸门未完）
 ```
 
-- **已有**：Shadow 决策与审计、Dashboard、备份路径、部署骨架  
-- **还在做**：Gate 2 长稳、私有 WS 稳定、Demo 下单与故障注入  
-- **不要指望**：把本仓库默认配置当成可直接实盘的交易系统  
+- **已有**：Shadow 闭环、风险准入审计、Demo 最小下单路径、Dashboard、备份、部署骨架  
+- **还在做**：Gate 2 长稳 soak、Demo 7 日与故障注入、私有 WS  
+- **不要指望**：默认配置可直接实盘（`mode=live` 被代码拒绝）  
 
-细节与勾选：[ROADMAP](docs/ROADMAP.md) · [GATE2_CHECKLIST](docs/GATE2_CHECKLIST.md)
+细节与勾选：[ROADMAP](docs/ROADMAP.md) · [NEXT](docs/NEXT.md) · [GATE2](docs/GATE2_CHECKLIST.md) · [GATE3](docs/GATE3_CHECKLIST.md)
 
 ---
 

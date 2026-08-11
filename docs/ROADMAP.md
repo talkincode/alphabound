@@ -13,7 +13,8 @@ Dashboard 提案/净值/BH/K 线/Memories/Events/System API、shadow buy-and-hol
 私有 WS：**协议**单测 + TLS 握手/upgrade 实连；login 后 OKX close 4004 仍在排查，
 默认跳过（`ALPHABOUND_PRIVATE_WS=1` 可启用探测），REST 对账仍为 Gate 1 主路径。
 **尚未完成**: 私有 WS login 长连仍 opt-in 不稳、Gate2 长稳 soak、Demo/Live 下单闸门。
-**下一步**: 见 [GATE2_CHECKLIST.md](GATE2_CHECKLIST.md)；远端检查 `HOST=<sshx-host> ./scripts/check-remote.sh`。
+**本迭代已补**: shadow 准入审计、`flatten`/`cancel-all`、`gate2-report.sh`、shadow 账户心跳；**Demo 最小下单路径**（`mode=demo`+`OKX_SIMULATED=1` → admit → planner → 市价单/查单/撤单）。
+**下一步**: Gate2 运维 soak + [GATE3_CHECKLIST.md](GATE3_CHECKLIST.md) 模拟盘联调；见 [NEXT.md](NEXT.md)。
 
 ```
 Phase 0 ──► Phase 1 ──► Phase 2 ──► Phase 3 ──► Phase 4 ──► Phase 5
@@ -97,7 +98,8 @@ Phase 0 ──► Phase 1 ──► Phase 2 ──► Phase 3 ──► Phase 4 
 - Market K 线只读面 — ✅ `/api/v1/candles` + sparkline（TradingView 归因仍待完整 K 线组件）
 - 统计: ✅ `--agent-stats` 有效提案率 / tool_calls 计数
 - 短 soak 脚本: ✅ `scripts/soak-shadow.sh`
-- 本机管理控制: ✅ `--control pause|resume|reconcile|shutdown|status`（控制文件，无网络面）
+- 本机管理控制: ✅ `--control pause|resume|reconcile|cancel-all|flatten|shutdown|status`（控制文件，无网络面；cancel 交易所路径待 Demo）
+- 提案准入审计: ✅ shadow 路径 `admission.admit` → `RISK_ADMISSION`（仍不执行订单）
 - 工具 UNAVAILABLE: ✅ HTTP 失败不伪造零行情
 - systemd unit + deploy 说明: ✅ `deploy/`
 
@@ -115,12 +117,17 @@ Phase 0 ──► Phase 1 ──► Phase 2 ──► Phase 3 ──► Phase 4 
 **范围**
 - Risk Kernel: 保守净值/压力净值/ExitReserve/风险预算、提案准入(APPROVE/REDUCE/REJECT)、
   风险状态机 NORMAL/EXIT_ONLY/FLATTENING/HALTED
+  - ✅ admission 单测 + shadow/demo 决策环调用
 - Execution Engine: 目标仓位→订单、幂等 client_order_id、部分成交、撤单、UNKNOWN 处置、最终对账
+  - ✅ planner + client_order_id + demo 市价 place/query/cancel；部分成交再规划 / limit 仍待
 - orders/fills 表、订单 8 状态投影(PLANNED..UNKNOWN)
+  - ✅ orders 投影写入；fills 表已有、成交明细落库仍可增强
 - 管理控制: pause / resume / reconcile / cancel-all / flatten / safe-shutdown(本机 CLI/Unix socket)
+  - ✅ 控制文件 CLI 全套；cancel-all 在 demo 拉 pending 撤单
 - 故障注入全组: 断网、DNS、时钟漂移、磁盘满、SQLite busy、LLM 超时、坏 JSON、工具污染
 - 测试金字塔补全: property(Risk Kernel 不变量)、replay(状态确定性)、integration(OKX Demo)
 - 发布流水线完整化: manifest + SHA256 + self-check + 自动回滚
+- 清单: [GATE3_CHECKLIST.md](GATE3_CHECKLIST.md)
 
 **退出条件(Gate 3)**
 - [ ] Demo Trading 连续稳定运行 ≥ 7 天(soak)

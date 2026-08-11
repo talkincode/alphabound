@@ -10,12 +10,18 @@ pub const Cmd = enum {
     /// CLI accepts "resume"; enum avoids Zig keyword `resume`.
     unpause,
     reconcile,
+    /// Cancel open orders (demo/live). Shadow: audit-only, no exchange calls.
+    cancel_all,
+    /// Force risk mode toward FLATTENING (operator exit).
+    flatten,
     shutdown,
 
     pub fn fromString(s: []const u8) ?Cmd {
         if (std.mem.eql(u8, s, "pause")) return .pause;
         if (std.mem.eql(u8, s, "resume") or std.mem.eql(u8, s, "unpause")) return .unpause;
         if (std.mem.eql(u8, s, "reconcile")) return .reconcile;
+        if (std.mem.eql(u8, s, "cancel-all") or std.mem.eql(u8, s, "cancel_all")) return .cancel_all;
+        if (std.mem.eql(u8, s, "flatten")) return .flatten;
         if (std.mem.eql(u8, s, "shutdown") or std.mem.eql(u8, s, "safe-shutdown")) return .shutdown;
         if (std.mem.eql(u8, s, "status")) return .none;
         return null;
@@ -27,6 +33,8 @@ pub const Cmd = enum {
             .pause => "pause",
             .unpause => "resume",
             .reconcile => "reconcile",
+            .cancel_all => "cancel-all",
+            .flatten => "flatten",
             .shutdown => "shutdown",
         };
     }
@@ -155,6 +163,10 @@ test "parse and format request roundtrip" {
     try testing.expectEqual(@as(i64, 42), r.ts_ms);
     const s2 = try formatRequest(&buf, .unpause, 1);
     try testing.expect(parseRequest(s2).cmd == .unpause);
+    try testing.expect(Cmd.fromString("cancel-all").? == .cancel_all);
+    try testing.expect(Cmd.fromString("flatten").? == .flatten);
+    const s3 = try formatRequest(&buf, .flatten, 9);
+    try testing.expect(parseRequest(s3).cmd == .flatten);
 }
 
 test "parse state paused" {

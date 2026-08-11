@@ -248,6 +248,23 @@ test "stale market data degrades to exit_only" {
     try testing.expectEqual(sm.RiskMode.normal, e.snapshot().risk_mode);
 }
 
+test "operator exit_trigger moves normal to flattening" {
+    var e = testEngine();
+    // Reach NORMAL via clean reconcile + fresh market tick.
+    _ = try e.apply(.{ .reconcile_result = .{
+        .ts_ms = 1000,
+        .cash_usdt = d("100"),
+        .btc_total = d("0"),
+        .btc_available = d("0"),
+        .hwm_from_db = d("100"),
+        .clean = true,
+    } });
+    _ = try e.apply(.{ .market_tick = .{ .ts_ms = 1100, .bid = d("100000"), .mark = d("100000") } });
+    try testing.expectEqual(sm.RiskMode.normal, e.snapshot().risk_mode);
+    _ = try e.apply(.{ .risk_trigger = .exit_trigger });
+    try testing.expectEqual(sm.RiskMode.flattening, e.snapshot().risk_mode);
+}
+
 test "drawdown breach forces flattening and HWM only rises reconciled" {
     var e = testEngine();
     _ = try e.apply(.{ .reconcile_result = .{

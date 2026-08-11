@@ -449,6 +449,55 @@ test "parse order ack" {
     try testing.expectEqualStrings("312269865356374016", ack.exchangeOrderId());
 }
 
+test "parse order query filled" {
+    const body =
+        \\{"code":"0","msg":"","data":[{"state":"filled","accFillSz":"0.0001","avgPx":"100000.1"}]}
+    ;
+    const q = try parseOrderQuery(testing.allocator, body);
+    try testing.expectEqualStrings("filled", q.status());
+    try testing.expect(q.filled_qty.eql(d("0.0001")));
+    try testing.expect(q.avg_price.eql(d("100000.1")));
+}
+
+/// Extract up to `out.len` client order ids from orders-pending response.
+pub fn parsePendingClOrdIds(gpa: std.mem.Allocator, body: []const u8, out: [][]const u8, backing: []u8) Error!usize {
+    var parsed = std.json.parseFromSlice(std.json.Value, gpa, body, .{}) catch return Error.MalformedResponse;
+    defer parsed.deinit();
+    const data = try unwrapEnvelope(parsed.value);
+    var n: usize = 0;
+    var w: usize = 0;
+    for (data.items) |item| {
+        if (n >= out.len) break;
+        const obj = switch (item) {
+            .object => |o| o,
+            else => continue,
+        };
+        const cl = getString(obj, "clOrdId") catch continue;
+        if (cl.len == 0) continue;
+        if (w + cl.len > backing.len) break;
+        @memcpy(backing[w .. w + cl.len], cl);
+        out[n] = backing[w .. w + cl.len];
+        w += cl.len;
+        n += 1;
+    }
+    return n;
+}
+
+test "parse pending clOrdIds" {
+    const body =
+        \\{"code":"0","msg":"","data":[
+        \\  {"clOrdId":"abaaa","ordId":"1"},
+        \\  {"clOrdId":"abbbb","ordId":"2"}
+        \\]}
+    ;
+    var ids: [4][]const u8 = undefined;
+    var backing: [64]u8 = undefined;
+    const n = try parsePendingClOrdIds(testing.allocator, body, &ids, &backing);
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqualStrings("abaaa", ids[0]);
+    try testing.expectEqualStrings("abbbb", ids[1]);
+}
+
 test "parse order query with empty avgPx" {
     const body =
         \\{"code":"0","msg":"","data":[{"state":"live","accFillSz":"","avgPx":""}]}

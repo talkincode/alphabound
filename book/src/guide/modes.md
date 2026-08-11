@@ -23,20 +23,34 @@
 
 ## demo
 
-- 使用 OKX 模拟盘端点与 Demo 密钥（见 `secrets.env`）。
-- 验证私有 WS、对账、下单幂等、部分成交、UNKNOWN 处置。
-- **Gate 3 / AC-GO8**：连续稳定 ≥7 天 + 至少一次断线恢复与版本回滚演练。
+- 使用 OKX **模拟盘密钥** + 请求头 `x-simulated-trading: 1`（环境变量 **`OKX_SIMULATED=1` 必填**）。
+- 引擎现金/BTC 来自私有 REST 余额（不再用 shadow 的 `initial_capital`）。
+- Agent 提案经 Risk 准入后：`APPROVE`/`REDUCE` → planner → **市价单**；HTTP 失败 → `UNKNOWN` → 查询后处置。
+- Admin：`cancel-all` 会拉取 pending 并撤单；`flatten` 切风险态。
+- **Gate 3 / AC-GO8**：连续稳定 ≥7 天 + 至少一次断线恢复与版本回滚演练。清单：[GATE3_CHECKLIST.md](../../docs/GATE3_CHECKLIST.md)。
+
+```bash
+export OKX_API_KEY=...
+export OKX_API_SECRET=...
+export OKX_API_PASSPHRASE=...
+export OKX_SIMULATED=1
+# config: mode = "demo"
+./zig-out/bin/alphabound --config config/local.toml --agent-once --ticks 8
+# 日志: admit=APPROVE|REDUCE exec=filled|acked|...
+```
 
 切换前检查清单：
 
-1. `mode = "demo"` 且 rest/ws 指向 Demo 主机
-2. Demo 密钥权限最小化（仅交易需要的 scope）
-3. `--self-check` 通过
+1. `mode = "demo"` 且 **`OKX_SIMULATED=1`**（缺一则 boot FATAL）
+2. Demo 密钥权限最小化；出口 IP 在 OKX 白名单
+3. `--self-check` 私有余额通过
 4. ready 探针在对账后变绿
+5. **live 仍被代码拒绝**，勿改 mode 碰运气
 
 ## live
 
 - 真金白银。设计默认实验资金 **100 USDT**。
+- **当前二进制直接拒绝 `mode=live`**（Gate 4 前）。
 - 进入条件：路线图 Gate 3 + 验收矩阵 P0–P3 相关条目全绿；任何无法解释的状态不一致都阻止实盘。
 - `max_drawdown`、费率、滑点等已按发版流程冻结。
 - 建议：先 shadow 长跑 → demo 7 日 → live，**禁止**从开发配置直接改 `live`。

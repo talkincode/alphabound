@@ -36,4 +36,13 @@ if grep -q 'proposal ok' "$LOG"; then
   echo "[soak] proposals:"
   grep 'proposal ok' "$LOG" | tail -5
 fi
+if grep -q 'admit=' "$LOG"; then
+  echo "[soak] admission:"
+  grep 'admit=' "$LOG" | tail -5
+fi
+# Optional: if a long-running daemon is already up, print Gate2 thresholds.
+if curl -fsS --max-time 2 http://127.0.0.1:8080/api/v1/system >/dev/null 2>&1; then
+  echo "[soak] --- gate2-report ---"
+  BASE_URL=http://127.0.0.1:8080 "$ROOT/scripts/gate2-report.sh" || true
+fi
 echo "[soak] done"

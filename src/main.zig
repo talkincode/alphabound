@@ -113,7 +113,7 @@ const CliArgs = struct {
     agent_once: bool = false,
     /// Print agent_runs / tool_calls validity stats and exit.
     agent_stats: bool = false,
-    /// One-shot local admin command: pause|resume|reconcile|shutdown|status.
+    /// One-shot local admin command: pause|resume|reconcile|cancel-all|flatten|shutdown|status.
     control_cmd: ?[]const u8 = null,
 };
 
@@ -326,7 +326,6 @@ const WebState = struct {
     }
 };
 
-
 /// Live connectivity/status snapshot for Dashboard「状态」页.
 const RuntimeStatus = struct {
     okx_public: []const u8 = "unknown",
@@ -431,7 +430,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     const cli = parseArgs(init.minimal.args) catch {
         std.debug.print(
-            "usage: alphabound [--config PATH] [--self-check] [--version] [--ticks N] [--agent-once] [--agent-stats] [--control CMD]\n",
+            "usage: alphabound [--config PATH] [--self-check] [--version] [--ticks N] [--agent-once] [--agent-stats] [--control pause|resume|reconcile|cancel-all|flatten|shutdown|status]\n",
             .{},
         );
         return 2;
@@ -483,6 +482,14 @@ pub fn main(init: std.process.Init) !u8 {
     }
     if (cfg.mode == .demo and okx_env == null) {
         std.debug.print("[boot] FATAL mode=demo requires OKX_* credentials\n", .{});
+        return 1;
+    }
+    if (cfg.mode == .demo and okx_env != null and !okx_env.?.simulated) {
+        // Demo trading must hit the simulated venue header path — never live keys "by accident".
+        std.debug.print(
+            "[boot] FATAL mode=demo requires OKX_SIMULATED=1 (refusing non-simulated keys)\n",
+            .{},
+        );
         return 1;
     }
 
@@ -575,6 +582,8 @@ pub fn main(init: std.process.Init) !u8 {
     defer tool_calls.deinit();
     var memories_repo = try ab.storage.MemoriesRepo.init(&db);
     defer memories_repo.deinit();
+    var orders_repo = try ab.storage.OrdersRepo.init(&db);
+    defer orders_repo.deinit();
 
     // In-process memory index rebuilt from SQLite latest versions.
     var mem_store = ab.memory.Store.init(gpa);
@@ -629,6 +638,38 @@ pub fn main(init: std.process.Init) !u8 {
     if (okx_env) |c| {
         okx.simulated = c.simulated or cfg.mode == .demo;
     }
+    // Instrument constraints for planner (demo execution). Fallback = OKX BTC-USDT defaults.
+    var trade_instrument = ab.planner.Instrument{
+        .tick_size = ab.decimal.Decimal.parse("0.1") catch ab.decimal.Decimal.one,
+        .lot_size = ab.decimal.Decimal.parse("0.00000001") catch ab.decimal.Decimal.one,
+        .min_size = ab.decimal.Decimal.parse("0.00001") catch ab.decimal.Decimal.one,
+        .min_notional = ab.decimal.Decimal.parse("1") catch ab.decimal.Decimal.one,
+    };
+    {
+        var ipath_buf: [96]u8 = undefined;
+        const ipath = std.fmt.bufPrint(&ipath_buf, "/api/v5/public/instruments?instType=SPOT&instId={s}", .{cfg.instrument}) catch "";
+        if (ipath.len > 0) {
+            if (okx.getPublic(ipath)) |ibody| {
+                defer gpa.free(ibody);
+                if (ab.okx_rest.parseInstrument(gpa, ibody)) |info| {
+                    trade_instrument = .{
+                        .tick_size = info.tick_size,
+                        .lot_size = info.lot_size,
+                        .min_size = info.min_size,
+                        .min_notional = trade_instrument.min_notional,
+                    };
+                    std.debug.print(
+                        "[boot] instrument {s} tick={f} lot={f} min={f}\n",
+                        .{ cfg.instrument, info.tick_size, info.lot_size, info.min_size },
+                    );
+                } else |_| {
+                    std.debug.print("[boot] instrument parse failed — using BTC-USDT defaults\n", .{});
+                }
+            } else |_| {
+                std.debug.print("[boot] instrument fetch failed — using BTC-USDT defaults\n", .{});
+            }
+        }
+    }
 
     std.debug.print("[connect] probing {s}\n", .{cfg.rest_url});
     if (okx.getPublic("/api/v5/public/time")) |body| {
@@ -644,17 +685,30 @@ pub fn main(init: std.process.Init) !u8 {
     }
 
     // ---- RECONCILING --------------------------------------------------------
-    // Shadow: engine cash = initial_capital (simulated). When keys exist we still
-    // probe private balance read-only for Gate 1 connectivity — never place orders.
+    // Shadow: engine cash = initial_capital (simulated).
+    // Demo: engine cash/BTC from private REST balance (simulated venue).
     const now_boot = nowMs();
+    var boot_cash = cfg.initial_capital;
+    var boot_btc = ab.decimal.Decimal.zero;
+    var boot_btc_avail = ab.decimal.Decimal.zero;
     if (okx_env != null) {
         const probe = probePrivateBalance(gpa, &okx);
         switch (probe) {
             .ok => |b| {
-                std.debug.print(
-                    "[reconcile] private balance ok usdt={f} avail={f} btc={f} (shadow keeps simulated engine cash)\n",
-                    .{ b.usdt_cash, b.usdt_avail, b.btc_cash },
-                );
+                if (cfg.mode == .demo) {
+                    boot_cash = b.usdt_cash;
+                    boot_btc = b.btc_cash;
+                    boot_btc_avail = b.btc_avail;
+                    std.debug.print(
+                        "[reconcile] demo balance applied usdt={f} avail={f} btc={f}\n",
+                        .{ b.usdt_cash, b.usdt_avail, b.btc_cash },
+                    );
+                } else {
+                    std.debug.print(
+                        "[reconcile] private balance ok usdt={f} avail={f} btc={f} (shadow keeps simulated engine cash)\n",
+                        .{ b.usdt_cash, b.usdt_avail, b.btc_cash },
+                    );
+                }
                 logEvent(&events_repo, &engine, "PRIVATE_BALANCE_OK", "exchange", "INFO", &cfg);
             },
             .err => |e| {
@@ -678,9 +732,9 @@ pub fn main(init: std.process.Init) !u8 {
 
     _ = engine.apply(.{ .reconcile_result = .{
         .ts_ms = now_boot,
-        .cash_usdt = cfg.initial_capital,
-        .btc_total = ab.decimal.Decimal.zero,
-        .btc_available = ab.decimal.Decimal.zero,
+        .cash_usdt = boot_cash,
+        .btc_total = boot_btc,
+        .btc_available = boot_btc_avail,
         .hwm_from_db = engine.snapshot().high_watermark,
         .clean = true,
     } }) catch return 1;
@@ -708,14 +762,16 @@ pub fn main(init: std.process.Init) !u8 {
 
     // ---- READY: shadow loop -------------------------------------------------
     std.debug.print(
-        "[ready] mode={t} live {s} data, simulated engine cash {f} USDT, web {s}, private_keys={s}, agent={s}\n",
+        "[ready] mode={t} inst={s} cash={f} USDT btc={f} web={s} keys={s} agent={s} exec={s}\n",
         .{
             cfg.mode,
             cfg.instrument,
-            cfg.initial_capital,
+            engine.snapshot().cash_usdt,
+            engine.snapshot().btc_total,
             cfg.web_bind,
             if (okx_env != null) "yes" else "no",
             if (llm_client != null) "on" else "off",
+            if (ab.okx_trade.executionAllowed(cfg.mode == .demo, okx.simulated)) "demo" else "off",
         },
     );
     web_state.update(engine.snapshot(), true);
@@ -769,6 +825,32 @@ pub fn main(init: std.process.Init) !u8 {
                         }
                         logEvent(&events_repo, &engine, "ADMIN_RECONCILE", "admin", "INFO", &cfg);
                     },
+                    .cancel_all => {
+                        const canceled_n = adminCancelAll(gpa, &okx, &cfg, &engine, &events_repo);
+                        std.debug.print("[admin] cancel-all mode={t} canceled≈{d}\n", .{ cfg.mode, canceled_n });
+                        var cab: [192]u8 = undefined;
+                        const cap = std.fmt.bufPrint(
+                            &cab,
+                            "{{\"mode\":\"{t}\",\"canceled\":{d}}}",
+                            .{ cfg.mode, canceled_n },
+                        ) catch "{\"canceled\":0}";
+                        logEventPayload(&events_repo, &engine, "ADMIN_CANCEL_ALL", "admin", "CRITICAL", &cfg, cap);
+                        _ = engine.apply(.{ .order_ambiguity = .{ .present = false } }) catch {};
+                    },
+                    .flatten => {
+                        const prev = engine.snapshot().risk_mode;
+                        _ = engine.apply(.{ .risk_trigger = .exit_trigger }) catch {};
+                        const now_mode = engine.snapshot().risk_mode;
+                        std.debug.print("[admin] flatten {t} -> {t}\n", .{ prev, now_mode });
+                        var flb: [192]u8 = undefined;
+                        const flp = std.fmt.bufPrint(
+                            &flb,
+                            "{{\"from\":\"{t}\",\"to\":\"{t}\",\"trigger\":\"operator_exit\"}}",
+                            .{ prev, now_mode },
+                        ) catch "{\"trigger\":\"operator_exit\"}";
+                        logEventPayload(&events_repo, &engine, "ADMIN_FLATTEN", "admin", "CRITICAL", &cfg, flp);
+                        web_state.update(engine.snapshot(), true);
+                    },
                     .shutdown => {
                         std.debug.print("[admin] safe-shutdown requested\n", .{});
                         shutdown_requested.store(true, .release);
@@ -789,6 +871,18 @@ pub fn main(init: std.process.Init) !u8 {
                     .bid = ticker.bid,
                     .mark = ticker.last,
                 } }) catch continue;
+                // Shadow uses a simulated book: keep account freshness aligned with
+                // market ticks so the risk mode does not spuriously enter EXIT_ONLY
+                // after account_ttl without private WS updates.
+                if (cfg.mode == .shadow) {
+                    const s0 = engine.snapshot();
+                    _ = engine.apply(.{ .account_update = .{
+                        .ts_ms = ticker.ts_ms,
+                        .cash_usdt = s0.cash_usdt,
+                        .btc_total = s0.btc_total,
+                        .btc_available = s0.btc_available,
+                    } }) catch {};
+                }
                 const snap = engine.snapshot();
                 web_state.update(snap, true);
 
@@ -876,7 +970,7 @@ pub fn main(init: std.process.Init) !u8 {
                 if (due_interval or due_once) {
                     last_agent_ms = tnow;
                     agent_done_once = true;
-                    runAgentDecision(gpa, client, &okx, &cfg, &engine, &tool_reg, &agent_runs, &tool_calls, &events_repo, &db, &mem_store, &memories_repo, env, &runtime_status);
+                    runAgentDecision(gpa, client, &okx, &cfg, &engine, &tool_reg, &agent_runs, &tool_calls, &events_repo, &orders_repo, &db, &mem_store, &memories_repo, env, &runtime_status, trade_instrument);
                     refreshWebCaches(&web_state, &db, &agent_runs, &equity_repo, &events_repo, &memories_repo, last_bh_cmp);
                     refreshSystemCache(&web_state, &db, &cfg, &mem_store, boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), llm_client != null, admin_paused, &runtime_status);
                 }
@@ -948,7 +1042,6 @@ fn registerDefaultTools(reg: *ab.tools.Registry) !void {
     });
 }
 
-
 fn runControlCli(io: std.Io, cmd_name: []const u8, db_path: []const u8) u8 {
     var path_buf: [640]u8 = undefined;
     const cpath = ab.admin_control.pathFromDb(db_path, &path_buf) catch {
@@ -970,7 +1063,7 @@ fn runControlCli(io: std.Io, cmd_name: []const u8, db_path: []const u8) u8 {
     }
 
     const cmd = ab.admin_control.Cmd.fromString(cmd_name) orelse {
-        std.debug.print("[control] unknown cmd '{s}' (pause|resume|reconcile|shutdown|status)\n", .{cmd_name});
+        std.debug.print("[control] unknown cmd '{s}' (pause|resume|reconcile|cancel-all|flatten|shutdown|status)\n", .{cmd_name});
         return 2;
     };
     if (cmd == .none) {
@@ -1165,10 +1258,25 @@ fn runPrivateReconcile(
     const probe = probePrivateBalance(gpa, okx);
     switch (probe) {
         .ok => |b| {
-            std.debug.print(
-                "[reconcile] private balance ok usdt={f} avail={f} btc={f} (shadow engine cash unchanged)\n",
-                .{ b.usdt_cash, b.usdt_avail, b.btc_cash },
-            );
+            if (cfg.mode == .demo) {
+                _ = engine.apply(.{ .reconcile_result = .{
+                    .ts_ms = nowMs(),
+                    .cash_usdt = b.usdt_cash,
+                    .btc_total = b.btc_cash,
+                    .btc_available = b.btc_avail,
+                    .hwm_from_db = engine.snapshot().high_watermark,
+                    .clean = true,
+                } }) catch {};
+                std.debug.print(
+                    "[reconcile] demo balance applied usdt={f} avail={f} btc={f}\n",
+                    .{ b.usdt_cash, b.usdt_avail, b.btc_cash },
+                );
+            } else {
+                std.debug.print(
+                    "[reconcile] private balance ok usdt={f} avail={f} btc={f} (shadow engine cash unchanged)\n",
+                    .{ b.usdt_cash, b.usdt_avail, b.btc_cash },
+                );
+            }
             var payload_buf: [256]u8 = undefined;
             const payload = std.fmt.bufPrint(
                 &payload_buf,
@@ -1308,7 +1416,85 @@ fn journalToolCall(repo: *ab.storage.ToolCallsRepo, run_id: []const u8, rec: ab.
     };
 }
 
-/// One slow-loop decision: tools → context → LLM → proposal parse → journal. No orders.
+/// Shadow-path Risk Kernel admission (audit only — never places orders).
+const ShadowAdmission = struct {
+    verdict_txt: []const u8,
+    reason_txt: []const u8,
+    admitted_weight: ab.decimal.Decimal,
+    stress_equity: ab.decimal.Decimal,
+    floor: ab.decimal.Decimal,
+};
+
+fn defaultStressParams(cfg: *const ab.config.Config) ab.admission.StressParams {
+    return .{
+        .price_shock = ab.decimal.Decimal.parse("0.05") catch ab.decimal.Decimal.zero,
+        .trade_fee_rate = cfg.taker_fee_rate,
+        .trade_slippage_rate = cfg.slippage_rate,
+        .exit_costs = .{ .fee_rate = cfg.taker_fee_rate, .slippage_rate = cfg.slippage_rate },
+        // Small absolute reserve so tiny shadow books still exercise the floor path.
+        .exit_reserve = ab.decimal.Decimal.parse("0.50") catch ab.decimal.Decimal.zero,
+    };
+}
+
+fn shadowAdmit(
+    snap: ab.state.PortfolioState,
+    proposal_snapshot_version: u64,
+    target_btc_weight: ab.decimal.Decimal,
+    cfg: *const ab.config.Config,
+    now_ms: i64,
+) ShadowAdmission {
+    const view = ab.admission.SnapshotView{
+        .version = snap.version,
+        .reconciled = snap.reconciled,
+        .market_fresh = snap.freshness.marketFresh(now_ms),
+        .account_fresh = snap.freshness.accountFresh(now_ms),
+        .unresolved_orders = snap.unresolved_orders,
+        .risk_mode = snap.risk_mode,
+        .cash_usdt = snap.cash_usdt,
+        .btc_total = snap.btc_total,
+        .liq_price = snap.bid_price,
+        .mark_price = if (snap.mark_price.gt(ab.decimal.Decimal.zero)) snap.mark_price else snap.bid_price,
+        .high_watermark = snap.high_watermark,
+    };
+    const prop = ab.admission.ProposalView{
+        .snapshot_version = proposal_snapshot_version,
+        .target_btc_weight = target_btc_weight,
+    };
+    const result = ab.admission.admit(view, prop, cfg.max_drawdown, defaultStressParams(cfg)) catch {
+        return .{
+            .verdict_txt = "ERROR",
+            .reason_txt = "admission_math_error",
+            .admitted_weight = ab.decimal.Decimal.zero,
+            .stress_equity = ab.decimal.Decimal.zero,
+            .floor = ab.decimal.Decimal.zero,
+        };
+    };
+    return switch (result.verdict) {
+        .approve => |w| .{
+            .verdict_txt = "APPROVE",
+            .reason_txt = "ok",
+            .admitted_weight = w,
+            .stress_equity = result.stress_equity,
+            .floor = result.floor,
+        },
+        .approve_reduced => |w| .{
+            .verdict_txt = "REDUCE",
+            .reason_txt = "reduced_to_boundary",
+            .admitted_weight = w,
+            .stress_equity = result.stress_equity,
+            .floor = result.floor,
+        },
+        .reject => |r| .{
+            .verdict_txt = "REJECT",
+            .reason_txt = r.text(),
+            .admitted_weight = ab.decimal.Decimal.zero,
+            .stress_equity = result.stress_equity,
+            .floor = result.floor,
+        },
+    };
+}
+
+/// One slow-loop decision: tools → context → LLM → proposal → admission → optional demo exec.
 fn runAgentDecision(
     gpa: std.mem.Allocator,
     client: *ab.openai.Client,
@@ -1319,11 +1505,13 @@ fn runAgentDecision(
     runs: *ab.storage.AgentRunsRepo,
     tools_repo: *ab.storage.ToolCallsRepo,
     events_repo: *ab.storage.EventsRepo,
+    orders_repo: *ab.storage.OrdersRepo,
     db: *ab.storage.Db,
     mem_store: *ab.memory.Store,
     memories_repo: *ab.storage.MemoriesRepo,
     env: *const std.process.Environ.Map,
     st: *RuntimeStatus,
+    instrument: ab.planner.Instrument,
 ) void {
     const snap = engine.snapshot();
 
@@ -1463,16 +1651,33 @@ fn runAgentDecision(
     };
     defer prop.deinit();
 
-    // Shadow: never execute. Audit only.
+    // Risk Kernel admission (always). Demo may execute; shadow never does.
     const action_txt: []const u8 = switch (prop.action) {
         .hold => "HOLD",
         .rebalance => "REBALANCE",
     };
+    const admit_now = nowMs();
+    const admission = shadowAdmit(snap, prop.snapshot_version, prop.target_btc_weight, cfg, admit_now);
+    var exec_note: []const u8 = "not_executed";
+    if (ab.okx_trade.executionAllowed(cfg.mode == .demo, okx.simulated)) {
+        exec_note = tryDemoExecute(
+            gpa,
+            okx,
+            cfg,
+            engine,
+            orders_repo,
+            events_repo,
+            prop.decision_id,
+            admission,
+            instrument,
+            snap,
+        );
+    }
     std.debug.print(
-        "[agent] proposal ok id={s} action={s} target_btc={f} conf={f} mem={d} (shadow: not executed)\n",
-        .{ prop.decision_id, action_txt, prop.target_btc_weight, prop.confidence, scored.items.len },
+        "[agent] proposal ok id={s} action={s} target_btc={f} conf={f} mem={d} admit={s} exec={s}\n",
+        .{ prop.decision_id, action_txt, prop.target_btc_weight, prop.confidence, scored.items.len, admission.verdict_txt, exec_note },
     );
-    completeRun(runs, run_id, "ok", out_digest, input_digest, nowMs());
+    completeRun(runs, run_id, "ok", out_digest, input_digest, admit_now);
     recordProposalEpisode(gpa, mem_store, memories_repo, run_id, prop.decision_id, action_txt, prop.target_btc_weight, prop.confidence);
     // Reflection: prefer LLM structured memory_ops; fail-closed → deterministic.
     const want_llm_reflect = cfg.agent_llm_reflection and llmReflectionWanted(env);
@@ -1499,22 +1704,296 @@ fn runAgentDecision(
         applyShadowReflection(gpa, mem_store, memories_repo, events_repo, engine, cfg, run_id, prop.decision_id, action_txt, prop.target_btc_weight, prop.confidence);
     }
 
-    var ok_buf: [512]u8 = undefined;
+    var ok_buf: [896]u8 = undefined;
     var w_buf: [48]u8 = undefined;
     var c_buf: [48]u8 = undefined;
+    var aw_buf: [48]u8 = undefined;
+    var se_buf: [48]u8 = undefined;
+    var fl_buf: [48]u8 = undefined;
     const weight_s = decFmt(&w_buf, prop.target_btc_weight);
     const conf_s = decFmt(&c_buf, prop.confidence);
+    const admitted_s = decFmt(&aw_buf, admission.admitted_weight);
+    const stress_s = decFmt(&se_buf, admission.stress_equity);
+    const floor_s = decFmt(&fl_buf, admission.floor);
+    const executed = !std.mem.eql(u8, exec_note, "not_executed") and
+        !std.mem.eql(u8, exec_note, "hold") and
+        !std.mem.eql(u8, exec_note, "skipped_reject") and
+        !std.mem.eql(u8, exec_note, "plan_hold") and
+        !std.mem.eql(u8, exec_note, "plan_error");
     const ok_payload = std.fmt.bufPrint(
         &ok_buf,
-        "{{\"run_id\":\"{s}\",\"decision_id\":\"{s}\",\"action\":\"{s}\",\"target_btc_weight\":\"{s}\",\"confidence\":\"{s}\",\"snapshot_version\":{d},\"output_digest\":\"{s}\",\"tools\":{d},\"executed\":false,\"usage\":{{\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d}}}}}",
-        .{ run_id, prop.decision_id, action_txt, weight_s, conf_s, prop.snapshot_version, out_digest, obs_n, chat_res.usage.prompt_tokens, chat_res.usage.completion_tokens, chat_res.usage.total_tokens },
+        "{{\"run_id\":\"{s}\",\"decision_id\":\"{s}\",\"action\":\"{s}\",\"target_btc_weight\":\"{s}\",\"confidence\":\"{s}\",\"snapshot_version\":{d},\"output_digest\":\"{s}\",\"tools\":{d},\"executed\":{},\"exec\":\"{s}\",\"admission\":{{\"verdict\":\"{s}\",\"reason\":\"{s}\",\"admitted_weight\":\"{s}\",\"stress_equity\":\"{s}\",\"floor\":\"{s}\"}},\"usage\":{{\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d}}}}}",
+        .{ run_id, prop.decision_id, action_txt, weight_s, conf_s, prop.snapshot_version, out_digest, obs_n, executed, exec_note, admission.verdict_txt, admission.reason_txt, admitted_s, stress_s, floor_s, chat_res.usage.prompt_tokens, chat_res.usage.completion_tokens, chat_res.usage.total_tokens },
     ) catch "{\"executed\":false}";
     {
-        var dbuf: [96]u8 = undefined;
-        const dtxt = std.fmt.bufPrint(&dbuf, "{s} {s} conf={s}", .{ action_txt, prop.decision_id, conf_s }) catch action_txt;
+        var dbuf: [160]u8 = undefined;
+        const dtxt = std.fmt.bufPrint(&dbuf, "{s} {s} conf={s} admit={s} exec={s}", .{ action_txt, prop.decision_id, conf_s, admission.verdict_txt, exec_note }) catch action_txt;
         st.setLastDecision(dtxt);
     }
     logEventPayload(events_repo, engine, "AGENT_PROPOSAL_OK", "agent", "INFO", cfg, ok_payload);
+    logEventPayload(events_repo, engine, "RISK_ADMISSION", "risk", "INFO", cfg, ok_payload);
+}
+
+/// Demo-only: plan + place market order after APPROVE/REDUCE. Never called for live.
+/// Returns a short stable token for logs/events (no secrets).
+fn tryDemoExecute(
+    gpa: std.mem.Allocator,
+    okx: *ab.okx_rest.Client,
+    cfg: *const ab.config.Config,
+    engine: *ab.state.Engine,
+    orders_repo: *ab.storage.OrdersRepo,
+    events_repo: *ab.storage.EventsRepo,
+    decision_id: []const u8,
+    admission: ShadowAdmission,
+    instrument: ab.planner.Instrument,
+    snap: ab.state.PortfolioState,
+) []const u8 {
+    if (!std.mem.eql(u8, admission.verdict_txt, "APPROVE") and !std.mem.eql(u8, admission.verdict_txt, "REDUCE")) {
+        return "skipped_reject";
+    }
+    const mark = if (snap.mark_price.gt(ab.decimal.Decimal.zero)) snap.mark_price else snap.bid_price;
+    const equity = if (snap.conservative_equity.gt(ab.decimal.Decimal.zero)) snap.conservative_equity else blk: {
+        break :blk snap.cash_usdt;
+    };
+    const planned = ab.planner.plan(.{
+        .cash_usdt = snap.cash_usdt,
+        .btc_total = snap.btc_total,
+        .equity = equity,
+        .mark_price = mark,
+        .admitted_btc_weight = admission.admitted_weight,
+        .instrument = instrument,
+    }) catch return "plan_error";
+
+    const po = switch (planned) {
+        .hold => {
+            logEventPayload(events_repo, engine, "EXEC_HOLD", "execution", "INFO", cfg, "{\"reason\":\"dust_or_zero_delta\"}");
+            return "plan_hold";
+        },
+        .order => |o| o,
+    };
+
+    var cl_buf: [32]u8 = undefined;
+    const cl_id = ab.orders.clientOrderId(&cl_buf, decision_id, snap.version, 0);
+    var body_buf: [384]u8 = undefined;
+    const body = ab.okx_trade.formatPlaceMarketBody(&body_buf, .{
+        .inst_id = cfg.instrument,
+        .side = po.side,
+        .qty = po.qty,
+        .client_order_id = cl_id,
+    }) catch return "body_error";
+
+    var qty_buf: [48]u8 = undefined;
+    const qty_s = decFmt(&qty_buf, po.qty);
+    const ts_now = nowMs();
+    var ts_buf: [32]u8 = undefined;
+    const ts = ab.clock.formatRfc3339Ms(ts_now, &ts_buf) catch return "ts_error";
+
+    orders_repo.upsert(.{
+        .client_order_id = cl_id,
+        .exchange_order_id = "",
+        .decision_id = decision_id,
+        .side = po.side.jsonName(),
+        .qty = qty_s,
+        .price = "market",
+        .status = ab.orders.OrderStatus.planned.jsonName(),
+        .created_ts = ts,
+        .updated_ts = ts,
+    }) catch {};
+
+    var status = ab.orders.OrderStatus.planned;
+    status = ab.orders.next(status, .submit) catch .submitted;
+
+    const resp = okx.postPrivate("/api/v5/trade/order", body, ts_now) catch {
+        status = ab.orders.next(status, .timeout) catch .unknown;
+        _ = engine.apply(.{ .order_ambiguity = .{ .present = true } }) catch {};
+        orders_repo.upsert(.{
+            .client_order_id = cl_id,
+            .decision_id = decision_id,
+            .side = po.side.jsonName(),
+            .qty = qty_s,
+            .price = "market",
+            .status = status.jsonName(),
+            .created_ts = ts,
+            .updated_ts = ts,
+        }) catch {};
+        // Fail-closed: query before any retry.
+        _ = queryAndResolveOrder(gpa, okx, cfg, engine, orders_repo, events_repo, decision_id, cl_id, po.side.jsonName(), qty_s, ts);
+        logEventPayload(events_repo, engine, "ORDER_UNKNOWN", "execution", "CRITICAL", cfg, "{\"reason\":\"http_timeout_or_error\"}");
+        return "unknown_http";
+    };
+    defer gpa.free(resp);
+
+    const ack = ab.okx_rest.parseOrderAck(gpa, resp) catch {
+        status = ab.orders.next(status, .timeout) catch .unknown;
+        _ = engine.apply(.{ .order_ambiguity = .{ .present = true } }) catch {};
+        _ = queryAndResolveOrder(gpa, okx, cfg, engine, orders_repo, events_repo, decision_id, cl_id, po.side.jsonName(), qty_s, ts);
+        return "unknown_parse";
+    };
+
+    if (!ack.s_code_ok) {
+        status = ab.orders.next(status, .reject_confirmed) catch .rejected;
+        orders_repo.upsert(.{
+            .client_order_id = cl_id,
+            .exchange_order_id = ack.exchangeOrderId(),
+            .decision_id = decision_id,
+            .side = po.side.jsonName(),
+            .qty = qty_s,
+            .price = "market",
+            .status = status.jsonName(),
+            .created_ts = ts,
+            .updated_ts = ts,
+        }) catch {};
+        var rbuf: [256]u8 = undefined;
+        const rp = std.fmt.bufPrint(
+            &rbuf,
+            "{{\"clOrdId\":\"{s}\",\"status\":\"REJECTED\",\"side\":\"{s}\",\"qty\":\"{s}\"}}",
+            .{ cl_id, po.side.jsonName(), qty_s },
+        ) catch "{\"status\":\"REJECTED\"}";
+        logEventPayload(events_repo, engine, "ORDER_REJECTED", "execution", "WARN", cfg, rp);
+        return "rejected";
+    }
+
+    status = ab.orders.next(status, .ack) catch .acknowledged;
+    const ex_id = ack.exchangeOrderId();
+    orders_repo.upsert(.{
+        .client_order_id = cl_id,
+        .exchange_order_id = ex_id,
+        .decision_id = decision_id,
+        .side = po.side.jsonName(),
+        .qty = qty_s,
+        .price = "market",
+        .status = status.jsonName(),
+        .created_ts = ts,
+        .updated_ts = ts,
+    }) catch {};
+
+    var abuf: [320]u8 = undefined;
+    const ap = std.fmt.bufPrint(
+        &abuf,
+        "{{\"clOrdId\":\"{s}\",\"ordId\":\"{s}\",\"side\":\"{s}\",\"qty\":\"{s}\",\"status\":\"ACKNOWLEDGED\"}}",
+        .{ cl_id, ex_id, po.side.jsonName(), qty_s },
+    ) catch "{\"status\":\"ACKNOWLEDGED\"}";
+    logEventPayload(events_repo, engine, "ORDER_ACK", "execution", "INFO", cfg, ap);
+
+    const resolved = queryAndResolveOrder(gpa, okx, cfg, engine, orders_repo, events_repo, decision_id, cl_id, po.side.jsonName(), qty_s, ts);
+    return resolved;
+}
+
+fn queryAndResolveOrder(
+    gpa: std.mem.Allocator,
+    okx: *ab.okx_rest.Client,
+    cfg: *const ab.config.Config,
+    engine: *ab.state.Engine,
+    orders_repo: *ab.storage.OrdersRepo,
+    events_repo: *ab.storage.EventsRepo,
+    decision_id: []const u8,
+    cl_id: []const u8,
+    side: []const u8,
+    qty_s: []const u8,
+    ts: []const u8,
+) []const u8 {
+    var path_buf: [192]u8 = undefined;
+    const path = ab.okx_trade.formatQueryPath(&path_buf, cfg.instrument, cl_id) catch return "query_path_error";
+    const body = okx.getPrivate(path, nowMs()) catch {
+        _ = engine.apply(.{ .order_ambiguity = .{ .present = true } }) catch {};
+        return "query_http_error";
+    };
+    defer gpa.free(body);
+
+    const q = ab.okx_rest.parseOrderQuery(gpa, body) catch {
+        // Empty data often means not found yet or never accepted.
+        if (std.mem.indexOf(u8, body, "\"data\":[]") != null) {
+            orders_repo.upsert(.{
+                .client_order_id = cl_id,
+                .decision_id = decision_id,
+                .side = side,
+                .qty = qty_s,
+                .price = "market",
+                .status = ab.orders.OrderStatus.canceled.jsonName(),
+                .created_ts = ts,
+                .updated_ts = ts,
+            }) catch {};
+            _ = engine.apply(.{ .order_ambiguity = .{ .present = false } }) catch {};
+            return "not_found_canceled";
+        }
+        _ = engine.apply(.{ .order_ambiguity = .{ .present = true } }) catch {};
+        return "query_parse_error";
+    };
+
+    const st = ab.okx_trade.mapOkxState(q.status());
+    var fill_buf: [48]u8 = undefined;
+    const fill_s = decFmt(&fill_buf, q.filled_qty);
+    orders_repo.upsert(.{
+        .client_order_id = cl_id,
+        .decision_id = decision_id,
+        .side = side,
+        .qty = qty_s,
+        .price = "market",
+        .status = st.jsonName(),
+        .created_ts = ts,
+        .updated_ts = ts,
+    }) catch {};
+
+    if (st == .filled or st == .canceled or st == .rejected) {
+        _ = engine.apply(.{ .order_ambiguity = .{ .present = false } }) catch {};
+    } else if (st == .unknown or st == .partial or st == .acknowledged) {
+        // Market orders usually fill quickly; leave ambiguity only for unknown.
+        _ = engine.apply(.{ .order_ambiguity = .{ .present = st == .unknown } }) catch {};
+    }
+
+    var pbuf: [320]u8 = undefined;
+    const payload = std.fmt.bufPrint(
+        &pbuf,
+        "{{\"clOrdId\":\"{s}\",\"okx_state\":\"{s}\",\"status\":\"{s}\",\"filled\":\"{s}\"}}",
+        .{ cl_id, q.status(), st.jsonName(), fill_s },
+    ) catch "{}";
+    logEventPayload(events_repo, engine, "ORDER_QUERY", "execution", "INFO", cfg, payload);
+
+    return switch (st) {
+        .filled => "filled",
+        .partial => "partial",
+        .canceled => "canceled",
+        .rejected => "rejected",
+        .acknowledged => "acked",
+        else => "open",
+    };
+}
+
+/// Cancel pending demo orders (shadow: no-op count 0).
+fn adminCancelAll(
+    gpa: std.mem.Allocator,
+    okx: *ab.okx_rest.Client,
+    cfg: *const ab.config.Config,
+    engine: *ab.state.Engine,
+    events_repo: *ab.storage.EventsRepo,
+) usize {
+    if (!ab.okx_trade.executionAllowed(cfg.mode == .demo, okx.simulated)) return 0;
+
+    var path_buf: [160]u8 = undefined;
+    const path = ab.okx_trade.formatPendingPath(&path_buf, cfg.instrument) catch return 0;
+    const body = okx.getPrivate(path, nowMs()) catch return 0;
+    defer gpa.free(body);
+
+    var ids: [32][]const u8 = undefined;
+    var backing: [1024]u8 = undefined;
+    const n = ab.okx_rest.parsePendingClOrdIds(gpa, body, &ids, &backing) catch 0;
+    var canceled: usize = 0;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        var cbuf: [192]u8 = undefined;
+        const cbody = ab.okx_trade.formatCancelBody(&cbuf, .{
+            .inst_id = cfg.instrument,
+            .client_order_id = ids[i],
+        }) catch continue;
+        if (okx.postPrivate("/api/v5/trade/cancel-order", cbody, nowMs())) |resp| {
+            defer gpa.free(resp);
+            canceled += 1;
+            var pbuf: [160]u8 = undefined;
+            const p = std.fmt.bufPrint(&pbuf, "{{\"clOrdId\":\"{s}\"}}", .{ids[i]}) catch "{}";
+            logEventPayload(events_repo, engine, "ORDER_CANCEL_SENT", "execution", "INFO", cfg, p);
+        } else |_| {}
+    }
+    return canceled;
 }
 
 fn completeRun(
@@ -1674,7 +2153,6 @@ fn recordProposalEpisode(
     for (touched.items) |m| persistMemory(repo, m);
 }
 
-
 fn refreshSystemCache(
     ws: *WebState,
     db: *ab.storage.Db,
@@ -1770,7 +2248,6 @@ fn refreshEgressIp(gpa: std.mem.Allocator, okx: *ab.okx_rest.Client, st: *Runtim
     const ip = std.mem.trim(u8, body, " \t\r\n");
     if (ip.len > 0 and ip.len < 64) st.setEgress(ip);
 }
-
 
 fn runSqliteBackup(
     db: *ab.storage.Db,
