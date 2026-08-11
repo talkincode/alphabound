@@ -210,60 +210,59 @@ pub const EventsRepo = struct {
         );
         defer stmt.finalize();
         try stmt.bindInt(1, limit);
-        var w: std.Io.Writer = .fixed(out);
-        w.writeAll("[") catch return DbError.StepFailed;
-        var i: usize = 0;
-        while (try stmt.step()) : (i += 1) {
-            if (i > 0) w.writeAll(",") catch return DbError.StepFailed;
-            w.print(
-                "{{\"event_id\":\"{s}\",\"ts\":\"{s}\",\"type\":\"{s}\",\"source\":\"{s}\",\"severity\":\"{s}\",\"state_version\":{d},\"payload\":{s}}}",
-                .{
-                    stmt.columnText(0),
-                    stmt.columnText(1),
-                    stmt.columnText(2),
-                    stmt.columnText(3),
-                    stmt.columnText(4),
-                    stmt.columnInt(5),
-                    stmt.columnText(6),
-                },
-            ) catch return DbError.StepFailed;
-        }
-        w.writeAll("]") catch return DbError.StepFailed;
-        return w.buffered();
+        return writeEventRows(&stmt, out);
     }
 
     /// Agent decision-related events (proposal / invalid / llm fail / reflection), newest first.
+    /// Scheduler wake-ups (AGENT_TRIGGER) stay in the raw events feed only.
     pub fn listAgentDecisionsJson(self: *EventsRepo, db: *Db, out: []u8, limit: i64) DbError![]const u8 {
         _ = self;
         var stmt = try db.prepare(
             \\SELECT event_id, ts, type, source, severity, state_version, payload_json
             \\FROM events
-            \\WHERE type GLOB 'AGENT_*'
+            \\WHERE type GLOB 'AGENT_*' AND type != 'AGENT_TRIGGER'
             \\ORDER BY ts DESC
             \\LIMIT ?1
         );
         defer stmt.finalize();
         try stmt.bindInt(1, limit);
-        var w: std.Io.Writer = .fixed(out);
+        return writeEventRows(&stmt, out);
+    }
+
+    /// Serialize stepped event rows as a JSON array, keeping as many newest
+    /// rows as fit: a row that overflows `out` is dropped (with every older
+    /// row) instead of failing the whole listing — the dashboard must never
+    /// go blank because one payload grew.
+    fn writeEventRows(stmt: *Stmt, out: []u8) DbError![]const u8 {
+        if (out.len < 2) return DbError.StepFailed;
+        var w: std.Io.Writer = .fixed(out[0 .. out.len - 1]); // reserve "]"
         w.writeAll("[") catch return DbError.StepFailed;
         var i: usize = 0;
         while (try stmt.step()) : (i += 1) {
-            if (i > 0) w.writeAll(",") catch return DbError.StepFailed;
-            w.print(
-                "{{\"event_id\":\"{s}\",\"ts\":\"{s}\",\"type\":\"{s}\",\"source\":\"{s}\",\"severity\":\"{s}\",\"state_version\":{d},\"payload\":{s}}}",
-                .{
-                    stmt.columnText(0),
-                    stmt.columnText(1),
-                    stmt.columnText(2),
-                    stmt.columnText(3),
-                    stmt.columnText(4),
-                    stmt.columnInt(5),
-                    stmt.columnText(6),
-                },
-            ) catch return DbError.StepFailed;
+            const mark = w.end;
+            const wrote = blk: {
+                if (i > 0) w.writeAll(",") catch break :blk false;
+                w.print(
+                    "{{\"event_id\":\"{s}\",\"ts\":\"{s}\",\"type\":\"{s}\",\"source\":\"{s}\",\"severity\":\"{s}\",\"state_version\":{d},\"payload\":{s}}}",
+                    .{
+                        stmt.columnText(0),
+                        stmt.columnText(1),
+                        stmt.columnText(2),
+                        stmt.columnText(3),
+                        stmt.columnText(4),
+                        stmt.columnInt(5),
+                        stmt.columnText(6),
+                    },
+                ) catch break :blk false;
+                break :blk true;
+            };
+            if (!wrote) {
+                w.end = mark;
+                break;
+            }
         }
-        w.writeAll("]") catch return DbError.StepFailed;
-        return w.buffered();
+        out[w.end] = ']';
+        return out[0 .. w.end + 1];
     }
 
     /// Compact event objects for agent context (oldest first). Writes into `backing`
@@ -391,6 +390,40 @@ pub const OrdersRepo = struct {
         try self.upsert_stmt.bindText(9, row.updated_ts);
         _ = try self.upsert_stmt.step();
     }
+
+    /// Newest orders as JSON array (newest first by updated_ts).
+    pub fn listRecentJson(self: *OrdersRepo, db: *Db, out: []u8, limit: i64) DbError![]const u8 {
+        _ = self;
+        var stmt = try db.prepare(
+            \\SELECT client_order_id, exchange_order_id, decision_id, side, qty, price,
+            \\  status, created_ts, updated_ts
+            \\FROM orders ORDER BY updated_ts DESC LIMIT ?1
+        );
+        defer stmt.finalize();
+        try stmt.bindInt(1, limit);
+        var w: std.Io.Writer = .fixed(out);
+        w.writeAll("[") catch return DbError.StepFailed;
+        var i: usize = 0;
+        while (try stmt.step()) : (i += 1) {
+            if (i > 0) w.writeAll(",") catch return DbError.StepFailed;
+            w.print(
+                "{{\"client_order_id\":\"{s}\",\"exchange_order_id\":\"{s}\",\"decision_id\":\"{s}\",\"side\":\"{s}\",\"qty\":\"{s}\",\"price\":\"{s}\",\"status\":\"{s}\",\"created_ts\":\"{s}\",\"updated_ts\":\"{s}\"}}",
+                .{
+                    stmt.columnText(0),
+                    stmt.columnText(1),
+                    stmt.columnText(2),
+                    stmt.columnText(3),
+                    stmt.columnText(4),
+                    stmt.columnText(5),
+                    stmt.columnText(6),
+                    stmt.columnText(7),
+                    stmt.columnText(8),
+                },
+            ) catch return DbError.StepFailed;
+        }
+        w.writeAll("]") catch return DbError.StepFailed;
+        return w.buffered();
+    }
 };
 
 pub const FillRow = struct {
@@ -427,6 +460,37 @@ pub const FillsRepo = struct {
         try self.insert.bindText(6, row.fee_ccy);
         try self.insert.bindText(7, row.ts);
         _ = try self.insert.step();
+    }
+
+    /// Newest fills as JSON array (newest first).
+    pub fn listRecentJson(self: *FillsRepo, db: *Db, out: []u8, limit: i64) DbError![]const u8 {
+        _ = self;
+        var stmt = try db.prepare(
+            \\SELECT fill_id, order_id, price, qty, fee, fee_ccy, ts
+            \\FROM fills ORDER BY ts DESC LIMIT ?1
+        );
+        defer stmt.finalize();
+        try stmt.bindInt(1, limit);
+        var w: std.Io.Writer = .fixed(out);
+        w.writeAll("[") catch return DbError.StepFailed;
+        var i: usize = 0;
+        while (try stmt.step()) : (i += 1) {
+            if (i > 0) w.writeAll(",") catch return DbError.StepFailed;
+            w.print(
+                "{{\"fill_id\":\"{s}\",\"order_id\":\"{s}\",\"price\":\"{s}\",\"qty\":\"{s}\",\"fee\":\"{s}\",\"fee_ccy\":\"{s}\",\"ts\":\"{s}\"}}",
+                .{
+                    stmt.columnText(0),
+                    stmt.columnText(1),
+                    stmt.columnText(2),
+                    stmt.columnText(3),
+                    stmt.columnText(4),
+                    stmt.columnText(5),
+                    stmt.columnText(6),
+                },
+            ) catch return DbError.StepFailed;
+        }
+        w.writeAll("]") catch return DbError.StepFailed;
+        return w.buffered();
     }
 };
 
@@ -854,6 +918,44 @@ test "events append and read back" {
         .source = "x",
         .severity = "INFO",
     }));
+
+    // Full listing fits.
+    var big: [2048]u8 = undefined;
+    const all = try repo.listRecentJson(&db, &big, 40);
+    try testing.expect(std.mem.indexOf(u8, all, "evt_001") != null);
+    try testing.expect(std.mem.indexOf(u8, all, "evt_002") != null);
+
+    // Undersized buffer truncates to the newest rows that fit — still valid
+    // JSON, never a hard failure that would blank the dashboard feed.
+    var small: [180]u8 = undefined;
+    const truncated = try repo.listRecentJson(&db, &small, 40);
+    try testing.expect(truncated.len >= 2);
+    try testing.expectEqual(@as(u8, '['), truncated[0]);
+    try testing.expectEqual(@as(u8, ']'), truncated[truncated.len - 1]);
+    try testing.expect(std.mem.indexOf(u8, truncated, "evt_002") != null); // newest kept
+    try testing.expect(std.mem.indexOf(u8, truncated, "evt_001") == null); // oldest dropped
+
+    // Scheduler wake-ups are excluded from the decisions listing.
+    try repo.append(.{
+        .event_id = "evt_003",
+        .ts = "2026-08-09T08:31:07.000Z",
+        .type = "AGENT_TRIGGER",
+        .source = "agent",
+        .severity = "INFO",
+        .payload_json = "{\"reason\":\"interval_active\"}",
+    });
+    try repo.append(.{
+        .event_id = "evt_004",
+        .ts = "2026-08-09T08:31:08.000Z",
+        .type = "AGENT_PROPOSAL_OK",
+        .source = "agent",
+        .severity = "INFO",
+    });
+    const decisions = try repo.listAgentDecisionsJson(&db, &big, 40);
+    try testing.expect(std.mem.indexOf(u8, decisions, "AGENT_PROPOSAL_OK") != null);
+    try testing.expect(std.mem.indexOf(u8, decisions, "AGENT_TRIGGER") == null);
+    const feed = try repo.listRecentJson(&db, &big, 40);
+    try testing.expect(std.mem.indexOf(u8, feed, "AGENT_TRIGGER") != null);
 }
 
 test "orders upsert projection" {
@@ -896,6 +998,11 @@ test "orders upsert projection" {
     try testing.expectEqualStrings("FILLED", stmt.columnText(0));
     try testing.expectEqualStrings("okx-777", stmt.columnText(1));
     try testing.expectEqualStrings("t1", stmt.columnText(2)); // created preserved
+
+    var json_buf: [1024]u8 = undefined;
+    const json = try repo.listRecentJson(&db, &json_buf, 10);
+    try testing.expect(std.mem.indexOf(u8, json, "\"status\":\"FILLED\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "okx-777") != null);
 }
 
 test "fills idempotent, equity samples, agent runs and tool calls" {
@@ -932,6 +1039,10 @@ test "fills idempotent, equity samples, agent runs and tool calls" {
     try fills.append(fill);
     try fills.append(fill); // duplicate push from WS + REST poll → ignored
     try testing.expectEqual(@as(i64, 1), try db.queryInt("SELECT COUNT(*) FROM fills"));
+    var fills_json_buf: [512]u8 = undefined;
+    const fills_json = try fills.listRecentJson(&db, &fills_json_buf, 10);
+    try testing.expect(std.mem.indexOf(u8, fills_json, "\"fill_id\":\"f1\"") != null);
+    try testing.expect(std.mem.indexOf(u8, fills_json, "abff") != null);
 
     var equity = try EquityRepo.init(&db);
     defer equity.deinit();

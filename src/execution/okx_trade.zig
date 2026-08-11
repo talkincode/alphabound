@@ -73,6 +73,20 @@ pub fn executionAllowed(mode_demo: bool, simulated: bool) bool {
     return mode_demo and simulated;
 }
 
+/// After a leg resolves, should we refresh portfolio and try another plan?
+/// `partial` always; `filled` too (fees/rounding may leave residual delta).
+pub fn wantsResidualPlan(resolve_note: []const u8) bool {
+    return std.mem.eql(u8, resolve_note, "partial") or std.mem.eql(u8, resolve_note, "filled");
+}
+
+/// Hard cap on market legs per decision (anti-runaway replan).
+pub const max_replan_legs: u16 = 3;
+
+/// Whether another leg is still allowed (`leg_index` is 0-based, already placed).
+pub fn canPlaceAnotherLeg(leg_index: u16) bool {
+    return leg_index + 1 < max_replan_legs;
+}
+
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
@@ -118,5 +132,17 @@ test "executionAllowed is demo+simulated only" {
     try testing.expect(executionAllowed(true, true));
     try testing.expect(!executionAllowed(true, false));
     try testing.expect(!executionAllowed(false, true));
+}
+
+test "residual plan policy and leg cap" {
+    try testing.expect(wantsResidualPlan("partial"));
+    try testing.expect(wantsResidualPlan("filled"));
+    try testing.expect(!wantsResidualPlan("rejected"));
+    try testing.expect(!wantsResidualPlan("unknown_http"));
+    try testing.expect(canPlaceAnotherLeg(0));
+    try testing.expect(canPlaceAnotherLeg(1));
+    try testing.expect(!canPlaceAnotherLeg(2));
+    try testing.expectEqual(@as(u16, 3), max_replan_legs);
+
     try testing.expect(!executionAllowed(false, false));
 }

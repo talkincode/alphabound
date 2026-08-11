@@ -95,9 +95,21 @@ static_dir = "/opt/alphabound/ui/current"   # 预留；当前 Dashboard 已嵌�
 | `model` | string | `gpt-4o-mini` | 可被 `LLM_MODEL` 覆盖 |
 | `base_url` | string | `https://api.openai.com/v1` | 可被 `LLM_API_URL` 覆盖 |
 | `decision_timeout_ms` | u32 | `30000` | 请求超时预算（规划） |
-| `decision_interval_ms` | u32 | `60000` | 慢环间隔；0 表示不按间隔调度 |
+| `decision_interval_ms` | u32 | `600000` | 慢环基础间隔（活跃时段）；0 表示不按间隔调度 |
+| `decision_interval_quiet_ms` | u32 | `0` | 静默时段间隔；0 = 同基础间隔 |
+| `decision_min_interval_ms` | u32 | `120000` | 任意两次决策的硬性冷却下限（事件触发也受限） |
+| `active_hours_utc` | string | `""` | UTC 活跃时段 `"start-end"`（end 不含，可跨 0 点如 `"22-4"`）；空 = 全天基础间隔 |
+| `event_price_move` | decimal | `0.005` | 距上次决策价格偏离 ≥ 该比例提前触发；0 关闭 |
+| `event_drawdown_step` | decimal | `0.01` | 回撤较上次决策加深 ≥ 该比例提前触发；0 关闭 |
 | `prompt_dir` | path | `prompts` | Prompt 目录 |
 | `enabled` | bool | `true` | false 时永不调 LLM |
+| `llm_reflection` | bool | `true` | 有效提案后跑 LLM 结构化反思；失败回退确定性 |
+| `llm_reflection_on_hold` | bool | `false` | HOLD 提案是否也跑 LLM 反思；false 时 HOLD 只用确定性反思 |
+
+慢环调度是多因素的：活跃/静默时段各有基础节奏，价格突变、回撤加深、
+风险模式切换会提前触发一次决策，且所有触发都受 `decision_min_interval_ms`
+冷却下限约束。风险内核不受此影响——它始终在快环独立执行。
+每次触发在事件流记录 `AGENT_TRIGGER`（含 reason），便于审计调用频率。
 
 ### `[storage]`
 

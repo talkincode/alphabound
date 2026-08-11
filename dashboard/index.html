@@ -129,6 +129,7 @@
   <div class="tabs" role="tablist">
     <button class="tab active" data-tab="overview" type="button">概览</button>
     <button class="tab" data-tab="decisions" type="button">决策历史</button>
+    <button class="tab" data-tab="orders" type="button">订单</button>
     <button class="tab" data-tab="status" type="button">状态</button>
   </div>
 
@@ -212,16 +213,6 @@
       </thead>
       <tbody id="eq_body"><tr><td colspan="6" class="muted">加载中…</td></tr></tbody>
     </table>
-
-    <h2>系统</h2>
-    <div class="grid">
-      <div class="card"><div class="label">运行模式</div><div class="value" id="sys_mode" style="font-size:16px">—</div></div>
-      <div class="card"><div class="label">管理状态</div><div class="value" id="sys_paused" style="font-size:16px">—</div></div>
-      <div class="card"><div class="label">运行时长</div><div class="value" id="sys_uptime" style="font-size:16px">—</div></div>
-      <div class="card"><div class="label">提案有效率</div><div class="value" id="sys_rate" style="font-size:16px">—</div></div>
-      <div class="card"><div class="label">记忆 / 工具调用</div><div class="value" id="sys_mem" style="font-size:16px">—</div></div>
-      <div class="card"><div class="label">私钥 / 私有 WS</div><div class="value" id="sys_priv" style="font-size:14px">—</div></div>
-    </div>
   </div>
 
   <!-- ========== 决策历史 ========== -->
@@ -259,6 +250,48 @@
     </table>
   </div>
 
+
+  <!-- ========== 订单 ========== -->
+  <div class="panel" id="panel-orders">
+    <div class="stats">
+      <div class="stat"><div class="k">订单数</div><div class="v" id="ord_total">—</div></div>
+      <div class="stat"><div class="k">终态成交</div><div class="v ok" id="ord_filled">—</div></div>
+      <div class="stat"><div class="k">进行中 / 未知</div><div class="v" id="ord_open">—</div></div>
+      <div class="stat"><div class="k">拒绝 / 撤销</div><div class="v" id="ord_dead">—</div></div>
+      <div class="stat"><div class="k">成交笔数</div><div class="v" id="ord_fills">—</div></div>
+    </div>
+    <p class="hint">订单与成交来自 SQLite 投影（events 为源）。Shadow 模式通常为空；Demo 下单后在此可见 clOrdId、状态与 decision 关联。</p>
+    <h2>订单投影</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>更新时间</th>
+          <th>状态</th>
+          <th>方向</th>
+          <th>数量</th>
+          <th>价格</th>
+          <th>client_order_id</th>
+          <th>exchange_id</th>
+          <th>decision_id</th>
+        </tr>
+      </thead>
+      <tbody id="ord_body"><tr><td colspan="8" class="muted">加载中…</td></tr></tbody>
+    </table>
+    <h2>成交明细</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>时间</th>
+          <th>fill_id</th>
+          <th>order_id</th>
+          <th>价格</th>
+          <th>数量</th>
+          <th>费用</th>
+        </tr>
+      </thead>
+      <tbody id="fills_body"><tr><td colspan="6" class="muted">加载中…</td></tr></tbody>
+    </table>
+  </div>
 
   <!-- ========== 状态 ========== -->
   <div class="panel" id="panel-status">
@@ -1020,9 +1053,62 @@ function renderStatus(system, state) {
   $("st_hint").textContent = hint;
 }
 
+function renderOrders(bundle) {
+  const orders = (bundle && Array.isArray(bundle.orders)) ? bundle.orders : [];
+  const fills = (bundle && Array.isArray(bundle.fills)) ? bundle.fills : [];
+  let filled = 0, open = 0, dead = 0;
+  for (const o of orders) {
+    const st = (o.status || "").toUpperCase();
+    if (st === "FILLED") filled++;
+    else if (st === "REJECTED" || st === "CANCELED") dead++;
+    else open++;
+  }
+  $("ord_total").textContent = String(orders.length);
+  $("ord_filled").textContent = String(filled);
+  $("ord_open").textContent = String(open);
+  $("ord_dead").textContent = String(dead);
+  $("ord_fills").textContent = String(fills.length);
+
+  const ob = $("ord_body");
+  if (orders.length === 0) {
+    ob.innerHTML = '<tr><td colspan="8" class="muted">暂无订单（Shadow 默认不下单）</td></tr>';
+  } else {
+    ob.innerHTML = orders.slice(0, 80).map(o => {
+      const st = (o.status || "").toUpperCase();
+      const cls = st === "FILLED" ? "ok" : (st === "REJECTED" || st === "UNKNOWN" ? "bad" : (st === "CANCELED" ? "muted" : "warn"));
+      return `<tr>
+        <td>${o.updated_ts || o.created_ts || ""}</td>
+        <td class="${cls}">${st || "—"}</td>
+        <td>${o.side || ""}</td>
+        <td>${o.qty || ""}</td>
+        <td>${o.price || ""}</td>
+        <td title="${o.client_order_id || ""}">${short(o.client_order_id, 18)}</td>
+        <td title="${o.exchange_order_id || ""}">${short(o.exchange_order_id, 14)}</td>
+        <td title="${o.decision_id || ""}">${short(o.decision_id, 18)}</td>
+      </tr>`;
+    }).join("");
+  }
+
+  const fb = $("fills_body");
+  if (fills.length === 0) {
+    fb.innerHTML = '<tr><td colspan="6" class="muted">暂无成交明细</td></tr>';
+  } else {
+    fb.innerHTML = fills.slice(0, 80).map(f =>
+      `<tr>
+        <td>${f.ts || ""}</td>
+        <td title="${f.fill_id || ""}">${short(f.fill_id, 16)}</td>
+        <td title="${f.order_id || ""}">${short(f.order_id, 16)}</td>
+        <td>${f.price || ""}</td>
+        <td>${f.qty || ""}</td>
+        <td>${(f.fee || "") + (f.fee_ccy ? " " + f.fee_ccy : "")}</td>
+      </tr>`
+    ).join("");
+  }
+}
+
 async function poll() {
   try {
-    const [s, shadow, runs, equity, candles, memories, events, system, decisions] = await Promise.all([
+    const [s, shadow, runs, equity, candles, memories, events, system, decisions, ordersBundle] = await Promise.all([
       jget("/api/v1/state"),
       jget("/api/v1/shadow"),
       jget("/api/v1/agent-runs"),
@@ -1032,6 +1118,7 @@ async function poll() {
       jget("/api/v1/events"),
       jget("/api/v1/system"),
       jget("/api/v1/decisions"),
+      jget("/api/v1/orders"),
     ]);
     lastOk = Date.now();
 
@@ -1065,6 +1152,7 @@ async function poll() {
     cachedRuns = runs;
     renderOverviewSummary(decisions, runs);
     renderDecisions(decisions, runs);
+    try { renderOrders(ordersBundle); } catch (err) { console.error("renderOrders", err); }
     try { renderStatus(system, s); } catch (err) { console.error("renderStatus", err); }
     // overview token strip
     {
@@ -1126,20 +1214,6 @@ async function poll() {
         </tr>`
       ).join("");
     }
-
-    const runMode = RUN_MODE_ZH[system.mode] || system.mode || "—";
-    $("sys_mode").textContent = runMode + (system.agent_enabled ? " · Agent 开启" : " · Agent 关闭");
-    $("sys_paused").textContent = system.paused ? "已暂停" : "运行中";
-    $("sys_paused").className = system.paused ? "value warn" : "value ok";
-    const up = system.uptime_ms || 0;
-    const ups = Math.floor(up / 1000);
-    $("sys_uptime").textContent = ups < 120 ? (ups + " 秒") : (Math.floor(ups / 60) + " 分 " + (ups % 60) + " 秒");
-    const ag = system.agent || {};
-    $("sys_rate").textContent = (ag.valid_rate != null ? ag.valid_rate + "%" : "—") +
-      "（" + (ag.ok || 0) + "/" + (ag.total || 0) + "）";
-    $("sys_mem").textContent = (system.memories ?? "—") + " / " + (ag.tool_calls ?? "—");
-    $("sys_priv").textContent = (system.private_keys ? "密钥已加载" : "无密钥") +
-      " · WS " + (system.private_ws_opt_in ? "可选开启" : "关闭");
 
     $("meta").textContent = "版本 " + s.software_version +
       " · 配置 " + short(s.config_hash, 24) +

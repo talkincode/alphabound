@@ -25,6 +25,14 @@ initial_capital = 100.0        # shadow 模式模拟起始资金 (USDT)
 provider = "configured-adapter"
 model = "configured-model"
 decision_timeout_ms = 30000
+# 多因素慢环调度:常规低频 + 交易时段 + 事件触发,均受冷却下限约束
+decision_interval_ms = 60000        # 开发环境快速迭代;生产建议 900000 (15 分钟)
+decision_interval_quiet_ms = 0      # 静默时段间隔;0 = 同 base
+decision_min_interval_ms = 30000    # 任意两次决策的硬性冷却下限
+active_hours_utc = ""               # UTC 活跃时段如 "13-21";空 = 全天 base
+event_price_move = 0.005            # 距上次决策价格偏离 ≥0.5% 提前触发
+event_drawdown_step = 0.01          # 回撤加深 ≥1% 提前触发
+llm_reflection_on_hold = false      # HOLD 提案用确定性反思,省一次 LLM 调用
 prompt_dir = "/etc/alphabound/prompts"
 
 [storage]

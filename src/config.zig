@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const dec = @import("core/decimal.zig");
+const scheduler = @import("core/scheduler.zig");
 const Decimal = dec.Decimal;
 
 pub const Mode = enum {
@@ -44,14 +45,29 @@ pub const Config = struct {
     /// Overridable by LLM_API_URL / OPENAI_BASE_URL env.
     agent_base_url: []const u8 = "https://api.openai.com/v1",
     decision_timeout_ms: u32 = 30_000,
-    /// Slow-loop cadence; 0 disables scheduled agent ticks (manual/env only).
-    decision_interval_ms: u32 = 60_000,
+    /// Slow-loop base cadence (active session); 0 disables scheduled agent
+    /// ticks (manual/env only). Not a short-term strategy — default 10 min.
+    decision_interval_ms: u32 = 600_000,
+    /// Cadence outside `active_hours_utc`; 0 → same as decision_interval_ms.
+    decision_interval_quiet_ms: u32 = 0,
+    /// Hard cooldown floor between any two decisions (event triggers included).
+    decision_min_interval_ms: u32 = 120_000,
+    /// UTC active trading session "start-end" (end exclusive, may wrap e.g.
+    /// "22-4"); empty → every hour uses the base cadence.
+    active_hours_utc: []const u8 = "",
+    /// Early decision when |bid − last_bid| / last_bid ≥ this fraction; 0 off.
+    event_price_move: Decimal = Decimal.parse("0.005") catch unreachable,
+    /// Early decision when drawdown deepens by ≥ this fraction; 0 off.
+    event_drawdown_step: Decimal = Decimal.parse("0.01") catch unreachable,
     prompt_dir: []const u8 = "prompts",
     /// When false, never call LLM even if keys are present.
     agent_enabled: bool = true,
     /// When true, after a valid proposal run a second LLM reflection call
     /// (structured memory_ops). Fail-closed → deterministic fallback.
     agent_llm_reflection: bool = true,
+    /// When false (default), HOLD proposals use the deterministic reflection
+    /// only — skipping the second LLM call on quiet cycles.
+    agent_llm_reflection_on_hold: bool = false,
     // [storage]
     db_path: []const u8 = "trading.db",
     wal: bool = true,
@@ -215,12 +231,29 @@ fn applyKey(a: std.mem.Allocator, cfg: *Config, section: []const u8, key: []cons
             cfg.decision_timeout_ms = parseInt(u32, val) catch return error.InvalidValue;
         } else if (std.mem.eql(u8, key, "decision_interval_ms")) {
             cfg.decision_interval_ms = parseInt(u32, val) catch return error.InvalidValue;
+        } else if (std.mem.eql(u8, key, "decision_interval_quiet_ms")) {
+            cfg.decision_interval_quiet_ms = parseInt(u32, val) catch return error.InvalidValue;
+        } else if (std.mem.eql(u8, key, "decision_min_interval_ms")) {
+            cfg.decision_min_interval_ms = parseInt(u32, val) catch return error.InvalidValue;
+        } else if (std.mem.eql(u8, key, "active_hours_utc")) {
+            cfg.active_hours_utc = try parseString(a, val);
+            _ = scheduler.parseHours(cfg.active_hours_utc) catch return error.InvalidValue;
+        } else if (std.mem.eql(u8, key, "event_price_move")) {
+            cfg.event_price_move = Decimal.parse(val) catch return error.InvalidValue;
+            if (cfg.event_price_move.isNegative() or
+                cfg.event_price_move.gte(Decimal.fromInt(1))) return error.InvalidValue;
+        } else if (std.mem.eql(u8, key, "event_drawdown_step")) {
+            cfg.event_drawdown_step = Decimal.parse(val) catch return error.InvalidValue;
+            if (cfg.event_drawdown_step.isNegative() or
+                cfg.event_drawdown_step.gte(Decimal.fromInt(1))) return error.InvalidValue;
         } else if (std.mem.eql(u8, key, "prompt_dir")) {
             cfg.prompt_dir = try parseString(a, val);
         } else if (std.mem.eql(u8, key, "enabled")) {
             cfg.agent_enabled = try parseBool(val);
         } else if (std.mem.eql(u8, key, "llm_reflection") or std.mem.eql(u8, key, "agent_llm_reflection")) {
             cfg.agent_llm_reflection = try parseBool(val);
+        } else if (std.mem.eql(u8, key, "llm_reflection_on_hold")) {
+            cfg.agent_llm_reflection_on_hold = try parseBool(val);
         } else return error.UnknownKey;
     } else if (std.mem.eql(u8, section, "storage")) {
         if (std.mem.eql(u8, key, "path")) {
@@ -342,4 +375,37 @@ test "config hash changes with content" {
     var c2 = try parse(testing.allocator, "[app]\nenvironment = \"b\"");
     defer c2.deinit();
     try testing.expect(!std.mem.eql(u8, c1.hash(), c2.hash()));
+}
+
+test "multi-factor schedule keys parse with validation" {
+    var cfg = try parse(testing.allocator,
+        \\[agent]
+        \\decision_interval_ms = 900000
+        \\decision_interval_quiet_ms = 3600000
+        \\decision_min_interval_ms = 180000
+        \\active_hours_utc = "13-21"
+        \\event_price_move = 0.005
+        \\event_drawdown_step = 0.01
+        \\llm_reflection_on_hold = true
+    );
+    defer cfg.deinit();
+    try testing.expectEqual(@as(u32, 900_000), cfg.decision_interval_ms);
+    try testing.expectEqual(@as(u32, 3_600_000), cfg.decision_interval_quiet_ms);
+    try testing.expectEqual(@as(u32, 180_000), cfg.decision_min_interval_ms);
+    try testing.expectEqualStrings("13-21", cfg.active_hours_utc);
+    try testing.expect(cfg.event_price_move.eql(Decimal.parse("0.005") catch unreachable));
+    try testing.expect(cfg.agent_llm_reflection_on_hold);
+
+    try testing.expectError(error.InvalidValue, parse(testing.allocator,
+        \\[agent]
+        \\active_hours_utc = "25-3"
+    ));
+    try testing.expectError(error.InvalidValue, parse(testing.allocator,
+        \\[agent]
+        \\event_price_move = 1.5
+    ));
+    try testing.expectError(error.InvalidValue, parse(testing.allocator,
+        \\[agent]
+        \\event_drawdown_step = -0.01
+    ));
 }
