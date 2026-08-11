@@ -62,8 +62,17 @@
   .pos { color: var(--ok); }
   .neg { color: var(--bad); }
   .chart-wrap { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; }
-  .chart-meta { color: var(--dim); font-size: 12px; margin-bottom: 8px; }
-  svg.spark { width: 100%; height: 140px; display: block; }
+  .chart-meta { color: var(--dim); font-size: 12px; margin-bottom: 8px; display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: baseline; justify-content: space-between; }
+  .chart-meta b { color: var(--text); font-weight: 600; }
+  .chart-host { width: 100%; height: 280px; position: relative; }
+  .chart-host.sm { height: 200px; }
+  .charts-grid { display: grid; grid-template-columns: 1fr; gap: 12px; }
+  @media (min-width: 960px) {
+    .charts-grid.two { grid-template-columns: 1.4fr 1fr; }
+  }
+  .tv-attr { color: var(--dim); font-size: 11px; margin-top: 8px; }
+  .tv-attr a { color: var(--line); text-decoration: none; }
+  .tv-attr a:hover { text-decoration: underline; }
   .pill { display: inline-block; padding: 1px 6px; border-radius: 999px; border: 1px solid var(--border); font-size: 11px; }
   .pill.hold { border-color: var(--ok); color: var(--ok); }
   .pill.rebalance { border-color: var(--warn); color: var(--warn); }
@@ -146,10 +155,18 @@
       <div class="card"><div class="label">建仓价 / BH-BTC</div><div class="value" id="sh_entry" style="font-size:14px">—</div></div>
     </div>
 
-    <h2>行情 — 1 小时 K 线</h2>
-    <div class="chart-wrap">
-      <div class="chart-meta" id="candle_meta">加载中…</div>
-      <svg class="spark" id="spark" viewBox="0 0 1000 140" preserveAspectRatio="none"></svg>
+    <h2>行情与净值</h2>
+    <div class="charts-grid two">
+      <div class="chart-wrap">
+        <div class="chart-meta" id="candle_meta"><span>BTC-USDT · 1H K 线</span><span class="muted">加载中…</span></div>
+        <div class="chart-host" id="chart_candles" role="img" aria-label="BTC-USDT 1 hour candlestick chart"></div>
+        <div class="tv-attr">Charts by <a href="https://www.tradingview.com" target="_blank" rel="noopener noreferrer">TradingView</a> · Lightweight Charts</div>
+      </div>
+      <div class="chart-wrap">
+        <div class="chart-meta" id="equity_meta"><span>保守净值 / 高水位</span><span class="muted">加载中…</span></div>
+        <div class="chart-host sm" id="chart_equity" role="img" aria-label="Equity and high-watermark chart"></div>
+        <div class="tv-attr">净值样本来自本机 SQLite · 不构成投资建议</div>
+      </div>
     </div>
 
     <h2>最近提案（摘要）</h2>
@@ -275,6 +292,8 @@
 
   <div class="footer" id="meta"></div>
 
+<!-- TradingView Lightweight Charts (CDN, pinned). Offline: charts stay empty, rest of UI works. -->
+<script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.2/dist/lightweight-charts.standalone.production.js" crossorigin="anonymous" onerror="window.__lwChartsLoadFailed=true"></script>
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
@@ -285,6 +304,16 @@ let lastDecisionsSig = "";
 let decFilter = localStorage.getItem("ab_dec_filter") || "all";
 let cachedDecisions = [];
 let cachedRuns = [];
+
+// --- Lightweight Charts state (lazy-init, incremental setData) ---
+let candleChart = null, candleSeries = null, volumeSeries = null;
+let equityChart = null, equitySeries = null, hwmSeries = null;
+let lastCandleSig = "";
+let lastEquitySig = "";
+const CHART_BG = "#161b22";
+const CHART_TEXT = "#8b949e";
+const CHART_GRID = "#30363d";
+const CHART_BORDER = "#30363d";
 try {
   const savedTab = localStorage.getItem("ab_tab");
   if (savedTab) activeTab = savedTab;
@@ -336,39 +365,250 @@ async function jget(path) {
   return r.json();
 }
 
-function drawSpark(candles) {
-  const svg = $("spark");
-  while (svg.firstChild) svg.removeChild(svg.firstChild);
-  if (!candles || candles.length < 2) {
-    $("candle_meta").textContent = "暂无 K 线数据";
+function lwAvailable() {
+  return !window.__lwChartsLoadFailed && typeof LightweightCharts !== "undefined" && LightweightCharts.createChart;
+}
+
+function chartBaseOptions(height) {
+  return {
+    height: height || 280,
+    layout: {
+      background: { type: "solid", color: CHART_BG },
+      textColor: CHART_TEXT,
+      fontSize: 11,
+      fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+    },
+    grid: {
+      vertLines: { color: CHART_GRID },
+      horzLines: { color: CHART_GRID },
+    },
+    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+    rightPriceScale: { borderColor: CHART_BORDER },
+    timeScale: {
+      borderColor: CHART_BORDER,
+      timeVisible: true,
+      secondsVisible: false,
+    },
+    localization: { locale: "zh-CN" },
+  };
+}
+
+function bindChartResize(chart, el) {
+  if (!window.ResizeObserver) {
+    window.addEventListener("resize", () => chart.applyOptions({ width: el.clientWidth }));
     return;
   }
-  const closes = candles.map(c => parseFloat(c.c)).filter(x => !isNaN(x));
-  if (closes.length < 2) return;
-  const min = Math.min.apply(null, closes);
-  const max = Math.max.apply(null, closes);
-  const span = (max - min) || 1;
-  const w = 1000, h = 140, pad = 8;
-  let d = "";
-  closes.forEach((v, i) => {
-    const x = pad + (i / (closes.length - 1)) * (w - pad * 2);
-    const y = pad + (1 - (v - min) / span) * (h - pad * 2);
-    d += (i === 0 ? "M" : "L") + x.toFixed(1) + " " + y.toFixed(1) + " ";
+  const ro = new ResizeObserver(() => {
+    if (el.clientWidth > 0) chart.applyOptions({ width: el.clientWidth });
   });
-  const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
-  path.setAttribute("d", d.trim());
-  path.setAttribute("fill", "none");
-  path.setAttribute("stroke", "var(--line)");
-  path.setAttribute("stroke-width", "2");
-  path.setAttribute("vector-effect", "non-scaling-stroke");
-  svg.appendChild(path);
-  const last = closes[closes.length - 1];
-  const first = closes[0];
-  const chg = ((last - first) / first) * 100;
-  $("candle_meta").innerHTML =
-    candles.length + " 根 · 1 小时 · 最新 <b>" + last + "</b> · 区间 " +
-    min + "–" + max + " · 涨跌 " +
-    "<span class=\"" + (chg >= 0 ? "pos" : "neg") + "\">" + chg.toFixed(2) + "%</span>";
+  ro.observe(el);
+}
+
+function ensureCandleChart() {
+  if (candleChart || !lwAvailable()) return !!candleChart;
+  const el = $("chart_candles");
+  if (!el) return false;
+  candleChart = LightweightCharts.createChart(el, chartBaseOptions(280));
+  candleSeries = candleChart.addCandlestickSeries({
+    upColor: "#3fb950",
+    downColor: "#f85149",
+    borderUpColor: "#3fb950",
+    borderDownColor: "#f85149",
+    wickUpColor: "#3fb950",
+    wickDownColor: "#f85149",
+  });
+  volumeSeries = candleChart.addHistogramSeries({
+    priceFormat: { type: "volume" },
+    priceScaleId: "vol",
+  });
+  candleChart.priceScale("vol").applyOptions({
+    scaleMargins: { top: 0.8, bottom: 0 },
+  });
+  candleChart.priceScale("right").applyOptions({
+    scaleMargins: { top: 0.08, bottom: 0.22 },
+  });
+  candleChart.applyOptions({ width: el.clientWidth || el.offsetWidth || 600 });
+  bindChartResize(candleChart, el);
+  return true;
+}
+
+function ensureEquityChart() {
+  if (equityChart || !lwAvailable()) return !!equityChart;
+  const el = $("chart_equity");
+  if (!el) return false;
+  equityChart = LightweightCharts.createChart(el, chartBaseOptions(200));
+  equitySeries = equityChart.addAreaSeries({
+    lineColor: "#58a6ff",
+    topColor: "rgba(88,166,255,0.28)",
+    bottomColor: "rgba(88,166,255,0.02)",
+    lineWidth: 2,
+    title: "净值",
+  });
+  hwmSeries = equityChart.addLineSeries({
+    color: "#d29922",
+    lineWidth: 1,
+    lineStyle: LightweightCharts.LineStyle.Dashed,
+    title: "HWM",
+  });
+  equityChart.applyOptions({ width: el.clientWidth || el.offsetWidth || 400 });
+  bindChartResize(equityChart, el);
+  return true;
+}
+
+function toUnixSec(tsMsOrIso) {
+  if (tsMsOrIso == null || tsMsOrIso === "") return null;
+  if (typeof tsMsOrIso === "number" && isFinite(tsMsOrIso)) {
+    return Math.floor(tsMsOrIso > 1e12 ? tsMsOrIso / 1000 : tsMsOrIso);
+  }
+  const ms = Date.parse(String(tsMsOrIso));
+  if (isNaN(ms)) return null;
+  return Math.floor(ms / 1000);
+}
+
+function updateCandleChart(payload) {
+  const meta = $("candle_meta");
+  const list = (payload && payload.candles) ? payload.candles : (Array.isArray(payload) ? payload : []);
+  const inst = (payload && payload.instrument) || "BTC-USDT";
+  const bar = (payload && payload.bar) || "1H";
+
+  if (!lwAvailable()) {
+    meta.innerHTML = "<span>" + inst + " · " + bar + "</span><span class=\"warn\">图表库未加载（需出网 CDN）</span>";
+    return;
+  }
+  if (!ensureCandleChart()) return;
+
+  if (!list || list.length < 1) {
+    meta.innerHTML = "<span>" + inst + " · " + bar + "</span><span class=\"muted\">暂无 K 线数据</span>";
+    return;
+  }
+
+  const rows = [];
+  const vols = [];
+  for (let i = 0; i < list.length; i++) {
+    const c = list[i];
+    const t = toUnixSec(c.ts_ms);
+    const o = parseFloat(c.o), h = parseFloat(c.h), l = parseFloat(c.l), cl = parseFloat(c.c);
+    const v = parseFloat(c.vol);
+    if (t == null || [o, h, l, cl].some(x => isNaN(x))) continue;
+    rows.push({ time: t, open: o, high: h, low: l, close: cl });
+    vols.push({
+      time: t,
+      value: isNaN(v) ? 0 : v,
+      color: cl >= o ? "rgba(63,185,80,0.45)" : "rgba(248,81,73,0.45)",
+    });
+  }
+  // API is oldest→newest; ensure strictly ascending unique times for LWC.
+  rows.sort((a, b) => a.time - b.time);
+  vols.sort((a, b) => a.time - b.time);
+  const dedup = [];
+  const dedupV = [];
+  for (let i = 0; i < rows.length; i++) {
+    if (dedup.length && dedup[dedup.length - 1].time === rows[i].time) {
+      dedup[dedup.length - 1] = rows[i];
+      dedupV[dedupV.length - 1] = vols[i];
+    } else {
+      dedup.push(rows[i]);
+      dedupV.push(vols[i]);
+    }
+  }
+  if (dedup.length < 1) {
+    meta.innerHTML = "<span>" + inst + " · " + bar + "</span><span class=\"muted\">K 线解析失败</span>";
+    return;
+  }
+
+  const sig = dedup.map(r => r.time + ":" + r.close).join(",");
+  if (sig !== lastCandleSig) {
+    lastCandleSig = sig;
+    candleSeries.setData(dedup);
+    volumeSeries.setData(dedupV);
+    candleChart.timeScale().fitContent();
+  }
+
+  const first = dedup[0].close;
+  const last = dedup[dedup.length - 1].close;
+  const hi = Math.max.apply(null, dedup.map(r => r.high));
+  const lo = Math.min.apply(null, dedup.map(r => r.low));
+  const chg = first ? ((last - first) / first) * 100 : 0;
+  meta.innerHTML =
+    "<span><b>" + inst + "</b> · " + bar + " · " + dedup.length + " 根</span>" +
+    "<span>最新 <b>" + last + "</b> · 高 " + hi + " / 低 " + lo +
+    " · 区间涨跌 <span class=\"" + (chg >= 0 ? "pos" : "neg") + "\">" +
+    (chg >= 0 ? "+" : "") + chg.toFixed(2) + "%</span></span>";
+}
+
+function updateEquityChart(equity) {
+  const meta = $("equity_meta");
+  if (!lwAvailable()) {
+    meta.innerHTML = "<span>保守净值 / 高水位</span><span class=\"warn\">图表库未加载</span>";
+    return;
+  }
+  if (!ensureEquityChart()) return;
+
+  if (!Array.isArray(equity) || equity.length < 1) {
+    meta.innerHTML = "<span>保守净值 / 高水位</span><span class=\"muted\">暂无净值样本</span>";
+    return;
+  }
+
+  // API is newest-first; reverse to chronological.
+  const chrono = equity.slice().reverse();
+  const eq = [];
+  const hw = [];
+  for (let i = 0; i < chrono.length; i++) {
+    const e = chrono[i];
+    const t = toUnixSec(e.ts);
+    const ev = parseFloat(e.equity);
+    const hv = parseFloat(e.hwm);
+    if (t == null || isNaN(ev)) continue;
+    eq.push({ time: t, value: ev });
+    if (!isNaN(hv)) hw.push({ time: t, value: hv });
+  }
+  // Dedup equal timestamps (keep last).
+  function dedupLine(arr) {
+    const out = [];
+    for (let i = 0; i < arr.length; i++) {
+      if (out.length && out[out.length - 1].time === arr[i].time) out[out.length - 1] = arr[i];
+      else out.push(arr[i]);
+    }
+    return out;
+  }
+  const eqD = dedupLine(eq);
+  const hwD = dedupLine(hw);
+  if (eqD.length < 1) {
+    meta.innerHTML = "<span>保守净值 / 高水位</span><span class=\"muted\">样本无法解析</span>";
+    return;
+  }
+
+  const sig = eqD.map(p => p.time + ":" + p.value).join(",") + "|" + hwD.map(p => p.value).join(",");
+  if (sig !== lastEquitySig) {
+    lastEquitySig = sig;
+    equitySeries.setData(eqD);
+    hwmSeries.setData(hwD);
+    equityChart.timeScale().fitContent();
+  }
+
+  const lastEq = eqD[eqD.length - 1].value;
+  const lastHw = hwD.length ? hwD[hwD.length - 1].value : lastEq;
+  const firstEq = eqD[0].value;
+  const chg = firstEq ? ((lastEq - firstEq) / firstEq) * 100 : 0;
+  const dd = lastHw > 0 ? Math.max(0, (lastHw - lastEq) / lastHw) * 100 : 0;
+  meta.innerHTML =
+    "<span>样本 <b>" + eqD.length + "</b></span>" +
+    "<span>净值 <b>" + lastEq.toFixed(4) + "</b> · HWM <b>" + lastHw.toFixed(4) + "</b>" +
+    " · 段内 <span class=\"" + (chg >= 0 ? "pos" : "neg") + "\">" +
+    (chg >= 0 ? "+" : "") + chg.toFixed(2) + "%</span>" +
+    " · 相对 HWM 回撤 <span class=\"" + (dd > 5 ? "neg" : "muted") + "\">" + dd.toFixed(2) + "%</span></span>";
+}
+
+function onOverviewChartsVisible() {
+  // Reflow after tab switch / first paint.
+  if (candleChart) {
+    const el = $("chart_candles");
+    if (el && el.clientWidth) candleChart.applyOptions({ width: el.clientWidth });
+  }
+  if (equityChart) {
+    const el = $("chart_equity");
+    if (el && el.clientWidth) equityChart.applyOptions({ width: el.clientWidth });
+  }
 }
 
 function actionPill(action) {
@@ -609,6 +849,10 @@ function showTab(name) {
   document.querySelectorAll(".panel").forEach(p => {
     p.classList.toggle("active", p.id === "panel-" + activeTab);
   });
+  if (activeTab === "overview") {
+    // Charts sized 0 while hidden — reflow on show.
+    setTimeout(onOverviewChartsVisible, 0);
+  }
 }
 document.querySelectorAll(".tab").forEach(btn => {
   btn.addEventListener("click", () => showTab(btn.getAttribute("data-tab")));
@@ -730,7 +974,9 @@ async function poll() {
     $("sh_alpha").className = alphaClass(shadow.alpha);
     $("sh_entry").textContent = (shadow.entry_bid || "—") + " / " + (shadow.bh_btc || "—");
 
-    drawSpark((candles && candles.candles) ? candles.candles : []);
+    updateCandleChart(candles || {});
+    updateEquityChart(equity);
+    if (activeTab === "overview") onOverviewChartsVisible();
     cachedDecisions = decisions;
     cachedRuns = runs;
     renderOverviewSummary(decisions, runs);

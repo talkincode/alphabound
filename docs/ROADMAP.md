@@ -95,7 +95,7 @@ Phase 0 ──► Phase 1 ──► Phase 2 ──► Phase 3 ──► Phase 4 
 - 提示注入防线: 工具返回一律进 data 字段;Agent worker 无 shell/文件/任意 URL 能力
   - ✅ ToolResult.data 不可信边界在类型层强制;LLM 凭证不进 Context
 - 影子对比: 提案 vs 基准(如 buy-and-hold)的假设性表现记录 — ✅ `shadow_bench` + `/api/v1/shadow`
-- Market K 线只读面 — ✅ `/api/v1/candles` + sparkline（TradingView 归因仍待完整 K 线组件）
+- Market K 线只读面 — ✅ `/api/v1/candles` + Dashboard **Lightweight Charts**（K 线/量/净值 + TradingView 归因）
 - 统计: ✅ `--agent-stats` 有效提案率 / tool_calls 计数
 - 短 soak 脚本: ✅ `scripts/soak-shadow.sh`
 - 本机管理控制: ✅ `--control pause|resume|reconcile|cancel-all|flatten|shutdown|status`（控制文件，无网络面；cancel 交易所路径待 Demo）
