@@ -63,6 +63,8 @@
 
 | 文档 | 内容 |
 |---|---|
+| [AGENTS.md](AGENTS.md) | **Agent/协作者硬约束**：隐私与敏感数据不得泄露（public 仓库） |
+| [SECURITY.md](SECURITY.md) | 安全基线：密钥、Dashboard 绑定、脱敏与漏洞报告 |
 | [book/src/](book/src/) | **手册源码**：快速开始、配置/CLI、运维、概念、开发 |
 | [docs/DESIGN_ANALYSIS.md](docs/DESIGN_ANALYSIS.md) | 系统设计分析:决策评估、风险点、实现关注项 |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | 路线图:Phase 0–5 里程碑、交付物与退出条件 |
