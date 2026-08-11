@@ -2218,7 +2218,8 @@ fn waitOrCancelLimit(
     var last: []const u8 = "acked";
 
     while (nowMs() < deadline) {
-        std.Thread.sleep(250 * std.time.ns_per_ms);
+        // Prefer the process Io clock (Zig 0.16); no Thread.sleep / posix.nanosleep.
+        okx.http.io.sleep(.{ .nanoseconds = 250_000_000 }, .awake) catch {};
         last = queryAndResolveOrder(gpa, okx, cfg, engine, orders_repo, fills_repo, events_repo, decision_id, cl_id, side, qty_s, ts);
         if (std.mem.eql(u8, last, "partial")) {
             _ = cancelDemoClOrd(gpa, okx, cfg, engine, events_repo, cl_id, "partial_remainder", wait_cap_ms);
