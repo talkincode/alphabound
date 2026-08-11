@@ -119,9 +119,9 @@ Phase 0 ──► Phase 1 ──► Phase 2 ──► Phase 3 ──► Phase 4 
   风险状态机 NORMAL/EXIT_ONLY/FLATTENING/HALTED
   - ✅ admission 单测 + shadow/demo 决策环调用
 - Execution Engine: 目标仓位→订单、幂等 client_order_id、部分成交、撤单、UNKNOWN 处置、最终对账
-  - ✅ planner + client_order_id + demo 市价 place/query/cancel；部分成交再规划 / limit 仍待
+  - ✅ planner + client_order_id + demo 市价 place/query/cancel；✅ 部分成交再规划（≤3 腿 + REST 对账）；limit 仍待
 - orders/fills 表、订单 8 状态投影(PLANNED..UNKNOWN)
-  - ✅ orders 投影写入；fills 表已有、成交明细落库仍可增强
+  - ✅ orders 投影写入；✅ `/api/v1/orders` + Dashboard 订单 Tab；✅ demo resolve 写 fills 聚合行（WS 多笔 fill 仍可增强）
 - 管理控制: pause / resume / reconcile / cancel-all / flatten / safe-shutdown(本机 CLI/Unix socket)
   - ✅ 控制文件 CLI 全套；cancel-all 在 demo 拉 pending 撤单
 - 故障注入全组: 断网、DNS、时钟漂移、磁盘满、SQLite busy、LLM 超时、坏 JSON、工具污染

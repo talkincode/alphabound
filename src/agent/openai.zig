@@ -101,25 +101,36 @@ pub const Client = struct {
             .response_writer = &resp_aw.writer,
             .extra_headers = auth_headers,
             .headers = .{ .content_type = .{ .override = "application/json" } },
-        }) catch return error.HttpFailed;
+        }) catch {
+            // No response body — DNS/TLS/timeout/connect. Never log URL query secrets.
+            std.debug.print("[llm] transport_failed\n", .{});
+            return error.HttpFailed;
+        };
 
         var list = resp_aw.toArrayList();
         const owned = list.toOwnedSlice(self.gpa) catch return error.OutOfMemory;
         errdefer self.gpa.free(owned);
 
+        const status_code: u16 = @intFromEnum(result.status);
         if (owned.len == 0) {
+            std.debug.print("[llm] empty_body status={d}\n", .{status_code});
             self.gpa.free(owned);
             return error.HttpFailed;
         }
-        _ = result;
 
-        // Stash last error class on failure via threadlocal-ish static is overkill;
-        // parseAssistantContent maps error object → ApiError; caller can re-classify body
-        // by catching and using classifyApiErrorBody if we keep body. Prefer content path.
+        // Non-2xx: classify without dumping body (may contain request ids only — still keep short).
+        if (status_code < 200 or status_code >= 300) {
+            const cls = classifyApiErrorBody(owned);
+            std.debug.print("[llm] http_status={d} class={s}\n", .{ status_code, cls });
+        }
+
+        // parseAssistantContent maps error object → ApiError; classify on ApiError path too.
         const parsed = parseChatResult(self.gpa, owned) catch |err| {
             if (err == error.ApiError) {
                 const cls = classifyApiErrorBody(owned);
                 std.debug.print("[llm] provider error class={s}\n", .{cls});
+            } else if (err == error.MalformedResponse) {
+                std.debug.print("[llm] malformed_response status={d} bytes={d}\n", .{ status_code, owned.len });
             }
             self.gpa.free(owned);
             return err;

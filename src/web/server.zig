@@ -34,6 +34,8 @@ pub const Context = struct {
     memories_json: []const u8 = "[]",
     system_json: []const u8 = "{}",
     decisions_json: []const u8 = "[]",
+    /// Orders projection + recent fills: `{"orders":[...],"fills":[...]}`.
+    orders_json: []const u8 = "{\"orders\":[],\"fills\":[]}",
     /// Dashboard HTML served at "/". Embedded at comptime; empty = 404.
     index_html: []const u8 = "",
 };
@@ -94,6 +96,9 @@ pub fn handle(buf: []u8, method: std.http.Method, target: []const u8, ctx: Conte
     }
     if (std.mem.eql(u8, path, "/api/v1/decisions")) {
         return copyBody(buf, ctx.decisions_json);
+    }
+    if (std.mem.eql(u8, path, "/api/v1/orders")) {
+        return copyBody(buf, ctx.orders_json);
     }
     if (std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, "/index.html")) {
         if (ctx.index_html.len > 0) {
@@ -319,6 +324,7 @@ test "agent-runs equity shadow endpoints serve context blobs" {
     ctx.memories_json = "[{\"memory_id\":\"m1\"}]";
     ctx.system_json = "{\"ready\":true}";
     ctx.decisions_json = "[{\"type\":\"AGENT_PROPOSAL_OK\"}]";
+    ctx.orders_json = "{\"orders\":[{\"status\":\"FILLED\"}],\"fills\":[]}";
     try testing.expectEqualStrings("[{\"run_id\":\"r1\"}]", handle(&buf, .GET, "/api/v1/agent-runs", ctx).body);
     try testing.expectEqualStrings("[{\"equity\":\"100\"}]", handle(&buf, .GET, "/api/v1/equity", ctx).body);
     try testing.expectEqualStrings("{\"alpha\":\"0\"}", handle(&buf, .GET, "/api/v1/shadow", ctx).body);
@@ -326,4 +332,5 @@ test "agent-runs equity shadow endpoints serve context blobs" {
     try testing.expectEqualStrings("[{\"memory_id\":\"m1\"}]", handle(&buf, .GET, "/api/v1/memories", ctx).body);
     try testing.expectEqualStrings("{\"ready\":true}", handle(&buf, .GET, "/api/v1/system", ctx).body);
     try testing.expectEqualStrings("[{\"type\":\"AGENT_PROPOSAL_OK\"}]", handle(&buf, .GET, "/api/v1/decisions", ctx).body);
+    try testing.expectEqualStrings("{\"orders\":[{\"status\":\"FILLED\"}],\"fills\":[]}", handle(&buf, .GET, "/api/v1/orders", ctx).body);
 }

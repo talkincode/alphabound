@@ -170,6 +170,9 @@ const WebState = struct {
     system_len: usize = 2,
     decisions_buf: [49152]u8 = undefined,
     decisions_len: usize = 2,
+    /// Bundle: {"orders":[...],"fills":[...]}.
+    orders_buf: [24576]u8 = undefined,
+    orders_len: usize = 2,
 
     fn initEmpty(self: *WebState) void {
         @memcpy(self.agent_runs_buf[0..2], "[]");
@@ -188,6 +191,9 @@ const WebState = struct {
         self.system_len = 2;
         @memcpy(self.decisions_buf[0..2], "[]");
         self.decisions_len = 2;
+        const empty_orders = "{\"orders\":[],\"fills\":[]}";
+        @memcpy(self.orders_buf[0..empty_orders.len], empty_orders);
+        self.orders_len = empty_orders.len;
     }
 
     fn contextFn(userdata: ?*anyopaque) ab.web.Context {
@@ -203,6 +209,7 @@ const WebState = struct {
             var memories: [8192]u8 = undefined;
             var system: [4096]u8 = undefined;
             var decisions: [49152]u8 = undefined;
+            var orders: [24576]u8 = undefined;
             var config_hash: [71]u8 = undefined;
             var agent_len: usize = 2;
             var equity_len: usize = 2;
@@ -212,6 +219,7 @@ const WebState = struct {
             var memories_len: usize = 2;
             var system_len: usize = 2;
             var decisions_len: usize = 2;
+            var orders_len: usize = 2;
         };
         const self: *WebState = @ptrCast(@alignCast(userdata.?));
         while (true) {
@@ -230,7 +238,8 @@ const WebState = struct {
             const ml = self.memories_len;
             const yl = self.system_len;
             const dl = self.decisions_len;
-            if (al > Tls.agent.len or el > Tls.equity.len or vl > Tls.events.len or sl > Tls.shadow.len or cl > Tls.candles.len or ml > Tls.memories.len or yl > Tls.system.len or dl > Tls.decisions.len) {
+            const ol = self.orders_len;
+            if (al > Tls.agent.len or el > Tls.equity.len or vl > Tls.events.len or sl > Tls.shadow.len or cl > Tls.candles.len or ml > Tls.memories.len or yl > Tls.system.len or dl > Tls.decisions.len or ol > Tls.orders.len) {
                 std.atomic.spinLoopHint();
                 continue;
             }
@@ -242,6 +251,7 @@ const WebState = struct {
             @memcpy(Tls.memories[0..ml], self.memories_buf[0..ml]);
             @memcpy(Tls.system[0..yl], self.system_buf[0..yl]);
             @memcpy(Tls.decisions[0..dl], self.decisions_buf[0..dl]);
+            @memcpy(Tls.orders[0..ol], self.orders_buf[0..ol]);
             @memcpy(Tls.config_hash[0..], self.config_hash[0..]);
             Tls.agent_len = al;
             Tls.equity_len = el;
@@ -251,6 +261,7 @@ const WebState = struct {
             Tls.memories_len = ml;
             Tls.system_len = yl;
             Tls.decisions_len = dl;
+            Tls.orders_len = ol;
             const s2 = self.seq.load(.acquire);
             if (s1 == s2) {
                 return .{
@@ -266,6 +277,7 @@ const WebState = struct {
                     .memories_json = Tls.memories[0..Tls.memories_len],
                     .system_json = Tls.system[0..Tls.system_len],
                     .decisions_json = Tls.decisions[0..Tls.decisions_len],
+                    .orders_json = Tls.orders[0..Tls.orders_len],
                     .index_html = dashboard_html,
                 };
             }
@@ -279,7 +291,7 @@ const WebState = struct {
         _ = self.seq.fetchAdd(1, .release); // even: stable
     }
 
-    fn setJson(self: *WebState, comptime which: enum { agent, equity, events, shadow, candles, memories, system, decisions }, src: []const u8) void {
+    fn setJson(self: *WebState, comptime which: enum { agent, equity, events, shadow, candles, memories, system, decisions, orders }, src: []const u8) void {
         _ = self.seq.fetchAdd(1, .acq_rel);
         switch (which) {
             .agent => {
@@ -321,6 +333,11 @@ const WebState = struct {
                 const n = @min(src.len, self.decisions_buf.len);
                 @memcpy(self.decisions_buf[0..n], src[0..n]);
                 self.decisions_len = n;
+            },
+            .orders => {
+                const n = @min(src.len, self.orders_buf.len);
+                @memcpy(self.orders_buf[0..n], src[0..n]);
+                self.orders_len = n;
             },
         }
         _ = self.seq.fetchAdd(1, .release);
@@ -512,7 +529,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     if (cli.self_check) {
         std.debug.print(
-            "[self-check] ok\n  config_hash:  {s}\n  instrument:   {s}\n  mode:         {t}\n  max_drawdown: {f}\n  db:           {s} (user_version {d})\n  web:          {s}\n  okx_keys:     {s}\n  agent:        enabled={} provider={s} model={s} base_url={s} interval_ms={d} llm_keys={s}\n",
+            "[self-check] ok\n  config_hash:  {s}\n  instrument:   {s}\n  mode:         {t}\n  max_drawdown: {f}\n  db:           {s} (user_version {d})\n  web:          {s}\n  okx_keys:     {s}\n  agent:        enabled={} provider={s} model={s} base_url={s} llm_keys={s}\n  schedule:     base_ms={d} quiet_ms={d} min_ms={d} active_utc={s} price_move={f} dd_step={f} reflect_on_hold={}\n",
             .{
                 cfg.hash(),
                 cfg.instrument,
@@ -526,8 +543,14 @@ pub fn main(init: std.process.Init) !u8 {
                 cfg.agent_provider,
                 if (llm_env) |l| l.model else cfg.agent_model,
                 if (llm_env) |l| l.base_url else cfg.agent_base_url,
-                cfg.decision_interval_ms,
                 if (llm_env != null) "present" else "absent",
+                cfg.decision_interval_ms,
+                cfg.decision_interval_quiet_ms,
+                cfg.decision_min_interval_ms,
+                if (cfg.active_hours_utc.len > 0) cfg.active_hours_utc else "always",
+                cfg.event_price_move,
+                cfg.event_drawdown_step,
+                cfg.agent_llm_reflection_on_hold,
             },
         );
 
@@ -585,6 +608,8 @@ pub fn main(init: std.process.Init) !u8 {
     defer memories_repo.deinit();
     var orders_repo = try ab.storage.OrdersRepo.init(&db);
     defer orders_repo.deinit();
+    var fills_repo = try ab.storage.FillsRepo.init(&db);
+    defer fills_repo.deinit();
 
     // In-process memory index rebuilt from SQLite latest versions.
     var mem_store = ab.memory.Store.init(gpa);
@@ -776,7 +801,7 @@ pub fn main(init: std.process.Init) !u8 {
         },
     );
     web_state.update(engine.snapshot(), true);
-    refreshWebCaches(&web_state, &db, &agent_runs, &equity_repo, &events_repo, &memories_repo, last_bh_cmp);
+    refreshWebCaches(&web_state, &db, &agent_runs, &equity_repo, &events_repo, &memories_repo, &orders_repo, &fills_repo, last_bh_cmp);
     refreshCandlesCache(gpa, &web_state, &okx, &cfg);
     refreshEgressIp(gpa, &okx, &runtime_status);
     refreshSystemCache(&web_state, &db, &cfg, &mem_store, boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), llm_client != null, admin_paused, &runtime_status);
@@ -784,10 +809,19 @@ pub fn main(init: std.process.Init) !u8 {
 
     var tick_count: u64 = 0;
     var last_sample_min: i64 = 0;
-    var last_agent_ms: i64 = 0;
     var last_private_ms: i64 = 0;
     var last_dashboard_ms: i64 = 0;
     var agent_done_once = false;
+    // Multi-factor decision scheduler: session-aware base cadence + event
+    // triggers (price move / drawdown step / risk-mode change) + cooldown floor.
+    var agent_sched = ab.scheduler.Scheduler.init(.{
+        .base_interval_ms = @as(i64, cfg.decision_interval_ms),
+        .quiet_interval_ms = @as(i64, cfg.decision_interval_quiet_ms),
+        .min_interval_ms = @as(i64, cfg.decision_min_interval_ms),
+        .active_hours = ab.scheduler.parseHours(cfg.active_hours_utc) catch .{},
+        .price_move = cfg.event_price_move,
+        .drawdown_step = cfg.event_drawdown_step,
+    });
     var ticker_path_buf: [128]u8 = undefined;
     const ticker_path = std.fmt.bufPrint(&ticker_path_buf, "/api/v5/market/ticker?instId={s}", .{cfg.instrument}) catch return 1;
     // Gate 1: periodic private REST reconcile; private WS is boot probe + optional re-probe.
@@ -965,14 +999,23 @@ pub fn main(init: std.process.Init) !u8 {
         if (!admin_paused) {
             if (llm_client) |*client| {
                 const tnow = nowMs();
-                const due_interval = cfg.decision_interval_ms > 0 and
-                    (last_agent_ms == 0 or tnow - last_agent_ms >= @as(i64, cfg.decision_interval_ms));
+                const snap_now = engine.snapshot();
+                const verdict = agent_sched.evaluate(tnow, snap_now.bid_price, snap_now.drawdown, snap_now.risk_mode);
                 const due_once = cli.agent_once and !agent_done_once and tick_count >= 1;
-                if (due_interval or due_once) {
-                    last_agent_ms = tnow;
+                if (verdict.fire or due_once) {
+                    agent_sched.commit(tnow, snap_now.bid_price, snap_now.drawdown, snap_now.risk_mode);
                     agent_done_once = true;
-                    runAgentDecision(gpa, client, &okx, &cfg, &engine, &tool_reg, &agent_runs, &tool_calls, &events_repo, &orders_repo, &db, &mem_store, &memories_repo, env, &runtime_status, trade_instrument);
-                    refreshWebCaches(&web_state, &db, &agent_runs, &equity_repo, &events_repo, &memories_repo, last_bh_cmp);
+                    const reason_txt = if (verdict.fire) verdict.reason.text() else "manual_once";
+                    std.debug.print("[agent] trigger reason={s}\n", .{reason_txt});
+                    var trig_buf: [192]u8 = undefined;
+                    const trig_payload = std.fmt.bufPrint(
+                        &trig_buf,
+                        "{{\"reason\":\"{s}\",\"hour_utc\":{d},\"interval_ms\":{d}}}",
+                        .{ reason_txt, ab.scheduler.hourUtc(tnow), agent_sched.params.effectiveInterval(ab.scheduler.hourUtc(tnow)) },
+                    ) catch "{\"reason\":\"unknown\"}";
+                    logEventPayload(&events_repo, &engine, "AGENT_TRIGGER", "agent", "INFO", &cfg, trig_payload);
+                    runAgentDecision(gpa, client, &okx, &cfg, &engine, &tool_reg, &agent_runs, &tool_calls, &events_repo, &orders_repo, &fills_repo, &db, &mem_store, &memories_repo, env, &runtime_status, trade_instrument);
+                    refreshWebCaches(&web_state, &db, &agent_runs, &equity_repo, &events_repo, &memories_repo, &orders_repo, &fills_repo, last_bh_cmp);
                     refreshSystemCache(&web_state, &db, &cfg, &mem_store, boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), llm_client != null, admin_paused, &runtime_status);
                 }
             }
@@ -983,7 +1026,7 @@ pub fn main(init: std.process.Init) !u8 {
             const tnow = nowMs();
             if (last_dashboard_ms == 0 or tnow - last_dashboard_ms >= dashboard_refresh_ms) {
                 last_dashboard_ms = tnow;
-                refreshWebCaches(&web_state, &db, &agent_runs, &equity_repo, &events_repo, &memories_repo, last_bh_cmp);
+                refreshWebCaches(&web_state, &db, &agent_runs, &equity_repo, &events_repo, &memories_repo, &orders_repo, &fills_repo, last_bh_cmp);
                 refreshCandlesCache(gpa, &web_state, &okx, &cfg);
                 refreshSystemCache(&web_state, &db, &cfg, &mem_store, boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), llm_client != null, admin_paused, &runtime_status);
             }
@@ -1004,7 +1047,7 @@ pub fn main(init: std.process.Init) !u8 {
     // ---- Graceful shutdown (§7.4) -------------------------------------------
     std.debug.print("[shutdown] draining after {d} ticks\n", .{tick_count});
     writeEquitySample(&equity_repo, engine.snapshot());
-    refreshWebCaches(&web_state, &db, &agent_runs, &equity_repo, &events_repo, &memories_repo, last_bh_cmp);
+    refreshWebCaches(&web_state, &db, &agent_runs, &equity_repo, &events_repo, &memories_repo, &orders_repo, &fills_repo, last_bh_cmp);
     logEvent(&events_repo, &engine, "SHUTDOWN_CLEAN", "core", "CRITICAL", &cfg);
     return 0;
 }
@@ -1125,6 +1168,8 @@ fn refreshWebCaches(
     equity: *ab.storage.EquityRepo,
     events: *ab.storage.EventsRepo,
     memories: *ab.storage.MemoriesRepo,
+    orders: *ab.storage.OrdersRepo,
+    fills: *ab.storage.FillsRepo,
     bh: ab.shadow_bench.Comparison,
 ) void {
     // Separate scratch buffers so a large events dump cannot clobber shadow JSON mid-format.
@@ -1152,6 +1197,19 @@ fn refreshWebCaches(
     if (ab.shadow_bench.formatJson(&tmp_shadow, bh)) |j| {
         ws.setJson(.shadow, j);
     } else |_| {}
+
+    // Orders bundle for Dashboard / Gate3 trade visibility.
+    var tmp_ord: [16384]u8 = undefined;
+    var tmp_fills: [8192]u8 = undefined;
+    var tmp_bundle: [24576]u8 = undefined;
+    const orders_j = orders.listRecentJson(db, &tmp_ord, 80) catch "[]";
+    const fills_j = fills.listRecentJson(db, &tmp_fills, 80) catch "[]";
+    var bw: std.Io.Writer = .fixed(&tmp_bundle);
+    bw.print("{{\"orders\":{s},\"fills\":{s}}}", .{ orders_j, fills_j }) catch {
+        ws.setJson(.orders, "{\"orders\":[],\"fills\":[]}");
+        return;
+    };
+    ws.setJson(.orders, bw.buffered());
 }
 
 const CandleBarSpec = struct { okx_bar: []const u8, limit: u16 };
@@ -1553,6 +1611,7 @@ fn runAgentDecision(
     tools_repo: *ab.storage.ToolCallsRepo,
     events_repo: *ab.storage.EventsRepo,
     orders_repo: *ab.storage.OrdersRepo,
+    fills_repo: *ab.storage.FillsRepo,
     db: *ab.storage.Db,
     mem_store: *ab.memory.Store,
     memories_repo: *ab.storage.MemoriesRepo,
@@ -1713,6 +1772,7 @@ fn runAgentDecision(
             cfg,
             engine,
             orders_repo,
+            fills_repo,
             events_repo,
             prop.decision_id,
             admission,
@@ -1727,7 +1787,10 @@ fn runAgentDecision(
     completeRun(runs, run_id, "ok", out_digest, input_digest, admit_now);
     recordProposalEpisode(gpa, mem_store, memories_repo, run_id, prop.decision_id, action_txt, prop.target_btc_weight, prop.confidence);
     // Reflection: prefer LLM structured memory_ops; fail-closed → deterministic.
-    const want_llm_reflect = cfg.agent_llm_reflection and llmReflectionWanted(env);
+    // HOLD cycles skip the second LLM call unless explicitly enabled — quiet
+    // markets should not burn tokens re-reflecting on identical no-ops.
+    const reflect_this_action = cfg.agent_llm_reflection_on_hold or prop.action != .hold;
+    const want_llm_reflect = cfg.agent_llm_reflection and reflect_this_action and llmReflectionWanted(env);
     var reflected = false;
     if (want_llm_reflect) {
         reflected = tryLlmReflection(
@@ -1782,6 +1845,7 @@ fn runAgentDecision(
 }
 
 /// Demo-only: plan + place market order after APPROVE/REDUCE. Never called for live.
+/// Partial fills: REST-reconcile portfolio then re-plan residual (max 3 legs).
 /// Returns a short stable token for logs/events (no secrets).
 fn tryDemoExecute(
     gpa: std.mem.Allocator,
@@ -1789,38 +1853,149 @@ fn tryDemoExecute(
     cfg: *const ab.config.Config,
     engine: *ab.state.Engine,
     orders_repo: *ab.storage.OrdersRepo,
+    fills_repo: *ab.storage.FillsRepo,
     events_repo: *ab.storage.EventsRepo,
     decision_id: []const u8,
     admission: ShadowAdmission,
     instrument: ab.planner.Instrument,
-    snap: ab.state.PortfolioState,
+    snap_in: ab.state.PortfolioState,
 ) []const u8 {
     if (!std.mem.eql(u8, admission.verdict_txt, "APPROVE") and !std.mem.eql(u8, admission.verdict_txt, "REDUCE")) {
         return "skipped_reject";
     }
-    const mark = if (snap.mark_price.gt(ab.decimal.Decimal.zero)) snap.mark_price else snap.bid_price;
-    const equity = if (snap.conservative_equity.gt(ab.decimal.Decimal.zero)) snap.conservative_equity else blk: {
-        break :blk snap.cash_usdt;
-    };
-    const planned = ab.planner.plan(.{
-        .cash_usdt = snap.cash_usdt,
-        .btc_total = snap.btc_total,
-        .equity = equity,
-        .mark_price = mark,
-        .admitted_btc_weight = admission.admitted_weight,
-        .instrument = instrument,
-    }) catch return "plan_error";
 
-    const po = switch (planned) {
-        .hold => {
-            logEventPayload(events_repo, engine, "EXEC_HOLD", "execution", "INFO", cfg, "{\"reason\":\"dust_or_zero_delta\"}");
-            return "plan_hold";
+    const max_legs = ab.okx_trade.max_replan_legs;
+    var seq: u16 = 0;
+    var last_note: []const u8 = "plan_hold";
+    var snap = snap_in;
+    var any_fill = false;
+
+    while (seq < max_legs) : (seq += 1) {
+        const mark = if (snap.mark_price.gt(ab.decimal.Decimal.zero)) snap.mark_price else snap.bid_price;
+        const equity = if (snap.conservative_equity.gt(ab.decimal.Decimal.zero))
+            snap.conservative_equity
+        else
+            snap.cash_usdt;
+
+        const planned = ab.planner.plan(.{
+            .cash_usdt = snap.cash_usdt,
+            .btc_total = snap.btc_total,
+            .equity = equity,
+            .mark_price = mark,
+            .admitted_btc_weight = admission.admitted_weight,
+            .instrument = instrument,
+        }) catch return if (seq == 0) "plan_error" else last_note;
+
+        const po = switch (planned) {
+            .hold => {
+                if (seq == 0) {
+                    logEventPayload(events_repo, engine, "EXEC_HOLD", "execution", "INFO", cfg, "{\"reason\":\"dust_or_zero_delta\"}");
+                    return "plan_hold";
+                }
+                // Residual below instrument mins after partial(s).
+                logEventPayload(events_repo, engine, "EXEC_REPLAN_HOLD", "execution", "INFO", cfg, "{\"reason\":\"residual_dust\"}");
+                return if (any_fill) "partial_then_hold" else last_note;
+            },
+            .order => |o| o,
+        };
+
+        if (seq > 0) {
+            var rbuf: [192]u8 = undefined;
+            var qbuf: [48]u8 = undefined;
+            const q_s = decFmt(&qbuf, po.qty);
+            const rp = std.fmt.bufPrint(
+                &rbuf,
+                "{{\"decision_id\":\"{s}\",\"seq\":{d},\"side\":\"{s}\",\"qty\":\"{s}\"}}",
+                .{ decision_id, seq, po.side.jsonName(), q_s },
+            ) catch "{\"replan\":true}";
+            logEventPayload(events_repo, engine, "EXEC_REPLAN", "execution", "INFO", cfg, rp);
+            std.debug.print("[exec] replan leg={d} side={s} qty={s}\n", .{ seq, po.side.jsonName(), q_s });
+        }
+
+        const leg = placeDemoMarketLeg(
+            gpa,
+            okx,
+            cfg,
+            engine,
+            orders_repo,
+            fills_repo,
+            events_repo,
+            decision_id,
+            snap.version,
+            seq,
+            po,
+        );
+        last_note = leg;
+
+        if (ab.okx_trade.wantsResidualPlan(leg)) {
+            any_fill = true;
+            // Pull venue balances so residual plan uses true position (§5.5).
+            _ = refreshDemoPortfolio(gpa, okx, engine);
+            snap = engine.snapshot();
+            if (std.mem.eql(u8, leg, "filled")) {
+                // If residual is dust, done; else continue for another leg.
+                const mark2 = if (snap.mark_price.gt(ab.decimal.Decimal.zero)) snap.mark_price else snap.bid_price;
+                const eq2 = if (snap.conservative_equity.gt(ab.decimal.Decimal.zero)) snap.conservative_equity else snap.cash_usdt;
+                const more = ab.planner.plan(.{
+                    .cash_usdt = snap.cash_usdt,
+                    .btc_total = snap.btc_total,
+                    .equity = eq2,
+                    .mark_price = mark2,
+                    .admitted_btc_weight = admission.admitted_weight,
+                    .instrument = instrument,
+                }) catch break;
+                if (more == .hold) return "filled";
+            }
+            if (!ab.okx_trade.canPlaceAnotherLeg(seq)) break;
+            continue;
+        }
+        // Terminal non-success or ambiguous — stop (fail-closed, no blind resend).
+        return leg;
+    }
+
+    if (any_fill and std.mem.eql(u8, last_note, "partial")) return "partial_max_legs";
+    return last_note;
+}
+
+/// Apply private REST balances into the engine (demo only). Returns false on probe failure.
+fn refreshDemoPortfolio(
+    gpa: std.mem.Allocator,
+    okx: *ab.okx_rest.Client,
+    engine: *ab.state.Engine,
+) bool {
+    const probe = probePrivateBalance(gpa, okx);
+    switch (probe) {
+        .ok => |b| {
+            _ = engine.apply(.{ .reconcile_result = .{
+                .ts_ms = nowMs(),
+                .cash_usdt = b.usdt_cash,
+                .btc_total = b.btc_cash,
+                .btc_available = b.btc_avail,
+                .hwm_from_db = engine.snapshot().high_watermark,
+                .clean = true,
+            } }) catch {};
+            return true;
         },
-        .order => |o| o,
-    };
+        .err => return false,
+    }
+}
 
+/// Single market leg: place + query/resolve. `seq` differentiates client_order_id on replans.
+fn placeDemoMarketLeg(
+    gpa: std.mem.Allocator,
+    okx: *ab.okx_rest.Client,
+    cfg: *const ab.config.Config,
+    engine: *ab.state.Engine,
+    orders_repo: *ab.storage.OrdersRepo,
+    fills_repo: *ab.storage.FillsRepo,
+    events_repo: *ab.storage.EventsRepo,
+    decision_id: []const u8,
+    snap_version: u64,
+    seq: u16,
+    po: ab.planner.PlannedOrder,
+) []const u8 {
     var cl_buf: [32]u8 = undefined;
-    const cl_id = ab.orders.clientOrderId(&cl_buf, decision_id, snap.version, 0);
+    const cl_id = ab.orders.clientOrderId(&cl_buf, decision_id, snap_version, seq);
     var body_buf: [384]u8 = undefined;
     const body = ab.okx_trade.formatPlaceMarketBody(&body_buf, .{
         .inst_id = cfg.instrument,
@@ -1863,8 +2038,7 @@ fn tryDemoExecute(
             .created_ts = ts,
             .updated_ts = ts,
         }) catch {};
-        // Fail-closed: query before any retry.
-        _ = queryAndResolveOrder(gpa, okx, cfg, engine, orders_repo, events_repo, decision_id, cl_id, po.side.jsonName(), qty_s, ts);
+        _ = queryAndResolveOrder(gpa, okx, cfg, engine, orders_repo, fills_repo, events_repo, decision_id, cl_id, po.side.jsonName(), qty_s, ts);
         logEventPayload(events_repo, engine, "ORDER_UNKNOWN", "execution", "CRITICAL", cfg, "{\"reason\":\"http_timeout_or_error\"}");
         return "unknown_http";
     };
@@ -1873,7 +2047,7 @@ fn tryDemoExecute(
     const ack = ab.okx_rest.parseOrderAck(gpa, resp) catch {
         status = ab.orders.next(status, .timeout) catch .unknown;
         _ = engine.apply(.{ .order_ambiguity = .{ .present = true } }) catch {};
-        _ = queryAndResolveOrder(gpa, okx, cfg, engine, orders_repo, events_repo, decision_id, cl_id, po.side.jsonName(), qty_s, ts);
+        _ = queryAndResolveOrder(gpa, okx, cfg, engine, orders_repo, fills_repo, events_repo, decision_id, cl_id, po.side.jsonName(), qty_s, ts);
         return "unknown_parse";
     };
 
@@ -1893,8 +2067,8 @@ fn tryDemoExecute(
         var rbuf: [256]u8 = undefined;
         const rp = std.fmt.bufPrint(
             &rbuf,
-            "{{\"clOrdId\":\"{s}\",\"status\":\"REJECTED\",\"side\":\"{s}\",\"qty\":\"{s}\"}}",
-            .{ cl_id, po.side.jsonName(), qty_s },
+            "{{\"clOrdId\":\"{s}\",\"status\":\"REJECTED\",\"side\":\"{s}\",\"qty\":\"{s}\",\"seq\":{d}}}",
+            .{ cl_id, po.side.jsonName(), qty_s, seq },
         ) catch "{\"status\":\"REJECTED\"}";
         logEventPayload(events_repo, engine, "ORDER_REJECTED", "execution", "WARN", cfg, rp);
         return "rejected";
@@ -1917,13 +2091,12 @@ fn tryDemoExecute(
     var abuf: [320]u8 = undefined;
     const ap = std.fmt.bufPrint(
         &abuf,
-        "{{\"clOrdId\":\"{s}\",\"ordId\":\"{s}\",\"side\":\"{s}\",\"qty\":\"{s}\",\"status\":\"ACKNOWLEDGED\"}}",
-        .{ cl_id, ex_id, po.side.jsonName(), qty_s },
+        "{{\"clOrdId\":\"{s}\",\"ordId\":\"{s}\",\"side\":\"{s}\",\"qty\":\"{s}\",\"status\":\"ACKNOWLEDGED\",\"seq\":{d}}}",
+        .{ cl_id, ex_id, po.side.jsonName(), qty_s, seq },
     ) catch "{\"status\":\"ACKNOWLEDGED\"}";
     logEventPayload(events_repo, engine, "ORDER_ACK", "execution", "INFO", cfg, ap);
 
-    const resolved = queryAndResolveOrder(gpa, okx, cfg, engine, orders_repo, events_repo, decision_id, cl_id, po.side.jsonName(), qty_s, ts);
-    return resolved;
+    return queryAndResolveOrder(gpa, okx, cfg, engine, orders_repo, fills_repo, events_repo, decision_id, cl_id, po.side.jsonName(), qty_s, ts);
 }
 
 fn queryAndResolveOrder(
@@ -1932,6 +2105,7 @@ fn queryAndResolveOrder(
     cfg: *const ab.config.Config,
     engine: *ab.state.Engine,
     orders_repo: *ab.storage.OrdersRepo,
+    fills_repo: *ab.storage.FillsRepo,
     events_repo: *ab.storage.EventsRepo,
     decision_id: []const u8,
     cl_id: []const u8,
@@ -1970,16 +2144,35 @@ fn queryAndResolveOrder(
     const st = ab.okx_trade.mapOkxState(q.status());
     var fill_buf: [48]u8 = undefined;
     const fill_s = decFmt(&fill_buf, q.filled_qty);
+    var avg_buf: [48]u8 = undefined;
+    const avg_s = if (q.avg_price.gt(ab.decimal.Decimal.zero)) decFmt(&avg_buf, q.avg_price) else "market";
     orders_repo.upsert(.{
         .client_order_id = cl_id,
         .decision_id = decision_id,
         .side = side,
         .qty = qty_s,
-        .price = "market",
+        .price = avg_s,
         .status = st.jsonName(),
         .created_ts = ts,
         .updated_ts = ts,
     }) catch {};
+
+    // Projection fill row when exchange reports cumulative filled qty.
+    // Idempotent fill_id = clOrdId + "f0" (single aggregate for REST query path;
+    // private WS multi-fill can mint f1/f2 later).
+    if (q.filled_qty.gt(ab.decimal.Decimal.zero)) {
+        var fid_buf: [40]u8 = undefined;
+        const fill_id = std.fmt.bufPrint(&fid_buf, "{s}f0", .{cl_id}) catch "fill0";
+        fills_repo.append(.{
+            .fill_id = fill_id,
+            .order_id = cl_id,
+            .price = avg_s,
+            .qty = fill_s,
+            .fee = "0",
+            .fee_ccy = "USDT",
+            .ts = ts,
+        }) catch {};
+    }
 
     if (st == .filled or st == .canceled or st == .rejected) {
         _ = engine.apply(.{ .order_ambiguity = .{ .present = false } }) catch {};
@@ -1991,8 +2184,8 @@ fn queryAndResolveOrder(
     var pbuf: [320]u8 = undefined;
     const payload = std.fmt.bufPrint(
         &pbuf,
-        "{{\"clOrdId\":\"{s}\",\"okx_state\":\"{s}\",\"status\":\"{s}\",\"filled\":\"{s}\"}}",
-        .{ cl_id, q.status(), st.jsonName(), fill_s },
+        "{{\"clOrdId\":\"{s}\",\"okx_state\":\"{s}\",\"status\":\"{s}\",\"filled\":\"{s}\",\"avgPx\":\"{s}\"}}",
+        .{ cl_id, q.status(), st.jsonName(), fill_s, avg_s },
     ) catch "{}";
     logEventPayload(events_repo, engine, "ORDER_QUERY", "execution", "INFO", cfg, payload);
 
@@ -2246,6 +2439,18 @@ fn refreshSystemCache(
     w.print(
         "\"agent\":{{\"total\":{d},\"ok\":{d},\"invalid\":{d},\"errors\":{d},\"valid_rate\":{d:.1},\"tool_calls\":{d}}},",
         .{ total, ok, invalid, errors, rate, tools_n },
+    ) catch return;
+    w.print(
+        "\"schedule\":{{\"base_ms\":{d},\"quiet_ms\":{d},\"min_ms\":{d},\"active_hours_utc\":\"{s}\",\"price_move\":\"{f}\",\"drawdown_step\":\"{f}\",\"reflect_on_hold\":{}}},",
+        .{
+            cfg.decision_interval_ms,
+            cfg.decision_interval_quiet_ms,
+            cfg.decision_min_interval_ms,
+            if (cfg.active_hours_utc.len > 0) cfg.active_hours_utc else "always",
+            cfg.event_price_move,
+            cfg.event_drawdown_step,
+            cfg.agent_llm_reflection_on_hold,
+        },
     ) catch return;
     w.print(
         "\"status\":{{\"okx_public\":\"{s}\",\"okx_public_ms\":{d},\"okx_public_detail\":\"{s}\",\"okx_private\":\"{s}\",\"okx_private_ms\":{d},\"okx_private_detail\":\"{s}\",\"llm\":\"{s}\",\"llm_ms\":{d},\"llm_detail\":\"{s}\",\"last_bid\":\"{s}\",",

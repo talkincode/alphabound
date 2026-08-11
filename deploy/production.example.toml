@@ -24,10 +24,18 @@ provider = "openai"
 model = "gpt-4o-mini"
 base_url = "https://api.openai.com/v1"
 decision_timeout_ms = 30000
-decision_interval_ms = 60000
+# Multi-factor slow-loop schedule: low base cadence + trading session +
+# event triggers, all bounded by a hard cooldown floor. Not a HFT system.
+decision_interval_ms = 900000        # 15 min base cadence in active session
+decision_interval_quiet_ms = 3600000 # 60 min outside active session
+decision_min_interval_ms = 180000    # 3 min hard floor between any two calls
+active_hours_utc = "13-21"           # EU/US overlap; empty = always base
+event_price_move = 0.005             # fire early on ≥0.5% move since last call
+event_drawdown_step = 0.01           # fire early when drawdown deepens ≥1%
 prompt_dir = "/etc/alphabound/prompts"
 enabled = true
 llm_reflection = true
+llm_reflection_on_hold = false       # HOLD cycles: deterministic reflection only
 
 [storage]
 path = "/var/lib/alphabound/trading.db"
