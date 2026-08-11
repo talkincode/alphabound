@@ -20,7 +20,7 @@
 | AC-FR03 | Agent 决策 | 决策基于一致性快照+检索记忆;可按需调用工具;全程可审计 | Shadow + Integration | P2 | ◐ Context+LLM + market 工具 + 记忆/events + **LLM reflection** + **Risk 准入审计**（不执行）+ 全审计; 长跑阈值评审仍待 |
 | AC-FR04 | 交易提案 | Proposal 严格 Schema(target/order_policy/confidence/thesis/evidence/invalid_if);坏 JSON/缺字段即作废 | Unit(Schema)+ Fuzz | P2 | ◐ `agent/proposal.zig` 严格解析:坏 JSON/缺字段/越界置信度全部拒绝(单测);fuzz 待做 |
 | AC-FR05 | 风险准入 | 校验 snapshot_version、数据新鲜度、压力净值≥HWM×90%+ExitReserve;能输出 APPROVE/REDUCE/REJECT | Property + Unit | P3 | ◐ 单测+property 基础; **shadow 路径已调用 admit 并落 `RISK_ADMISSION`**; Demo 执行联动仍待 |
-| AC-FR06 | 订单执行 | client_order_id 幂等(decision_id+版本+序号);部分成交重算差额;超时→UNKNOWN→查询后处置 | Integration + Fault + Replay | P3 | ◐ 单测 + **demo 路径** place/query/cancel + UNKNOWN 查询 + **partial 再规划(≤3腿)**; Fault/7d soak 待做 |
+| AC-FR06 | 订单执行 | client_order_id 幂等(decision_id+版本+序号);部分成交重算差额;超时→UNKNOWN→查询后处置 | Integration + Fault + Replay | P3 | ◐ 单测 + **demo 市价/limit** place/query/cancel + UNKNOWN 查询 + **partial 再规划(≤3腿)**; Fault/7d soak 待做 |
 | AC-FR07 | 长期 Context | 五层记忆可写入/检索/版本化;Reflection 产出结构化 memory_ops 并生效 | Shadow + Unit | P2 | ◐ store+reflection 单测; **Shadow**: boot/retrieve/episode/**LLM+确定性 reflection ops** + Dashboard memories |
 | AC-FR08 | 可选数据工具 | 工具注册含 Schema/时效/成本;返回统一 ToolResult;调用与结果全部落事件日志 | Unit + Integration | P2(市场类)/ P5(扩展类) | ◐ registry + `market.ticker`/`market.candles` OKX REST provider 实调落 `tool_calls`;扩展域 provider 待做 |
 | AC-FR09 | Dashboard | Overview/Market/Trade Detail/Events/Memory/System 六视图;K 线+交易/风险标记;保留 TradingView attribution | Manual(UI 走查)+ Integration(API) | P1(基础)/ P2(全视图) | ◐ Overview+提案+BH+**Lightweight Charts K线/量/净值HWM**+Memories+Events+System+**订单/fills API+Tab**+TV 归因；提案链路完整 Trade Detail 回放仍待 |

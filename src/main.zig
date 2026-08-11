@@ -1778,6 +1778,7 @@ fn runAgentDecision(
             admission,
             instrument,
             snap,
+            prop.order_policy,
         );
     }
     std.debug.print(
@@ -1859,11 +1860,14 @@ fn tryDemoExecute(
     admission: ShadowAdmission,
     instrument: ab.planner.Instrument,
     snap_in: ab.state.PortfolioState,
+    order_policy: ab.proposal.OrderPolicy,
 ) []const u8 {
     if (!std.mem.eql(u8, admission.verdict_txt, "APPROVE") and !std.mem.eql(u8, admission.verdict_txt, "REDUCE")) {
         return "skipped_reject";
     }
 
+    // LIMIT_ONLY → limit legs; LIMIT_OR_MARKET → market (demo default, fast fill).
+    const prefer_limit = order_policy.type == .limit_only;
     const max_legs = ab.okx_trade.max_replan_legs;
     var seq: u16 = 0;
     var last_note: []const u8 = "plan_hold";
@@ -1912,7 +1916,7 @@ fn tryDemoExecute(
             std.debug.print("[exec] replan leg={d} side={s} qty={s}\n", .{ seq, po.side.jsonName(), q_s });
         }
 
-        const leg = placeDemoMarketLeg(
+        const leg = placeDemoLeg(
             gpa,
             okx,
             cfg,
@@ -1924,6 +1928,10 @@ fn tryDemoExecute(
             snap.version,
             seq,
             po,
+            mark,
+            instrument,
+            prefer_limit,
+            order_policy.urgency,
         );
         last_note = leg;
 
@@ -1980,8 +1988,9 @@ fn refreshDemoPortfolio(
     }
 }
 
-/// Single market leg: place + query/resolve. `seq` differentiates client_order_id on replans.
-fn placeDemoMarketLeg(
+/// Single place + query/resolve leg. `seq` differentiates client_order_id on replans.
+/// When `prefer_limit`, posts a limit at urgency-adjusted mark (tick-snapped).
+fn placeDemoLeg(
     gpa: std.mem.Allocator,
     okx: *ab.okx_rest.Client,
     cfg: *const ab.config.Config,
@@ -1993,19 +2002,45 @@ fn placeDemoMarketLeg(
     snap_version: u64,
     seq: u16,
     po: ab.planner.PlannedOrder,
+    mark: ab.decimal.Decimal,
+    instrument: ab.planner.Instrument,
+    prefer_limit: bool,
+    urgency: ab.decimal.Decimal,
 ) []const u8 {
     var cl_buf: [32]u8 = undefined;
     const cl_id = ab.orders.clientOrderId(&cl_buf, decision_id, snap_version, seq);
+
+    var px_opt: ?ab.decimal.Decimal = null;
+    if (prefer_limit) {
+        const max_passive = ab.decimal.Decimal.parse("0.001") catch ab.decimal.Decimal.zero; // 10 bps
+        px_opt = ab.planner.limitPriceFromMark(mark, instrument.tick_size, po.side, urgency, max_passive) catch null;
+        if (px_opt == null) return "limit_price_error";
+    }
+
     var body_buf: [384]u8 = undefined;
-    const body = ab.okx_trade.formatPlaceMarketBody(&body_buf, .{
-        .inst_id = cfg.instrument,
-        .side = po.side,
-        .qty = po.qty,
-        .client_order_id = cl_id,
-    }) catch return "body_error";
+    const body = blk: {
+        if (px_opt) |px| {
+            break :blk ab.okx_trade.formatPlaceLimitBody(&body_buf, .{
+                .inst_id = cfg.instrument,
+                .side = po.side,
+                .qty = po.qty,
+                .price = px,
+                .client_order_id = cl_id,
+            }) catch return "body_error";
+        } else {
+            break :blk ab.okx_trade.formatPlaceMarketBody(&body_buf, .{
+                .inst_id = cfg.instrument,
+                .side = po.side,
+                .qty = po.qty,
+                .client_order_id = cl_id,
+            }) catch return "body_error";
+        }
+    };
 
     var qty_buf: [48]u8 = undefined;
     const qty_s = decFmt(&qty_buf, po.qty);
+    var price_buf: [48]u8 = undefined;
+    const price_s: []const u8 = if (px_opt) |px| decFmt(&price_buf, px) else "market";
     const ts_now = nowMs();
     var ts_buf: [32]u8 = undefined;
     const ts = ab.clock.formatRfc3339Ms(ts_now, &ts_buf) catch return "ts_error";
@@ -2016,7 +2051,7 @@ fn placeDemoMarketLeg(
         .decision_id = decision_id,
         .side = po.side.jsonName(),
         .qty = qty_s,
-        .price = "market",
+        .price = price_s,
         .status = ab.orders.OrderStatus.planned.jsonName(),
         .created_ts = ts,
         .updated_ts = ts,
@@ -2033,7 +2068,7 @@ fn placeDemoMarketLeg(
             .decision_id = decision_id,
             .side = po.side.jsonName(),
             .qty = qty_s,
-            .price = "market",
+            .price = price_s,
             .status = status.jsonName(),
             .created_ts = ts,
             .updated_ts = ts,
@@ -2059,16 +2094,16 @@ fn placeDemoMarketLeg(
             .decision_id = decision_id,
             .side = po.side.jsonName(),
             .qty = qty_s,
-            .price = "market",
+            .price = price_s,
             .status = status.jsonName(),
             .created_ts = ts,
             .updated_ts = ts,
         }) catch {};
-        var rbuf: [256]u8 = undefined;
+        var rbuf: [288]u8 = undefined;
         const rp = std.fmt.bufPrint(
             &rbuf,
-            "{{\"clOrdId\":\"{s}\",\"status\":\"REJECTED\",\"side\":\"{s}\",\"qty\":\"{s}\",\"seq\":{d}}}",
-            .{ cl_id, po.side.jsonName(), qty_s, seq },
+            "{{\"clOrdId\":\"{s}\",\"status\":\"REJECTED\",\"side\":\"{s}\",\"qty\":\"{s}\",\"px\":\"{s}\",\"seq\":{d}}}",
+            .{ cl_id, po.side.jsonName(), qty_s, price_s, seq },
         ) catch "{\"status\":\"REJECTED\"}";
         logEventPayload(events_repo, engine, "ORDER_REJECTED", "execution", "WARN", cfg, rp);
         return "rejected";
@@ -2082,20 +2117,21 @@ fn placeDemoMarketLeg(
         .decision_id = decision_id,
         .side = po.side.jsonName(),
         .qty = qty_s,
-        .price = "market",
+        .price = price_s,
         .status = status.jsonName(),
         .created_ts = ts,
         .updated_ts = ts,
     }) catch {};
 
-    var abuf: [320]u8 = undefined;
+    var abuf: [360]u8 = undefined;
     const ap = std.fmt.bufPrint(
         &abuf,
-        "{{\"clOrdId\":\"{s}\",\"ordId\":\"{s}\",\"side\":\"{s}\",\"qty\":\"{s}\",\"status\":\"ACKNOWLEDGED\",\"seq\":{d}}}",
-        .{ cl_id, ex_id, po.side.jsonName(), qty_s, seq },
+        "{{\"clOrdId\":\"{s}\",\"ordId\":\"{s}\",\"side\":\"{s}\",\"qty\":\"{s}\",\"px\":\"{s}\",\"status\":\"ACKNOWLEDGED\",\"seq\":{d}}}",
+        .{ cl_id, ex_id, po.side.jsonName(), qty_s, price_s, seq },
     ) catch "{\"status\":\"ACKNOWLEDGED\"}";
     logEventPayload(events_repo, engine, "ORDER_ACK", "execution", "INFO", cfg, ap);
 
+    // Limit that stays live is a valid outcome (acked); residual replan only on fill/partial.
     return queryAndResolveOrder(gpa, okx, cfg, engine, orders_repo, fills_repo, events_repo, decision_id, cl_id, po.side.jsonName(), qty_s, ts);
 }
 

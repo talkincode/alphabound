@@ -51,7 +51,7 @@
    - ✅ Dashboard 订单视图 API + 决策详情关联订单  
    - ✅ 部分成交再规划 + fills 投影  
    - ✅ Fault 矩阵单测骨架（AC-FD1..5/9）；FD6–8/10 仍需注入/演练  
-   - 挂单 limit  
+   - ✅ 挂单 limit（`LIMIT_ONLY` → tick-snapped limit；`LIMIT_OR_MARKET` 仍走市价）  
    - Demo ≥7 天 soak
 
 ---
