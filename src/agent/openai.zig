@@ -91,6 +91,23 @@ pub const Client = struct {
             },
         };
 
+        // Sparse LLM cadence (often many minutes). Azure/API gateways drop idle TLS
+        // sockets; Zig may re-offer a half-closed pooled connection and then keep
+        // failing until process restart. Disable keep-alive and hard-reset+retry once.
+        return self.chatOnce(url, body, auth_headers) catch |err| {
+            if (err != error.HttpFailed) return err;
+            std.debug.print("[llm] transport_failed; reset_http_retry\n", .{});
+            self.resetHttp();
+            return self.chatOnce(url, body, auth_headers);
+        };
+    }
+
+    fn chatOnce(
+        self: *Client,
+        url: []const u8,
+        body: []const u8,
+        auth_headers: []const std.http.Header,
+    ) Error!ChatResult {
         var resp_aw = std.Io.Writer.Allocating.init(self.gpa);
         defer resp_aw.deinit();
 
@@ -101,9 +118,10 @@ pub const Client = struct {
             .response_writer = &resp_aw.writer,
             .extra_headers = auth_headers,
             .headers = .{ .content_type = .{ .override = "application/json" } },
-        }) catch {
-            // No response body — DNS/TLS/timeout/connect. Never log URL query secrets.
-            std.debug.print("[llm] transport_failed\n", .{});
+            .keep_alive = false,
+        }) catch |err| {
+            // No response body — DNS/TLS/timeout/connect/stale-socket. Never log secrets.
+            std.debug.print("[llm] transport_failed err={s}\n", .{@errorName(err)});
             return error.HttpFailed;
         };
 
@@ -137,6 +155,14 @@ pub const Client = struct {
         };
         self.gpa.free(owned);
         return parsed;
+    }
+
+    /// Drop any pooled sockets (including half-closed ones Zig may have re-offered).
+    fn resetHttp(self: *Client) void {
+        const io = self.http.io;
+        const allocator = self.http.allocator;
+        self.http.deinit();
+        self.http = .{ .allocator = allocator, .io = io };
     }
 };
 

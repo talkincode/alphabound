@@ -1932,6 +1932,7 @@ fn tryDemoExecute(
             instrument,
             prefer_limit,
             order_policy.urgency,
+            order_policy.max_wait_ms,
         );
         last_note = leg;
 
@@ -2006,6 +2007,7 @@ fn placeDemoLeg(
     instrument: ab.planner.Instrument,
     prefer_limit: bool,
     urgency: ab.decimal.Decimal,
+    max_wait_ms: u32,
 ) []const u8 {
     var cl_buf: [32]u8 = undefined;
     const cl_id = ab.orders.clientOrderId(&cl_buf, decision_id, snap_version, seq);
@@ -2131,8 +2133,107 @@ fn placeDemoLeg(
     ) catch "{\"status\":\"ACKNOWLEDGED\"}";
     logEventPayload(events_repo, engine, "ORDER_ACK", "execution", "INFO", cfg, ap);
 
-    // Limit that stays live is a valid outcome (acked); residual replan only on fill/partial.
-    return queryAndResolveOrder(gpa, okx, cfg, engine, orders_repo, fills_repo, events_repo, decision_id, cl_id, po.side.jsonName(), qty_s, ts);
+    var resolved = queryAndResolveOrder(gpa, okx, cfg, engine, orders_repo, fills_repo, events_repo, decision_id, cl_id, po.side.jsonName(), qty_s, ts);
+
+    // LIMIT_ONLY: do not leave working leaves when replan may fire.
+    if (prefer_limit and std.mem.eql(u8, resolved, "partial")) {
+        _ = cancelDemoClOrd(gpa, okx, cfg, engine, events_repo, cl_id, "partial_remainder", 0);
+        resolved = queryAndResolveOrder(gpa, okx, cfg, engine, orders_repo, fills_repo, events_repo, decision_id, cl_id, po.side.jsonName(), qty_s, ts);
+        if (std.mem.eql(u8, resolved, "canceled")) resolved = "partial";
+        return resolved;
+    }
+
+    // Poll until terminal or max_wait, then cancel remainder (no stuck leaves).
+    if (prefer_limit and isOpenOrderNote(resolved)) {
+        resolved = waitOrCancelLimit(
+            gpa,
+            okx,
+            cfg,
+            engine,
+            orders_repo,
+            fills_repo,
+            events_repo,
+            decision_id,
+            cl_id,
+            po.side.jsonName(),
+            qty_s,
+            ts,
+            max_wait_ms,
+        );
+    }
+    return resolved;
+}
+
+fn isOpenOrderNote(note: []const u8) bool {
+    return std.mem.eql(u8, note, "acked") or
+        std.mem.eql(u8, note, "open") or
+        std.mem.eql(u8, note, "partial");
+}
+
+fn cancelDemoClOrd(
+    gpa: std.mem.Allocator,
+    okx: *ab.okx_rest.Client,
+    cfg: *const ab.config.Config,
+    engine: *ab.state.Engine,
+    events_repo: *ab.storage.EventsRepo,
+    cl_id: []const u8,
+    reason: []const u8,
+    wait_ms: u32,
+) bool {
+    var cbuf: [192]u8 = undefined;
+    const cbody = ab.okx_trade.formatCancelBody(&cbuf, .{
+        .inst_id = cfg.instrument,
+        .client_order_id = cl_id,
+    }) catch return false;
+    const resp = okx.postPrivate("/api/v5/trade/cancel-order", cbody, nowMs()) catch return false;
+    defer gpa.free(resp);
+    var pbuf: [224]u8 = undefined;
+    const p = std.fmt.bufPrint(
+        &pbuf,
+        "{{\"clOrdId\":\"{s}\",\"reason\":\"{s}\",\"wait_ms\":{d}}}",
+        .{ cl_id, reason, wait_ms },
+    ) catch "{\"reason\":\"cancel\"}";
+    logEventPayload(events_repo, engine, "ORDER_CANCEL_SENT", "execution", "INFO", cfg, p);
+    return true;
+}
+
+/// Poll order state until terminal or deadline; cancel if still working.
+fn waitOrCancelLimit(
+    gpa: std.mem.Allocator,
+    okx: *ab.okx_rest.Client,
+    cfg: *const ab.config.Config,
+    engine: *ab.state.Engine,
+    orders_repo: *ab.storage.OrdersRepo,
+    fills_repo: *ab.storage.FillsRepo,
+    events_repo: *ab.storage.EventsRepo,
+    decision_id: []const u8,
+    cl_id: []const u8,
+    side: []const u8,
+    qty_s: []const u8,
+    ts: []const u8,
+    max_wait_ms: u32,
+) []const u8 {
+    const wait_cap_ms: u32 = if (max_wait_ms == 0) 30_000 else @min(max_wait_ms, 300_000);
+    const deadline = nowMs() + @as(i64, wait_cap_ms);
+    var last: []const u8 = "acked";
+
+    while (nowMs() < deadline) {
+        std.Thread.sleep(250 * std.time.ns_per_ms);
+        last = queryAndResolveOrder(gpa, okx, cfg, engine, orders_repo, fills_repo, events_repo, decision_id, cl_id, side, qty_s, ts);
+        if (std.mem.eql(u8, last, "partial")) {
+            _ = cancelDemoClOrd(gpa, okx, cfg, engine, events_repo, cl_id, "partial_remainder", wait_cap_ms);
+            last = queryAndResolveOrder(gpa, okx, cfg, engine, orders_repo, fills_repo, events_repo, decision_id, cl_id, side, qty_s, ts);
+            if (std.mem.eql(u8, last, "canceled")) return "partial";
+            return last;
+        }
+        if (!isOpenOrderNote(last)) return last;
+    }
+
+    _ = cancelDemoClOrd(gpa, okx, cfg, engine, events_repo, cl_id, "max_wait_ms", wait_cap_ms);
+    last = queryAndResolveOrder(gpa, okx, cfg, engine, orders_repo, fills_repo, events_repo, decision_id, cl_id, side, qty_s, ts);
+    if (std.mem.eql(u8, last, "filled") or std.mem.eql(u8, last, "partial")) return last;
+    if (std.mem.eql(u8, last, "canceled")) return "limit_timeout";
+    return last;
 }
 
 fn queryAndResolveOrder(

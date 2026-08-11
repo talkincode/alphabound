@@ -18,6 +18,9 @@
 - [x] Fault 矩阵单测骨架：`src/fault/matrix.zig`（FD1–5/9）
 - [x] Dashboard 决策详情关联 orders/fills（decision_id）
 - [x] Limit 挂单：`formatPlaceLimitBody` + `limitPriceFromMark`；demo `LIMIT_ONLY` 下 limit 腿
+- [x] LIMIT_ONLY：`max_wait_ms` 内轮询，超时/部分成交撤余量（`ORDER_CANCEL_SENT`）
+- [x] FD6–8 策略单测：`src/storage/policy.zig`（busy / disk / corrupt）
+- [x] LLM 传输：禁用 keep-alive + 一次 HTTP 客户端 reset 重试
 
 ## 配置最小集
 

@@ -17,6 +17,7 @@ const market = @import("../tools/market.zig");
 const tools = @import("../tools/registry.zig");
 const openai = @import("../agent/openai.zig");
 const proposal = @import("../agent/proposal.zig");
+const storage_policy = @import("../storage/policy.zig");
 const Decimal = @import("../core/decimal.zig").Decimal;
 
 fn d(s: []const u8) Decimal {
@@ -141,6 +142,24 @@ test "AC-FD5 timeout to UNKNOWN forbids blind resubmit" {
 
     try testing.expect(!okx_trade.executionAllowed(false, true));
     try testing.expect(!okx_trade.executionAllowed(true, false));
+}
+
+// --- AC-FD6 / FD7 / FD8: storage policies (pure) ----------------------------
+
+test "AC-FD6 SQLite busy policy retries then degrades" {
+    try testing.expectEqual(storage_policy.BusyAction.retry, storage_policy.onBusy(0, 2));
+    try testing.expectEqual(storage_policy.BusyAction.degrade_telemetry, storage_policy.onBusy(2, 2));
+}
+
+test "AC-FD7 disk low blocks increase; critical halts" {
+    try testing.expectEqual(sm.RiskMode.exit_only, storage_policy.riskModeForDisk(.normal, .low));
+    try testing.expectEqual(sm.RiskMode.halted, storage_policy.riskModeForDisk(.exit_only, .critical));
+    try testing.expect(!storage_policy.allowsRiskIncreaseOnDisk(.low));
+}
+
+test "AC-FD8 corruption never silent-recreate" {
+    try testing.expect(storage_policy.looksLikeCorruption(true, false));
+    try testing.expectEqual(storage_policy.CorruptOpenAction.refuse_and_halt, storage_policy.onCorruptOpen());
 }
 
 // --- AC-FD9: boundary breach path into FLATTENING / HALTED ------------------

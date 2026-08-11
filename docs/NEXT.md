@@ -52,6 +52,9 @@
    - ✅ 部分成交再规划 + fills 投影  
    - ✅ Fault 矩阵单测骨架（AC-FD1..5/9）；FD6–8/10 仍需注入/演练  
    - ✅ 挂单 limit（`LIMIT_ONLY` → tick-snapped limit；`LIMIT_OR_MARKET` 仍走市价）  
+   - ✅ LIMIT_ONLY `max_wait_ms` 超时撤单 + partial 余量撤单  
+   - ✅ FD6–8 存储策略纯函数（`storage/policy.zig`）+ fault matrix 单测  
+   - ✅ LLM 空闲连接：keep-alive off + HttpFailed 时 reset 重试一次  
    - Demo ≥7 天 soak
 
 ---
