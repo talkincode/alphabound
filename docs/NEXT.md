@@ -2,14 +2,11 @@
 
 > 与 [ROADMAP.md](ROADMAP.md)、[GATE2_CHECKLIST.md](GATE2_CHECKLIST.md)、[GATE3_CHECKLIST.md](GATE3_CHECKLIST.md) 对齐。
 
-**当前焦点（2026-08）**: Gate 2 运维 soak（部署重启后 uptime 重计，需再跑满 24h）+ Gate 3 Demo 联调；**live 仍禁用**。  
-**本会话**:
-- ✅ Dashboard `/api/v1/orders` + 订单 Tab（orders/fills 投影）
-- ✅ 将生产已跑的 scheduler 提交（`b3b3b2f` 等）合入工作树，避免再因 `UnknownKey` 把远端打挂
-- ✅ Demo resolve 路径写入 fills 投影（`clOrdId+"f0"` 幂等聚合）+ 订单 avgPx
-- ✅ LLM `http_failed` 诊断：记录 `transport_failed` / `http_status` / `class`（不落密钥）
-- ✅ **部分成交再规划**：最多 3 腿；每腿后 REST 对账 → `planner.plan` 残差；事件 `EXEC_REPLAN` / `EXEC_REPLAN_HOLD`
-- ℹ 远端 LLM 在 redeploy 后已恢复 `proposal ok`；此前数小时 `http_failed` 更像上游瞬断
+**当前焦点（2026-08）**: Gate 2 24h soak + Gate 3 Demo 联调；**live 仍禁用**。  
+**已合并**: PR #1（orders API / scheduler / fills / partial replan）。  
+**本迭代**:
+- ✅ Gate3 **故障矩阵单测** `src/fault/matrix.zig`（AC-FD1..5/9 + replan cap）
+- ✅ 决策详情 **关联订单/成交**（decision_id → orders/fills）
 
 ---
 
@@ -51,9 +48,10 @@
    ```
 4. **按 [GATE3_CHECKLIST.md](GATE3_CHECKLIST.md) 勾选联调项**
 5. **下一代码迭代**  
-   - ✅ Dashboard 订单视图 API（`/api/v1/orders` + 订单 Tab）  
-   - 部分成交再规划 / 挂单 limit / fills 落库增强  
-   - 系统化 Fault 套件  
+   - ✅ Dashboard 订单视图 API + 决策详情关联订单  
+   - ✅ 部分成交再规划 + fills 投影  
+   - ✅ Fault 矩阵单测骨架（AC-FD1..5/9）；FD6–8/10 仍需注入/演练  
+   - 挂单 limit  
    - Demo ≥7 天 soak
 
 ---

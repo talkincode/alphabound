@@ -47,7 +47,7 @@
 | AC-GO4 | 断开 LLM、新闻、链上和 Dashboard 后,风险监控与订单对账仍工作 | Fault Injection | ☐ |
 | AC-GO5 | 所有订单可追溯到 decision_id、snapshot_version、risk decision 和 config_hash | Replay(审计链抽查) | ☐ |
 | AC-GO6 | 未知订单/陈旧数据/数据库异常进入安全状态,不默认继续增仓 | Fault Injection | ☐ |
-| AC-GO7 | Dashboard 可完整回放一笔交易从观察到反思的链路 | Manual(UI 走查) | ☐ |
+| AC-GO7 | Dashboard 可完整回放一笔交易从观察到反思的链路 | Manual(UI 走查) | ◐ 决策展开含 admission/exec + **按 decision_id 关联订单/成交**; 完整链路 UI 走查待 Demo |
 | AC-GO8 | Demo Trading 连续稳定 ≥7 天,完成 ≥1 次断线恢复和 ≥1 次版本回滚演练 | Soak + Manual | ☐ |
 
 ## D. 风险内核专项(§5)
@@ -65,15 +65,15 @@
 
 | ID | 故障场景 | 期望自动动作 | 验证方法 | 状态 |
 |---|---|---|---|---|
-| AC-FD1 | LLM 超时/报错 | 本轮 HOLD,无订单;风险与对账继续 | Fault | ◐ shadow 路径已验证 error→HOLD + 关键环继续;系统化 Fault 套件待做 |
-| AC-FD2 | 外部工具不可用 | ToolResult=UNAVAILABLE;不得把缺失数据编造成零值 | Fault + Unit | ◐ market HTTP 失败 → UNAVAILABLE；parse 仍 ERROR；系统化 Fault 套件待做 |
-| AC-FD3 | 公共行情过期 | 进入 EXIT_ONLY;重连 + REST 校验;不增险 | Fault | ◐ staleness→EXIT_ONLY 在状态机与 revalue 路径已单测;实网断线注入待做 |
-| AC-FD4 | 私有账户 WS 断开 | EXIT_ONLY + REST 对账;未知期间不自主开仓 | Fault | ☐ |
-| AC-FD5 | 下单超时 | 订单 UNKNOWN→查询后处置;禁止直接重发 | Fault + Integration | ☐ |
+| AC-FD1 | LLM 超时/报错 | 本轮 HOLD,无订单;风险与对账继续 | Fault | ◐ shadow HOLD + `fault/matrix` 分类/坏 JSON 单测; 实网 Fault 注入待做 |
+| AC-FD2 | 外部工具不可用 | ToolResult=UNAVAILABLE;不得把缺失数据编造成零值 | Fault + Unit | ◐ UNAVAILABLE/`null` data 单测（`fault/matrix`）+ market HTTP 路径 |
+| AC-FD3 | 公共行情过期 | 进入 EXIT_ONLY;重连 + REST 校验;不增险 | Fault | ◐ stale→EXIT_ONLY + admission 拒增仓（`fault/matrix`）; 实网断线待做 |
+| AC-FD4 | 私有账户 WS 断开 | EXIT_ONLY + REST 对账;未知期间不自主开仓 | Fault | ◐ unresolved/stale account 拒增仓单测; WS 断线注入待做 |
+| AC-FD5 | 下单超时 | 订单 UNKNOWN→查询后处置;禁止直接重发 | Fault + Integration | ◐ UNKNOWN 禁止 submit 单测 + demo query 路径; 实网超时注入待做 |
 | AC-FD6 | SQLite busy | 短暂重试+降采样遥测;关键事件优先落库 | Fault | ☐ |
 | AC-FD7 | 磁盘接近满 | 停新交易,清理可重建缓存;严重时 HALTED | Fault | ☐ |
 | AC-FD8 | 数据库损坏 | 仅保留退出能力+应急文本日志;禁止静默新建空库继续交易 | Fault | ☐ |
-| AC-FD9 | 回撤边界触发 | FLATTENING → HALTED;记录穿透与成本 | Fault + Replay | ◐ 边界触发自动转 FLATTENING + 穿透幅度如实计算已单测;极端行情 replay 待做 |
+| AC-FD9 | 回撤边界触发 | FLATTENING → HALTED;记录穿透与成本 | Fault + Replay | ◐ FLATTENING→HALTED + 无自动恢复（`fault/matrix`）;极端行情 replay 待做 |
 | AC-FD10 | 进程崩溃 | systemd 重启→重新对账→READY;重启前状态不被假定正确 | Fault(kill -9) | ☐ |
 
 ## F. 安全边界(§7.3 / §7.4)
