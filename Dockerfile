@@ -37,6 +37,7 @@ COPY src ./src
 COPY vendor ./vendor
 COPY migrations ./migrations
 COPY dashboard ./dashboard
+COPY prompts ./prompts
 COPY config ./config
 
 RUN zig build -Doptimize=ReleaseSafe --summary all \

@@ -125,7 +125,7 @@ open http://127.0.0.1:8080/
 
 ### Docker / GHCR
 
-镜像：`ghcr.io/talkincode/alphabound`（push `main` / tag `v*` 由 Actions 发布）
+镜像：`ghcr.io/talkincode/alphabound`（仅 git tag `v*` / 手动 workflow 由 Actions 发布；`main` 推送不构建镜像）
 
 ```bash
 docker pull ghcr.io/talkincode/alphabound:latest

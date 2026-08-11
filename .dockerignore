@@ -7,11 +7,13 @@ book/src
 book.toml
 docs
 tests
-prompts
 deploy
 scripts
+# Keep prompts/*.md — build.zig embeds system/reflection prompts into the binary.
 *.md
 !README.md
+!prompts/
+!prompts/**
 **/*.db
 **/*.db-wal
 **/*.db-shm

@@ -33,8 +33,9 @@ zig build test --summary all  # 全量单元 / 回放测试
 
 | 文件 | 职责 |
 |---|---|
-| `.github/workflows/ci.yml` | Zig build + test + self-check |
+| `.github/workflows/ci.yml` | Zig build + test + self-check（`main` / PR） |
 | `.github/workflows/docs.yml` | mdBook 构建（可选发布 Pages） |
+| `.github/workflows/release-docker.yml` | GHCR 镜像（**仅** tag `v*` / 手动，不跟 `main`） |
 
 本地应用同等门槛再推送。
 

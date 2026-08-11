@@ -13,7 +13,7 @@
 | | |
 |---|---|
 | 仓库 | `ghcr.io/talkincode/alphabound` |
-| 默认标签 | `latest`（main）、`edge`、`sha-<short>`、`vX.Y.Z`（git tag） |
+| 默认标签 | 仅 **git tag `v*`** 发布：`X.Y.Z`、`X.Y`、`latest`、`sha-<short>` |
 | 用户 | uid `10001` `alphabound`（非 root） |
 | 配置 | 镜像内 `/etc/alphabound/alphabound.toml`（`config/docker.toml`） |
 | 数据卷 | `/var/lib/alphabound`（SQLite） |
@@ -25,8 +25,8 @@
 # 公共包可直接拉；若包仍是 private，先登录
 echo $GHCR_TOKEN | docker login ghcr.io -u USERNAME --password-stdin
 
-docker pull ghcr.io/talkincode/alphabound:latest
-docker pull ghcr.io/talkincode/alphabound:v0.1.0   # 发布 tag 后
+docker pull ghcr.io/talkincode/alphabound:0.1.0   # 推荐：与 git tag v0.1.0 对应
+docker pull ghcr.io/talkincode/alphabound:latest  # 最近一次 v* 发布
 ```
 
 首次 push 后若组织默认 private package，在 GitHub → Packages → alphabound → Package settings → **Change visibility → Public**（或保持 private 仅 CI/内部拉）。
@@ -77,18 +77,20 @@ docker run --rm -p 127.0.0.1:8080:8080 \
 
 | 触发 | 行为 |
 |---|---|
-| push `main` | 构建并推送 `latest`、`edge`、`sha-*` |
-| push tag `v*` | 额外推送 semver 标签 |
-| `workflow_dispatch` | 手动；可附额外 tag |
+| push `main` | **不**构建镜像（只跑 [CI](../dev/build.md) 编译/测试） |
+| push tag `v*` | 构建并推送 `X.Y.Z`、`X.Y`、`latest`、`sha-*` |
+| `workflow_dispatch` | 手动；可附额外 tag（无 semver 时主要靠 `tag_extra` / sha） |
 
 使用 `docker/build-push-action` + Buildx，`linux/amd64`，GHA cache，provenance/SBOM 开启。权限：`packages: write`（`GITHUB_TOKEN`）。
+
+构建上下文必须包含 `prompts/`（嵌入二进制）；`.dockerignore` 不得排除 `prompts/**`。
 
 ### 打版本 release
 
 ```bash
 git tag -a v0.1.0 -m "alphabound v0.1.0"
 git push origin v0.1.0
-# Actions → Release Docker 推送 ghcr.io/talkincode/alphabound:0.1.0 等
+# Actions → Release Docker → ghcr.io/talkincode/alphabound:0.1.0 等
 ```
 
 ## 本地构建
