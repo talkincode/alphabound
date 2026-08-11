@@ -34,6 +34,13 @@ chmod +x "$STAGE/install.sh"
 COPYFILE_DISABLE=1 tar -C "$(dirname "$STAGE")" -czf "$TAR" "$(basename "$STAGE")"
 echo "[deploy] upload -> $HOST"
 sshx -h="$HOST" --upload="$TAR" --to=/tmp/alphabound-deploy.tgz
+# Extract without sudo first (sshx sudo auto-fill is more reliable on a dedicated sudo step).
+echo "[deploy] extract"
+sshx -h="$HOST" --json --timeout=60s \
+  "rm -rf /tmp/alphabound-deploy && tar xzf /tmp/alphabound-deploy.tgz -C /tmp"
+echo "[deploy] install (sudo)"
 sshx -h="$HOST" --json --timeout=180s \
-  "rm -rf /tmp/alphabound-deploy && tar xzf /tmp/alphabound-deploy.tgz -C /tmp && sudo bash /tmp/alphabound-deploy/install.sh /tmp/alphabound-deploy && rm -rf /tmp/alphabound-deploy /tmp/alphabound-deploy.tgz"
+  "sudo bash /tmp/alphabound-deploy/install.sh /tmp/alphabound-deploy"
+sshx -h="$HOST" --json --timeout=30s \
+  "rm -rf /tmp/alphabound-deploy /tmp/alphabound-deploy.tgz" || true
 echo "[deploy] done — whitelist server egress IP on OKX if private balance fails"

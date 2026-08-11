@@ -9,11 +9,20 @@ mkdir -p /opt/alphabound/current /opt/alphabound/ui/current \
   /etc/alphabound/prompts /var/lib/alphabound
 
 install -m 0755 -o root -g root "$ROOT/opt/alphabound/current/alphabound" /opt/alphabound/current/alphabound
-install -m 0644 -o root -g root "$ROOT/etc/alphabound/alphabound.toml" /etc/alphabound/alphabound.toml
+
+# Preserve live site config/bind on upgrade; only seed example on first install.
+if [[ ! -f /etc/alphabound/alphabound.toml ]]; then
+  install -m 0644 -o root -g root "$ROOT/etc/alphabound/alphabound.toml" /etc/alphabound/alphabound.toml
+  echo "[install] seeded /etc/alphabound/alphabound.toml"
+else
+  echo "[install] keep existing /etc/alphabound/alphabound.toml"
+fi
+
 install -m 0644 -o root -g root "$ROOT/etc/alphabound/prompts/system.md" /etc/alphabound/prompts/system.md
 install -m 0644 -o root -g root "$ROOT/etc/alphabound/prompts/reflection.md" /etc/alphabound/prompts/reflection.md
 
 if [[ -f "$ROOT/etc/alphabound/secrets.env" ]]; then
+  # Refresh secrets from deploy bundle when provided (local secrets.env filtered).
   install -m 0600 -o root -g alphabound "$ROOT/etc/alphabound/secrets.env" /etc/alphabound/secrets.env
 else
   test -f /etc/alphabound/secrets.env || install -m 0600 -o root -g alphabound /dev/null /etc/alphabound/secrets.env
