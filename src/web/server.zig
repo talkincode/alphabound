@@ -212,13 +212,14 @@ pub fn serve(
 fn handleConnection(io: std.Io, stream: std.Io.net.Stream, ctx_fn: ContextFn, userdata: ?*anyopaque) !void {
     defer stream.close(io);
     var in_buf: [8192]u8 = undefined;
-    var out_buf: [65536]u8 = undefined;
+    // Large enough for multi-timeframe candles JSON + headers (and dashboard HTML path).
+    var out_buf: [196608]u8 = undefined;
     var reader = stream.reader(io, &in_buf);
     var writer = stream.writer(io, &out_buf);
     var server = std.http.Server.init(&reader.interface, &writer.interface);
 
     var req = server.receiveHead() catch return;
-    var body_buf: [65536]u8 = undefined;
+    var body_buf: [196608]u8 = undefined;
     const resp = handle(&body_buf, req.head.method, req.head.target, ctx_fn(userdata));
     try req.respond(resp.body, .{
         .status = resp.status,

@@ -161,7 +161,8 @@ const WebState = struct {
     events_len: usize = 2,
     shadow_buf: [512]u8 = undefined,
     shadow_len: usize = 2,
-    candles_buf: [12288]u8 = undefined,
+    /// Multi-timeframe candles JSON (分时/1m…1D); sized for ~1k bars total.
+    candles_buf: [131072]u8 = undefined,
     candles_len: usize = 2,
     memories_buf: [8192]u8 = undefined,
     memories_len: usize = 2,
@@ -198,7 +199,7 @@ const WebState = struct {
             var equity: [8192]u8 = undefined;
             var events: [12288]u8 = undefined;
             var shadow: [512]u8 = undefined;
-            var candles: [12288]u8 = undefined;
+            var candles: [131072]u8 = undefined;
             var memories: [8192]u8 = undefined;
             var system: [4096]u8 = undefined;
             var decisions: [49152]u8 = undefined;
@@ -1153,38 +1154,85 @@ fn refreshWebCaches(
     } else |_| {}
 }
 
+const CandleBarSpec = struct { okx_bar: []const u8, limit: u16 };
+
+/// Dashboard timeframes (OKX public candles). 1m powers 分时 line chart.
+// Aggregate JSON must fit web body buffer (~192KiB).
+const candle_bar_specs = [_]CandleBarSpec{
+    .{ .okx_bar = "1m", .limit = 180 }, // 分时 / 1分 ≈ 3h
+    .{ .okx_bar = "5m", .limit = 120 },
+    .{ .okx_bar = "15m", .limit = 96 },
+    .{ .okx_bar = "1H", .limit = 72 },
+    .{ .okx_bar = "4H", .limit = 60 },
+    .{ .okx_bar = "1D", .limit = 90 },
+};
+
 fn refreshCandlesCache(
     gpa: std.mem.Allocator,
     ws: *WebState,
     okx: *ab.okx_rest.Client,
     cfg: *const ab.config.Config,
 ) void {
-    var path_buf: [160]u8 = undefined;
-    const path = std.fmt.bufPrint(
-        &path_buf,
-        "/api/v5/market/candles?instId={s}&bar=1H&limit=48",
+    // Keep 1H candles for legacy top-level `candles` field (and default UI).
+    var default_bars: [100]ab.okx_rest.Candle = undefined;
+    var default_n: usize = 0;
+
+    var tmp: [131072]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&tmp);
+    w.print(
+        "{{\"instrument\":\"{s}\",\"default_bar\":\"1H\",\"bars\":{{",
         .{cfg.instrument},
     ) catch return;
-    const body = okx.getPublic(path) catch return;
-    defer gpa.free(body);
-    var candles: [48]ab.okx_rest.Candle = undefined;
-    const count = ab.okx_rest.parseCandles(gpa, body, &candles) catch return;
-    if (count == 0) return;
-    // Chronological for sparkline (OKX is newest-first).
-    var ordered: [48]ab.okx_rest.Candle = undefined;
-    var i: usize = 0;
-    while (i < count) : (i += 1) {
-        ordered[i] = candles[count - 1 - i];
+
+    var any = false;
+    for (candle_bar_specs) |spec| {
+        var path_buf: [192]u8 = undefined;
+        const path = std.fmt.bufPrint(
+            &path_buf,
+            "/api/v5/market/candles?instId={s}&bar={s}&limit={d}",
+            .{ cfg.instrument, spec.okx_bar, spec.limit },
+        ) catch continue;
+        const body = okx.getPublic(path) catch continue;
+        defer gpa.free(body);
+
+        var raw: [300]ab.okx_rest.Candle = undefined;
+        const count = ab.okx_rest.parseCandles(gpa, body, raw[0..spec.limit]) catch continue;
+        if (count == 0) continue;
+
+        var ordered: [300]ab.okx_rest.Candle = undefined;
+        var i: usize = 0;
+        while (i < count) : (i += 1) {
+            ordered[i] = raw[count - 1 - i];
+        }
+
+        if (std.mem.eql(u8, spec.okx_bar, "1H")) {
+            const n = @min(count, default_bars.len);
+            @memcpy(default_bars[0..n], ordered[0..n]);
+            default_n = n;
+        }
+
+        if (any) w.writeByte(',') catch return;
+        any = true;
+        w.print("\"{s}\":{{\"bar\":\"{s}\",\"candles\":", .{ spec.okx_bar, spec.okx_bar }) catch return;
+        writeCandlesArray(&w, ordered[0..count]) catch return;
+        w.writeByte('}') catch return;
     }
-    var tmp: [12288]u8 = undefined;
-    if (formatCandlesApiJson(&tmp, cfg.instrument, ordered[0..count])) |j| {
-        ws.setJson(.candles, j);
-    } else |_| {}
+
+    if (!any) return;
+
+    // Close bars; legacy top-level fields keep older clients working.
+    w.writeAll("},\"bar\":\"1H\",\"candles\":") catch return;
+    if (default_n > 0) {
+        writeCandlesArray(&w, default_bars[0..default_n]) catch return;
+    } else {
+        w.writeAll("[]") catch return;
+    }
+    w.writeAll("}") catch return;
+    ws.setJson(.candles, w.buffered());
 }
 
-fn formatCandlesApiJson(buf: []u8, instrument: []const u8, candles: []const ab.okx_rest.Candle) error{BufferTooSmall}![]const u8 {
-    var w: std.Io.Writer = .fixed(buf);
-    w.print("{{\"instrument\":\"{s}\",\"bar\":\"1H\",\"candles\":[", .{instrument}) catch return error.BufferTooSmall;
+fn writeCandlesArray(w: *std.Io.Writer, candles: []const ab.okx_rest.Candle) error{BufferTooSmall}!void {
+    w.writeByte('[') catch return error.BufferTooSmall;
     for (candles, 0..) |c, i| {
         if (i > 0) w.writeByte(',') catch return error.BufferTooSmall;
         w.print(
@@ -1192,8 +1240,7 @@ fn formatCandlesApiJson(buf: []u8, instrument: []const u8, candles: []const ab.o
             .{ c.ts_ms, c.open, c.high, c.low, c.close, c.vol },
         ) catch return error.BufferTooSmall;
     }
-    w.writeAll("]}") catch return error.BufferTooSmall;
-    return w.buffered();
+    w.writeByte(']') catch return error.BufferTooSmall;
 }
 
 /// One-shot private WS TLS login/subscribe probe. Never places orders.

@@ -17,9 +17,9 @@ ssh -L 18180:127.0.0.1:18180 user@your-vm
 | 入口 | `GET /` 与 `GET /index.html` |
 | 依赖 | 零 Node 运行时；浏览器直接 `fetch` API |
 | 刷新 | 前端约 2s 轮询 state / shadow / agent-runs / equity / candles / memories / events / system |
-| 内容 | Overview + Shadow vs BH + **TradingView Lightweight Charts**（1H K 线 + 成交量 + 净值/HWM）+ 提案/记忆/事件 + System |
+| 内容 | Overview + Shadow vs BH + **TradingView Lightweight Charts**（分时/多周期 K 线 + 成交量 + 净值/HWM）+ 提案/记忆/事件 + System |
 
-概览图表使用 [Lightweight Charts](https://www.tradingview.com/lightweight-charts/)（CDN 加载，页面内含 TradingView 归因）。离线无 CDN 时其余 UI 仍可用，图表区提示未加载。
+概览图表使用 [Lightweight Charts](https://www.tradingview.com/lightweight-charts/)（CDN）。周期按钮：**分时**（1m 收盘面积图）、1分/5分/15分/1时/4时/1日。离线无 CDN 时其余 UI 仍可用。
 
 ### 本地打开
 
@@ -82,7 +82,7 @@ BH 在首个有效 bid 按 `initial_capital` 与 taker fee 初始化；shadow �
 
 | 接口 | 用途 | 状态 |
 |---|---|---|
-| `GET /api/v1/candles` | K 线缓存 | ✅ 已有（1H，供 Lightweight Charts） |
+| `GET /api/v1/candles` | 多周期 K 线缓存 | ✅ `bars.{1m,5m,15m,1H,4H,1D}` + 兼容顶层 `candles` |
 | `GET /api/v1/trades/{id}` | 单笔情节回放 | 待做 |
 | `GET /api/v1/memories` | 假设与记忆版本 | 待做 |
 | `WS /ws/v1/events` | 增量推送 | 待做 |

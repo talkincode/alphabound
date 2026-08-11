@@ -92,6 +92,8 @@
     padding: 6px 12px; font: inherit; font-size: 12px; cursor: pointer;
   }
   .filters button.active { color: var(--text); border-color: var(--line); color: var(--line); }
+  .bar-filters { margin: 0 0 10px; }
+  .bar-filters button { min-width: 44px; }
   .token-strip {
     display: flex; flex-wrap: wrap; gap: 10px 18px; margin: 0 0 14px;
     padding: 10px 14px; background: var(--panel); border: 1px solid var(--border);
@@ -158,9 +160,18 @@
     <h2>行情与净值</h2>
     <div class="charts-grid two">
       <div class="chart-wrap">
-        <div class="chart-meta" id="candle_meta"><span>BTC-USDT · 1H K 线</span><span class="muted">加载中…</span></div>
-        <div class="chart-host" id="chart_candles" role="img" aria-label="BTC-USDT 1 hour candlestick chart"></div>
-        <div class="tv-attr">Charts by <a href="https://www.tradingview.com" target="_blank" rel="noopener noreferrer">TradingView</a> · Lightweight Charts</div>
+        <div class="chart-meta" id="candle_meta"><span>BTC-USDT</span><span class="muted">加载中…</span></div>
+        <div class="filters bar-filters" id="bar_filters" role="group" aria-label="K线周期">
+          <button type="button" data-bar="time" title="1 分钟收盘连线">分时</button>
+          <button type="button" data-bar="1m">1分</button>
+          <button type="button" data-bar="5m">5分</button>
+          <button type="button" data-bar="15m">15分</button>
+          <button type="button" data-bar="1H" class="active">1时</button>
+          <button type="button" data-bar="4H">4时</button>
+          <button type="button" data-bar="1D">1日</button>
+        </div>
+        <div class="chart-host" id="chart_candles" role="img" aria-label="BTC-USDT price chart"></div>
+        <div class="tv-attr">Charts by <a href="https://www.tradingview.com" target="_blank" rel="noopener noreferrer">TradingView</a> · Lightweight Charts · 分时=1m 收盘线</div>
       </div>
       <div class="chart-wrap">
         <div class="chart-meta" id="equity_meta"><span>保守净值 / 高水位</span><span class="muted">加载中…</span></div>
@@ -306,10 +317,14 @@ let cachedDecisions = [];
 let cachedRuns = [];
 
 // --- Lightweight Charts state (lazy-init, incremental setData) ---
-let candleChart = null, candleSeries = null, volumeSeries = null;
+let candleChart = null, candleSeries = null, volumeSeries = null, timeSeries = null;
 let equityChart = null, equitySeries = null, hwmSeries = null;
 let lastCandleSig = "";
 let lastEquitySig = "";
+let cachedCandlesPayload = null;
+/** @type {string} UI bar key: time | 1m | 5m | 15m | 1H | 4H | 1D */
+let selectedBar = localStorage.getItem("ab_candle_bar") || "1H";
+const BAR_LABEL = { time: "分时", "1m": "1分", "5m": "5分", "15m": "15分", "1H": "1时", "4H": "4时", "1D": "1日" };
 const CHART_BG = "#161b22";
 const CHART_TEXT = "#8b949e";
 const CHART_GRID = "#30363d";
@@ -417,6 +432,15 @@ function ensureCandleChart() {
     wickUpColor: "#3fb950",
     wickDownColor: "#f85149",
   });
+  // 分时：收盘价面积图（与 K 线互斥显示）
+  timeSeries = candleChart.addAreaSeries({
+    lineColor: "#58a6ff",
+    topColor: "rgba(88,166,255,0.35)",
+    bottomColor: "rgba(88,166,255,0.02)",
+    lineWidth: 2,
+    crosshairMarkerVisible: true,
+  });
+  timeSeries.applyOptions({ visible: false });
   volumeSeries = candleChart.addHistogramSeries({
     priceFormat: { type: "volume" },
     priceScaleId: "vol",
@@ -430,6 +454,43 @@ function ensureCandleChart() {
   candleChart.applyOptions({ width: el.clientWidth || el.offsetWidth || 600 });
   bindChartResize(candleChart, el);
   return true;
+}
+
+function setPriceChartMode(isTimeShare) {
+  if (!candleSeries || !timeSeries) return;
+  candleSeries.applyOptions({ visible: !isTimeShare });
+  timeSeries.applyOptions({ visible: !!isTimeShare });
+}
+
+function resolveBarBundle(payload, barKey) {
+  const bars = (payload && payload.bars) || null;
+  const want = barKey === "time" ? "1m" : barKey;
+  if (bars && bars[want] && Array.isArray(bars[want].candles)) {
+    return { bar: want, candles: bars[want].candles, source: want };
+  }
+  // Legacy single-series payload
+  if (payload && Array.isArray(payload.candles)) {
+    return { bar: payload.bar || want, candles: payload.candles, source: payload.bar || "legacy" };
+  }
+  return { bar: want, candles: [], source: want };
+}
+
+function syncBarFilterButtons() {
+  const root = $("bar_filters");
+  if (!root) return;
+  root.querySelectorAll("button[data-bar]").forEach(btn => {
+    btn.classList.toggle("active", btn.getAttribute("data-bar") === selectedBar);
+  });
+}
+
+function setSelectedBar(bar) {
+  const allowed = { time: 1, "1m": 1, "5m": 1, "15m": 1, "1H": 1, "4H": 1, "1D": 1 };
+  if (!allowed[bar]) return;
+  selectedBar = bar;
+  try { localStorage.setItem("ab_candle_bar", selectedBar); } catch (_) {}
+  lastCandleSig = ""; // force redraw
+  syncBarFilterButtons();
+  if (cachedCandlesPayload) updateCandleChart(cachedCandlesPayload);
 }
 
 function ensureEquityChart() {
@@ -466,24 +527,29 @@ function toUnixSec(tsMsOrIso) {
 }
 
 function updateCandleChart(payload) {
+  cachedCandlesPayload = payload || cachedCandlesPayload;
   const meta = $("candle_meta");
-  const list = (payload && payload.candles) ? payload.candles : (Array.isArray(payload) ? payload : []);
   const inst = (payload && payload.instrument) || "BTC-USDT";
-  const bar = (payload && payload.bar) || "1H";
+  const isTime = selectedBar === "time";
+  const bundle = resolveBarBundle(payload, selectedBar);
+  const list = bundle.candles || [];
+  const barLabel = BAR_LABEL[selectedBar] || selectedBar;
 
   if (!lwAvailable()) {
-    meta.innerHTML = "<span>" + inst + " · " + bar + "</span><span class=\"warn\">图表库未加载（需出网 CDN）</span>";
+    meta.innerHTML = "<span>" + inst + " · " + barLabel + "</span><span class=\"warn\">图表库未加载（需出网 CDN）</span>";
     return;
   }
   if (!ensureCandleChart()) return;
+  setPriceChartMode(isTime);
 
   if (!list || list.length < 1) {
-    meta.innerHTML = "<span>" + inst + " · " + bar + "</span><span class=\"muted\">暂无 K 线数据</span>";
+    meta.innerHTML = "<span>" + inst + " · " + barLabel + "</span><span class=\"muted\">暂无行情数据</span>";
     return;
   }
 
   const rows = [];
   const vols = [];
+  const line = [];
   for (let i = 0; i < list.length; i++) {
     const c = list[i];
     const t = toUnixSec(c.ts_ms);
@@ -491,35 +557,46 @@ function updateCandleChart(payload) {
     const v = parseFloat(c.vol);
     if (t == null || [o, h, l, cl].some(x => isNaN(x))) continue;
     rows.push({ time: t, open: o, high: h, low: l, close: cl });
+    line.push({ time: t, value: cl });
     vols.push({
       time: t,
       value: isNaN(v) ? 0 : v,
       color: cl >= o ? "rgba(63,185,80,0.45)" : "rgba(248,81,73,0.45)",
     });
   }
-  // API is oldest→newest; ensure strictly ascending unique times for LWC.
   rows.sort((a, b) => a.time - b.time);
   vols.sort((a, b) => a.time - b.time);
+  line.sort((a, b) => a.time - b.time);
   const dedup = [];
   const dedupV = [];
+  const dedupL = [];
   for (let i = 0; i < rows.length; i++) {
     if (dedup.length && dedup[dedup.length - 1].time === rows[i].time) {
       dedup[dedup.length - 1] = rows[i];
       dedupV[dedupV.length - 1] = vols[i];
+      dedupL[dedupL.length - 1] = line[i];
     } else {
       dedup.push(rows[i]);
       dedupV.push(vols[i]);
+      dedupL.push(line[i]);
     }
   }
   if (dedup.length < 1) {
-    meta.innerHTML = "<span>" + inst + " · " + bar + "</span><span class=\"muted\">K 线解析失败</span>";
+    meta.innerHTML = "<span>" + inst + " · " + barLabel + "</span><span class=\"muted\">行情解析失败</span>";
     return;
   }
 
-  const sig = dedup.map(r => r.time + ":" + r.close).join(",");
+  const modeTag = isTime ? "line" : "candle";
+  const sig = modeTag + "|" + selectedBar + "|" + dedup.map(r => r.time + ":" + r.close).join(",");
   if (sig !== lastCandleSig) {
     lastCandleSig = sig;
-    candleSeries.setData(dedup);
+    if (isTime) {
+      timeSeries.setData(dedupL);
+      candleSeries.setData([]);
+    } else {
+      candleSeries.setData(dedup);
+      timeSeries.setData([]);
+    }
     volumeSeries.setData(dedupV);
     candleChart.timeScale().fitContent();
   }
@@ -529,8 +606,10 @@ function updateCandleChart(payload) {
   const hi = Math.max.apply(null, dedup.map(r => r.high));
   const lo = Math.min.apply(null, dedup.map(r => r.low));
   const chg = first ? ((last - first) / first) * 100 : 0;
+  const nLabel = isTime ? (dedup.length + " 点") : (dedup.length + " 根");
   meta.innerHTML =
-    "<span><b>" + inst + "</b> · " + bar + " · " + dedup.length + " 根</span>" +
+    "<span><b>" + inst + "</b> · " + barLabel +
+    (isTime ? "（1m）" : "") + " · " + nLabel + "</span>" +
     "<span>最新 <b>" + last + "</b> · 高 " + hi + " / 低 " + lo +
     " · 区间涨跌 <span class=\"" + (chg >= 0 ? "pos" : "neg") + "\">" +
     (chg >= 0 ? "+" : "") + chg.toFixed(2) + "%</span></span>";
@@ -867,6 +946,11 @@ document.querySelectorAll("#dec_filters button").forEach(btn => {
     document.querySelectorAll("#dec_filters button").forEach(b => b.classList.toggle("active", b === btn));
     renderDecisions(cachedDecisions, cachedRuns);
   });
+});
+
+syncBarFilterButtons();
+document.querySelectorAll("#bar_filters button[data-bar]").forEach(btn => {
+  btn.addEventListener("click", () => setSelectedBar(btn.getAttribute("data-bar") || "1H"));
 });
 
 
