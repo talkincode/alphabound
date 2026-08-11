@@ -1,149 +1,202 @@
 # AlphaBound
 
-**有边界的自主投资 Agent** — 在明确风险边界内,通过持续网络研究、基本面分析、事件调查、市场情绪理解和长期记忆,自主管理 BTC 风险暴露。
+**有边界的自主投资 Agent** —— 研究市场、形成观点、提出交易；真正能不能下、下多大，由确定性的风险内核说了算。
 
-> **宽信息入口,慢投资决策,快风险反应,窄交易出口。**
-> AI 可以提出任何交易观点,但不能直接调用交易凭证,也不能修改 10% 最大回撤边界。
+> **宽信息入口 · 慢投资决策 · 快风险反应 · 窄交易出口**
+>
+> AI 可以大胆想，但不能碰交易密钥，也不能改 10% 最大回撤边界。
 
 | | |
 |---|---|
-| 状态 | MVP 设计基线 (v0.1, 2026-08-09) |
-| 范围 | OKX BTC-USDT 现货 / 100 USDT 实验资金 |
-| 硬边界 | 基于历史高水位 (HWM) 的 10% 最大回撤 |
-| 技术栈 | Zig 0.16.0 · SQLite WAL · Azure Linux VM · systemd · 零依赖单文件 Dashboard |
+| **现在能做什么** | Shadow 模式：接 OKX 行情、调 LLM 出提案、写审计与记忆、看 Dashboard —— **不下单** |
+| **实验范围** | OKX `BTC-USDT` 现货 · 设计目标约 100 USDT 实验资金 |
+| **硬边界** | 相对历史高水位（HWM）约 **10%** 最大回撤（工程目标，非绝对保证） |
+| **技术栈** | Zig 0.16.0 · SQLite WAL · systemd · 单文件嵌入式 Dashboard |
+| **文档** | [在线手册](https://talkincode.github.io/alphabound/) |
 
-**四支柱与代码的映射**
+---
 
-| 支柱 | 含义 | 模块 |
-|---|---|---|
-| 宽信息入口 | 工具只扩展观察,内容一律视为不可信数据 | `tools/registry.zig`(ToolResult、时效降级、审计摘要) |
-| 慢投资决策 | 每轮组装稳定能力边界,可 HOLD,可反思 | `agent/context.zig` · `agent/proposal.zig` · `agent/reflection.zig` · `memory/store.zig` |
-| 快风险反应 | 确定性关键路径,不等 LLM | `risk/equity.zig` · `risk/state_machine.zig` · `risk/admission.zig` · `core/state.zig` |
-| 窄交易出口 | 唯一出口是结构化提案 + 风险准入 + 幂等订单 | `agent/proposal.zig` → `risk/admission.zig` → `execution/` |
+## 一分钟理解
 
-## 核心设计命题
+多数「AI 交易机器人」让模型直接下单。AlphaBound 反过来：
 
-让 Agent 在**策略层面保持自主**;让**风险、状态一致性、订单幂等和权限边界保持确定**。
+1. **Agent** 看行情、调工具、写理由，只产出**结构化提案**（要买/卖/持有多少）。
+2. **Risk Kernel** 用确定性规则做准入：批准、缩减或拒绝 —— **不调用 LLM**。
+3. 行情变脏、状态对不上、订单状态不明 → **Fail Closed**（偏安全，不继续加仓）。
+4. 每一笔意图都应能追到：快照版本、决策 ID、风险结论、配置哈希。
 
 ```
-观察 → 工具调查 → 假设 → 交易提案 → 风险准入 → 执行
-  ↑                                              ↓
-长期记忆 ← 结果归因 ← 交易结算 ← 订单与成交事件 ←──┘
+观察 → 工具 → 假设 → 提案 → 风险准入 → 执行
+  ↑                                    ↓
+记忆与反思 ← 结算与归因 ← 订单/成交 ←──┘
 ```
 
-> ⚠️ **风险说明**:"最大回撤 10%" 是系统工程目标,不是绝对保证。极端跳空、流动性消失、
-> 交易所故障、网络中断或成交延迟均可能造成边界穿透。系统尽力提前保留退出缓冲并如实记录任何突破。
+当前公开进度：**Shadow 闭环已通**（观察 → 提案 → 反思 → Dashboard）。模拟盘 / 实盘下单仍在闸门之后，见 [路线图](docs/ROADMAP.md)。
 
-## 架构总览
+> **风险说明**：「最大回撤 10%」是系统设计目标，不是承诺。跳空、流动性枯竭、交易所或网络故障都可能导致边界被穿透；系统会尽量留退出缓冲，并**如实记录**任何突破。
 
-双通道运行模型 + 单写者状态:
+---
 
-- **关键路径**(确定性): Exchange Gateway → State Engine → Risk Kernel → Execution Engine。
-  不调用 LLM,不等待外部数据源,行情事件进入进程后风险计算 p99 < 10ms。
-- **Agent 路径**(可等待/可失败): Context 构建 → 工具调用 → LLM 推理 → Decision Proposal。
-  超时或失败最多导致本轮不产生新交易,不阻塞风险计算。
-- **State Engine 是唯一状态写入者**,所有输入转为消息顺序处理;Agent 和 Dashboard 只读不可变快照。
-- **Agent 只输出结构化提案**(绑定 snapshot_version),Risk Kernel 在压力情景下决定批准 / 缩减 / 拒绝。
-- **风险状态机**: `NORMAL → EXIT_ONLY → FLATTENING → HALTED`,Fail Closed。
+## 快速开始
 
-详见 [docs/DESIGN_ANALYSIS.md](docs/DESIGN_ANALYSIS.md)(设计分析)与
-[docs/design/AlphaBound_System_Design_v0.1.docx](docs/design/AlphaBound_System_Design_v0.1.docx)(完整设计文档)。
-
-## 文档导航
-
-**使用手册（mdBook）** 是面向操作与开发的主文档：
-
-- 在线阅读：https://talkincode.github.io/alphabound/
-- 本地预览：
+需要 **Zig 0.16.0**（版本钉死，勿用其他 minor）。
 
 ```bash
-./scripts/build-docs.sh          # 构建到 book/book/
-./scripts/build-docs.sh serve    # http://127.0.0.1:3000
+git clone https://github.com/talkincode/alphabound.git
+cd alphabound
+
+zig version                    # 应为 0.16.0
+zig build
+zig build test --summary all
+
+# 配置自检（TOML / DB 路径 / Web 绑定）
+./zig-out/bin/alphabound --config config/alphabound.toml --self-check
+
+# Shadow：公共行情 + 模拟账户，默认不下单
+./zig-out/bin/alphabound --config config/alphabound.toml
+# 冒烟：跑 N 个轮询后退出
+# ./zig-out/bin/alphabound --config config/alphabound.toml --ticks 5
 ```
 
-| 文档 | 内容 |
+浏览器打开 Dashboard（默认只绑本机）：
+
+```bash
+open http://127.0.0.1:8080/
+curl -sS http://127.0.0.1:8080/health/live
+curl -sS http://127.0.0.1:8080/api/v1/state | head
+```
+
+| 你想… | 怎么做 |
 |---|---|
-| [AGENTS.md](AGENTS.md) | **Agent/协作者硬约束**：隐私与敏感数据不得泄露（public 仓库） |
-| [SECURITY.md](SECURITY.md) | 安全基线：密钥、Dashboard 绑定、脱敏与漏洞报告 |
-| [book/src/](book/src/) | **手册源码**：快速开始、配置/CLI、运维、概念、开发 |
-| [docs/DESIGN_ANALYSIS.md](docs/DESIGN_ANALYSIS.md) | 系统设计分析:决策评估、风险点、实现关注项 |
-| [docs/ROADMAP.md](docs/ROADMAP.md) | 路线图:Phase 0–5 里程碑、交付物与退出条件 |
-| [docs/ACCEPTANCE_MATRIX.md](docs/ACCEPTANCE_MATRIX.md) | 验收矩阵:FR/NFR/上线标准 → 验证方法 → 所属阶段 |
-| [docs/design/](docs/design/) | 原始系统设计文档 (v0.1) |
+| 只看行情与状态 | 直接用示例配置启动即可 |
+| 接真实 LLM 提案 | 配置 OpenAI 兼容端点与密钥（见手册；**勿**把密钥写进仓库） |
+| 本机控制进程 | `--control pause\|resume\|reconcile\|shutdown\|status` |
+| 换数据目录 / 端口 | 复制 `config/alphabound.toml` 改 `[storage]` / `[web]` |
 
-规划类 Markdown 经 mdBook `{{#include}}` 编入手册「工程规划」篇，修改 `docs/*.md` 即可同步。
+更完整的配置、CLI、部署步骤：[使用手册](https://talkincode.github.io/alphabound/)。
 
-## 代码结构
+### 用 Docker 跑 Shadow 实验室
+
+生产设计仍偏向 **VM + systemd 裸二进制**。镜像适合本地试用与版本分发：
+
+```bash
+docker compose up --build
+# 或（有发布 tag 后）
+# docker pull ghcr.io/talkincode/alphabound:latest
+# docker run --rm -p 127.0.0.1:8080:8080 -v alphabound-data:/var/lib/alphabound \
+#   ghcr.io/talkincode/alphabound:latest
+```
+
+- 镜像：`ghcr.io/talkincode/alphabound`
+- **仅** git tag `v*`（或手动 workflow）构建推送；推 `main` 不会发镜像
+- 宿主机端口请只映射 `127.0.0.1`，不要把 Dashboard 裸奔到公网
+
+详见 [Docker 与 GHCR](https://talkincode.github.io/alphabound/guide/docker.html)。
+
+---
+
+## 它如何工作（精简）
+
+两条路径并行，状态只有一个写者：
+
+| 路径 | 特点 | 做什么 |
+|---|---|---|
+| **关键路径** | 确定性、可失败关闭 | 行情/账户 → 状态机 → 风险 →（将来）执行 |
+| **Agent 路径** | 可慢、可失败 | 组 Context → 工具 → LLM → 提案 / 反思 |
+| **State Engine** | 单写者 | 所有变更排队处理；Agent / Dashboard **只读快照** |
+
+四条产品原则对应到代码（方便读源码时定位）：
+
+| 原则 | 人话 | 主要代码 |
+|---|---|---|
+| 宽信息入口 | 工具只多看世界；返回内容不可信 | `src/tools/` |
+| 慢投资决策 | 可以 HOLD，可以反思，不抢跑 | `src/agent/` · `src/memory/` |
+| 快风险反应 | 风控不等模型 | `src/risk/` · `src/core/` |
+| 窄交易出口 | 只能提案 → 准入 → 幂等订单 | `src/agent/proposal.zig` → `src/risk/` → `src/execution/` |
+
+设计长文：[设计分析](docs/DESIGN_ANALYSIS.md) · [系统设计 v0.1](docs/design/AlphaBound_System_Design_v0.1.docx)
+
+---
+
+## 安全与不可破的约定
+
+本仓库是 **public**。协作时请先读 [AGENTS.md](AGENTS.md) 与 [SECURITY.md](SECURITY.md)。
+
+**永远不要提交**：API key / secret / passphrase、真实余额与订单号、内网或出口 IP、生产主机名、本机绝对路径里的隐私信息。密钥只放本机忽略文件（如 `secrets.env`）或部署机受控环境。
+
+改代码时默认遵守：
+
+1. Agent **拿不到**交易所密钥，也**调不到**直接下单；只能交提案。
+2. 提案必须绑定当前 `snapshot_version`；状态一变，旧提案作废。
+3. 下单超时先标 `UNKNOWN`，**查清再处置**，禁止盲着重发。
+4. 数据过期 / 不一致 / 未知订单 → 进入安全态，**不主动加仓**。
+5. `max_drawdown` 与风险内核参数**不能**热改、**不能**被 Agent 改；要改走发布与人工确认。
+6. 订单应能追溯到 `decision_id`、`snapshot_version`、风险结论与 `config_hash`。
+
+Dashboard 默认 `127.0.0.1`；日志落库前走脱敏。漏洞请私下联系维护者，**不要**在公开 Issue 里贴密钥。
+
+---
+
+## 文档地图
+
+按角色选入口，避免在仓库根目录迷路：
+
+| 我想… | 去哪 |
+|---|---|
+| 安装、配置、日常操作 | [在线手册](https://talkincode.github.io/alphabound/)（源码在 `book/src/`） |
+| 本地预览手册 | `./scripts/build-docs.sh serve` → http://127.0.0.1:3000 |
+| 阶段进度与下一步 | [docs/ROADMAP.md](docs/ROADMAP.md) · [Gate 2 清单](docs/GATE2_CHECKLIST.md) |
+| 验收勾选（FR/NFR/故障） | [docs/ACCEPTANCE_MATRIX.md](docs/ACCEPTANCE_MATRIX.md) |
+| 设计取舍与风险点 | [docs/DESIGN_ANALYSIS.md](docs/DESIGN_ANALYSIS.md) |
+| 给 Agent / 协作者的硬约束 | [AGENTS.md](AGENTS.md) |
+| 安全基线 | [SECURITY.md](SECURITY.md) |
+
+规划类 Markdown 会编入手册「工程规划」篇；改 `docs/*.md` 即可同步进书。
+
+---
+
+## 仓库结构
 
 ```
 alphabound/
-├── build.zig / build.zig.zon   # Zig 0.16.0 固定工具链
-├── book.toml / book/src/       # mdBook 使用手册
-├── scripts/build-docs.sh       # mdbook build | serve
-├── Dockerfile / docker-compose.yml  # GHCR 发布与本地 shadow lab
-├── src/
-│   ├── main.zig
-│   ├── core/          # messages, state engine, decimal, clock
-│   ├── exchange/okx/  # REST, WS, auth, reconciliation
-│   ├── risk/          # equity, drawdown, stress, admission
-│   ├── execution/     # planner, orders, fills, idempotency
-│   ├── agent/         # context, model adapter, proposal schema
-│   ├── tools/         # registry and provider adapters
-│   ├── memory/        # retrieval, episodes, reflection
-│   ├── storage/       # SQLite, migrations, repositories
-│   ├── web/           # HTTP, WebSocket, health, static assets
-│   └── observability/ # events, metrics, redaction
-├── dashboard/         # 单文件零依赖 HTML(嵌入二进制,无运行时 Node)
-├── migrations/        # SQLite schema 迁移
-├── config/            # alphabound.toml 示例
-├── prompts/           # 系统 Prompt(版本化,hash 审计)
-├── tests/             # unit / property / replay / integration
-└── deploy/            # systemd unit, release.sh
+├── src/                 # 守护进程与领域代码
+│   ├── core/            # 状态机、事件、定点小数
+│   ├── exchange/okx/    # 行情、鉴权、对账
+│   ├── risk/            # 净值、回撤、准入、状态
+│   ├── execution/       # 订单规划与幂等（Demo/Live 闸门后）
+│   ├── agent/           # Context、LLM、提案、反思
+│   ├── tools/           # 工具注册与市场等适配
+│   ├── memory/          # 情节与策略记忆
+│   ├── storage/         # SQLite
+│   ├── web/             # HTTP API 与健康检查
+│   └── observability/   # 事件、指标、脱敏
+├── dashboard/           # 零依赖 HTML（编译期嵌入二进制）
+├── config/              # 示例 TOML
+├── prompts/             # 系统 / 反思 Prompt（版本可审计）
+├── migrations/          # SQLite 迁移
+├── deploy/              # systemd 与发布脚本
+├── book/                # 使用手册（mdBook）
+├── docs/                # 路线图、验收矩阵、设计
+└── Dockerfile           # GHCR / 本地 lab 镜像
 ```
 
-## 构建与运行
+---
 
-```bash
-zig version   # 必须是 0.16.0(固定版本,ReleaseSafe)
-zig build     # 产出 zig-out/bin/alphabound(静态链接 vendor SQLite)
-zig build test --summary all   # 单元/回放测试
+## 当前阶段（诚实版）
 
-# 配置自检(校验 TOML、DB 可写、web 绑定白名单)
-./zig-out/bin/alphabound --config config/alphabound.toml --self-check
-
-# shadow 模式运行(实网 OKX 公共行情 + 模拟账户,不下单)
-./zig-out/bin/alphabound --config config/alphabound.toml
-#   --ticks N     有界运行 N 个轮询后优雅退出(冒烟测试用)
-#   --version     打印版本
-
-# Web 端点(默认 127.0.0.1; 容器内可用 0.0.0.0,宿主机仍只映射 loopback)
-curl http://127.0.0.1:8080/health/live
-curl http://127.0.0.1:8080/health/ready
-curl http://127.0.0.1:8080/api/v1/state
-open http://127.0.0.1:8080/
+```
+Phase 0 可行性  →  1 只读观察  →  2 Shadow（不下单）  →  3 Demo  →  4 小资金实盘  →  5 数据工具
+                         ▲ 你在这里附近（闭环已通，长稳与 Demo 闸门未完）
 ```
 
-### Docker / GHCR
+- **已有**：Shadow 决策与审计、Dashboard、备份路径、部署骨架  
+- **还在做**：Gate 2 长稳、私有 WS 稳定、Demo 下单与故障注入  
+- **不要指望**：把本仓库默认配置当成可直接实盘的交易系统  
 
-镜像：`ghcr.io/talkincode/alphabound`（仅 git tag `v*` / 手动 workflow 由 Actions 发布；`main` 推送不构建镜像）
+细节与勾选：[ROADMAP](docs/ROADMAP.md) · [GATE2_CHECKLIST](docs/GATE2_CHECKLIST.md)
 
-```bash
-docker pull ghcr.io/talkincode/alphabound:latest
-docker run --rm -p 127.0.0.1:8080:8080 \
-  -v alphabound-data:/var/lib/alphabound \
-  ghcr.io/talkincode/alphabound:latest
+---
 
-# 或本地 compose
-docker compose up --build
-```
+## 许可
 
-说明见手册 [Docker 与 GHCR](https://talkincode.github.io/alphabound/guide/docker.html)。
-
-## 关键不变量(所有代码变更不得违反)
-
-1. Agent 无法访问 OKX 密钥、直接下单函数或风险配置 —— 只能提交 Proposal。
-2. 任何提案必须绑定 `snapshot_version`,状态变化后旧提案自动失效。
-3. 订单请求超时视为 `UNKNOWN`,先查询后处置,禁止盲目重发。
-4. 数据过期 / 状态不一致 / 未知订单 → Fail Closed,进入安全状态,不增加风险。
-5. `max_drawdown` 与 Risk Kernel 参数不可热加载,必须走版本发布 + 人工确认。
-6. 每笔订单可追溯到 `decision_id`、`snapshot_version`、risk decision 和 `config_hash`。
+源码与文档的使用条款以仓库声明为准；实验性软件，**使用风险自负**，不构成投资建议。
