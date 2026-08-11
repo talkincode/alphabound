@@ -1,0 +1,28 @@
+[book]
+title = "AlphaBound 手册"
+authors = ["talkincode"]
+description = "有边界的自主投资 Agent — 使用手册、运维指南与工程文档"
+language = "zh"
+src = "book/src"
+
+[build]
+build-dir = "book/book"
+create-missing = false
+
+[output.html]
+default-theme = "navy"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/talkincode/alphabound"
+edit-url-template = "https://github.com/talkincode/alphabound/edit/main/{path}"
+site-url = "/alphabound/"
+no-section-label = false
+
+[output.html.fold]
+enable = true
+level = 1
+
+[output.html.search]
+enable = true
+limit-results = 30
+teaser-word-count = 30
+use-boolean-and = true

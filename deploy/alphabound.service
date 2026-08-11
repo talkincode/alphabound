@@ -1,0 +1,32 @@
+# AlphaBound daemon — systemd unit(设计 §7.3 / §8 加固要求)
+[Unit]
+Description=AlphaBound bounded-autonomy trading agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=alphabound
+Group=alphabound
+ExecStart=/opt/alphabound/current/alphabound --config /etc/alphabound/alphabound.toml
+EnvironmentFile=/etc/alphabound/secrets.env
+Restart=always
+RestartSec=5
+
+# 安全加固
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/alphabound
+CapabilityBoundingSet=
+AmbientCapabilities=
+LockPersonality=true
+RestrictSUIDSGID=true
+
+# 资源可见性
+MemoryAccounting=true
+TasksAccounting=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,42 @@
+# Local verification config (shadow). Secrets stay in env / secrets.env — never here.
+
+[app]
+environment = "development"
+instance_id = "local-dev"
+
+[exchange]
+provider = "okx"
+instrument = "BTC-USDT"
+mode = "shadow"
+poll_interval_ms = 3000
+
+[risk]
+max_drawdown = 0.10
+valuation = "conservative_liquidation"
+allow_runtime_override = false
+taker_fee_rate = 0.001
+slippage_rate = 0.0005
+initial_capital = 100.0
+
+[agent]
+provider = "openai"
+# 优先用环境变量 LLM_MODEL / LLM_API_URL（见 secrets.env）
+# Azure OpenAI：model 必须是 Deployment 名称
+model = "gpt-4o-mini"
+base_url = "https://api.openai.com/v1"
+decision_timeout_ms = 30000
+decision_interval_ms = 60000
+prompt_dir = "prompts"
+enabled = true
+# Second LLM call after proposal for structured memory_ops (fail → deterministic).
+# Override off: ALPHABOUND_LLM_REFLECTION=0
+llm_reflection = true
+
+[storage]
+path = "var/trading.db"
+wal = true
+
+[web]
+# 18180 avoids clash with other local tools often on 18080 (e.g. rtp-desktop).
+bind = "127.0.0.1:18180"
+static_dir = "dashboard/dist"

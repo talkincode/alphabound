@@ -1,0 +1,30 @@
+# Container / compose defaults (shadow lab).
+# Host should publish web as 127.0.0.1:8080->8080 only.
+# Secrets: inject via env file / orchestrator — never bake into the image.
+
+[app]
+environment = "development"
+instance_id = "docker-shadow"
+
+[exchange]
+provider = "okx"
+instrument = "BTC-USDT"
+mode = "shadow"
+poll_interval_ms = 5000
+
+[risk]
+max_drawdown = 0.10
+valuation = "conservative_liquidation"
+allow_runtime_override = false
+taker_fee_rate = 0.001
+slippage_rate = 0.0005
+initial_capital = 100.0
+
+[storage]
+path = "/var/lib/alphabound/trading.db"
+wal = true
+
+[web]
+# All interfaces inside the netns so Docker port-publish works.
+# Do NOT map this port to 0.0.0.0 on the host.
+bind = "0.0.0.0:8080"

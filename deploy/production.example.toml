@@ -1,0 +1,39 @@
+# Example production config (shadow). Copy to /etc/alphabound/alphabound.toml
+# Secrets: /etc/alphabound/secrets.env (0600) — never commit real keys.
+
+[app]
+environment = "production"
+instance_id = "btc-shadow-01"
+
+[exchange]
+provider = "okx"
+instrument = "BTC-USDT"
+mode = "shadow"
+poll_interval_ms = 5000
+
+[risk]
+max_drawdown = 0.10
+valuation = "conservative_liquidation"
+allow_runtime_override = false
+taker_fee_rate = 0.001
+slippage_rate = 0.0005
+initial_capital = 100.0
+
+[agent]
+provider = "openai"
+model = "gpt-4o-mini"
+base_url = "https://api.openai.com/v1"
+decision_timeout_ms = 30000
+decision_interval_ms = 60000
+prompt_dir = "/etc/alphabound/prompts"
+enabled = true
+llm_reflection = true
+
+[storage]
+path = "/var/lib/alphabound/trading.db"
+wal = true
+
+[web]
+# Prefer 127.0.0.1 and SSH tunnel; use 0.0.0.0 only on trusted private networks.
+bind = "127.0.0.1:8080"
+static_dir = "/opt/alphabound/ui/current"

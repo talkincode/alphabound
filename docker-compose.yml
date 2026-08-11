@@ -1,0 +1,36 @@
+# Local shadow lab — no trading keys required.
+#
+#   docker compose up --build
+#   open http://127.0.0.1:8080/
+#   curl http://127.0.0.1:8080/health/live
+#
+# Override image after GHCR publish:
+#   IMAGE=ghcr.io/talkincode/alphabound:latest docker compose up
+
+services:
+  alphabound:
+    image: ${IMAGE:-alphabound:local}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: alphabound
+    restart: unless-stopped
+    # Host loopback only — never publish dashboard on a public interface.
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - alphabound-data:/var/lib/alphabound
+      # Optional: mount your own config
+      # - ./config/docker.toml:/etc/alphabound/alphabound.toml:ro
+    # Optional secrets for future demo/live (not used in pure shadow):
+    # env_file:
+    #   - secrets.env
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health/live"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  alphabound-data:

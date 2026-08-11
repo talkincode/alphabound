@@ -1,0 +1,36 @@
+# AlphaBound 配置示例(设计文档附录 B)
+# 生产路径: /etc/alphabound/alphabound.toml
+# 密钥不放在本文件,见 secrets.env (0600, root 管理)
+
+[app]
+environment = "production"
+instance_id = "azure-btc-01"
+
+[exchange]
+provider = "okx"
+instrument = "BTC-USDT"
+mode = "shadow"                # shadow | demo | live
+# rest_url = "https://www.okx.com"   # 可选;默认 OKX 生产 REST 地址
+poll_interval_ms = 5000        # shadow 行情轮询间隔
+
+[risk]
+max_drawdown = 0.10            # 不可热加载;Agent 不可修改
+valuation = "conservative_liquidation"
+allow_runtime_override = false
+taker_fee_rate = 0.001         # 保守估值用 taker 费率
+slippage_rate = 0.0005         # 保守估值滑点缓冲
+initial_capital = 100.0        # shadow 模式模拟起始资金 (USDT)
+
+[agent]
+provider = "configured-adapter"
+model = "configured-model"
+decision_timeout_ms = 30000
+prompt_dir = "/etc/alphabound/prompts"
+
+[storage]
+path = "/var/lib/alphabound/trading.db"
+wal = true
+
+[web]
+bind = "127.0.0.1:8080"        # 默认仅 localhost,SSH tunnel 访问
+static_dir = "/opt/alphabound/ui/current"

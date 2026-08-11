@@ -1,0 +1,29 @@
+# Zig
+.zig-cache/
+zig-out/
+
+# Dashboard
+dashboard/node_modules/
+dashboard/dist/
+
+# 运行时与本地数据
+*.db
+*.db-wal
+*.db-shm
+secrets.env
+*.local.toml
+
+# mdBook 构建产物
+book/book/
+
+# 系统
+.DS_Store
+*.bak
+*.control
+*.control.state
+# secrets & local runtime
+*.env
+!*.env.example
+var/
+*.db-journal
+.sshx-audit/
