@@ -348,6 +348,7 @@ let lastDecisionsSig = "";
 let decFilter = localStorage.getItem("ab_dec_filter") || "all";
 let cachedDecisions = [];
 let cachedRuns = [];
+let cachedOrdersBundle = { orders: [], fills: [] };
 
 // --- Lightweight Charts state (lazy-init, incremental setData) ---
 let candleChart = null, candleSeries = null, volumeSeries = null, timeSeries = null;
@@ -740,6 +741,19 @@ function typePill(type) {
   return '<span class="' + cls + '">' + zh + "</span>";
 }
 
+function ordersForDecision(decisionId) {
+  if (!decisionId) return [];
+  const all = (cachedOrdersBundle && cachedOrdersBundle.orders) || [];
+  return all.filter(o => o.decision_id === decisionId);
+}
+
+function fillsForOrders(orderList) {
+  const ids = {};
+  (orderList || []).forEach(o => { if (o.client_order_id) ids[o.client_order_id] = true; });
+  const all = (cachedOrdersBundle && cachedOrdersBundle.fills) || [];
+  return all.filter(f => ids[f.order_id]);
+}
+
 function renderDecisions(decisions, runs) {
   const runById = {};
   (runs || []).forEach(r => { if (r.run_id) runById[r.run_id] = r; });
@@ -815,9 +829,35 @@ function renderDecisions(decisions, runs) {
       lines.push("Token：prompt=" + (u.prompt_tokens||0) + " completion=" + (u.completion_tokens||0) + " total=" + (u.total_tokens||0));
     }
     if (p.executed === false) lines.push("执行：否（shadow 审计 only）");
+    if (p.exec) lines.push("执行结果：" + p.exec);
+    if (p.admission) {
+      const a = p.admission;
+      lines.push("准入：" + (a.verdict || "—") + (a.reason ? " · " + a.reason : "") +
+        (a.admitted_weight != null ? " · admitted=" + a.admitted_weight : ""));
+    }
     if (p.error) lines.push("错误：" + p.error);
     if (p.reason) lines.push("原因：" + p.reason);
     if (p.degraded) lines.push("降级策略：" + p.degraded);
+    // Trade detail: join orders/fills by decision_id (Gate3 AC-GO7 slice).
+    const linked = ordersForDecision(p.decision_id);
+    if (linked.length) {
+      lines.push("关联订单（" + linked.length + "）：");
+      linked.slice(0, 8).forEach(o => {
+        lines.push("  · " + (o.status || "?") + " " + (o.side || "") + " qty=" + (o.qty || "") +
+          " px=" + (o.price || "") + " clOrdId=" + (o.client_order_id || "") +
+          (o.exchange_order_id ? " ex=" + o.exchange_order_id : ""));
+      });
+      const fl = fillsForOrders(linked);
+      if (fl.length) {
+        lines.push("关联成交（" + fl.length + "）：");
+        fl.slice(0, 8).forEach(f => {
+          lines.push("  · fill " + (f.qty || "") + " @ " + (f.price || "") +
+            " fee=" + (f.fee || "0") + " order=" + short(f.order_id, 16));
+        });
+      }
+    } else if (p.decision_id && p.executed) {
+      lines.push("关联订单：暂无（可能尚未投影或仍为 shadow）");
+    }
     if (run.model) lines.push("模型：" + run.model);
     if (run.status) lines.push("运行状态：" + zhStatus(run.status));
     if (run.started_ts) lines.push("开始：" + run.started_ts);
@@ -1150,9 +1190,12 @@ async function poll() {
     if (activeTab === "overview") onOverviewChartsVisible();
     cachedDecisions = decisions;
     cachedRuns = runs;
+    cachedOrdersBundle = ordersBundle && typeof ordersBundle === "object"
+      ? ordersBundle
+      : { orders: [], fills: [] };
     renderOverviewSummary(decisions, runs);
     renderDecisions(decisions, runs);
-    try { renderOrders(ordersBundle); } catch (err) { console.error("renderOrders", err); }
+    try { renderOrders(cachedOrdersBundle); } catch (err) { console.error("renderOrders", err); }
     try { renderStatus(system, s); } catch (err) { console.error("renderStatus", err); }
     // overview token strip
     {

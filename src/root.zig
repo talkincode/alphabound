@@ -30,6 +30,7 @@ pub const shadow_bench = @import("core/shadow_bench.zig");
 pub const scheduler = @import("core/scheduler.zig");
 pub const admin_control = @import("admin/control.zig");
 pub const web = @import("web/server.zig");
+pub const fault_matrix = @import("fault/matrix.zig");
 
 pub const Decimal = decimal.Decimal;
 

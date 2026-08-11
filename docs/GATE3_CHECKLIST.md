@@ -15,6 +15,8 @@
 - [x] 事件：`ORDER_ACK` / `ORDER_REJECTED` / `ORDER_UNKNOWN` / `ORDER_QUERY` / `ORDER_CANCEL_SENT`
 - [x] Dashboard：`/api/v1/orders`（orders+fills 投影）+ 订单标签页
 - [x] 部分成交再规划：resolve=`partial`/`filled` 后 REST 刷新仓位 → 残差 plan → 新 `clOrdId`(seq++)；最多 3 腿；`EXEC_REPLAN`
+- [x] Fault 矩阵单测骨架：`src/fault/matrix.zig`（FD1–5/9）
+- [x] Dashboard 决策详情关联 orders/fills（decision_id）
 
 ## 配置最小集
 
