@@ -874,7 +874,9 @@ pub fn main(init: std.process.Init) !u8 {
     var ticker_path_buf: [128]u8 = undefined;
     const ticker_path = std.fmt.bufPrint(&ticker_path_buf, "/api/v5/market/ticker?instId={s}", .{cfg.instrument}) catch return 1;
     // Gate 1: periodic private REST reconcile; private WS is boot probe + optional re-probe.
-    const private_reconcile_ms: i64 = 60_000;
+    // Demo executes against the real account: reconcile must beat account_ttl_ms
+    // (30s) or the risk kernel flaps NORMAL→EXIT_ONLY between reconciles.
+    const private_reconcile_ms: i64 = if (cfg.mode == .demo) 20_000 else 60_000;
     const dashboard_refresh_ms: i64 = 5_000;
     const private_ws_reprobe_ms: i64 = 300_000;
     const backup_interval_ms: i64 = 3_600_000;
