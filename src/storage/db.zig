@@ -1000,6 +1000,124 @@ test "events append and read back" {
     try testing.expect(std.mem.indexOf(u8, feed, "AGENT_TRIGGER") != null);
 }
 
+test "audit chain queries trace orders to stamped decision events (AC-GO5)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const path = try tmpDbPath(&tmp, &buf);
+    var db = try Db.open(path);
+    defer db.close();
+
+    var events = try EventsRepo.init(&db);
+    defer events.deinit();
+    var orders = try OrdersRepo.init(&db);
+    defer orders.deinit();
+    var fills = try FillsRepo.init(&db);
+    defer fills.deinit();
+
+    // Fully traceable order: stamped proposal event + ORDER_* event + fill.
+    try events.append(.{
+        .event_id = "evt_p1",
+        .ts = "t1",
+        .type = "AGENT_PROPOSAL_OK",
+        .source = "agent",
+        .severity = "INFO",
+        .software_version = "0.1.0",
+        .config_hash = "sha256:abc",
+        .payload_json = "{\"decision_id\":\"dec_ok\",\"snapshot_version\":5,\"admission\":{\"verdict\":\"APPROVE\"}}",
+    });
+    try events.append(.{
+        .event_id = "evt_o1",
+        .ts = "t2",
+        .type = "ORDER_ACK",
+        .source = "execution",
+        .severity = "INFO",
+        .software_version = "0.1.0",
+        .config_hash = "sha256:abc",
+        .payload_json = "{\"client_order_id\":\"ab_good\",\"decision_id\":\"dec_ok\"}",
+    });
+    try orders.upsert(.{
+        .client_order_id = "ab_good",
+        .decision_id = "dec_ok",
+        .side = "buy",
+        .qty = "0.001",
+        .price = "100",
+        .status = "FILLED",
+        .created_ts = "t2",
+        .updated_ts = "t3",
+    });
+    try fills.append(.{ .fill_id = "f_good", .order_id = "ab_good", .price = "100", .qty = "0.001", .fee = "0", .ts = "t3" });
+
+    const q_no_dec = "SELECT COUNT(*) FROM orders WHERE decision_id = ''";
+    const q_no_proposal =
+        \\SELECT COUNT(*) FROM orders o WHERE NOT EXISTS (
+        \\  SELECT 1 FROM events e WHERE e.type = 'AGENT_PROPOSAL_OK'
+        \\  AND instr(e.payload_json, '"decision_id":"' || o.decision_id || '"') > 0)
+    ;
+    const q_unstamped =
+        \\SELECT COUNT(*) FROM orders o WHERE EXISTS (
+        \\  SELECT 1 FROM events e WHERE e.type = 'AGENT_PROPOSAL_OK'
+        \\  AND instr(e.payload_json, '"decision_id":"' || o.decision_id || '"') > 0
+        \\  AND (e.config_hash = '' OR e.software_version = ''))
+    ;
+    const q_no_events =
+        \\SELECT COUNT(*) FROM orders o WHERE NOT EXISTS (
+        \\  SELECT 1 FROM events e WHERE e.type LIKE 'ORDER_%'
+        \\  AND instr(e.payload_json, o.client_order_id) > 0)
+    ;
+    const q_orphan_fills =
+        \\SELECT COUNT(*) FROM fills f WHERE NOT EXISTS (
+        \\  SELECT 1 FROM orders o WHERE o.client_order_id = f.order_id)
+    ;
+
+    try testing.expectEqual(@as(i64, 0), try db.queryInt(q_no_dec));
+    try testing.expectEqual(@as(i64, 0), try db.queryInt(q_no_proposal));
+    try testing.expectEqual(@as(i64, 0), try db.queryInt(q_unstamped));
+    try testing.expectEqual(@as(i64, 0), try db.queryInt(q_no_events));
+    try testing.expectEqual(@as(i64, 0), try db.queryInt(q_orphan_fills));
+
+    // Broken chain: order with no proposal event, no ORDER_* event; orphan fill;
+    // plus an unstamped proposal for a second order.
+    try events.append(.{
+        .event_id = "evt_p2",
+        .ts = "t4",
+        .type = "AGENT_PROPOSAL_OK",
+        .source = "agent",
+        .severity = "INFO",
+        .payload_json = "{\"decision_id\":\"dec_unstamped\"}",
+    });
+    try orders.upsert(.{
+        .client_order_id = "ab_orphan",
+        .decision_id = "dec_missing",
+        .side = "sell",
+        .qty = "1",
+        .price = "1",
+        .status = "LIVE",
+        .created_ts = "t4",
+        .updated_ts = "t4",
+    });
+    try orders.upsert(.{
+        .client_order_id = "ab_unstamped",
+        .decision_id = "dec_unstamped",
+        .side = "sell",
+        .qty = "1",
+        .price = "1",
+        .status = "LIVE",
+        .created_ts = "t4",
+        .updated_ts = "t4",
+    });
+    // Orphan fill: FK is ON in normal operation, so simulate a damaged
+    // restore snapshot by inserting with FK off.
+    try db.execAll("PRAGMA foreign_keys = OFF;");
+    try fills.append(.{ .fill_id = "f_orphan", .order_id = "ab_ghost", .price = "1", .qty = "1", .fee = "0", .ts = "t5" });
+    try db.execAll("PRAGMA foreign_keys = ON;");
+
+    try testing.expectEqual(@as(i64, 1), try db.queryInt(q_no_proposal)); // dec_missing
+    try testing.expectEqual(@as(i64, 1), try db.queryInt(q_unstamped)); // dec_unstamped
+    try testing.expectEqual(@as(i64, 2), try db.queryInt(q_no_events)); // both new orders
+    try testing.expectEqual(@as(i64, 1), try db.queryInt(q_orphan_fills)); // f_orphan
+}
+
 test "orders upsert projection" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

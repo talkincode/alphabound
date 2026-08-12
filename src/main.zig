@@ -2865,6 +2865,47 @@ fn verifyDbSnapshot(path: []const u8) u8 {
         }
     }
 
+    // 6. Audit chain (AC-GO5): every order traceable to its decision event
+    //    (decision_id → AGENT_PROPOSAL_OK payload, carrying snapshot_version
+    //    + admission verdict), stamped with config_hash/software_version,
+    //    covered by ORDER_* events; fills must reference a known order.
+    {
+        const o_no_dec = db.queryInt(
+            "SELECT COUNT(*) FROM orders WHERE decision_id = ''",
+        ) catch -1;
+        const o_no_proposal = db.queryInt(
+            \\SELECT COUNT(*) FROM orders o WHERE NOT EXISTS (
+            \\  SELECT 1 FROM events e WHERE e.type = 'AGENT_PROPOSAL_OK'
+            \\  AND instr(e.payload_json, '"decision_id":"' || o.decision_id || '"') > 0)
+        ) catch -1;
+        const o_unstamped_dec = db.queryInt(
+            \\SELECT COUNT(*) FROM orders o WHERE EXISTS (
+            \\  SELECT 1 FROM events e WHERE e.type = 'AGENT_PROPOSAL_OK'
+            \\  AND instr(e.payload_json, '"decision_id":"' || o.decision_id || '"') > 0
+            \\  AND (e.config_hash = '' OR e.software_version = ''))
+        ) catch -1;
+        const o_no_events = db.queryInt(
+            \\SELECT COUNT(*) FROM orders o WHERE NOT EXISTS (
+            \\  SELECT 1 FROM events e WHERE e.type LIKE 'ORDER_%'
+            \\  AND instr(e.payload_json, o.client_order_id) > 0)
+        ) catch -1;
+        const orphan_fills = db.queryInt(
+            \\SELECT COUNT(*) FROM fills f WHERE NOT EXISTS (
+            \\  SELECT 1 FROM orders o WHERE o.client_order_id = f.order_id)
+        ) catch -1;
+        if (o_no_dec != 0 or o_no_proposal != 0 or o_unstamped_dec != 0 or
+            o_no_events != 0 or orphan_fills != 0)
+        {
+            std.debug.print(
+                "[verify-db] FAIL audit chain: no_decision_id={d} no_proposal_event={d} unstamped_decision={d} no_order_events={d} orphan_fills={d}\n",
+                .{ o_no_dec, o_no_proposal, o_unstamped_dec, o_no_events, orphan_fills },
+            );
+            fails += 1;
+        } else {
+            std.debug.print("[verify-db] audit chain ok ({d} orders, {d} fills)\n", .{ orders, fills });
+        }
+    }
+
     if (fails == 0) {
         std.debug.print("[verify-db] PASS {s}\n", .{path});
         return 0;
