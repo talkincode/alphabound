@@ -124,7 +124,7 @@
 </head>
 <body>
   <h1>AlphaBound <span id="staleness" class="sub"></span></h1>
-  <div class="sub">有界自主交易 Agent — 影子模式</div>
+  <div class="sub">有界自主交易 Agent — <span id="run_mode_banner">连接中…</span></div>
 
   <div class="tabs" role="tablist">
     <button class="tab active" data-tab="overview" type="button">概览</button>
@@ -150,7 +150,7 @@
       <div class="card"><div class="label">状态版本</div><div class="value" id="version">—</div></div>
     </div>
 
-    <h2>影子 vs 买入持有</h2>
+    <h2>影子账本（决策模拟基准）vs 买入持有</h2>
     <div class="grid">
       <div class="card"><div class="label">影子净值</div><div class="value" id="sh_shadow">—</div></div>
       <div class="card"><div class="label">买入持有净值</div><div class="value" id="sh_bh">—</div></div>
@@ -225,7 +225,7 @@
       <div class="stat"><div class="k">REBALANCE</div><div class="v" id="dec_reb">—</div></div>
       <div class="stat"><div class="k">已反思</div><div class="v" id="dec_ref">—</div></div>
     </div>
-    <p class="hint">展示 Agent 慢环全部审计事件。点击任意行可展开文本摘要与原始 payload。影子模式不实际下单。</p>
+    <p class="hint">展示 Agent 慢环全部审计事件。点击任意行可展开文本摘要与原始 payload。是否实际下单取决于运行模式与准入结果。</p>
     <div class="filters" id="dec_filters">
       <button type="button" data-filter="all" class="active">全部</button>
       <button type="button" data-filter="proposal">仅提案</button>
@@ -373,7 +373,16 @@ try {
 const KIND_ZH = { working: "工作", episodic: "情景", strategy: "策略", reflection: "反思", hypothesis: "假设" };
 const STATUS_ZH = { ok: "成功", running: "运行中", active: "有效", unverified: "未验证", invalidated: "已作废", merged: "已合并" };
 const MODE_ZH = { NORMAL: "正常", EXIT_ONLY: "仅减仓", FLATTENING: "强制平仓", HALTED: "已停机" };
-const RUN_MODE_ZH = { shadow: "影子", demo: "模拟盘", live: "实盘" };
+const RUN_MODE_ZH = { shadow: "影子模式", demo: "Demo 执行", live: "实盘" };
+function runModeLabel(system) {
+  const m = system && system.mode;
+  const ex = (system && system.execution) || {};
+  if (m === "demo") {
+    if (ex.real_money) return "小额实盘（demo·真实资金）";
+    return ex.enabled ? "模拟盘（demo）" : "Demo（执行未授权）";
+  }
+  return RUN_MODE_ZH[m] || m || "—";
+}
 const DEC_TYPE_ZH = {
   AGENT_PROPOSAL_OK: "提案成功",
   AGENT_INVALID_OUTPUT: "输出无效",
@@ -814,7 +823,7 @@ function renderDecisions(decisions, runs) {
       lines.push("动作：" + (act === "HOLD" ? "持有 (HOLD)" : act === "REBALANCE" ? "调仓 (REBALANCE)" : p.action));
     }
     if (p.target_btc_weight != null && p.target_btc_weight !== "")
-      lines.push("目标 BTC 权重：" + p.target_btc_weight + "（影子模式不执行）");
+      lines.push("目标 BTC 权重：" + p.target_btc_weight);
     if (p.confidence != null && p.confidence !== "")
       lines.push("置信度：" + p.confidence);
     if (p.snapshot_version != null)
@@ -829,7 +838,7 @@ function renderDecisions(decisions, runs) {
       const u = p.usage;
       lines.push("Token：prompt=" + (u.prompt_tokens||0) + " completion=" + (u.completion_tokens||0) + " total=" + (u.total_tokens||0));
     }
-    if (p.executed === false) lines.push("执行：否（shadow 审计 only）");
+    if (p.executed === false) lines.push("执行：否（仅审计，未发订单）");
     if (p.exec) lines.push("执行结果：" + p.exec);
     if (p.admission) {
       const a = p.admission;
@@ -857,7 +866,7 @@ function renderDecisions(decisions, runs) {
         });
       }
     } else if (p.decision_id && p.executed) {
-      lines.push("关联订单：暂无（可能尚未投影或仍为 shadow）");
+      lines.push("关联订单：暂无（可能尚未投影或未实际执行）");
     }
     if (run.model) lines.push("模型：" + run.model);
     if (run.status) lines.push("运行状态：" + zhStatus(run.status));
@@ -875,12 +884,12 @@ function renderDecisions(decisions, runs) {
         blurb = "摘要：Agent 建议继续持有现金/当前仓位，目标 BTC 权重 " +
           (p.target_btc_weight != null ? p.target_btc_weight : "0") +
           "，置信度 " + (p.confidence != null ? p.confidence : "—") +
-          "。影子模式仅记录，不下单。";
+          (p.executed ? "。已执行。" : "。本轮未发订单。");
       } else if (act === "REBALANCE") {
         blurb = "摘要：Agent 建议调仓至 BTC 权重 " +
           (p.target_btc_weight != null ? p.target_btc_weight : "—") +
           "，置信度 " + (p.confidence != null ? p.confidence : "—") +
-          "。影子模式仅审计，不发送订单。";
+          (p.executed ? "。已进入执行。" : "。未执行（见准入/执行结果）。");
       } else {
         blurb = "摘要：提案已通过 Schema 校验并落库审计。";
       }
@@ -1049,7 +1058,12 @@ function renderStatus(system, state) {
   const ag = (system && system.agent) || {};
   $("st_ready").textContent = system.ready ? "就绪 READY" : "未就绪";
   $("st_ready").className = system.ready ? "value ok" : "value err";
-  $("st_mode").textContent = (RUN_MODE_ZH[system.mode] || system.mode || "—");
+  $("st_mode").textContent = runModeLabel(system);
+  const banner = $("run_mode_banner");
+  if (banner) {
+    banner.textContent = runModeLabel(system);
+    banner.style.color = (system.execution && system.execution.real_money) ? "#f0883e" : "";
+  }
   const rm = state.risk_mode || "";
   $("st_risk").textContent = MODE_ZH[rm] || rm || "—";
   $("st_risk").className = "value mode-" + rm;
@@ -1123,7 +1137,7 @@ function renderOrders(bundle) {
 
   const ob = $("ord_body");
   if (orders.length === 0) {
-    ob.innerHTML = '<tr><td colspan="8" class="muted">暂无订单（Shadow 默认不下单）</td></tr>';
+    ob.innerHTML = '<tr><td colspan="8" class="muted">暂无订单</td></tr>';
   } else {
     ob.innerHTML = orders.slice(0, 80).map(o => {
       const st = (o.status || "").toUpperCase();

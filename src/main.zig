@@ -541,6 +541,7 @@ pub fn main(init: std.process.Init) !u8 {
         );
     }
     exec_venue_authorized = if (okx_env) |c| (c.simulated or c.real_money_ok) else false;
+    exec_real_money = if (okx_env) |c| (!c.simulated and c.real_money_ok) else false;
 
     var db_path_buf: [512:0]u8 = undefined;
     const db_path = std.fmt.bufPrintZ(&db_path_buf, "{s}", .{cfg.db_path}) catch return 1;
@@ -2715,6 +2716,13 @@ fn refreshSystemCache(
         .{ total, ok, invalid, errors, rate, tools_n },
     ) catch return;
     w.print(
+        "\"execution\":{{\"enabled\":{},\"real_money\":{}}},",
+        .{
+            ab.okx_trade.executionAllowed(cfg.mode == .demo, exec_venue_authorized),
+            exec_real_money,
+        },
+    ) catch return;
+    w.print(
         "\"schedule\":{{\"base_ms\":{d},\"quiet_ms\":{d},\"min_ms\":{d},\"active_hours_utc\":\"{s}\",\"price_move\":\"{f}\",\"drawdown_step\":\"{f}\",\"reflect_on_hold\":{}}},",
         .{
             cfg.decision_interval_ms,
@@ -3367,6 +3375,8 @@ var event_counter = std.atomic.Value(u64).init(0);
 /// Venue authorization for demo execution: simulated keys, or explicit
 /// real-money opt-in (OKX_REAL_MONEY_OK=1). Set once during boot.
 var exec_venue_authorized: bool = false;
+/// True only when real (non-simulated) keys run with explicit opt-in.
+var exec_real_money: bool = false;
 
 fn logEvent(
     repo: *ab.storage.EventsRepo,
