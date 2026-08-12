@@ -471,6 +471,13 @@ fn headerValue(head_buf: []const u8, name: []const u8) ?[]const u8 {
     return null;
 }
 
+fn copyOptHeader(head_buf: []const u8, name: []const u8, out: []u8) ?[]const u8 {
+    const v = headerValue(head_buf, name) orelse return null;
+    if (v.len > out.len) return null;
+    @memcpy(out[0..v.len], v);
+    return out[0..v.len];
+}
+
 fn handleConnection(io: std.Io, stream: std.Io.net.Stream, ctx_fn: ContextFn, userdata: ?*anyopaque) !void {
     defer stream.close(io);
     var in_buf: [8192]u8 = undefined;
@@ -481,10 +488,26 @@ fn handleConnection(io: std.Io, stream: std.Io.net.Stream, ctx_fn: ContextFn, us
     var server = std.http.Server.init(&reader.interface, &writer.interface);
 
     var req = server.receiveHead() catch return;
+
+    // Copy request-line fields and auth headers BEFORE body read:
+    // `readerExpectNone` invalidates head string slices.
+    var target_buf: [512]u8 = undefined;
+    const target_len = @min(req.head.target.len, target_buf.len);
+    @memcpy(target_buf[0..target_len], req.head.target[0..target_len]);
+    const method = req.head.method;
+
+    var authz_buf: [512]u8 = undefined;
+    var x_tok_buf: [256]u8 = undefined;
+    var cookie_hdr_buf: [1024]u8 = undefined;
+    const authorization = copyOptHeader(req.head_buffer, "authorization", &authz_buf);
+    const x_api_token = copyOptHeader(req.head_buffer, "x-api-token", &x_tok_buf);
+    const cookie_hdr = copyOptHeader(req.head_buffer, "cookie", &cookie_hdr_buf);
+    const content_length = req.head.content_length;
+
     var body_storage: [8192]u8 = undefined;
     var body_len: usize = 0;
-    if (req.head.method == .POST) {
-        if (req.head.content_length) |cl| {
+    if (method == .POST) {
+        if (content_length) |cl| {
             if (cl > body_storage.len) {
                 try req.respond("{\"error\":\"body_too_large\"}", .{
                     .status = .payload_too_large,
@@ -519,11 +542,11 @@ fn handleConnection(io: std.Io, stream: std.Io.net.Stream, ctx_fn: ContextFn, us
     ctx.auth_buf = &auth_buf;
 
     const info = RequestInfo{
-        .method = req.head.method,
-        .target = req.head.target,
-        .authorization = headerValue(req.head_buffer, "authorization"),
-        .x_api_token = headerValue(req.head_buffer, "x-api-token"),
-        .cookie = headerValue(req.head_buffer, "cookie"),
+        .method = method,
+        .target = target_buf[0..target_len],
+        .authorization = authorization,
+        .x_api_token = x_api_token,
+        .cookie = cookie_hdr,
         .body = body_storage[0..body_len],
         .now_ms = clock.SystemClock.clock().wallMs(),
     };
