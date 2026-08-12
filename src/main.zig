@@ -165,7 +165,8 @@ const WebState = struct {
     /// Pre-rendered JSON blobs (owned buffers inside WebState).
     agent_runs_buf: [24576]u8 = undefined,
     agent_runs_len: usize = 2,
-    equity_buf: [8192]u8 = undefined,
+    /// ~1m samples × ~170B; 48KiB holds ~280 points (~4.5h) with headroom.
+    equity_buf: [49152]u8 = undefined,
     equity_len: usize = 2,
     events_buf: [12288]u8 = undefined,
     events_len: usize = 2,
@@ -219,7 +220,7 @@ const WebState = struct {
         // Safe: web accept loop is single-threaded.
         const Tls = struct {
             var agent: [24576]u8 = undefined;
-            var equity: [8192]u8 = undefined;
+            var equity: [49152]u8 = undefined;
             var events: [12288]u8 = undefined;
             var shadow: [512]u8 = undefined;
             var candles: [131072]u8 = undefined;
@@ -1493,16 +1494,29 @@ fn refreshWebCaches(
 ) void {
     // Separate scratch buffers so a large events dump cannot clobber shadow JSON mid-format.
     var tmp_agent: [24576]u8 = undefined;
-    var tmp_equity: [8192]u8 = undefined;
+    // Must match WebState.equity_buf. Old 8KiB overflowed ~60×1m rows → API stuck at [].
+    var tmp_equity: [49152]u8 = undefined;
     var tmp_events: [12288]u8 = undefined;
     var tmp_shadow: [768]u8 = undefined;
     var tmp_mem: [8192]u8 = undefined;
     if (runs.listRecentJson(db, &tmp_agent, 50)) |j| {
         ws.setJson(.agent, j);
     } else |_| {}
-    if (equity.listRecentJson(db, &tmp_equity, 60)) |j| {
-        ws.setJson(.equity, j);
-    } else |_| {}
+    // Prefer ~4h of 1m samples; fall back if a row ever grows past estimate.
+    {
+        var eq_limit: i64 = 240;
+        var equity_ok = false;
+        while (eq_limit >= 30) : (eq_limit = @divTrunc(eq_limit, 2)) {
+            if (equity.listRecentJson(db, &tmp_equity, eq_limit)) |j| {
+                ws.setJson(.equity, j);
+                equity_ok = true;
+                break;
+            } else |_| {}
+        }
+        if (!equity_ok) {
+            std.debug.print("[dashboard] equity json render failed (buffer/db)\n", .{});
+        }
+    }
     if (events.listRecentJson(db, &tmp_events, 40)) |j| {
         ws.setJson(.events, j);
     } else |_| {}
