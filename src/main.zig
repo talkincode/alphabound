@@ -2216,9 +2216,22 @@ fn tryDemoExecute(
 
         if (ab.okx_trade.wantsResidualPlan(leg)) {
             any_fill = true;
-            // Pull venue balances so residual plan uses true position (§5.5).
-            _ = refreshDemoPortfolio(gpa, okx, engine);
+            // Authoritative venue balances required before another leg.
+            // If refresh fails, apply local fill once and STOP — never replan
+            // on a stale zero book (that path triple-bought after API blips).
+            if (!refreshDemoPortfolio(gpa, okx, engine)) {
+                applyLocalFill(engine, po.side, po.qty, mark);
+                logEventPayload(events_repo, engine, "EXEC_REFRESH_FAILED", "execution", "WARN", cfg, "{\"action\":\"stop_replan_local_fill\"}");
+                return if (std.mem.eql(u8, leg, "filled")) "filled_refresh_failed" else "partial_refresh_failed";
+            }
             snap = engine.snapshot();
+            // If venue still reports a zero book after a confirmed fill, the
+            // balance feed is lagging/wrong — stop rather than buy again.
+            if (std.mem.eql(u8, leg, "filled") and snap.btc_total.isZero() and po.side == .buy) {
+                applyLocalFill(engine, po.side, po.qty, mark);
+                logEventPayload(events_repo, engine, "EXEC_BOOK_LAG", "execution", "WARN", cfg, "{\"action\":\"stop_replan_zero_btc\"}");
+                return "filled_book_lag";
+            }
             if (std.mem.eql(u8, leg, "filled")) {
                 // If residual is dust, done; else continue for another leg.
                 const mark2 = if (snap.mark_price.gt(ab.decimal.Decimal.zero)) snap.mark_price else snap.bid_price;
@@ -2265,6 +2278,38 @@ fn refreshDemoPortfolio(
         },
         .err => return false,
     }
+}
+
+/// Best-effort book update from a known fill when venue balance refresh fails.
+/// Used only to keep the engine off a false zero book — not a substitute for reconcile.
+fn applyLocalFill(
+    engine: *ab.state.Engine,
+    side: ab.orders.Side,
+    qty: ab.decimal.Decimal,
+    px: ab.decimal.Decimal,
+) void {
+    if (!qty.gt(ab.decimal.Decimal.zero) or !px.gt(ab.decimal.Decimal.zero)) return;
+    const notional = qty.mul(px, .up) catch return;
+    const s0 = engine.snapshot();
+    var cash = s0.cash_usdt;
+    var btc = s0.btc_total;
+    switch (side) {
+        .buy => {
+            cash = cash.sub(notional) catch return;
+            btc = btc.add(qty) catch return;
+        },
+        .sell => {
+            cash = cash.add(notional) catch return;
+            btc = btc.sub(qty) catch return;
+            if (btc.isNegative()) btc = ab.decimal.Decimal.zero;
+        },
+    }
+    _ = engine.apply(.{ .account_update = .{
+        .ts_ms = nowMs(),
+        .cash_usdt = cash,
+        .btc_total = btc,
+        .btc_available = btc,
+    } }) catch {};
 }
 
 /// Single place + query/resolve leg. `seq` differentiates client_order_id on replans.
