@@ -61,6 +61,33 @@ sudo -u alphabound /opt/alphabound/current/alphabound \
 Dashboard: bind defaults to loopback; use SSH local forward, or set
 `bind = "0.0.0.0:8080"` only on a trusted private network behind a firewall.
 
+## Public edge (nginx + domain)
+
+Prefer binding the daemon to loopback and terminating TLS at nginx (or another
+trusted reverse proxy):
+
+```bash
+# on the host
+sudo cp deploy/nginx-alphabound.conf.example /etc/nginx/sites-available/alphabound
+# edit YOUR_DOMAIN + certificate paths, then:
+sudo ln -sf /etc/nginx/sites-available/alphabound /etc/nginx/sites-enabled/alphabound
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+Required secrets when behind a proxy (see `secrets.env.example`):
+
+- `ALPHABOUND_TRUST_PROXY=1`
+- `ALPHABOUND_TRUSTED_PROXY_HOPS=1` (right-most `X-Forwarded-For` hop)
+- `ALPHABOUND_WEBAUTHN_RP_ID` / `ALPHABOUND_WEBAUTHN_ORIGIN` matching the public hostname
+
+Cloudflare DNS helper (needs **Zone.DNS Edit** token — read-only tokens return 403):
+
+```bash
+export CF_API_TOKEN=...   # do not commit
+./scripts/cf-upsert-dns-a.sh your.domain.example x.x.x.x true
+# Dashboard SSL/TLS mode: Full (not Flexible) when origin serves HTTPS
+```
+
 ## OKX
 
 Add the **server egress public IP** to the API key whitelist so private
