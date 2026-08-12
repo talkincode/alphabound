@@ -2090,7 +2090,13 @@ fn runAgentDecision(
     const bound_version = bindProposalVersion(prop.snapshot_version, decision_start_version, admit_snap.version);
     const admission = shadowAdmit(admit_snap, bound_version, prop.target_btc_weight, cfg, admit_now);
     var exec_note: []const u8 = "not_executed";
-    if (ab.okx_trade.executionAllowed(cfg.mode == .demo, exec_venue_authorized)) {
+    // HOLD is always a no-op at the execution boundary. target_btc_weight is 0 by
+    // schema for HOLD — must NEVER be planned as "flatten to cash" (that wiped a
+    // live BTC book after balance reconcile recovered).
+    if (prop.action == .hold) {
+        exec_note = "hold";
+        logEventPayload(events_repo, engine, "EXEC_HOLD", "execution", "INFO", cfg, "{\"reason\":\"action_hold\"}");
+    } else if (ab.okx_trade.executionAllowed(cfg.mode == .demo, exec_venue_authorized)) {
         exec_note = tryDemoExecute(
             gpa,
             okx,
