@@ -30,6 +30,7 @@ fi
 
 cp deploy/install-remote.sh "$STAGE/install.sh"
 chmod +x "$STAGE/install.sh"
+git -C "$ROOT" rev-parse --short HEAD > "$STAGE/DEPLOY_SHA" 2>/dev/null || echo unknown > "$STAGE/DEPLOY_SHA"
 
 COPYFILE_DISABLE=1 tar -C "$(dirname "$STAGE")" -czf "$TAR" "$(basename "$STAGE")"
 echo "[deploy] upload -> $HOST"

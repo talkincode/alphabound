@@ -37,8 +37,8 @@
 
 ## 现在做什么（按序）
 
-1. **运维 Gate 2**（若 shadow 尚未 24h 绿）  
-   `gate2-report.sh` + `check-remote.sh`
+1. **滚动 soak 验收**（替代冻结 24h/7d：部署重启豁免，只有 crash 判负）  
+   `HOST=<host> ./scripts/soak-report.sh 24` + `gate2-report.sh` + `check-remote.sh`
 2. **准备模拟盘密钥**（`OKX_SIMULATED=1`，IP 白名单）  
 3. **本机 Demo 冒烟**  
    ```bash

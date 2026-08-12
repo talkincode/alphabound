@@ -30,6 +30,10 @@ Or use the helper (requires `sshx` and `HOST=`):
 ```bash
 HOST=your-sshx-host ./scripts/deploy-remote.sh
 HOST=your-sshx-host ./scripts/check-remote.sh
+# Rolling-soak acceptance: deploy restarts (logged to
+# /var/lib/alphabound/deploys.log by install) are expected; only
+# unexpected exits in the window fail the report.
+HOST=your-sshx-host ./scripts/soak-report.sh 24
 ```
 
 Unit hardens: `NoNewPrivileges`, `PrivateTmp`, `ProtectSystem=strict`,

@@ -34,6 +34,14 @@ chmod 750 /var/lib/alphabound
 install -m 0644 -o root -g root "$ROOT/systemd/alphabound.service" /etc/systemd/system/alphabound.service
 systemctl daemon-reload
 systemctl enable alphabound
+
+# Rolling-soak accounting: every deploy restart is recorded so the soak
+# report can separate intentional restarts from crashes.
+DEPLOY_SHA="unknown"
+[[ -f "$ROOT/DEPLOY_SHA" ]] && DEPLOY_SHA="$(cat "$ROOT/DEPLOY_SHA")"
+echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) deploy sha=$DEPLOY_SHA" >> /var/lib/alphabound/deploys.log
+chown alphabound:alphabound /var/lib/alphabound/deploys.log
+
 systemctl restart alphabound
 sleep 2
 systemctl --no-pager -l status alphabound || true

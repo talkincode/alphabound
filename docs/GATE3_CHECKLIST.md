@@ -54,7 +54,7 @@ export LLM_API_KEY=...
 | 4 | Dashboard/events 可见 `ORDER_*` | ☐ |
 | 5 | `--control cancel-all` 清空 pending | ☐ |
 | 6 | `--control flatten` 后不再增仓（admission REJECT） | ☐ |
-| 7 | 连续运行 ≥24h 无非预期 crash（向 7 天 soak 迈进） | ☐ |
+| 7 | 滚动 24h 窗口 0 次非预期退出（`soak-report.sh 24` PASS；向 168h 窗口迈进） | ☐ |
 | 8 | 断线恢复演练 | ☐ |
 | 9 | 版本回滚演练 | ☐ |
 | 10 | 故障矩阵 AC-FD1..10 逐项 | ☐ |
