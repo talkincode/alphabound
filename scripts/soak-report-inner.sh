@@ -77,6 +77,21 @@ echo "=== WAL / DB size ==="
 ls -l /var/lib/alphabound/trading.db* 2>/dev/null | awk '{print $5, $9}'
 ls /var/lib/alphabound/*.bak* 2>/dev/null | tail -5
 
+echo "=== resource guards (AC-NFR06) ==="
+RES_BREACH=0
+PID_NOW="$(systemctl show -p MainPID --value alphabound)"
+if [[ -n "$PID_NOW" && "$PID_NOW" != "0" ]]; then
+  RSS_KB=$(ps -o rss= -p "$PID_NOW" | tr -d ' ')
+  FDS=$(ls /proc/"$PID_NOW"/fd 2>/dev/null | wc -l)
+  echo "rss_kb $RSS_KB (budget ${RSS_BUDGET_KB:-262144})"
+  echo "open_fds $FDS (budget ${FD_BUDGET:-256})"
+  [[ "$RSS_KB" -gt "${RSS_BUDGET_KB:-262144}" ]] && { echo "RESOURCE_BREACH rss"; RES_BREACH=1; }
+  [[ "$FDS" -gt "${FD_BUDGET:-256}" ]] && { echo "RESOURCE_BREACH fds"; RES_BREACH=1; }
+fi
+WAL_B=$(stat -c %s /var/lib/alphabound/trading.db-wal 2>/dev/null || echo 0)
+echo "wal_bytes $WAL_B (budget ${WAL_BUDGET_B:-67108864})"
+[[ "$WAL_B" -gt "${WAL_BUDGET_B:-67108864}" ]] && { echo "RESOURCE_BREACH wal"; RES_BREACH=1; }
+
 echo "=== verdict ==="
 # Recorded kill -9 drills (NFR04) are expected: discount them.
 FAILED_ADJ=$((FAILED - DRILL_KILLS))
@@ -87,6 +102,10 @@ if [[ "$FAILED_ADJ" -gt 0 ]]; then
 fi
 if [[ "$LAT_BREACH" -gt 0 ]]; then
   echo "SOAK FAIL latency p99 over budget (AC-NFR01)"
+  exit 1
+fi
+if [[ "$RES_BREACH" -gt 0 ]]; then
+  echo "SOAK FAIL resource budget breached (AC-NFR06)"
   exit 1
 fi
 EXTRA=$((STARTS - DEPLOYS))

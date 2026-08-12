@@ -3,6 +3,22 @@ set +e
 echo "=== service ==="
 systemctl is-active alphabound
 systemctl is-enabled alphabound 2>/dev/null
+echo "=== secrets hygiene (AC-SEC2) ==="
+SEC_FAIL=0
+if [ -f /etc/alphabound/secrets.env ]; then
+  PERMS=$(stat -c '%a %U:%G' /etc/alphabound/secrets.env)
+  echo "secrets.env $PERMS"
+  case "$PERMS" in
+    "600 root:alphabound"|"640 root:alphabound"|"600 root:root") ;;
+    *) echo "SEC2 FAIL: unexpected perms/owner (want 600 root:alphabound)"; SEC_FAIL=1 ;;
+  esac
+else
+  echo "secrets.env missing"
+fi
+# Secrets must never leak into data dir or backups.
+LEAK=$(grep -rl "OKX_API\|API_KEY" /var/lib/alphabound/ 2>/dev/null | grep -v '\.db' | head -3)
+if [ -n "$LEAK" ]; then echo "SEC2 FAIL: secret-like strings in data dir: $LEAK"; SEC_FAIL=1; else echo "data dir clean"; fi
+[ "$SEC_FAIL" -eq 0 ] && echo "SEC2 OK"
 echo "=== health ==="
 curl -sS --max-time 3 http://127.0.0.1:8080/health/live; echo
 curl -sS --max-time 3 http://127.0.0.1:8080/health/ready; echo

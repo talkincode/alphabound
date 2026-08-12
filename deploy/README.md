@@ -38,6 +38,8 @@ HOST=your-sshx-host ./scripts/soak-report.sh 24
 HOST=your-sshx-host ./scripts/restore-drill.sh    # verify newest backup restores (AC-OPS4)
 HOST=your-sshx-host ./scripts/rollback-remote.sh  # roll back to previous release (AC-OPS6)
 HOST=your-sshx-host ./scripts/kill9-drill.sh      # SIGKILL crash-recovery drill (AC-NFR04)
+HOST=your-sshx-host ./scripts/restart-drill.sh 3  # restart-reconcile drill (AC-GO1)
+./scripts/llm-outage-drill.sh                     # local LLM-outage drill (AC-NFR02)
 ```
 
 Deploys are versioned: each install stages

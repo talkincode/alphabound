@@ -31,24 +31,24 @@
 | ID | 属性 | 验收标准 | 验证方法 | 阶段 | 状态 |
 |---|---|---|---|---|---|
 | AC-NFR01 | 延迟 | 行情事件进程内风险计算 p99 < 10ms(不含公网);有持续测量与告警 | Soak(基准测量) | P3 | ◐ `observability/latency.zig` Histogram(2048 环形窗口,nearest-rank 分位)+主循环 market_tick→engine.apply µs 测量,system JSON `latency_us{p50,p99,max,samples}` 持续可见;soak-report p99 门限告警已接(samples≥20 且 p99>P99_BUDGET_US 默认 10ms → SOAK FAIL);长窗口基准累积中 |
-| AC-NFR02 | 可用性 | 断开 LLM/新闻/链上/Dashboard 后,风险监控、订单对账与退出能力仍工作 | Fault Injection | P3 | ☐ |
+| AC-NFR02 | 可用性 | 断开 LLM/新闻/链上/Dashboard 后,风险监控、订单对账与退出能力仍工作 | Fault Injection | P3 | ◐ LLM 断连注入演练 PASS(2026-08-12,`scripts/llm-outage-drill.sh`:不可达端点→tick/风险循环继续、HOLD 兜底、干净退出、DB verify PASS);新闻/链上无外呼路径;Dashboard 断开注入待做 |
 | AC-NFR03 | 一致性 | 提案未绑定当前 snapshot_version 即拒绝;状态变化后旧提案自动失效 | Property + Unit | P2 | ◐ admission 单测:`snapshot_version` 失配 → REJECT(stale_snapshot);property 广度待扩 |
 | AC-NFR04 | 恢复 | 重启→恢复 DB→OKX 对账→READY;对账完成前不产生增仓提案 | Integration + Fault(kill -9 注入) | P3 | ◐ 生命周期 BOOTING→CONNECTING→RECONCILING→READY 已实现并实网验证;未对账时 fail-closed 起步 exit_only(单测);kill -9 演练 PASS(2026-08-12 生产 SIGKILL→systemd 拉起→10s 恢复 READY,`scripts/kill9-drill.sh` 可重复执行,soak-report 入账不误报) |
-| AC-NFR05 | 部署发布 | 生产 VM 无 Python/Node/Docker;核心二进制与 Dashboard 均可原子回滚;health fail 自动回滚 | Manual(发布演练) | P3 | ☐ |
-| AC-NFR06 | 审计资源 | 关键事件带 state_version/software_version/config_hash/correlation_id;资源(CPU/RSS/fd/WAL/磁盘)有告警 | Unit(信封)+ Soak | P3 | ◐ `core/events.zig` 事件信封四字段已单测;daemon 落库事件实测含全部戳;资源告警待做 |
+| AC-NFR05 | 部署发布 | 生产 VM 无 Python/Node/Docker;核心二进制与 Dashboard 均可原子回滚;health fail 自动回滚 | Manual(发布演练) | P3 | ◐ 二进制 musl 静态链接(ldd "not a dynamic executable",daemon 零运行时依赖);releases+current symlink 原子回滚+health fail 自动回滚演练 PASS(2026-08-12);共享 VM 上存在他项目的 docker/python,daemon 不依赖 |
+| AC-NFR06 | 审计资源 | 关键事件带 state_version/software_version/config_hash/correlation_id;资源(CPU/RSS/fd/WAL/磁盘)有告警 | Unit(信封)+ Soak | P3 | ◐ `core/events.zig` 事件信封四字段已单测;daemon 落库事件实测含全部戳;soak-report 资源门限已接(RSS>256MB/fd>256/WAL>64MB → SOAK FAIL;磁盘 statvfs 已在 daemon 内) |
 
 ## C. 上线验收标准(§9.3,Phase 4 实盘闸门)
 
 | ID | 标准 | 验证方法 | 状态 |
 |---|---|---|---|
-| AC-GO1 | 重启后可从 OKX 对账出正确余额、BTC 数量、开放订单和 HWM | Integration(重启演练×3) | ☐ |
+| AC-GO1 | 重启后可从 OKX 对账出正确余额、BTC 数量、开放订单和 HWM | Integration(重启演练×3) | ◐ 重启演练×3 PASS(2026-08-12 生产,`scripts/restart-drill.sh`:每轮 HWM 恢复+461 memories 重载+OKX 私有余额对账 ok+READY≤9s);开放订单对账待 demo 挂单场景 |
 | AC-GO2 | Agent 无法直接访问交易凭证或绕过 Risk Kernel(代码层能力缺失,非 prompt 约束) | Manual(红队评审)+ Unit(接口不可达) | ◐ 架构落地:`agent/` 仅产出 Proposal 值类型;凭证只在 `exchange/okx/auth.zig`;`security/isolation.zig` 源码扫描单测持续强制隔离;红队评审待做 |
 | AC-GO3 | Risk Kernel 核心性质过 property test,覆盖边界/费用/滑点/部分成交 | Property | ☑ admission 2000 次随机 + halted/flattening 模式 + 费用/滑点/shock 单调性(stress equity 非增)+ max_drawdown 收紧单调 + planner 部分成交迭代收敛(qty 单调减不翻向) property 全过 |
-| AC-GO4 | 断开 LLM、新闻、链上和 Dashboard 后,风险监控与订单对账仍工作 | Fault Injection | ☐ |
+| AC-GO4 | 断开 LLM、新闻、链上和 Dashboard 后,风险监控与订单对账仍工作 | Fault Injection | ◐ LLM 断连演练 PASS(同 AC-NFR02);新闻/链上无外呼路径;Dashboard 进程内无独立断开面 |
 | AC-GO5 | 所有订单可追溯到 decision_id、snapshot_version、risk decision 和 config_hash | Replay(审计链抽查) | ☐ |
 | AC-GO6 | 未知订单/陈旧数据/数据库异常进入安全状态,不默认继续增仓 | Fault Injection | ☐ |
 | AC-GO7 | Dashboard 可完整回放一笔交易从观察到反思的链路 | Manual(UI 走查) | ◐ 决策展开含 admission/exec + **按 decision_id 关联订单/成交**; 完整链路 UI 走查待 Demo |
-| AC-GO8 | Demo Trading 连续稳定 ≥7 天,完成 ≥1 次断线恢复和 ≥1 次版本回滚演练 | Soak + Manual | ☐ |
+| AC-GO8 | Demo Trading 连续稳定 ≥7 天,完成 ≥1 次断线恢复和 ≥1 次版本回滚演练 | Soak + Manual | ◐ 版本回滚演练 ≥1 次 PASS(2026-08-12 双向);kill -9/重启恢复演练 PASS;7 天滚动 soak 与 demo 断线恢复待 demo 凭证 |
 
 ## D. 风险内核专项(§5)
 
@@ -65,7 +65,7 @@
 
 | ID | 故障场景 | 期望自动动作 | 验证方法 | 状态 |
 |---|---|---|---|---|
-| AC-FD1 | LLM 超时/报错 | 本轮 HOLD,无订单;风险与对账继续 | Fault | ◐ shadow HOLD + `fault/matrix` 分类/坏 JSON 单测; 实网 Fault 注入待做 |
+| AC-FD1 | LLM 超时/报错 | 本轮 HOLD,无订单;风险与对账继续 | Fault | ◐ shadow HOLD + `fault/matrix` 分类/坏 JSON 单测;实网断连注入 PASS(`scripts/llm-outage-drill.sh`) |
 | AC-FD2 | 外部工具不可用 | ToolResult=UNAVAILABLE;不得把缺失数据编造成零值 | Fault + Unit | ◐ UNAVAILABLE/`null` data 单测（`fault/matrix`）+ market HTTP 路径 |
 | AC-FD3 | 公共行情过期 | 进入 EXIT_ONLY;重连 + REST 校验;不增险 | Fault | ◐ stale→EXIT_ONLY + admission 拒增仓（`fault/matrix`）; 实网断线待做 |
 | AC-FD4 | 私有账户 WS 断开 | EXIT_ONLY + REST 对账;未知期间不自主开仓 | Fault | ◐ unresolved/stale account 拒增仓单测; WS 断线注入待做 |
@@ -74,14 +74,14 @@
 | AC-FD7 | 磁盘接近满 | 停新交易,清理可重建缓存;严重时 HALTED | Fault | ◐ `storage/disk` statvfs + `disk_ok` 进健康检查; low→EXIT_ONLY critical→HALTED; 缓存清理待做 |
 | AC-FD8 | 数据库损坏 | 仅保留退出能力+应急文本日志;禁止静默新建空库继续交易 | Fault | ◐ boot：已存在文件 open 失败 → FATAL refuse recreate; 应急文本日志/只退能力待扩 |
 | AC-FD9 | 回撤边界触发 | FLATTENING → HALTED;记录穿透与成本 | Fault + Replay | ◐ FLATTENING→HALTED + 无自动恢复（`fault/matrix`）;极端行情 replay 待做 |
-| AC-FD10 | 进程崩溃 | systemd 重启→重新对账→READY;重启前状态不被假定正确 | Fault(kill -9) | ☐ |
+| AC-FD10 | 进程崩溃 | systemd 重启→重新对账→READY;重启前状态不被假定正确 | Fault(kill -9) | ◐ 生产 kill -9 演练 PASS(2026-08-12:SIGKILL→systemd 拉起→重新对账→10s READY;HWM/memories 从 DB 重建,`scripts/kill9-drill.sh` 可重复) |
 
 ## F. 安全边界(§7.3 / §7.4)
 
 | ID | 验收标准 | 验证方法 | 阶段 | 状态 |
 |---|---|---|---|---|
 | AC-SEC1 | OKX API Key 仅 Read+Trade(无 Withdraw),绑定 Azure 固定出口 IP 白名单 | Manual(配置审查) | P4 | ☐ |
-| AC-SEC2 | 密钥文件 root 管理 0600;服务进程只读;密钥不进备份 | Manual + 脚本检查 | P4 | ☐ |
+| AC-SEC2 | 密钥文件 root 管理 0600;服务进程只读;密钥不进备份 | Manual + 脚本检查 | P4 | ◐ check-remote.sh SEC2 段自动检查(600 root:alphabound + 数据目录无密钥泄漏),生产 PASS(2026-08-12);备份内容抽查待做 |
 | AC-SEC3 | LLM Context/日志/错误栈/Dashboard 响应中无 secret/passphrase/签名材料(redaction 生效) | Unit(redaction)+ Manual 抽查 | P2 | ◐ `redaction.redact` 单测 + journal `logEventPayload` 落库前 redact/looksLeaky 拦截; Dashboard 抽查仍待 |
 | AC-SEC4 | systemd 加固: NoNewPrivileges/PrivateTmp/ProtectSystem/受限写目录 | Manual(unit 审查) | P1 | ◐ `deploy/alphabound.service` 已含加固项；生产装机演练仍待 |
 | AC-SEC5 | 外部 HTTP 响应有大小/解压/超时/JSON 深度限制 | Unit + Fuzz | P2 | ◐ `security/limits.zig` 上限常量+`jsonStructureSane` 结构扫描(单测含深度炸弹/breakout/截断);OKX REST 512KB、LLM 1MB、egress 探针 4KB 固定容量 sink 接线,超限→记录并拒绝;解压炸弹面(gzip)待评审 |
