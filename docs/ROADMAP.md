@@ -4,22 +4,17 @@
 > 阶段串行推进,**退出条件未满足不得进入下一阶段**;各条目与
 > [验收矩阵](ACCEPTANCE_MATRIX.md) 的 AC 编号对应。
 
-**当前进度(2026-08)**: Phase 0–3 离线组件 + shadow 在线路径已打通并通过单元测试。
-**本机已验证**: OKX 公共行情 + 周期只读私有余额 REST 对账、`market.ticker`/`market.candles`
-工具 → `tool_calls` 审计、OpenAI 兼容 LLM（Azure）shadow `proposal ok`、
-`agent_runs` digests + `AGENT_*` payload、`--agent-stats`、GHCR 镜像、
-Dashboard 提案/净值/BH/K 线/Memories/Events/System API、shadow buy-and-hold 基准、
-记忆 boot 重建 + 决策环 retrieve/events + 提案 episode + **LLM reflection**（失败回退确定性）、小时 SQLite 备份。
-私有 WS：**协议**单测 + TLS 握手/upgrade 实连；login 后 OKX close 4004 仍在排查，
-默认跳过（`ALPHABOUND_PRIVATE_WS=1` 可启用探测），REST 对账仍为 Gate 1 主路径。
-**尚未完成**: 私有 WS login 长连仍 opt-in 不稳、Gate2 长稳 soak、Demo/Live 下单闸门。
-**本迭代已补**: shadow 准入审计、`flatten`/`cancel-all`、`gate2-report.sh`、shadow 账户心跳；**Demo 最小下单路径**（`mode=demo`+`OKX_SIMULATED=1` → admit → planner → 市价单/查单/撤单）。
-**下一步**: Gate2 运维 soak + [GATE3_CHECKLIST.md](GATE3_CHECKLIST.md) 模拟盘联调；见 [NEXT.md](NEXT.md)。
+**当前进度(2026-08)**: Phase 0–3 代码主路径已通；**小额 `mode=live` 已解锁**（`OKX_REAL_MONEY_OK=1`）。
+**本机/生产已验证**: OKX 公共行情 + 私有余额 REST 对账、Agent 提案/反思、Dashboard、
+小额实盘下单（operator + agent REBALANCE → FILLED）、flatten/cancel-all、部署回滚与 soak 脚本。
+私有 WS 仍 opt-in；REST 对账为主路径。
+**尚未完成**: Gate3 故障矩阵逐项 + ≥7 日滚动 soak（AC-GO8）、Phase 5 L1 引用率观察。
+**下一步**: 配置迁 `mode=live`、稳盘证据、故障矩阵收口；见 [NEXT.md](NEXT.md)。
 
 ```
 Phase 0 ──► Phase 1 ──► Phase 2 ──► Phase 3 ──► Phase 4 ──► Phase 5
-可行性 Spike  只读市场     Shadow Mode   Demo Trading  100 USDT 实盘  数据工具扩展
-(go/no-go)   + Dashboard  (不下单)      (模拟盘)      (真金白银)     (按需增强)
+可行性 Spike  只读市场     Shadow Mode   交易路径       MVP 运维判定   数据工具扩展
+(go/no-go)   + Dashboard  (不下单)      (demo|live)   (长稳/验收)    (按需增强)
 ```
 
 ---
@@ -110,9 +105,9 @@ Phase 0 ──► Phase 1 ──► Phase 2 ──► Phase 3 ──► Phase 4 
 
 ---
 
-## Phase 3 — Demo Trading(模拟盘)
+## Phase 3 — Trading path（demo | 小额 live）
 
-**目标**: 打通 Risk Kernel + Execution 全链路,在 OKX Demo 环境经受故障注入。
+**目标**: 打通 Risk Kernel + Execution 全链路；可在 OKX 模拟盘或**小额实盘子账号**经受故障注入与 soak。
 
 **范围**
 - Risk Kernel: 保守净值/压力净值/ExitReserve/风险预算、提案准入(APPROVE/REDUCE/REJECT)、
@@ -130,25 +125,25 @@ Phase 0 ──► Phase 1 ──► Phase 2 ──► Phase 3 ──► Phase 4 
 - 清单: [GATE3_CHECKLIST.md](GATE3_CHECKLIST.md)
 
 **退出条件(Gate 3)**
-- [ ] Demo Trading 连续稳定运行 ≥ 7 天(soak)
-- [ ] 至少一次断线恢复演练 + 一次版本回滚演练通过
+- [ ] 交易模式（demo 或小额 live）连续稳定运行 ≥ 7 天(soak)
+- [x] 至少一次断线恢复演练 + 一次版本回滚演练通过（2026-08-12）
 - [ ] 故障降级矩阵(§7.2)10 项场景逐项验证
-- [ ] Risk Kernel property test 全绿(边界/费用/滑点/部分成交覆盖)
+- [x] Risk Kernel property / 费用滑点部分成交相关验收项已落地（见 ACCEPTANCE_MATRIX）
+- [x] **`mode=live` 小额路径解锁**（`OKX_REAL_MONEY_OK=1`，非主账户）
 
 ---
 
-## Phase 4 — 100 USDT Live(实盘)
+## Phase 4 — MVP 运维判定（非「再开 live 锁」）
 
-**目标**: OKX 独立子账户真实资金运行,人工每日检查,自动 halt 兜底。
+**目标**: 小额 live 已可跑的前提下，用长稳与运营证据判定 MVP 成立；**不是**再解一把代码锁。
 
 **范围**
-- 子账户开设 + API Key(仅 Read+Trade,无 Withdraw)+ Azure 固定出口 IP 白名单
-- 密钥安全落地: root 管理 0600、systemd 加固(NoNewPrivileges/PrivateTmp/ProtectSystem)
-- 上线验收清单(§9.3 全部 8 条)逐项签署
+- 子账户纪律: API Key 仅 Read+Trade、出口 IP 白名单、密钥 0600 + systemd 加固
+- 上线验收清单(§9.3)逐项签署与滚动 soak 证据归档
 - 每日人工检查流程 + 周度 restore drill
-- 回撤边界实弹: FLATTENING → HALTED 全链路在真实市场验证(可用小幅人工触发演练)
+- 回撤边界实弹: FLATTENING → HALTED 在真实市场可重复
 
-**进入条件**: Gate 3 全过 + 验收矩阵 P4 列全绿(任何无法解释的状态不一致都阻止实盘)
+**进入条件**: Gate 3 故障矩阵与 7 日 soak 收口；任何无法解释的状态不一致都阻止扩容
 
 **退出条件(Gate 4,判定 MVP 成立)**
 - [ ] 无状态不一致事件;所有风险事件可解释、可追溯

@@ -14,7 +14,7 @@ pub const Cmd = enum {
     cancel_all,
     /// Force risk mode toward FLATTENING (operator exit).
     flatten,
-    /// Operator path probe: admit+execute toward a target BTC weight (demo only).
+    /// Operator path probe: admit+execute toward a target BTC weight (demo/live).
     target_weight,
     shutdown,
 

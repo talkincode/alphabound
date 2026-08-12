@@ -34,7 +34,7 @@ const OkxEnvCreds = struct {
     passphrase: []const u8,
     simulated: bool,
     /// Explicit operator opt-in: real (small sub-account) keys may execute
-    /// in demo mode. Never implied; OKX_REAL_MONEY_OK=1 only.
+    /// in live (or legacy demo+real) mode. Never implied; OKX_REAL_MONEY_OK=1 only.
     real_money_ok: bool,
 
     fn load(map: *const std.process.Environ.Map) ?OkxEnvCreds {
@@ -530,18 +530,35 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("[boot] LLM credentials absent — agent slow-loop idle\n", .{});
     }
 
-    // Refuse live mode without keys (and refuse live entirely until Gate 4).
-    if (cfg.mode == .live) {
-        std.debug.print("[boot] FATAL mode=live is disabled until Gate 4; use shadow\n", .{});
+    // Trading modes need credentials + an explicit venue authorization.
+    // live = small real sub-account (OKX_REAL_MONEY_OK=1, never simulated header).
+    // demo = OKX simulated (OKX_SIMULATED=1), or legacy demo+REAL_MONEY (compat).
+    if (cfg.mode.isTrading() and okx_env == null) {
+        std.debug.print("[boot] FATAL mode={t} requires OKX_* credentials\n", .{cfg.mode});
         return 1;
     }
-    if (cfg.mode == .demo and okx_env == null) {
-        std.debug.print("[boot] FATAL mode=demo requires OKX_* credentials\n", .{});
-        return 1;
+    if (cfg.mode == .live) {
+        const c = okx_env.?;
+        if (c.simulated) {
+            std.debug.print(
+                "[boot] FATAL mode=live refuses OKX_SIMULATED=1 — use mode=demo for simulated venue\n",
+                .{},
+            );
+            return 1;
+        }
+        if (!c.real_money_ok) {
+            std.debug.print(
+                "[boot] FATAL mode=live needs OKX_REAL_MONEY_OK=1 (explicit small-capital opt-in)\n",
+                .{},
+            );
+            return 1;
+        }
+        std.debug.print(
+            "[boot] *** LIVE REAL-MONEY AUTHORIZED (OKX_REAL_MONEY_OK=1) — small sub-account expected ***\n",
+            .{},
+        );
     }
     if (cfg.mode == .demo and okx_env != null and !okx_env.?.simulated and !okx_env.?.real_money_ok) {
-        // Demo trading needs an explicit venue: simulated keys, or a real
-        // small sub-account with the operator's explicit opt-in.
         std.debug.print(
             "[boot] FATAL mode=demo needs OKX_SIMULATED=1 or OKX_REAL_MONEY_OK=1 (refusing implicit real keys)\n",
             .{},
@@ -550,7 +567,7 @@ pub fn main(init: std.process.Init) !u8 {
     }
     if (cfg.mode == .demo and okx_env != null and !okx_env.?.simulated and okx_env.?.real_money_ok) {
         std.debug.print(
-            "[boot] *** REAL-MONEY EXECUTION AUTHORIZED (OKX_REAL_MONEY_OK=1) — small sub-account expected ***\n",
+            "[boot] *** REAL-MONEY via mode=demo (legacy) — prefer mode=live + OKX_REAL_MONEY_OK=1 ***\n",
             .{},
         );
     }
@@ -820,7 +837,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     // ---- RECONCILING --------------------------------------------------------
     // Shadow: engine cash = initial_capital (simulated).
-    // Demo: engine cash/BTC from private REST balance (simulated venue).
+    // Demo/live: engine cash/BTC from private REST balance (exchange book).
     const now_boot = nowMs();
     var boot_cash = cfg.initial_capital;
     var boot_btc = ab.decimal.Decimal.zero;
@@ -830,13 +847,13 @@ pub fn main(init: std.process.Init) !u8 {
         const probe = probePrivateBalanceRetry(gpa, &okx, io, 6);
         switch (probe) {
             .ok => |b| {
-                if (cfg.mode == .demo) {
+                if (cfg.mode.isTrading()) {
                     boot_cash = b.usdt_cash;
                     boot_btc = b.btc_cash;
                     boot_btc_avail = b.btc_avail;
                     std.debug.print(
-                        "[reconcile] demo balance applied usdt={f} avail={f} btc={f}\n",
-                        .{ b.usdt_cash, b.usdt_avail, b.btc_cash },
+                        "[reconcile] {t} balance applied usdt={f} avail={f} btc={f}\n",
+                        .{ cfg.mode, b.usdt_cash, b.usdt_avail, b.btc_cash },
                     );
                 } else {
                     std.debug.print(
@@ -849,15 +866,15 @@ pub fn main(init: std.process.Init) !u8 {
             .err => |e| {
                 std.debug.print("[reconcile] private balance FAILED: {s}\n", .{e});
                 logEvent(&events_repo, &engine, "PRIVATE_BALANCE_FAILED", "exchange", "CRITICAL", &cfg);
-                // Demo real-money: hard-fail only on auth/IP (not retryable blips).
+                // Trading: hard-fail only on auth/IP (not retryable blips).
                 // Temporary API errors boot degraded (not reconciled) until loop recover.
-                if (cfg.mode == .demo) {
+                if (cfg.mode.isTrading()) {
                     const fatal = std.mem.eql(u8, e, "ip_whitelist") or
                         std.mem.eql(u8, e, "invalid_sign") or
                         std.mem.eql(u8, e, "invalid_key") or
                         std.mem.eql(u8, e, "invalid_passphrase");
                     if (fatal) return 1;
-                    std.debug.print("[reconcile] demo boot degraded — will retry private balance in loop\n", .{});
+                    std.debug.print("[reconcile] {t} boot degraded — will retry private balance in loop\n", .{cfg.mode});
                     boot_cash = ab.decimal.Decimal.zero;
                     boot_btc = ab.decimal.Decimal.zero;
                     boot_btc_avail = ab.decimal.Decimal.zero;
@@ -867,7 +884,7 @@ pub fn main(init: std.process.Init) !u8 {
         }
         // AC-SEC1 (code side): real-money execution refuses keys that can
         // withdraw. Read+trade is the ceiling for this agent.
-        if (cfg.mode == .demo and okx_env.?.real_money_ok and !okx_env.?.simulated) {
+        if (cfg.mode.isTrading() and okx_env.?.real_money_ok and !okx_env.?.simulated) {
             if (okx.getPrivate("/api/v5/account/config", nowMs())) |cbody| {
                 defer gpa.free(cbody);
                 if (ab.okx_rest.parseKeyPerms(gpa, cbody)) |perms| {
@@ -944,7 +961,7 @@ pub fn main(init: std.process.Init) !u8 {
             cfg.web_bind,
             if (okx_env != null) "yes" else "no",
             if (llm_client != null) "on" else "off",
-            if (ab.okx_trade.executionAllowed(cfg.mode == .demo, exec_venue_authorized)) "demo" else "off",
+            execLabel(cfg.mode),
         },
     );
     web_state.update(engine.snapshot(), true);
@@ -975,9 +992,9 @@ pub fn main(init: std.process.Init) !u8 {
     var ticker_path_buf: [128]u8 = undefined;
     const ticker_path = std.fmt.bufPrint(&ticker_path_buf, "/api/v5/market/ticker?instId={s}", .{cfg.instrument}) catch return 1;
     // Gate 1: periodic private REST reconcile; private WS is boot probe + optional re-probe.
-    // Demo executes against the real account: reconcile must beat account_ttl_ms
+    // Trading executes against the exchange book: reconcile must beat account_ttl_ms
     // (30s) or the risk kernel flaps NORMAL→EXIT_ONLY between reconciles.
-    const private_reconcile_ms: i64 = if (cfg.mode == .demo) 20_000 else 60_000;
+    const private_reconcile_ms: i64 = if (cfg.mode.isTrading()) 20_000 else 60_000;
     const dashboard_refresh_ms: i64 = 5_000;
     const private_ws_reprobe_ms: i64 = 300_000;
     const backup_interval_ms: i64 = 3_600_000;
@@ -1224,7 +1241,7 @@ pub fn main(init: std.process.Init) !u8 {
         }
 
         // Operator flatten must sell to cash and complete → HALTED (not mode-only).
-        if (cfg.mode == .demo and engine.snapshot().risk_mode == .flattening) {
+        if (cfg.mode.isTrading() and engine.snapshot().risk_mode == .flattening) {
             driveFlattenPosition(
                 gpa,
                 &okx,
@@ -1245,7 +1262,7 @@ pub fn main(init: std.process.Init) !u8 {
         // even while an LLM call blocks the loop for tens of seconds.
         refreshSystemCache(&web_state, &db, &cfg, &mem_store, boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), llm_client != null, admin_paused, &runtime_status, &risk_latency);
 
-        // Slow agent loop: proposals always risk-admitted; demo may execute.
+        // Slow agent loop: proposals always risk-admitted; trading modes may execute.
         // Paused: keep risk/market/reconcile; skip agent decisions.
         // While FLATTENING/HALTED, skip agent so it cannot fight the exit path.
         if (!admin_paused and engine.snapshot().risk_mode != .flattening and engine.snapshot().risk_mode != .halted) {
@@ -1665,7 +1682,7 @@ fn runPrivateReconcile(
     const probe = probePrivateBalance(gpa, okx);
     switch (probe) {
         .ok => |b| {
-            if (cfg.mode == .demo) {
+            if (cfg.mode.isTrading()) {
                 _ = engine.apply(.{ .reconcile_result = .{
                     .ts_ms = nowMs(),
                     .cash_usdt = b.usdt_cash,
@@ -1675,8 +1692,8 @@ fn runPrivateReconcile(
                     .clean = true,
                 } }) catch {};
                 std.debug.print(
-                    "[reconcile] demo balance applied usdt={f} avail={f} btc={f}\n",
-                    .{ b.usdt_cash, b.usdt_avail, b.btc_cash },
+                    "[reconcile] {t} balance applied usdt={f} avail={f} btc={f}\n",
+                    .{ cfg.mode, b.usdt_cash, b.usdt_avail, b.btc_cash },
                 );
             } else {
                 std.debug.print(
@@ -2027,12 +2044,12 @@ fn refreshBeforeAdmission(
             } }) catch {};
         } else |_| {}
     } else |_| {}
-    if (cfg.mode == .demo) {
+    if (cfg.mode.isTrading()) {
         _ = refreshDemoPortfolio(gpa, okx, engine);
     }
 }
 
-/// Operator path probe: same admission + demo execution stack as agent REBALANCE.
+/// Operator path probe: same admission + trading execution stack as agent REBALANCE.
 /// Used to unblock Gate3 order-path verification without waiting on LLM HOLD bias.
 /// While risk_mode=FLATTENING: market-sell toward weight 0; when dust, emit flatten_complete → HALTED.
 fn driveFlattenPosition(
@@ -2116,7 +2133,7 @@ fn runOperatorTargetWeight(
         logEventPayload(events_repo, engine, "ADMIN_TARGET_WEIGHT", "admin", "WARN", cfg, "{\"error\":\"weight_out_of_range\"}");
         return "bad_weight";
     }
-    if (!ab.okx_trade.executionAllowed(cfg.mode == .demo, exec_venue_authorized)) {
+    if (!ab.okx_trade.executionAllowed(cfg.mode.isTrading(), exec_venue_authorized)) {
         logEventPayload(events_repo, engine, "ADMIN_TARGET_WEIGHT", "admin", "WARN", cfg, "{\"error\":\"execution_not_allowed\"}");
         return "exec_off";
     }
@@ -2347,7 +2364,7 @@ fn runAgentDecision(
     if (prop.action == .hold) {
         exec_note = "hold";
         logEventPayload(events_repo, engine, "EXEC_HOLD", "execution", "INFO", cfg, "{\"reason\":\"action_hold\"}");
-    } else if (ab.okx_trade.executionAllowed(cfg.mode == .demo, exec_venue_authorized)) {
+    } else if (ab.okx_trade.executionAllowed(cfg.mode.isTrading(), exec_venue_authorized)) {
         exec_note = tryDemoExecute(
             gpa,
             okx,
@@ -2973,7 +2990,7 @@ fn queryAndResolveOrder(
     };
 }
 
-/// Cancel pending demo orders (shadow: no-op count 0).
+/// Cancel pending trading orders (shadow: no-op count 0).
 fn adminCancelAll(
     gpa: std.mem.Allocator,
     okx: *ab.okx_rest.Client,
@@ -2981,7 +2998,7 @@ fn adminCancelAll(
     engine: *ab.state.Engine,
     events_repo: *ab.storage.EventsRepo,
 ) usize {
-    if (!ab.okx_trade.executionAllowed(cfg.mode == .demo, exec_venue_authorized)) return 0;
+    if (!ab.okx_trade.executionAllowed(cfg.mode.isTrading(), exec_venue_authorized)) return 0;
 
     var path_buf: [160]u8 = undefined;
     const path = ab.okx_trade.formatPendingPath(&path_buf, cfg.instrument) catch return 0;
@@ -3092,7 +3109,7 @@ fn seedBootstrapMemories(
         .kind = .working,
         .status = .active,
         .confidence = ab.decimal.Decimal.parse("0.95") catch ab.decimal.Decimal.one,
-        .content_json = "{\"summary\":\"Execution is risk-gated: only admitted REBALANCE weights may trade; live mode stays locked until Gate4.\",\"tags\":[\"demo\",\"BTC-USDT\",\"policy\"]}",
+        .content_json = "{\"summary\":\"Execution is risk-gated: only admitted REBALANCE weights may trade; live needs OKX_REAL_MONEY_OK=1 on a small sub-account.\",\"tags\":[\"live\",\"BTC-USDT\",\"policy\"]}",
     } }, now, &touched) catch {};
     store.applyOp(.{ .create = .{
         .memory_id = "H_btc_spot_default",
@@ -3218,7 +3235,7 @@ fn refreshSystemCache(
     w.print(
         "\"execution\":{{\"enabled\":{},\"real_money\":{}}},",
         .{
-            ab.okx_trade.executionAllowed(cfg.mode == .demo, exec_venue_authorized),
+            ab.okx_trade.executionAllowed(cfg.mode.isTrading(), exec_venue_authorized),
             exec_real_money,
         },
     ) catch return;
@@ -3874,11 +3891,17 @@ fn webThreadMain(io: std.Io, host: []const u8, port: u16, ws: *WebState) void {
 
 var event_counter = std.atomic.Value(u64).init(0);
 
-/// Venue authorization for demo execution: simulated keys, or explicit
+/// Venue authorization for trading execution: simulated keys, or explicit
 /// real-money opt-in (OKX_REAL_MONEY_OK=1). Set once during boot.
 var exec_venue_authorized: bool = false;
 /// True only when real (non-simulated) keys run with explicit opt-in.
 var exec_real_money: bool = false;
+
+fn execLabel(mode: ab.config.Mode) []const u8 {
+    if (!ab.okx_trade.executionAllowed(mode.isTrading(), exec_venue_authorized)) return "off";
+    if (exec_real_money) return "live";
+    return "demo";
+}
 
 fn logEvent(
     repo: *ab.storage.EventsRepo,

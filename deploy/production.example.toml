@@ -1,14 +1,16 @@
-# Example production config (shadow). Copy to /etc/alphabound/alphabound.toml
+# Example production config. Copy to /etc/alphabound/alphabound.toml
 # Secrets: /etc/alphabound/secrets.env (0600) — never commit real keys.
+# Modes: shadow (default, no orders) | demo (OKX_SIMULATED=1) |
+#        live (small sub-account + OKX_REAL_MONEY_OK=1).
 
 [app]
 environment = "production"
-instance_id = "btc-shadow-01"
+instance_id = "btc-01"
 
 [exchange]
 provider = "okx"
 instrument = "BTC-USDT"
-mode = "shadow"
+mode = "shadow"               # set "live" for small-capital real money
 poll_interval_ms = 5000
 
 [risk]

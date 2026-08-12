@@ -89,7 +89,7 @@ curl -sS https://api.ipify.org; echo   # 把该 IP 加到 OKX API Key 白名单
 [shutdown] draining after 5 ticks
 ```
 
-`mode=live` 在 Gate 4 前会被进程直接拒绝。
+`mode=live` 需要 `OKX_REAL_MONEY_OK=1` 与小额子账号密钥；详见 [运行模式](modes.md)。
 
 ## 6. 探活与 Dashboard
 

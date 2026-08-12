@@ -48,7 +48,7 @@
 | AC-GO5 | 所有订单可追溯到 decision_id、snapshot_version、risk decision 和 config_hash | Replay(审计链抽查) | ◐ `--verify-db` 审计链:订单→AGENT_PROPOSAL_OK **或** ADMIN_TARGET_WEIGHT + ORDER_* + 无孤儿 fills;单测含 operator 锚点;`scripts/audit-go5.sh` 远端抽查;2026-08-12 真实 agent REBALANCE 样本已有 exchange_id |
 | AC-GO6 | 未知订单/陈旧数据/数据库异常进入安全状态,不默认继续增仓 | Fault Injection | ◐ 未知订单→`order_ambiguity`→degraded(单测);陈旧数据→admission REJECT `stale_data`(property);DB 审计写失败→`journal_ok=false`→exit_only、写恢复自愈(2026-08-12 新增,state 单测锁定;行情新鲜不能单独清除降级);进程级 fault 注入演练待做 |
 | AC-GO7 | Dashboard 可完整回放一笔交易从观察到反思的链路 | Manual(UI 走查) | ◐ 决策展开含 admission/exec + **按 decision_id 关联订单/成交**; 完整链路 UI 走查待 Demo |
-| AC-GO8 | Demo Trading 连续稳定 ≥7 天,完成 ≥1 次断线恢复和 ≥1 次版本回滚演练 | Soak + Manual | ◐ 版本回滚演练 ≥1 次 PASS(2026-08-12 双向);kill -9/重启恢复演练 PASS;执行场所已就绪(小额实盘子账号+`OKX_REAL_MONEY_OK=1`,2026-08-12 生产 demo 模式上线);7 天滚动 soak 窗口积累中 |
+| AC-GO8 | 交易模式连续稳定 ≥7 天,完成 ≥1 次断线恢复和 ≥1 次版本回滚演练 | Soak + Manual | ◐ 版本回滚演练 ≥1 次 PASS(2026-08-12 双向);kill -9/重启恢复演练 PASS;执行场所已就绪(`mode=live`+小额子账号+`OKX_REAL_MONEY_OK=1`);7 天滚动 soak 窗口积累中 |
 
 ## D. 风险内核专项(§5)
 
@@ -111,7 +111,7 @@
 | Gate 1(P1 退出) | AC-FR01/02、AC-FR09(基础)、AC-SEC4/8、AC-OPS1/2/3 |
 | Gate 2(P2 退出) | AC-FR03/04/07/08(市场类)、AC-NFR03、AC-SEC3/5/6/7、AC-OPS7/8 |
 | Gate 3(P3 退出) | AC-FR05/06/10、AC-NFR01/02/04/05/06、AC-RK1..6、AC-FD1..10、AC-OPS4/5/6/9 |
-| Gate 4(实盘进入) | AC-GO1..8 + AC-SEC1/2 + 以上全部 |
+| Gate 4(MVP 运维判定) | AC-GO1..8 + AC-SEC1/2 + 以上全部；小额 live 已在 Gate3 解锁 |
 
 > 维护约定: 每次闸门评审更新状态列并附证据链接(CI run / 演练记录 / 评审纪要);
 > 新增需求先补矩阵行再写代码。

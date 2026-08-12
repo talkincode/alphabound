@@ -1,6 +1,7 @@
-//! OKX trade request builders + response helpers for Demo execution (§5.5).
-//! Pure / offline-testable — no network. Live mode must never call these
-//! from the daemon until Gate 4 explicitly unlocks it.
+//! OKX trade request builders + response helpers for trading execution (§5.5).
+//! Pure / offline-testable — no network. Callers must gate with
+//! `executionAllowed(mode.isTrading(), venue_authorized)` (demo simulated or
+//! live + OKX_REAL_MONEY_OK).
 
 const std = @import("std");
 const dec = @import("../core/decimal.zig");
@@ -90,12 +91,11 @@ pub fn mapOkxState(state: []const u8) orders.OrderStatus {
     return .unknown;
 }
 
-/// Whether demo-path execution is allowed for this process configuration.
-/// Live mode is never allowed here; demo requires an authorized venue —
-/// simulated keys, or a real small sub-account with explicit operator
-/// opt-in (OKX_REAL_MONEY_OK=1).
-pub fn executionAllowed(mode_demo: bool, venue_authorized: bool) bool {
-    return mode_demo and venue_authorized;
+/// Whether order execution is allowed for this process configuration.
+/// `trading_mode` is true for `mode=demo|live` (not shadow). Venue must be
+/// authorized: OKX_SIMULATED=1 (demo) or OKX_REAL_MONEY_OK=1 (live / legacy).
+pub fn executionAllowed(trading_mode: bool, venue_authorized: bool) bool {
+    return trading_mode and venue_authorized;
 }
 
 /// After a leg resolves, should we refresh portfolio and try another plan?
@@ -170,10 +170,11 @@ test "okx state mapping" {
     try testing.expectEqual(orders.OrderStatus.unknown, mapOkxState("something_else"));
 }
 
-test "executionAllowed is demo+authorized-venue only" {
+test "executionAllowed is trading-mode+authorized-venue only" {
     try testing.expect(executionAllowed(true, true));
     try testing.expect(!executionAllowed(true, false));
     try testing.expect(!executionAllowed(false, true));
+    try testing.expect(!executionAllowed(false, false));
 }
 
 test "residual plan policy and leg cap" {

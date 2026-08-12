@@ -5,15 +5,15 @@
 | 模式 | 行情 | 账户 | 下单 | 适用阶段 |
 |---|---|---|---|---|
 | **shadow** | 实网公共行情 | 模拟（`initial_capital`） | **否** | 开发、CI、观察链路 |
-| **demo** | OKX Demo | Demo 账户 | Demo 单 | Phase 3 闸门、7 日 soak |
-| **live** | 实盘 | 实盘（小资金） | **真单** | Phase 4，验收矩阵全绿后 |
+| **demo** | OKX 模拟盘 | Demo 账户 | 模拟盘单 | 无实盘密钥时的联调 |
+| **live** | 实盘 | 小额实盘子账号 | **真单** | 当前默认实盘路径（显式 opt-in） |
 
 ## shadow（默认）
 
 - 连接 OKX 公共 REST（时间、ticker 等），**不需要** API Key。
 - 启动时注入模拟账户（`initial_capital` USDT，BTC=0），`reconcile_result` 标记 clean。
 - 风险内核、状态机、事件落库、Dashboard **全链路真实代码路径**。
-- Agent 若接入，提案可算、可审计，但执行层不得对实盘发单。
+- Agent 若接入，提案可算、可审计，但执行层不得对交易所发单。
 
 适合：
 
@@ -21,13 +21,12 @@
 ./zig-out/bin/alphabound --config dev.toml --ticks 20
 ```
 
-## demo
+## demo（OKX 模拟盘）
 
 - 使用 OKX **模拟盘密钥** + 请求头 `x-simulated-trading: 1`（环境变量 **`OKX_SIMULATED=1` 必填**）。
 - 引擎现金/BTC 来自私有 REST 余额（不再用 shadow 的 `initial_capital`）。
-- Agent 提案经 Risk 准入后：`APPROVE`/`REDUCE` → planner → **市价单**；HTTP 失败 → `UNKNOWN` → 查询后处置。
-- Admin：`cancel-all` 会拉取 pending 并撤单；`flatten` 切风险态。
-- **Gate 3 / AC-GO8**：连续稳定 ≥7 天 + 至少一次断线恢复与版本回滚演练。清单：[GATE3_CHECKLIST.md](../../docs/GATE3_CHECKLIST.md)。
+- Agent 提案经 Risk 准入后：`APPROVE`/`REDUCE` → planner → **市价/限价单**；HTTP 失败 → `UNKNOWN` → 查询后处置。
+- Admin：`cancel-all` / `flatten` / `target-weight` 走同一执行栈。
 
 ```bash
 export OKX_API_KEY=...
@@ -36,24 +35,34 @@ export OKX_API_PASSPHRASE=...
 export OKX_SIMULATED=1
 # config: mode = "demo"
 ./zig-out/bin/alphabound --config config/local.toml --agent-once --ticks 8
-# 日志: admit=APPROVE|REDUCE exec=filled|acked|...
 ```
 
-切换前检查清单：
+> **兼容**：历史部署可用 `mode=demo` + `OKX_REAL_MONEY_OK=1` 跑小额真金；boot 会告警，**请改 `mode=live`**。
 
-1. `mode = "demo"` 且 **`OKX_SIMULATED=1`**（缺一则 boot FATAL）
-2. Demo 密钥权限最小化；出口 IP 在 OKX 白名单
-3. `--self-check` 私有余额通过
-4. ready 探针在对账后变绿
-5. **live 仍被代码拒绝**，勿改 mode 碰运气
+## live（小额实盘 — 当前路径）
 
-## live
+- 真金白银，设计默认实验资金约 **100 USDT 子账号**。
+- **已解锁**，但必须同时满足：
+  1. `mode = "live"`
+  2. `OKX_*` 密钥（**Read+Trade，禁止 Withdraw**）
+  3. **`OKX_REAL_MONEY_OK=1`**（显式 opt-in，从不默认）
+  4. **不得**设 `OKX_SIMULATED=1`（live 拒绝模拟盘 header）
+- Boot 打印醒目 banner；启动时探测 key 权限，带 withdraw 的 key 直接 FATAL。
+- 风险边界 = 子账号余额 + `max_drawdown`；主账户/大资金不在范围内。
 
-- 真金白银。设计默认实验资金 **100 USDT**。
-- **当前二进制直接拒绝 `mode=live`**（Gate 4 前）。
-- 进入条件：路线图 Gate 3 + 验收矩阵 P0–P3 相关条目全绿；任何无法解释的状态不一致都阻止实盘。
-- `max_drawdown`、费率、滑点等已按发版流程冻结。
-- 建议：先 shadow 长跑 → demo 7 日 → live，**禁止**从开发配置直接改 `live`。
+```bash
+export OKX_API_KEY=...
+export OKX_API_SECRET=...
+export OKX_API_PASSPHRASE=...
+export OKX_REAL_MONEY_OK=1
+# config: mode = "live"
+./zig-out/bin/alphabound --config /etc/alphabound/alphabound.toml
+# 日志: [boot] *** LIVE REAL-MONEY AUTHORIZED ...
+#        [ready] mode=live ... exec=live
+```
+
+Gate / 运维清单见 [GATE3_CHECKLIST.md](../../docs/GATE3_CHECKLIST.md)。  
+「更大资金 / MVP 成立判定」仍是路线图 Phase 4 的运维与验收问题，**不是**再开一把代码锁。
 
 ## 模式与风险状态机正交
 
@@ -65,15 +74,15 @@ NORMAL → EXIT_ONLY → FLATTENING → HALTED
 
 - 数据陈旧 / 未对账 → fail-closed，常从 `EXIT_ONLY` 起步
 - 回撤边界触发 → `FLATTENING` → 完成后可 `HALTED`
-- `HALTED` **不**自动恢复交易，需人工与发版流程介入
+- `HALTED` **不**自动恢复交易，需人工 `resume`（含 operator_reset）
 
-shadow 下也会演练状态机（例如人工压测陈旧数据），只是不会碰到真实资金。
+shadow 下也会演练状态机，只是不会碰到真实资金。
 
 ## 切换操作建议
 
 ```toml
 # 1. 改配置（新文件或发版产物），不要热改内存
-mode = "demo"   # 或 live
+mode = "live"   # 或 demo / shadow
 ```
 
 ```bash

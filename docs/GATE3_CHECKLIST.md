@@ -1,13 +1,13 @@
 # Gate 3 验收清单（Demo Trading）
 
-> 目标：Risk Kernel + Execution 在 **demo 授权场所** 全链路可跑，故障可降级。  
-> 授权场所 = OKX 模拟盘（`OKX_SIMULATED=1`）**或** 小额实盘子账号 + 显式开关（`OKX_REAL_MONEY_OK=1`）。  
-> 当前采用后者：≈100 USDT 子账号，风险边界即子账号余额。`mode=live` 仍锁死（Gate 4）。  
+> 目标：Risk Kernel + Execution 在 **授权交易场所** 全链路可跑，故障可降级。  
+> 授权场所 = OKX 模拟盘（`mode=demo` + `OKX_SIMULATED=1`）**或** 小额实盘子账号（`mode=live` + `OKX_REAL_MONEY_OK=1`）。  
+> **当前主路径**：≈100 USDT 子账号 + `mode=live`；风险边界即子账号余额。  
 > 退出条件见 [ROADMAP.md](ROADMAP.md) Phase 3。滚动任务见 [NEXT.md](NEXT.md)。
 
 ## 已具备（代码）
 
-- [x] `mode=demo` 启动闸：必须 `OKX_*` + （`OKX_SIMULATED=1` 或显式 `OKX_REAL_MONEY_OK=1`）；`mode=live` 仍直接拒绝；实盘授权时 boot 打印醒目 banner，且真实 key 绝不发送模拟盘 header
+- [x] 交易模式启动闸：`demo` → `OKX_*` + `OKX_SIMULATED=1`（或 legacy `REAL_MONEY`）；`live` → `OKX_*` + `OKX_REAL_MONEY_OK=1` 且拒绝 `SIMULATED`；实盘 banner + withdraw 权限探测；真实 key 绝不发送模拟盘 header
 - [x] Demo 对账：私有 REST 余额写入引擎（非 shadow 模拟本金）
 - [x] 提案 → `admission.admit` → planner → 市价单（`tgtCcy=base_ccy`）
 - [x] 幂等 `client_order_id`（`ab` + hash）+ `orders` 表投影
@@ -33,7 +33,7 @@
 
 ```toml
 [exchange]
-mode = "demo"
+mode = "live"                 # 小额实盘主路径；模拟盘用 "demo"
 instrument = "BTC-USDT"
 ```
 
@@ -41,9 +41,10 @@ instrument = "BTC-USDT"
 export OKX_API_KEY=...
 export OKX_API_SECRET=...
 export OKX_API_PASSPHRASE=...
-export OKX_SIMULATED=1        # 模拟盘 key
-# 或：小额实盘子账号（显式二次确认，绝不默认）
-# export OKX_REAL_MONEY_OK=1
+# 小额实盘（显式二次确认，绝不默认）
+export OKX_REAL_MONEY_OK=1
+# 模拟盘则改为 mode=demo 且：
+# export OKX_SIMULATED=1
 # 可选 LLM
 export LLM_API_KEY=...
 ```
@@ -52,7 +53,7 @@ export LLM_API_KEY=...
 
 | # | 项 | 状态 |
 |---|---|---|
-| 1 | 执行场所就绪（实盘子账号 ≈100 USDT + `OKX_REAL_MONEY_OK=1`，代替模拟盘） | ☑ 2026-08-12 |
+| 1 | 执行场所就绪（`mode=live` + 实盘子账号 ≈100 USDT + `OKX_REAL_MONEY_OK=1`） | ☑ 2026-08-12（配置迁 live） |
 | 2 | 私有余额对账 ok（`[reconcile] demo balance applied usdt=… btc=…`） | ☑ 2026-08-12（含 excess-decimal 修复后对账） |
 | 3 | 一轮决策出现 `exec=filled`（非 shadow `not_executed`） | ☑ 2026-08-12 operator `target-weight=0.05` → FILLED；agent HOLD 现为 `exec=hold` no-op |
 | 4 | Dashboard/events 可见 `ORDER_*` + orders/fills 投影 | ☑ 2026-08-12（多笔 buy/sell FILLED；exchange_order_id 保留修复随后） |
@@ -67,5 +68,6 @@ export LLM_API_KEY=...
 
 ## 安全提醒
 
-- **永远不要**在未过 Gate 3 时把 `mode` 设为 `live`
-- Demo 密钥也不得提交仓库；日志已脱敏，仍勿打印完整响应中的敏感头
+- `mode=live` 仅限**小额子账号** + `OKX_REAL_MONEY_OK=1`；禁止 withdraw 权限 key  
+- 密钥不得提交仓库；日志已脱敏，仍勿打印完整响应中的敏感头  
+- 主账户 / 大资金扩容仍走 Phase 4 运维判定，不是关掉 opt-in

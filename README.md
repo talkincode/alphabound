@@ -8,7 +8,7 @@
 
 | | |
 |---|---|
-| **现在能做什么** | **Shadow**（默认）：行情 + LLM 提案 + 风险准入审计 + Dashboard，**不下单**。**Demo**（需模拟盘密钥）：准入通过后可在 OKX 模拟盘下市价单 |
+| **现在能做什么** | **Shadow**（默认）：行情 + LLM 提案 + 风险准入审计 + Dashboard，**不下单**。**Demo**：OKX 模拟盘下单。**Live**：小额实盘子账号 + `OKX_REAL_MONEY_OK=1` 真单（显式 opt-in） |
 | **实验范围** | OKX `BTC-USDT` 现货 · 设计目标约 100 USDT 实验资金 |
 | **硬边界** | 相对历史高水位（HWM）约 **10%** 最大回撤（工程目标，非绝对保证） |
 | **技术栈** | Zig 0.16.0 · SQLite WAL · systemd · 单文件嵌入式 Dashboard |
@@ -31,7 +31,7 @@
 记忆与反思 ← 结算与归因 ← 订单/成交 ←──┘
 ```
 
-当前公开进度：**Shadow 闭环已通**（观察 → 提案 → 反思 → Dashboard）。模拟盘 / 实盘下单仍在闸门之后，见 [路线图](docs/ROADMAP.md)。
+当前公开进度：**Shadow 闭环已通**；**小额 live 下单路径已解锁**（须显式 `OKX_REAL_MONEY_OK=1`）。见 [路线图](docs/ROADMAP.md) · [运行模式](https://talkincode.github.io/alphabound/guide/modes.html)。
 
 > **风险说明**：「最大回撤 10%」是系统设计目标，不是承诺。跳空、流动性枯竭、交易所或网络故障都可能导致边界被穿透；系统会尽量留退出缓冲，并**如实记录**任何突破。
 
@@ -185,13 +185,14 @@ alphabound/
 ## 当前阶段（诚实版）
 
 ```
-Phase 0 可行性  →  1 只读观察  →  2 Shadow（不下单）  →  3 Demo  →  4 小资金实盘  →  5 数据工具
-                         ▲ 你在这里附近（闭环已通，长稳与 Demo 闸门未完）
+Phase 0 可行性  →  1 只读观察  →  2 Shadow（不下单）  →  3 交易路径  →  4 MVP 运维判定  →  5 数据工具
+                                              ▲ 小额 live 已可跑（显式 opt-in）
 ```
 
-- **已有**：Shadow 闭环、风险准入审计、Demo 最小下单路径、Dashboard、备份、部署骨架  
-- **还在做**：Gate 2 长稳 soak、Demo 7 日与故障注入、私有 WS  
-- **不要指望**：默认配置可直接实盘（`mode=live` 被代码拒绝）  
+- **已有**：Shadow 闭环、风险准入审计、小额 `mode=live` 下单路径、Dashboard、备份、部署骨架  
+- **还在做**：滚动 soak、故障矩阵逐项、Phase 5 L1 引用率观察  
+- **不要指望**：默认 shadow 配置会下单；live 必须 `OKX_REAL_MONEY_OK=1` + 子账号  
+
 
 细节与勾选：[ROADMAP](docs/ROADMAP.md) · [NEXT](docs/NEXT.md) · [GATE2](docs/GATE2_CHECKLIST.md) · [GATE3](docs/GATE3_CHECKLIST.md)
 
