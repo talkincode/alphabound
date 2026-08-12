@@ -324,11 +324,17 @@ pub fn parseOrderAck(gpa: std.mem.Allocator, body: []const u8) Error!OrderAck {
 pub const OrderQuery = struct {
     status_buf: [24]u8 = undefined,
     status_len: usize = 0,
+    exchange_order_id_buf: [32]u8 = undefined,
+    exchange_order_id_len: usize = 0,
     filled_qty: Decimal,
     avg_price: Decimal,
 
     pub fn status(self: *const OrderQuery) []const u8 {
         return self.status_buf[0..self.status_len];
+    }
+
+    pub fn exchangeOrderId(self: *const OrderQuery) []const u8 {
+        return self.exchange_order_id_buf[0..self.exchange_order_id_len];
     }
 };
 
@@ -342,12 +348,18 @@ pub fn parseOrderQuery(gpa: std.mem.Allocator, body: []const u8) Error!OrderQuer
     const acc_fill = try getString(obj, "accFillSz");
     const avg_px = try getString(obj, "avgPx");
     var q = OrderQuery{
-        .filled_qty = if (acc_fill.len == 0) Decimal.zero else Decimal.parse(acc_fill) catch return Error.MalformedResponse,
-        .avg_price = if (avg_px.len == 0) Decimal.zero else Decimal.parse(avg_px) catch return Error.MalformedResponse,
+        .filled_qty = if (acc_fill.len == 0) Decimal.zero else Decimal.parseLossy(acc_fill) catch return Error.MalformedResponse,
+        .avg_price = if (avg_px.len == 0) Decimal.zero else Decimal.parseLossy(avg_px) catch return Error.MalformedResponse,
     };
     if (state.len > q.status_buf.len) return Error.MalformedResponse;
     @memcpy(q.status_buf[0..state.len], state);
     q.status_len = state.len;
+    if (getString(obj, "ordId")) |ord_id| {
+        if (ord_id.len > 0 and ord_id.len <= q.exchange_order_id_buf.len) {
+            @memcpy(q.exchange_order_id_buf[0..ord_id.len], ord_id);
+            q.exchange_order_id_len = ord_id.len;
+        }
+    } else |_| {}
     return q;
 }
 
@@ -635,10 +647,11 @@ test "parse order ack" {
 
 test "parse order query filled" {
     const body =
-        \\{"code":"0","msg":"","data":[{"state":"filled","accFillSz":"0.0001","avgPx":"100000.1"}]}
+        \\{"code":"0","msg":"","data":[{"ordId":"312269865356374099","state":"filled","accFillSz":"0.0001","avgPx":"100000.1"}]}
     ;
     const q = try parseOrderQuery(testing.allocator, body);
     try testing.expectEqualStrings("filled", q.status());
+    try testing.expectEqualStrings("312269865356374099", q.exchangeOrderId());
     try testing.expect(q.filled_qty.eql(d("0.0001")));
     try testing.expect(q.avg_price.eql(d("100000.1")));
 }

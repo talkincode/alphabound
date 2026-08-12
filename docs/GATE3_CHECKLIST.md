@@ -53,15 +53,17 @@ export LLM_API_KEY=...
 | # | 项 | 状态 |
 |---|---|---|
 | 1 | 执行场所就绪（实盘子账号 ≈100 USDT + `OKX_REAL_MONEY_OK=1`，代替模拟盘） | ☑ 2026-08-12 |
-| 2 | 私有余额对账 ok（`[reconcile] demo balance applied usdt=100`） | ☑ 2026-08-12 |
-| 3 | 一轮 agent 出现 `exec=filled\|acked\|...`（非 shadow `not_executed`） | ☐ |
-| 4 | Dashboard/events 可见 `ORDER_*` | ☐ |
+| 2 | 私有余额对账 ok（`[reconcile] demo balance applied usdt=… btc=…`） | ☑ 2026-08-12（含 excess-decimal 修复后对账） |
+| 3 | 一轮决策出现 `exec=filled`（非 shadow `not_executed`） | ☑ 2026-08-12 operator `target-weight=0.05` → FILLED；agent HOLD 现为 `exec=hold` no-op |
+| 4 | Dashboard/events 可见 `ORDER_*` + orders/fills 投影 | ☑ 2026-08-12（多笔 buy/sell FILLED；exchange_order_id 保留修复随后） |
 | 5 | `--control cancel-all` 清空 pending | ☐ |
 | 6 | `--control flatten` 后不再增仓（admission REJECT） | ☐ |
-| 7 | 滚动 24h 窗口 0 次非预期退出（`soak-report.sh 24` PASS；向 168h 窗口迈进） | ☐ |
+| 7 | 滚动 24h 窗口 0 次非预期退出（`soak-report.sh 24` PASS；向 168h 窗口迈进） | ☐ 滚动观察中（持续部署豁免） |
 | 8 | 断线恢复演练 | ◐（kill -9 恢复 + 重启对账×3 + LLM 断连均 PASS；OKX WS 断线注入待 demo） |
 | 9 | 版本回滚演练 | ☑ 2026-08-12（`scripts/rollback-remote.sh` 双向 PASS；health 门禁自动回滚已真实触发过一次） |
 | 10 | 故障矩阵 AC-FD1..10 逐项 | ☐ |
+| 11 | HOLD 不交易 / 仅 REBALANCE 改仓 | ☑ 2026-08-12（曾误把 HOLD weight=0 当清仓，已修） |
+| 12 | 残差 replan 不在余额滞后时连买 | ☑ 2026-08-12 |
 
 ## 安全提醒
 

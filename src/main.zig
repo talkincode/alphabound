@@ -2662,6 +2662,7 @@ fn queryAndResolveOrder(
     const avg_s = if (q.avg_price.gt(ab.decimal.Decimal.zero)) decFmt(&avg_buf, q.avg_price) else "market";
     orders_repo.upsert(.{
         .client_order_id = cl_id,
+        .exchange_order_id = q.exchangeOrderId(),
         .decision_id = decision_id,
         .side = side,
         .qty = qty_s,

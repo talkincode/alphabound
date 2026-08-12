@@ -409,8 +409,11 @@ pub const OrdersRepo = struct {
             \\  side, qty, price, status, created_ts, updated_ts)
             \\VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
             \\ON CONFLICT(client_order_id) DO UPDATE SET
-            \\  exchange_order_id = excluded.exchange_order_id,
+            \\  exchange_order_id = CASE
+            \\    WHEN excluded.exchange_order_id = '' THEN orders.exchange_order_id
+            \\    ELSE excluded.exchange_order_id END,
             \\  status = excluded.status,
+            \\  price = excluded.price,
             \\  updated_ts = excluded.updated_ts
         ) };
     }
@@ -1163,6 +1166,25 @@ test "orders upsert projection" {
     const json = try repo.listRecentJson(&db, &json_buf, 10);
     try testing.expect(std.mem.indexOf(u8, json, "\"status\":\"FILLED\"") != null);
     try testing.expect(std.mem.indexOf(u8, json, "okx-777") != null);
+
+    // Query-path upsert with empty exchange_order_id must not wipe ACK ordId.
+    try repo.upsert(.{
+        .client_order_id = "ab0011223344556677889900aabbccdd",
+        .exchange_order_id = "",
+        .decision_id = "dec_001",
+        .side = "buy",
+        .qty = "0.00100000",
+        .price = "100001.5",
+        .status = "FILLED",
+        .created_ts = "t1",
+        .updated_ts = "t3",
+    });
+    var stmt2 = try db.prepare("SELECT exchange_order_id, price FROM orders WHERE client_order_id = ?1");
+    defer stmt2.finalize();
+    try stmt2.bindText(1, "ab0011223344556677889900aabbccdd");
+    try testing.expect(try stmt2.step());
+    try testing.expectEqualStrings("okx-777", stmt2.columnText(0));
+    try testing.expectEqualStrings("100001.5", stmt2.columnText(1));
 }
 
 test "fills idempotent, equity samples, agent runs and tool calls" {
