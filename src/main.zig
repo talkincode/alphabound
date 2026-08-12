@@ -526,7 +526,7 @@ pub fn main(init: std.process.Init) !u8 {
     // AC-FD8: if a DB file already exists and open fails, refuse boot — never
     // silently recreate an empty trading database over a corrupted file.
     const db_existed = blk: {
-        std.fs.cwd().access(cfg.db_path, .{}) catch break :blk false;
+        std.Io.Dir.cwd().access(io, cfg.db_path, .{}) catch break :blk false;
         break :blk true;
     };
 
