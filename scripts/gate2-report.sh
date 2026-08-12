@@ -55,6 +55,12 @@ mode = s.get("mode") or s.get("exchange_mode") or "?"
 
 invalid_rate = (100.0 * invalid / total) if total else 0.0
 
+st = s.get("status") or {}
+disk = st.get("disk") or "unknown"
+disk_free = st.get("disk_free_bytes")
+llm = st.get("llm") or "unknown"
+llm_detail = st.get("llm_detail") or ""
+
 print("=== Gate 2 report ===")
 print(f"health.live={live!r} health.ready={ready!r}")
 print(f"mode={mode} paused={paused}")
@@ -62,9 +68,20 @@ print(
     f"agent total={total} ok={ok} invalid={invalid} errors={errors} "
     f"valid_rate={valid_rate:.1f}% invalid_rate={invalid_rate:.1f}% tool_calls={tools}"
 )
+free_txt = ""
+if isinstance(disk_free, (int, float)) and disk_free > 0:
+    free_txt = f" free_bytes={int(disk_free)}"
+print(f"disk={disk}{free_txt} llm={llm}" + (f"/{llm_detail}" if llm_detail else ""))
 
 fails = []
 warns = []
+
+if disk in ("low", "critical"):
+    fails.append(f"disk band {disk} (FD7)")
+elif disk == "unknown":
+    warns.append("disk band unknown (probe not yet run)")
+if llm in ("error",):
+    warns.append(f"llm={llm}" + (f" detail={llm_detail}" if llm_detail else ""))
 
 if live.strip() not in ("ok", "OK", '{"status":"ok"}', "alive") and "live" not in live.lower() and live.strip() != "true":
     # Accept plain "ok" or any non-empty 2xx body from health/live.

@@ -3,10 +3,11 @@
 > 与 [ROADMAP.md](ROADMAP.md)、[GATE2_CHECKLIST.md](GATE2_CHECKLIST.md)、[GATE3_CHECKLIST.md](GATE3_CHECKLIST.md) 对齐。
 
 **当前焦点（2026-08）**: Gate 2 24h soak + Gate 3 Demo 联调；**live 仍禁用**。  
-**已合并**: PR #1（orders API / scheduler / fills / partial replan）。  
+**已合并**: PR #1–#3（orders/scheduler/partial replan、fault matrix、limit、LLM timeout、FD7/8 disk）。  
 **本迭代**:
 - ✅ Gate3 **故障矩阵单测** `src/fault/matrix.zig`（AC-FD1..5/9 + replan cap）
 - ✅ 决策详情 **关联订单/成交**（decision_id → orders/fills）
+- ✅ FD6 关键写路径 `stepCritical` busy 重试
 
 ---
 

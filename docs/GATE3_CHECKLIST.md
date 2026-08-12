@@ -25,6 +25,7 @@
 - [x] OKX REST：keep-alive off + transport reset 重试  
 - [x] FD7：DB 卷 `statvfs` 周期探测 → `disk_ok` / EXIT_ONLY / critical→HALTED + system `disk`  
 - [x] FD8：已存在 DB 打开失败拒绝启动（不静默空库）
+- [x] FD6：关键写 `Stmt.stepCritical` busy 重试；gate2-report / check-remote 展示 disk+llm
 
 ## 配置最小集
 
