@@ -167,6 +167,10 @@ Phase 0 ──► Phase 1 ──► Phase 2 ──► Phase 3 ──► Phase 4 
 - 工具价值评估闭环: 使用率、引用进 evidence 的频率、对决策质量的增量贡献(Reflection 统计)
 - 逐步校准: 风险压力参数、ExitReserve、Agent 触发策略(成本预算闸)
 
+**进展**
+- [x] `market.derivatives`(2026-08-12): SWAP 资金费率 + 未平仓量,OKX 公共端点、零新增外部依赖;Agent 上下文 tools=3
+- [ ] 4 周价值评估(至 ~2026-09-09): derivatives 引用进 evidence 的频率、对非 HOLD 决策的贡献
+
 **退出条件(滚动)**
 - [ ] 每个新工具上线 4 周后完成使用率与增量价值评估,低价值工具降级或下线
 
