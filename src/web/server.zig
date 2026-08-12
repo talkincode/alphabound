@@ -60,8 +60,10 @@ pub const Context = struct {
     cred_store: ?*auth.CredStore = null,
     challenges: ?*auth.ChallengeBank = null,
     fail_guard: ?*auth.FailGuard = null,
-    /// When true, prefer left-most X-Forwarded-For over peer IP (Azure / reverse proxy).
+    /// When true, prefer X-Forwarded-For over TCP peer (only behind a trusted edge).
     trust_proxy: bool = false,
+    /// How many trusted proxy hops append to XFF (default 1 → use right-most IP).
+    trusted_proxy_hops: u32 = 1,
     /// Scratch for Set-Cookie (owned by connection handler).
     cookie_buf: []u8 = &.{},
     /// Scratch for auth JSON bodies.
@@ -648,12 +650,38 @@ fn formatPeerIp(stream: std.Io.net.Stream, out: []u8) []const u8 {
     return "unknown";
 }
 
-fn firstForwardedIp(xff: []const u8) []const u8 {
+/// Pick client IP from X-Forwarded-For under a *trusted* reverse proxy.
+///
+/// Proxies that **append** (Azure App Gateway, many nginx configs) produce:
+///   client-forged..., real-client, [optional extra hops]
+/// The left-most value is attacker-controlled. With `hops` trusted proxy layers
+/// that each append once, the client is at index `len - hops` (0-based from left),
+/// i.e. `hops` from the right. Default hops=1 → **right-most** IP.
+fn forwardedClientIp(xff: []const u8, hops: u32) []const u8 {
     const trimmed = std.mem.trim(u8, xff, " \t");
-    if (std.mem.indexOfScalar(u8, trimmed, ',')) |i| {
-        return std.mem.trim(u8, trimmed[0..i], " \t");
+    if (trimmed.len == 0) return "";
+    const use_hops: u32 = if (hops == 0) 1 else hops;
+
+    // Collect up to 16 comma-separated tokens (right-most wins for our purpose).
+    var parts: [16][]const u8 = undefined;
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, trimmed, ',');
+    while (it.next()) |raw| {
+        const p = std.mem.trim(u8, raw, " \t");
+        if (p.len == 0) continue;
+        if (n < parts.len) {
+            parts[n] = p;
+            n += 1;
+        } else {
+            // shift left, keep last 16
+            var i: usize = 0;
+            while (i + 1 < parts.len) : (i += 1) parts[i] = parts[i + 1];
+            parts[parts.len - 1] = p;
+        }
     }
-    return trimmed;
+    if (n == 0) return "";
+    const h: usize = @min(@as(usize, use_hops), n);
+    return parts[n - h];
 }
 
 fn clientIpOk(ip: []const u8) bool {
@@ -740,9 +768,11 @@ fn handleConnection(io: std.Io, stream: std.Io.net.Stream, ctx_fn: ContextFn, us
     var client_ip: []const u8 = peer_ip;
     if (ctx.trust_proxy) {
         if (xff_hdr) |xff| {
-            const first = firstForwardedIp(xff);
-            if (clientIpOk(first)) client_ip = first;
+            const hops = if (ctx.trusted_proxy_hops == 0) 1 else ctx.trusted_proxy_hops;
+            const picked = forwardedClientIp(xff, hops);
+            if (clientIpOk(picked)) client_ip = picked;
         }
+        // No XFF → keep TCP peer (usually the proxy). Do not honor client-spoofable headers alone.
     }
 
     const info = RequestInfo{
@@ -975,6 +1005,24 @@ test "auth status rp_id follows Host header" {
         .now_ms = 1,
     }, ctx);
     try testing.expect(std.mem.indexOf(u8, r3.body, "\"rp_id\":\"localhost\"") != null);
+}
+
+test "forwardedClientIp uses rightmost under append semantics" {
+    // Client forged left side; real client is last hop before our single trusted proxy.
+    try testing.expectEqualStrings(
+        "203.0.113.50",
+        forwardedClientIp("1.2.3.4, 203.0.113.50", 1),
+    );
+    try testing.expectEqualStrings(
+        "203.0.113.50",
+        forwardedClientIp("203.0.113.50", 1),
+    );
+    // Two trusted hops: client is second from right.
+    try testing.expectEqualStrings(
+        "198.51.100.7",
+        forwardedClientIp("evil, 198.51.100.7, 10.0.0.1", 2),
+    );
+    try testing.expectEqualStrings("", forwardedClientIp("  ", 1));
 }
 
 test "auth fail guard locks login after repeated bad tokens" {

@@ -189,6 +189,7 @@ const WebState = struct {
     challenges: ?*ab.web_auth.ChallengeBank = null,
     fail_guard: ?*ab.web_auth.FailGuard = null,
     trust_proxy: bool = false,
+    trusted_proxy_hops: u32 = 1,
 
     fn initEmpty(self: *WebState) void {
         @memcpy(self.agent_runs_buf[0..2], "[]");
@@ -300,6 +301,7 @@ const WebState = struct {
                     .challenges = self.challenges,
                     .fail_guard = self.fail_guard,
                     .trust_proxy = self.trust_proxy,
+                    .trusted_proxy_hops = self.trusted_proxy_hops,
                 };
             }
         }
@@ -717,19 +719,26 @@ pub fn main(init: std.process.Init) !u8 {
     web_state.cred_store = &cred_store;
     web_state.challenges = &challenge_bank;
     web_state.fail_guard = &fail_guard;
-    // Azure / reverse-proxy: set ALPHABOUND_TRUST_PROXY=1 to key lockouts on X-Forwarded-For.
+    // Azure / reverse-proxy: set ALPHABOUND_TRUST_PROXY=1 only when a trusted edge
+    // strips/appends XFF. We take the right-most hop (see trusted_proxy_hops) so
+    // client-supplied left-most XFF cannot rotate fail-guard keys.
     const trust_proxy_raw = env.get("ALPHABOUND_TRUST_PROXY") orelse "";
     web_state.trust_proxy = std.mem.eql(u8, trust_proxy_raw, "1") or
         std.ascii.eqlIgnoreCase(trust_proxy_raw, "true") or
         std.ascii.eqlIgnoreCase(trust_proxy_raw, "yes");
+    if (env.get("ALPHABOUND_TRUSTED_PROXY_HOPS")) |hops_s| {
+        const h = std.fmt.parseInt(u32, hops_s, 10) catch 1;
+        web_state.trusted_proxy_hops = if (h == 0) 1 else h;
+    }
     if (web_state.auth_cfg.required()) {
         if (api_token.len < 24) {
             std.debug.print("[boot] WARN ALPHABOUND_API_TOKEN is short (<24); use a long random token before public exposure\n", .{});
         }
-        std.debug.print("[boot] web auth enabled (token set; passkeys={d} rp_id={s} trust_proxy={} fail_guard=on)\n", .{
+        std.debug.print("[boot] web auth enabled (token set; passkeys={d} rp_id={s} trust_proxy={} hops={d} fail_guard=on)\n", .{
             cred_store.count(),
             web_rp_id,
             web_state.trust_proxy,
+            web_state.trusted_proxy_hops,
         });
     } else {
         std.debug.print("[boot] web auth open (no ALPHABOUND_API_TOKEN)\n", .{});

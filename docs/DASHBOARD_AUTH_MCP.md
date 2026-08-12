@@ -19,8 +19,24 @@
 ALPHABOUND_API_TOKEN=...                    # long random (≥24 chars; 32+ recommended for public)
 ALPHABOUND_WEBAUTHN_RP_ID=localhost          # hostname only
 ALPHABOUND_WEBAUTHN_ORIGIN=http://127.0.0.1:8080
-ALPHABOUND_TRUST_PROXY=1                    # Azure/App Gateway: key lockouts on X-Forwarded-For
+ALPHABOUND_TRUST_PROXY=1                    # ONLY behind a trusted TLS/proxy edge
+ALPHABOUND_TRUSTED_PROXY_HOPS=1             # XFF: use Nth IP from the right (default 1)
 ```
+
+### `X-Forwarded-For` can be forged
+
+| Setup | Client can spoof lockout key? |
+|-------|-------------------------------|
+| `TRUST_PROXY` **off** (default) | **No** — FailGuard keys on TCP peer only |
+| `TRUST_PROXY=1` + take **left-most** XFF | **Yes** — attacker rotates forged IPs, bypasses lockout |
+| `TRUST_PROXY=1` + take **right-most** (our default hops=1) | **No** for a single append-style proxy that always adds the real peer |
+
+Rules:
+
+1. **Default off.** Direct internet → alphabound: never enable trust proxy.
+2. **Enable only** when Azure App Gateway / Front Door / nginx terminates TLS and is the **only** path to the process (NSG / private bind / no public :8080).
+3. We parse XFF as append-chain and pick **`hops` from the right** (default 1 = right-most). Left-most client junk is ignored.
+4. Prefer edge WAF rate limits; FailGuard is in-process last line. Peer IP of the proxy alone would collapse all users into one bucket if XFF were missing — still fail-closed for brute force.
 
 ## Brute-force / rate limits
 
@@ -44,9 +60,10 @@ This is process-local (resets on restart). Put Azure Front Door / WAF / nginx in
 Public exposure checklist:
 
 1. Long random `ALPHABOUND_API_TOKEN` (e.g. `openssl rand -hex 32`)
-2. HTTPS terminator; set `ALPHABOUND_TRUST_PROXY=1` only behind a trusted proxy
+2. HTTPS terminator; `ALPHABOUND_TRUST_PROXY=1` **only** if the edge is trusted and clients cannot reach the app directly
 3. Prefer session cookie / passkey after first login; do not put the raw token in browser JS storage
 4. Keep `/health/*` open for probes; never put secrets in health bodies
+5. Do not expose dashboard port publicly without the proxy; forged XFF is useless if `TRUST_PROXY` stays off
 
 ### Passkey / WebAuthn 限制（重要）
 
