@@ -48,7 +48,7 @@
 | AC-GO5 | 所有订单可追溯到 decision_id、snapshot_version、risk decision 和 config_hash | Replay(审计链抽查) | ☐ |
 | AC-GO6 | 未知订单/陈旧数据/数据库异常进入安全状态,不默认继续增仓 | Fault Injection | ☐ |
 | AC-GO7 | Dashboard 可完整回放一笔交易从观察到反思的链路 | Manual(UI 走查) | ◐ 决策展开含 admission/exec + **按 decision_id 关联订单/成交**; 完整链路 UI 走查待 Demo |
-| AC-GO8 | Demo Trading 连续稳定 ≥7 天,完成 ≥1 次断线恢复和 ≥1 次版本回滚演练 | Soak + Manual | ◐ 版本回滚演练 ≥1 次 PASS(2026-08-12 双向);kill -9/重启恢复演练 PASS;7 天滚动 soak 与 demo 断线恢复待 demo 凭证 |
+| AC-GO8 | Demo Trading 连续稳定 ≥7 天,完成 ≥1 次断线恢复和 ≥1 次版本回滚演练 | Soak + Manual | ◐ 版本回滚演练 ≥1 次 PASS(2026-08-12 双向);kill -9/重启恢复演练 PASS;执行场所已就绪(小额实盘子账号+`OKX_REAL_MONEY_OK=1`,2026-08-12 生产 demo 模式上线);7 天滚动 soak 窗口积累中 |
 
 ## D. 风险内核专项(§5)
 

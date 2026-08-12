@@ -33,6 +33,9 @@ const OkxEnvCreds = struct {
     secret_key: []const u8,
     passphrase: []const u8,
     simulated: bool,
+    /// Explicit operator opt-in: real (small sub-account) keys may execute
+    /// in demo mode. Never implied; OKX_REAL_MONEY_OK=1 only.
+    real_money_ok: bool,
 
     fn load(map: *const std.process.Environ.Map) ?OkxEnvCreds {
         const key = map.get("OKX_API_KEY") orelse return null;
@@ -41,11 +44,14 @@ const OkxEnvCreds = struct {
         if (key.len == 0 or secret.len == 0 or pass.len == 0) return null;
         const sim_raw = map.get("OKX_SIMULATED") orelse "";
         const simulated = std.mem.eql(u8, sim_raw, "1") or std.mem.eql(u8, sim_raw, "true");
+        const real_raw = map.get("OKX_REAL_MONEY_OK") orelse "";
+        const real_money_ok = std.mem.eql(u8, real_raw, "1") or std.mem.eql(u8, real_raw, "true");
         return .{
             .api_key = key,
             .secret_key = secret,
             .passphrase = pass,
             .simulated = simulated,
+            .real_money_ok = real_money_ok,
         };
     }
 
@@ -519,14 +525,22 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("[boot] FATAL mode=demo requires OKX_* credentials\n", .{});
         return 1;
     }
-    if (cfg.mode == .demo and okx_env != null and !okx_env.?.simulated) {
-        // Demo trading must hit the simulated venue header path — never live keys "by accident".
+    if (cfg.mode == .demo and okx_env != null and !okx_env.?.simulated and !okx_env.?.real_money_ok) {
+        // Demo trading needs an explicit venue: simulated keys, or a real
+        // small sub-account with the operator's explicit opt-in.
         std.debug.print(
-            "[boot] FATAL mode=demo requires OKX_SIMULATED=1 (refusing non-simulated keys)\n",
+            "[boot] FATAL mode=demo needs OKX_SIMULATED=1 or OKX_REAL_MONEY_OK=1 (refusing implicit real keys)\n",
             .{},
         );
         return 1;
     }
+    if (cfg.mode == .demo and okx_env != null and !okx_env.?.simulated and okx_env.?.real_money_ok) {
+        std.debug.print(
+            "[boot] *** REAL-MONEY EXECUTION AUTHORIZED (OKX_REAL_MONEY_OK=1) — small sub-account expected ***\n",
+            .{},
+        );
+    }
+    exec_venue_authorized = if (okx_env) |c| (c.simulated or c.real_money_ok) else false;
 
     var db_path_buf: [512:0]u8 = undefined;
     const db_path = std.fmt.bufPrintZ(&db_path_buf, "{s}", .{cfg.db_path}) catch return 1;
@@ -589,7 +603,7 @@ pub fn main(init: std.process.Init) !u8 {
         if (okx_env) |c| {
             var okx_sc = ab.okx_rest.Client.init(gpa, io, cfg.rest_url, c.asAuth());
             defer okx_sc.deinit();
-            okx_sc.simulated = c.simulated or cfg.mode == .demo;
+            okx_sc.simulated = c.simulated;
             const probe = probePrivateBalance(gpa, &okx_sc);
             switch (probe) {
                 .ok => |b| std.debug.print(
@@ -694,7 +708,7 @@ pub fn main(init: std.process.Init) !u8 {
     var okx = ab.okx_rest.Client.init(gpa, io, cfg.rest_url, auth_creds);
     defer okx.deinit();
     if (okx_env) |c| {
-        okx.simulated = c.simulated or cfg.mode == .demo;
+        okx.simulated = c.simulated;
     }
     // Instrument constraints for planner (demo execution). Fallback = OKX BTC-USDT defaults.
     var trade_instrument = ab.planner.Instrument{
@@ -829,7 +843,7 @@ pub fn main(init: std.process.Init) !u8 {
             cfg.web_bind,
             if (okx_env != null) "yes" else "no",
             if (llm_client != null) "on" else "off",
-            if (ab.okx_trade.executionAllowed(cfg.mode == .demo, okx.simulated)) "demo" else "off",
+            if (ab.okx_trade.executionAllowed(cfg.mode == .demo, exec_venue_authorized)) "demo" else "off",
         },
     );
     web_state.update(engine.snapshot(), true);
@@ -1811,7 +1825,7 @@ fn runAgentDecision(
     const admit_now = nowMs();
     const admission = shadowAdmit(snap, prop.snapshot_version, prop.target_btc_weight, cfg, admit_now);
     var exec_note: []const u8 = "not_executed";
-    if (ab.okx_trade.executionAllowed(cfg.mode == .demo, okx.simulated)) {
+    if (ab.okx_trade.executionAllowed(cfg.mode == .demo, exec_venue_authorized)) {
         exec_note = tryDemoExecute(
             gpa,
             okx,
@@ -2391,7 +2405,7 @@ fn adminCancelAll(
     engine: *ab.state.Engine,
     events_repo: *ab.storage.EventsRepo,
 ) usize {
-    if (!ab.okx_trade.executionAllowed(cfg.mode == .demo, okx.simulated)) return 0;
+    if (!ab.okx_trade.executionAllowed(cfg.mode == .demo, exec_venue_authorized)) return 0;
 
     var path_buf: [160]u8 = undefined;
     const path = ab.okx_trade.formatPendingPath(&path_buf, cfg.instrument) catch return 0;
@@ -3233,6 +3247,10 @@ fn webThreadMain(io: std.Io, host: []const u8, port: u16, ws: *WebState) void {
 }
 
 var event_counter = std.atomic.Value(u64).init(0);
+
+/// Venue authorization for demo execution: simulated keys, or explicit
+/// real-money opt-in (OKX_REAL_MONEY_OK=1). Set once during boot.
+var exec_venue_authorized: bool = false;
 
 fn logEvent(
     repo: *ab.storage.EventsRepo,

@@ -90,10 +90,12 @@ pub fn mapOkxState(state: []const u8) orders.OrderStatus {
     return .unknown;
 }
 
-/// Whether demo execution is allowed for this process configuration.
-/// Live is never allowed here; demo requires simulated trading header path.
-pub fn executionAllowed(mode_demo: bool, simulated: bool) bool {
-    return mode_demo and simulated;
+/// Whether demo-path execution is allowed for this process configuration.
+/// Live mode is never allowed here; demo requires an authorized venue —
+/// simulated keys, or a real small sub-account with explicit operator
+/// opt-in (OKX_REAL_MONEY_OK=1).
+pub fn executionAllowed(mode_demo: bool, venue_authorized: bool) bool {
+    return mode_demo and venue_authorized;
 }
 
 /// After a leg resolves, should we refresh portfolio and try another plan?
@@ -168,7 +170,7 @@ test "okx state mapping" {
     try testing.expectEqual(orders.OrderStatus.unknown, mapOkxState("something_else"));
 }
 
-test "executionAllowed is demo+simulated only" {
+test "executionAllowed is demo+authorized-venue only" {
     try testing.expect(executionAllowed(true, true));
     try testing.expect(!executionAllowed(true, false));
     try testing.expect(!executionAllowed(false, true));

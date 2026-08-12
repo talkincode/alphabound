@@ -31,7 +31,7 @@
 |---|---|---|
 | B1–B2 | Admin flatten / cancel-all 控制面 | ✅ |
 | B3 | Demo 订单 REST place/cancel/query 封装 | ✅ `execution/okx_trade.zig` |
-| B4 | APPROVE/REDUCE → planner → 幂等市价单 | ✅ `mode=demo` + `OKX_SIMULATED=1` |
+| B4 | APPROVE/REDUCE → planner → 幂等市价单 | ✅ `mode=demo` + 授权场所 |
 | B5 | Demo 余额写入引擎 | ✅ |
 | B6 | 故障注入全矩阵 | ☐ 随后 |
 
@@ -41,7 +41,7 @@
 
 1. **滚动 soak 验收**（替代冻结 24h/7d：部署重启豁免，只有 crash 判负）  
    `HOST=<host> ./scripts/soak-report.sh 24` + `gate2-report.sh` + `check-remote.sh`
-2. **准备模拟盘密钥**（`OKX_SIMULATED=1`，IP 白名单）  
+2. **执行场所已就绪**：小额实盘子账号（≈100 USDT）+ `OKX_REAL_MONEY_OK=1`（模拟盘数据质量差，弃用；风险边界=子账号余额；live 仍锁死）  
 3. **本机 Demo 冒烟**  
    ```bash
    # config: mode = "demo"

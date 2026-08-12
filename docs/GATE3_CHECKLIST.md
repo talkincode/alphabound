@@ -1,16 +1,18 @@
 # Gate 3 验收清单（Demo Trading）
 
-> 目标：Risk Kernel + Execution 在 **OKX 模拟盘** 全链路可跑，故障可降级。  
+> 目标：Risk Kernel + Execution 在 **demo 授权场所** 全链路可跑，故障可降级。  
+> 授权场所 = OKX 模拟盘（`OKX_SIMULATED=1`）**或** 小额实盘子账号 + 显式开关（`OKX_REAL_MONEY_OK=1`）。  
+> 当前采用后者：≈100 USDT 子账号，风险边界即子账号余额。`mode=live` 仍锁死（Gate 4）。  
 > 退出条件见 [ROADMAP.md](ROADMAP.md) Phase 3。滚动任务见 [NEXT.md](NEXT.md)。
 
 ## 已具备（代码）
 
-- [x] `mode=demo` 启动闸：必须 `OKX_*` + `OKX_SIMULATED=1`；`mode=live` 仍直接拒绝
+- [x] `mode=demo` 启动闸：必须 `OKX_*` + （`OKX_SIMULATED=1` 或显式 `OKX_REAL_MONEY_OK=1`）；`mode=live` 仍直接拒绝；实盘授权时 boot 打印醒目 banner，且真实 key 绝不发送模拟盘 header
 - [x] Demo 对账：私有 REST 余额写入引擎（非 shadow 模拟本金）
 - [x] 提案 → `admission.admit` → planner → 市价单（`tgtCcy=base_ccy`）
 - [x] 幂等 `client_order_id`（`ab` + hash）+ `orders` 表投影
 - [x] 下单 HTTP 失败 → `UNKNOWN` + 查询后再处置（禁止盲重发）
-- [x] Admin `cancel-all`：拉取 pending 并逐笔 cancel（仅 demo+simulated）
+- [x] Admin `cancel-all`：拉取 pending 并逐笔 cancel（仅 demo + 授权场所）
 - [x] Admin `flatten`：风险态 `FLATTENING`
 - [x] 事件：`ORDER_ACK` / `ORDER_REJECTED` / `ORDER_UNKNOWN` / `ORDER_QUERY` / `ORDER_CANCEL_SENT`
 - [x] Dashboard：`/api/v1/orders`（orders+fills 投影）+ 订单标签页
@@ -39,7 +41,9 @@ instrument = "BTC-USDT"
 export OKX_API_KEY=...
 export OKX_API_SECRET=...
 export OKX_API_PASSPHRASE=...
-export OKX_SIMULATED=1
+export OKX_SIMULATED=1        # 模拟盘 key
+# 或：小额实盘子账号（显式二次确认，绝不默认）
+# export OKX_REAL_MONEY_OK=1
 # 可选 LLM
 export LLM_API_KEY=...
 ```
@@ -48,8 +52,8 @@ export LLM_API_KEY=...
 
 | # | 项 | 状态 |
 |---|---|---|
-| 1 | 模拟盘 API Key + IP 白名单 | ☐ |
-| 2 | `--self-check` 私有余额 ok | ☐ |
+| 1 | 执行场所就绪（实盘子账号 ≈100 USDT + `OKX_REAL_MONEY_OK=1`，代替模拟盘） | ☑ 2026-08-12 |
+| 2 | 私有余额对账 ok（`[reconcile] demo balance applied usdt=100`） | ☑ 2026-08-12 |
 | 3 | 一轮 agent 出现 `exec=filled\|acked\|...`（非 shadow `not_executed`） | ☐ |
 | 4 | Dashboard/events 可见 `ORDER_*` | ☐ |
 | 5 | `--control cancel-all` 清空 pending | ☐ |
