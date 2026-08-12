@@ -83,11 +83,11 @@
 | AC-SEC1 | OKX API Key 仅 Read+Trade(无 Withdraw),绑定 Azure 固定出口 IP 白名单 | Manual(配置审查) | P4 | ◐ boot 代码门禁:实盘授权时探测 /account/config,withdraw 权限直接拒绝启动;生产验证 read=true trade=true withdraw=false(2026-08-12);IP 白名单绑定为 OKX 侧人工配置 |
 | AC-SEC2 | 密钥文件 root 管理 0600;服务进程只读;密钥不进备份 | Manual + 脚本检查 | P4 | ✅ check-remote.sh SEC2 段自动检查:600 root:alphabound + 数据目录无密钥泄漏 + DB/备份/WAL 字节级抽查真实密钥值不存在,生产 PASS(2026-08-12) |
 | AC-SEC3 | LLM Context/日志/错误栈/Dashboard 响应中无 secret/passphrase/签名材料(redaction 生效) | Unit(redaction)+ Manual 抽查 | P2 | ◐ `redaction.redact` 单测 + `logEventPayload` 落库前 redact/looksLeaky 拦截;check-remote SEC3 段抽查全部 Dashboard API(system/state/events/decisions/orders/memories/shadow)不含真实密钥值,生产 PASS(2026-08-12);LLM context 出站抽查待做 |
-| AC-SEC4 | systemd 加固: NoNewPrivileges/PrivateTmp/ProtectSystem/受限写目录 | Manual(unit 审查) | P1 | ◐ `deploy/alphabound.service` 已含加固项；生产装机演练仍待 |
+| AC-SEC4 | systemd 加固: NoNewPrivileges/PrivateTmp/ProtectSystem/受限写目录 | Manual(unit 审查) | P1 | ✅ 生产核验(2026-08-12 `systemctl show`):NoNewPrivileges=yes PrivateTmp=yes ProtectSystem=strict ProtectHome=yes ReadWritePaths=/var/lib/alphabound User=alphabound |
 | AC-SEC5 | 外部 HTTP 响应有大小/解压/超时/JSON 深度限制 | Unit + Fuzz | P2 | ◐ `security/limits.zig` 上限常量+`jsonStructureSane` 结构扫描(单测含深度炸弹/breakout/截断);OKX REST 512KB、LLM 1MB、egress 探针 4KB 固定容量 sink 接线,超限→记录并拒绝;解压炸弹面(gzip)待评审 |
 | AC-SEC6 | Agent 禁止项全部不可达: 读环境变量/密钥/DB 文件、执行 shell、任意 URL、直接获得 OKX client、修改风险配置/Prompt/二进制 | Manual(红队)+ Unit | P2 | ◐ `security/isolation.zig` @embedFile 源码扫描测试:agent 纯逻辑禁 std.http/net/fs/process/getenv/Child/exchange/execution/storage/risk-admission/凭证 token,openai.zig 仅白名单 std.http;人工红队评审待做 |
 | AC-SEC7 | 工具返回视为不可信数据,只进 data 字段;第三方文字不得成为系统指令(注入测试) | Fault(工具污染注入) | P2 | ☑ `formatObservation` 对 data_json 结构扫描,失败→null;`fault/matrix.zig` 注入测试:提示注入文本仅存于 data.note 字符串值内,risk_rules 不可变,breakout/深度炸弹 payload 全部中和 |
-| AC-SEC8 | Dashboard 默认仅绑定 127.0.0.1;管理命令仅本机 CLI/Unix socket | Integration(端口扫描) | P1 | ◐ web 默认 127.0.0.1；管理为本地控制文件 CLI（无 socket 面）；端口扫描演练待做 |
+| AC-SEC8 | Dashboard 默认仅绑定 127.0.0.1;管理命令仅本机 CLI/Unix socket | Integration(端口扫描) | P1 | ◐ 默认 bind 127.0.0.1;生产为私网 VM 上 0.0.0.0(局域网 Dashboard),互联网侧探测出口 IP:8080 不可达(NAT 无端口映射,2026-08-12 实测);管理仅本地控制文件 CLI;完整端口扫描(nmap 全端口)待做 |
 
 ## G. 数据与运维(§6 / §7.5 / §8)
 
