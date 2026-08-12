@@ -765,8 +765,9 @@ pub fn main(init: std.process.Init) !u8 {
     var boot_cash = cfg.initial_capital;
     var boot_btc = ab.decimal.Decimal.zero;
     var boot_btc_avail = ab.decimal.Decimal.zero;
+    var boot_clean = true;
     if (okx_env != null) {
-        const probe = probePrivateBalance(gpa, &okx);
+        const probe = probePrivateBalanceRetry(gpa, &okx, io, 6);
         switch (probe) {
             .ok => |b| {
                 if (cfg.mode == .demo) {
@@ -788,8 +789,20 @@ pub fn main(init: std.process.Init) !u8 {
             .err => |e| {
                 std.debug.print("[reconcile] private balance FAILED: {s}\n", .{e});
                 logEvent(&events_repo, &engine, "PRIVATE_BALANCE_FAILED", "exchange", "CRITICAL", &cfg);
-                // Shadow may continue on public data; demo requires working keys.
-                if (cfg.mode == .demo) return 1;
+                // Demo real-money: hard-fail only on auth/IP (not retryable blips).
+                // Temporary API errors boot degraded (not reconciled) until loop recover.
+                if (cfg.mode == .demo) {
+                    const fatal = std.mem.eql(u8, e, "ip_whitelist") or
+                        std.mem.eql(u8, e, "invalid_sign") or
+                        std.mem.eql(u8, e, "invalid_key") or
+                        std.mem.eql(u8, e, "invalid_passphrase");
+                    if (fatal) return 1;
+                    std.debug.print("[reconcile] demo boot degraded — will retry private balance in loop\n", .{});
+                    boot_cash = ab.decimal.Decimal.zero;
+                    boot_btc = ab.decimal.Decimal.zero;
+                    boot_btc_avail = ab.decimal.Decimal.zero;
+                    boot_clean = false;
+                }
             },
         }
         // AC-SEC1 (code side): real-money execution refuses keys that can
@@ -832,9 +845,13 @@ pub fn main(init: std.process.Init) !u8 {
         .btc_total = boot_btc,
         .btc_available = boot_btc_avail,
         .hwm_from_db = engine.snapshot().high_watermark,
-        .clean = true,
+        .clean = boot_clean,
     } }) catch return 1;
-    logEvent(&events_repo, &engine, "RECONCILE_COMPLETED", "core", "INFO", &cfg);
+    if (boot_clean) {
+        logEvent(&events_repo, &engine, "RECONCILE_COMPLETED", "core", "INFO", &cfg);
+    } else {
+        logEvent(&events_repo, &engine, "RECONCILE_DEGRADED", "core", "CRITICAL", &cfg);
+    }
 
     // Local admin pause flag (control file). Risk/market loop keeps running.
     var admin_paused: bool = false;
@@ -1167,9 +1184,39 @@ fn probePrivateBalance(gpa: std.mem.Allocator, client: *ab.okx_rest.Client) Priv
     };
     defer gpa.free(body);
     const bal = ab.okx_rest.parseBalance(gpa, body) catch {
-        return .{ .err = ab.okx_rest.classifyErrorBody(body) };
+        const token = ab.okx_rest.classifyErrorBody(body);
+        // One-line body snippet for ops (no secrets expected in OKX error JSON).
+        const snip_n = @min(body.len, 160);
+        std.debug.print("[okx] balance_err token={s} body={s}\n", .{ token, body[0..snip_n] });
+        return .{ .err = token };
     };
     return .{ .ok = bal };
+}
+
+/// Boot-time balance probe with short retries (rate-limit / blip tolerant).
+fn probePrivateBalanceRetry(
+    gpa: std.mem.Allocator,
+    client: *ab.okx_rest.Client,
+    io: std.Io,
+    attempts: u8,
+) PrivateProbe {
+    var last: PrivateProbe = .{ .err = "http_failed" };
+    var i: u8 = 0;
+    while (i < attempts) : (i += 1) {
+        last = probePrivateBalance(gpa, client);
+        switch (last) {
+            .ok => return last,
+            .err => |e| {
+                if (!ab.okx_rest.isRetryablePrivateError(e) and !std.mem.eql(u8, e, "http_failed"))
+                    return last;
+                if (i + 1 < attempts) {
+                    std.debug.print("[reconcile] balance retry {d}/{d} after {s}\n", .{ i + 1, attempts, e });
+                    io.sleep(.{ .nanoseconds = 2_000_000_000 }, .awake) catch {};
+                }
+            },
+        }
+    }
+    return last;
 }
 
 fn registerDefaultTools(reg: *ab.tools.Registry) !void {

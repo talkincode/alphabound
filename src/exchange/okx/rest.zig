@@ -468,8 +468,21 @@ pub fn classifyErrorBody(body: []const u8) []const u8 {
     if (std.mem.indexOf(u8, body, "50111") != null) return "invalid_key";
     if (std.mem.indexOf(u8, body, "50119") != null) return "invalid_passphrase";
     if (std.mem.indexOf(u8, body, "50102") != null) return "timestamp";
+    // Rate / frequency limits (retryable).
+    if (std.mem.indexOf(u8, body, "50011") != null) return "rate_limit";
+    if (std.mem.indexOf(u8, body, "50013") != null) return "rate_limit";
+    if (std.mem.indexOf(u8, body, "50001") != null) return "service_busy";
     if (std.mem.indexOf(u8, body, "\"code\"") != null) return "api_error";
     return "http_or_network";
+}
+
+/// True when a private REST failure is worth a short retry (not auth/IP).
+pub fn isRetryablePrivateError(token: []const u8) bool {
+    return std.mem.eql(u8, token, "rate_limit") or
+        std.mem.eql(u8, token, "service_busy") or
+        std.mem.eql(u8, token, "http_or_network") or
+        std.mem.eql(u8, token, "api_error") or
+        std.mem.eql(u8, token, "timestamp");
 }
 
 // ---------------------------------------------------------------------------
