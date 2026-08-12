@@ -45,7 +45,7 @@
 | AC-GO2 | Agent 无法直接访问交易凭证或绕过 Risk Kernel(代码层能力缺失,非 prompt 约束) | Manual(红队评审)+ Unit(接口不可达) | ◐ 架构落地:`agent/` 仅产出 Proposal 值类型;凭证只在 `exchange/okx/auth.zig`;`security/isolation.zig` 源码扫描单测持续强制隔离;红队评审待做 |
 | AC-GO3 | Risk Kernel 核心性质过 property test,覆盖边界/费用/滑点/部分成交 | Property | ☑ admission 2000 次随机 + halted/flattening 模式 + 费用/滑点/shock 单调性(stress equity 非增)+ max_drawdown 收紧单调 + planner 部分成交迭代收敛(qty 单调减不翻向) property 全过 |
 | AC-GO4 | 断开 LLM、新闻、链上和 Dashboard 后,风险监控与订单对账仍工作 | Fault Injection | ◐ LLM 断连演练 PASS(同 AC-NFR02);新闻/链上无外呼路径;Dashboard 进程内无独立断开面 |
-| AC-GO5 | 所有订单可追溯到 decision_id、snapshot_version、risk decision 和 config_hash | Replay(审计链抽查) | ◐ `--verify-db` 审计链段:订单→AGENT_PROPOSAL_OK(payload 含 snapshot_version+admission verdict)链接、决策事件 config_hash/software_version 戳、订单↔ORDER_* 事件覆盖、fills 无孤儿;单测锁定 SQL 语义;restore-drill 每次自动跑;真实订单样本待首单 |
+| AC-GO5 | 所有订单可追溯到 decision_id、snapshot_version、risk decision 和 config_hash | Replay(审计链抽查) | ◐ `--verify-db` 审计链:订单→AGENT_PROPOSAL_OK **或** ADMIN_TARGET_WEIGHT + ORDER_* + 无孤儿 fills;单测含 operator 锚点;`scripts/audit-go5.sh` 远端抽查;2026-08-12 真实 agent REBALANCE 样本已有 exchange_id |
 | AC-GO6 | 未知订单/陈旧数据/数据库异常进入安全状态,不默认继续增仓 | Fault Injection | ◐ 未知订单→`order_ambiguity`→degraded(单测);陈旧数据→admission REJECT `stale_data`(property);DB 审计写失败→`journal_ok=false`→exit_only、写恢复自愈(2026-08-12 新增,state 单测锁定;行情新鲜不能单独清除降级);进程级 fault 注入演练待做 |
 | AC-GO7 | Dashboard 可完整回放一笔交易从观察到反思的链路 | Manual(UI 走查) | ◐ 决策展开含 admission/exec + **按 decision_id 关联订单/成交**; 完整链路 UI 走查待 Demo |
 | AC-GO8 | Demo Trading 连续稳定 ≥7 天,完成 ≥1 次断线恢复和 ≥1 次版本回滚演练 | Soak + Manual | ◐ 版本回滚演练 ≥1 次 PASS(2026-08-12 双向);kill -9/重启恢复演练 PASS;执行场所已就绪(小额实盘子账号+`OKX_REAL_MONEY_OK=1`,2026-08-12 生产 demo 模式上线);7 天滚动 soak 窗口积累中 |

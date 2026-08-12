@@ -42,18 +42,18 @@
 
 ### P0 — 稳盘 + 证据（本周）
 
-1. **滚动 soak**（部署重启豁免，crash/对账失败才判负）  
+1. **滚动 soak**（部署重启 + 邻近 crash-loop 计 churn；稳定后 0 非预期退出）  
    `HOST=<host> ./scripts/soak-report.sh 24` + `check-remote.sh`
-2. **控制面演练**：`cancel-all`（无 pending 时 no-op）→ `flatten` → 确认 admission 拒增仓 → 再 `target-weight=0.05` 恢复小仓
-3. **等 agent 自发 REBALANCE**（HOLD 已 no-op）。当前 `active_hours_utc=13-21`；窗外 quiet 间隔 1h。开发期可临时放宽 active hours（改 `/etc/alphabound/alphabound.toml`，**不提交**真实主机细节）
-4. **对账抽查**：Dashboard 状态页 cash/btc 与 OKX 子账号一致；orders 有 `exchange_id`
+2. **控制面演练**：`cancel-all` → `flatten` → 拒增仓 → `target-weight=0.05` 恢复
+3. ✅ **agent 自发 REBALANCE**（2026-08-12 `dec_…` w=0.08 `exec=filled`，exchange_id 非空）
+4. **对账抽查**：cash/btc 与 OKX 一致；新单 `exchange_id` 非空
 
 ### P1 — Gate3 收口代码
 
-1. ✅ orders upsert **保留** `exchange_order_id`（query 回写不再抹掉 ACK 的 ordId）
-2. AC-GO5 审计链脚本：orders.decision_id ↔ events；fills 无孤儿
+1. ✅ orders upsert **保留** `exchange_order_id`
+2. ✅ AC-GO5：`--verify-db` 认 `ADMIN_TARGET_WEIGHT` + `scripts/audit-go5.sh`
 3. Fault 矩阵 FD3/9/10 实网或注入补强（清单 #10）
-4. Dashboard：卖出/买入并列、exchange_id 列非空验证
+4. Dashboard：exchange_id 列非空验证（新单已通）
 
 ### P2 — 不做
 

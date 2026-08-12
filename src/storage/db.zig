@@ -1054,12 +1054,14 @@ test "audit chain queries trace orders to stamped decision events (AC-GO5)" {
     const q_no_dec = "SELECT COUNT(*) FROM orders WHERE decision_id = ''";
     const q_no_proposal =
         \\SELECT COUNT(*) FROM orders o WHERE NOT EXISTS (
-        \\  SELECT 1 FROM events e WHERE e.type = 'AGENT_PROPOSAL_OK'
+        \\  SELECT 1 FROM events e
+        \\  WHERE e.type IN ('AGENT_PROPOSAL_OK','ADMIN_TARGET_WEIGHT')
         \\  AND instr(e.payload_json, '"decision_id":"' || o.decision_id || '"') > 0)
     ;
     const q_unstamped =
         \\SELECT COUNT(*) FROM orders o WHERE EXISTS (
-        \\  SELECT 1 FROM events e WHERE e.type = 'AGENT_PROPOSAL_OK'
+        \\  SELECT 1 FROM events e
+        \\  WHERE e.type IN ('AGENT_PROPOSAL_OK','ADMIN_TARGET_WEIGHT')
         \\  AND instr(e.payload_json, '"decision_id":"' || o.decision_id || '"') > 0
         \\  AND (e.config_hash = '' OR e.software_version = ''))
     ;
@@ -1078,6 +1080,39 @@ test "audit chain queries trace orders to stamped decision events (AC-GO5)" {
     try testing.expectEqual(@as(i64, 0), try db.queryInt(q_unstamped));
     try testing.expectEqual(@as(i64, 0), try db.queryInt(q_no_events));
     try testing.expectEqual(@as(i64, 0), try db.queryInt(q_orphan_fills));
+
+    // Operator probe path: ADMIN_TARGET_WEIGHT is a valid decision anchor.
+    try events.append(.{
+        .event_id = "evt_op",
+        .ts = "t2b",
+        .type = "ADMIN_TARGET_WEIGHT",
+        .source = "admin",
+        .severity = "CRITICAL",
+        .software_version = "0.1.0",
+        .config_hash = "sha256:abc",
+        .payload_json = "{\"decision_id\":\"dec_op_tw_1\",\"source\":\"operator\",\"admission\":\"APPROVE\"}",
+    });
+    try events.append(.{
+        .event_id = "evt_op_ack",
+        .ts = "t2c",
+        .type = "ORDER_ACK",
+        .source = "execution",
+        .severity = "INFO",
+        .software_version = "0.1.0",
+        .config_hash = "sha256:abc",
+        .payload_json = "{\"clOrdId\":\"ab_op\",\"decision_id\":\"dec_op_tw_1\"}",
+    });
+    try orders.upsert(.{
+        .client_order_id = "ab_op",
+        .decision_id = "dec_op_tw_1",
+        .side = "buy",
+        .qty = "0.001",
+        .price = "market",
+        .status = "FILLED",
+        .created_ts = "t2b",
+        .updated_ts = "t2c",
+    });
+    try testing.expectEqual(@as(i64, 0), try db.queryInt(q_no_proposal));
 
     // Broken chain: order with no proposal event, no ORDER_* event; orphan fill;
     // plus an unstamped proposal for a second order.

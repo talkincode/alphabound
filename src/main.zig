@@ -3188,21 +3188,23 @@ fn verifyDbSnapshot(path: []const u8) u8 {
     }
 
     // 6. Audit chain (AC-GO5): every order traceable to its decision event
-    //    (decision_id → AGENT_PROPOSAL_OK payload, carrying snapshot_version
-    //    + admission verdict), stamped with config_hash/software_version,
-    //    covered by ORDER_* events; fills must reference a known order.
+    //    (decision_id → AGENT_PROPOSAL_OK or ADMIN_TARGET_WEIGHT payload),
+    //    stamped with config_hash/software_version, covered by ORDER_* events;
+    //    fills must reference a known order. Operator probes use dec_op_* + ADMIN_*.
     {
         const o_no_dec = db.queryInt(
             "SELECT COUNT(*) FROM orders WHERE decision_id = ''",
         ) catch -1;
         const o_no_proposal = db.queryInt(
             \\SELECT COUNT(*) FROM orders o WHERE NOT EXISTS (
-            \\  SELECT 1 FROM events e WHERE e.type = 'AGENT_PROPOSAL_OK'
+            \\  SELECT 1 FROM events e
+            \\  WHERE e.type IN ('AGENT_PROPOSAL_OK','ADMIN_TARGET_WEIGHT')
             \\  AND instr(e.payload_json, '"decision_id":"' || o.decision_id || '"') > 0)
         ) catch -1;
         const o_unstamped_dec = db.queryInt(
             \\SELECT COUNT(*) FROM orders o WHERE EXISTS (
-            \\  SELECT 1 FROM events e WHERE e.type = 'AGENT_PROPOSAL_OK'
+            \\  SELECT 1 FROM events e
+            \\  WHERE e.type IN ('AGENT_PROPOSAL_OK','ADMIN_TARGET_WEIGHT')
             \\  AND instr(e.payload_json, '"decision_id":"' || o.decision_id || '"') > 0
             \\  AND (e.config_hash = '' OR e.software_version = ''))
         ) catch -1;

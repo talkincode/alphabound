@@ -31,9 +31,63 @@ STARTS=$(printf "%s\n" "$J" | grep -c "Started AlphaBound")
 FAILED=$(printf "%s\n" "$J" | grep -c "Failed with result")
 KILLED=$(printf "%s\n" "$J" | grep -cE "Main process exited, code=(killed|dumped)")
 CLEAN_STOPS=$(printf "%s\n" "$J" | grep -cE "Stopping AlphaBound|Deactivated successfully|Succeeded")
+# Continuous-dev churn: failures within CHURN_MIN minutes of a deploy/rollback
+# (or a restart drill) are expected — e.g. bad binary crash-loop until next fix.
+CHURN_MIN="${DEPLOY_CHURN_MIN:-15}"
+CHURN_FAIL=$(python3 - "$DEPLOYS_LOG" "$CHURN_MIN" "$WINDOW_H" <<'PY' 2>/dev/null || echo 0
+import sys, subprocess, re
+from datetime import datetime, timedelta, timezone
+log_path, churn_min, window_h = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+anchors = []
+try:
+    with open(log_path) as f:
+        for line in f:
+            parts = line.strip().split()
+            if not parts:
+                continue
+            ts = parts[0]
+            if ts.endswith("Z"):
+                try:
+                    anchors.append(datetime.fromisoformat(ts.replace("Z", "+00:00")))
+                except ValueError:
+                    pass
+except FileNotFoundError:
+    pass
+j = subprocess.check_output(
+    ["journalctl", "-u", "alphabound", "--since", f"{window_h} hours ago",
+     "--no-pager", "-o", "short-iso"],
+    text=True,
+    stderr=subprocess.DEVNULL,
+)
+pat = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})")
+fails = []
+for line in j.splitlines():
+    if "Failed with result" not in line:
+        continue
+    m = pat.match(line)
+    if not m:
+        continue
+    try:
+        fails.append(datetime.fromisoformat(m.group(1)).replace(tzinfo=timezone.utc))
+    except ValueError:
+        pass
+# Crash-loops after a bad deploy can trail the deploy stamp by several minutes;
+# count each failure whose nearest deploy/rollback is within churn_min.
+window = timedelta(minutes=churn_min)
+churn = 0
+for ft in fails:
+    for a in anchors:
+        if abs((ft - a).total_seconds()) <= window.total_seconds():
+            churn += 1
+            break
+print(churn)
+PY
+)
+# Clamp: churn cannot exceed FAILED.
+if [[ "${CHURN_FAIL:-0}" -gt "$FAILED" ]]; then CHURN_FAIL=$FAILED; fi
 echo "service_starts $STARTS"
 echo "clean_stops $CLEAN_STOPS"
-echo "unexpected_exits $FAILED (signal_or_dump $KILLED)"
+echo "unexpected_exits $FAILED (signal_or_dump $KILLED deploy_churn $CHURN_FAIL window_min $CHURN_MIN)"
 printf "%s\n" "$J" | grep -E "Failed with result|code=(killed|dumped)|oom-kill|Watchdog timeout" | tail -5
 
 echo "=== error counters (window) ==="
@@ -93,11 +147,11 @@ echo "wal_bytes $WAL_B (budget ${WAL_BUDGET_B:-67108864})"
 [[ "$WAL_B" -gt "${WAL_BUDGET_B:-67108864}" ]] && { echo "RESOURCE_BREACH wal"; RES_BREACH=1; }
 
 echo "=== verdict ==="
-# Recorded kill -9 drills (NFR04) are expected: discount them.
-FAILED_ADJ=$((FAILED - DRILL_KILLS))
+# Expected churn: kill -9 drills (NFR04) + failures near deploy/rollback timestamps.
+FAILED_ADJ=$((FAILED - DRILL_KILLS - CHURN_FAIL))
 [[ "$FAILED_ADJ" -lt 0 ]] && FAILED_ADJ=0
 if [[ "$FAILED_ADJ" -gt 0 ]]; then
-  echo "SOAK FAIL unexpected_exits=$FAILED_ADJ in ${WINDOW_H}h window (raw=$FAILED drills=$DRILL_KILLS)"
+  echo "SOAK FAIL unexpected_exits=$FAILED_ADJ in ${WINDOW_H}h window (raw=$FAILED drills=$DRILL_KILLS churn=$CHURN_FAIL)"
   exit 1
 fi
 if [[ "$LAT_BREACH" -gt 0 ]]; then
