@@ -790,6 +790,28 @@ pub fn main(init: std.process.Init) !u8 {
                 if (cfg.mode == .demo) return 1;
             },
         }
+        // AC-SEC1 (code side): real-money execution refuses keys that can
+        // withdraw. Read+trade is the ceiling for this agent.
+        if (cfg.mode == .demo and okx_env.?.real_money_ok and !okx_env.?.simulated) {
+            if (okx.getPrivate("/api/v5/account/config", nowMs())) |cbody| {
+                defer gpa.free(cbody);
+                if (ab.okx_rest.parseKeyPerms(gpa, cbody)) |perms| {
+                    if (perms.can_withdraw) {
+                        std.debug.print("[boot] FATAL real-money key has WITHDRAW permission — use a read+trade-only key\n", .{});
+                        logEvent(&events_repo, &engine, "KEY_PERMS_REJECTED", "exchange", "CRITICAL", &cfg);
+                        return 1;
+                    }
+                    std.debug.print(
+                        "[boot] key perms ok read={} trade={} withdraw={}\n",
+                        .{ perms.can_read, perms.can_trade, perms.can_withdraw },
+                    );
+                } else |_| {
+                    std.debug.print("[boot] WARN key perms unparseable — proceeding (verify manually)\n", .{});
+                }
+            } else |_| {
+                std.debug.print("[boot] WARN key perms probe failed — proceeding (verify manually)\n", .{});
+            }
+        }
         // Private WS probe is opt-in: TLS+WS over std.http.Client currently gets
         // OKX close 4004 after upgrade on some paths; REST reconcile remains the
         // Gate 1 default. Set ALPHABOUND_PRIVATE_WS=1 to attempt a boot probe.

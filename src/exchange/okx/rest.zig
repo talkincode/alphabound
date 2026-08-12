@@ -213,6 +213,31 @@ pub fn parseBalance(gpa: std.mem.Allocator, body: []const u8) Error!Balance {
     return out;
 }
 
+/// API key permissions from /api/v5/account/config (`perm` is a
+/// comma-separated list like "read_only,trade,withdraw").
+pub const KeyPerms = struct {
+    can_read: bool,
+    can_trade: bool,
+    can_withdraw: bool,
+};
+
+pub fn parseKeyPerms(gpa: std.mem.Allocator, body: []const u8) Error!KeyPerms {
+    var parsed = std.json.parseFromSlice(std.json.Value, gpa, body, .{}) catch return Error.MalformedResponse;
+    defer parsed.deinit();
+    const data = try unwrapEnvelope(parsed.value);
+    const obj = try firstObject(data);
+    const perm = try getString(obj, "perm");
+    var out = KeyPerms{ .can_read = false, .can_trade = false, .can_withdraw = false };
+    var it = std.mem.splitScalar(u8, perm, ',');
+    while (it.next()) |raw| {
+        const p = std.mem.trim(u8, raw, " ");
+        if (std.mem.eql(u8, p, "read_only")) out.can_read = true;
+        if (std.mem.eql(u8, p, "trade")) out.can_trade = true;
+        if (std.mem.eql(u8, p, "withdraw")) out.can_withdraw = true;
+    }
+    return out;
+}
+
 pub const OrderAck = struct {
     exchange_order_id_buf: [32]u8 = undefined,
     exchange_order_id_len: usize = 0,
@@ -466,6 +491,20 @@ test "parse balance extracts USDT and BTC details" {
     try testing.expect(b.usdt_avail.eql(d("37.5")));
     try testing.expect(b.btc_cash.eql(d("0.0005")));
     try testing.expect(b.btc_avail.eql(d("0.0005")));
+}
+
+test "parse key perms flags withdraw" {
+    const body =
+        \\{"code":"0","msg":"","data":[{"acctLv":"1","perm":"read_only,trade"}]}
+    ;
+    const p = try parseKeyPerms(testing.allocator, body);
+    try testing.expect(p.can_read and p.can_trade and !p.can_withdraw);
+
+    const body_w =
+        \\{"code":"0","msg":"","data":[{"perm":"read_only,withdraw,trade"}]}
+    ;
+    const pw = try parseKeyPerms(testing.allocator, body_w);
+    try testing.expect(pw.can_withdraw);
 }
 
 test "parse order ack" {
