@@ -23,7 +23,7 @@ initial_capital = 100.0
 provider = "openai"
 model = "gpt-4o-mini"
 base_url = "https://api.openai.com/v1"
-decision_timeout_ms = 30000
+decision_timeout_ms = 180000
 # Multi-factor slow-loop schedule: low base cadence + trading session +
 # event triggers, all bounded by a hard cooldown floor. Not a HFT system.
 decision_interval_ms = 900000        # 15 min base cadence in active session

@@ -39,7 +39,7 @@ initial_capital = 100.0          # shadow 模拟起始资金 (USDT)
 [agent]
 provider = "configured-adapter"
 model = "configured-model"
-decision_timeout_ms = 30000
+decision_timeout_ms = 180000
 prompt_dir = "/etc/alphabound/prompts"
 
 [storage]
@@ -94,7 +94,7 @@ static_dir = "/opt/alphabound/ui/current"   # 预留；当前 Dashboard 已嵌�
 | `provider` | string | `openai` | 适配器名（当前仅 openai 兼容） |
 | `model` | string | `gpt-4o-mini` | 可被 `LLM_MODEL` 覆盖 |
 | `base_url` | string | `https://api.openai.com/v1` | 可被 `LLM_API_URL` 覆盖 |
-| `decision_timeout_ms` | u32 | `30000` | 请求超时预算（规划） |
+| `decision_timeout_ms` | u32 | `120000` | 单次 LLM chat 墙钟超时（超时→HOLD，不阻塞 daemon） |
 | `decision_interval_ms` | u32 | `600000` | 慢环基础间隔（活跃时段）；0 表示不按间隔调度 |
 | `decision_interval_quiet_ms` | u32 | `0` | 静默时段间隔；0 = 同基础间隔 |
 | `decision_min_interval_ms` | u32 | `120000` | 任意两次决策的硬性冷却下限（事件触发也受限） |

@@ -303,6 +303,7 @@
       <div class="card"><div class="label">管理</div><div class="value" id="st_admin" style="font-size:16px">—</div></div>
       <div class="card"><div class="label">运行时长</div><div class="value" id="st_up" style="font-size:16px">—</div></div>
       <div class="card"><div class="label">进程出口 IP</div><div class="value" id="st_ip" style="font-size:14px">—</div></div>
+      <div class="card"><div class="label">磁盘（DB 卷）</div><div class="value" id="st_disk" style="font-size:14px">—</div></div>
     </div>
 
     <h2>接口连接</h2>
@@ -1058,6 +1059,17 @@ function renderStatus(system, state) {
   $("st_up").textContent = ups < 120 ? (ups + " 秒") : (Math.floor(ups/60) + " 分 " + (ups%60) + " 秒");
   const ip = st.egress_ip || "—";
   $("st_ip").textContent = ip + (st.egress_ip_ms ? " · " + ageText(st.egress_ip_ms) : "");
+  {
+    const band = st.disk || "unknown";
+    const free = st.disk_free_bytes != null ? st.disk_free_bytes : 0;
+    let freeTxt = "—";
+    if (free > 0) {
+      if (free >= 1024*1024*1024) freeTxt = (free / (1024*1024*1024)).toFixed(1) + " GiB";
+      else freeTxt = Math.round(free / (1024*1024)) + " MiB";
+    }
+    $("st_disk").textContent = band + " · free " + freeTxt + (st.disk_ms ? " · " + ageText(st.disk_ms) : "");
+    $("st_disk").className = "value" + (band === "critical" ? " bad" : band === "low" ? " warn" : band === "ok" ? " ok" : "");
+  }
 
   const pub = st.okx_public || "unknown";
   $("st_pub").textContent = (CONN_ZH[pub] || pub) + (st.okx_public_detail ? " · " + st.okx_public_detail : "") + " · " + ageText(st.okx_public_ms);

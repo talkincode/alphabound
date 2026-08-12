@@ -24,7 +24,7 @@ provider = "openai"
 # Azure OpenAI：model 必须是 Deployment 名称
 model = "gpt-4o-mini"
 base_url = "https://api.openai.com/v1"
-decision_timeout_ms = 30000
+decision_timeout_ms = 180000
 decision_interval_ms = 60000
 prompt_dir = "prompts"
 enabled = true

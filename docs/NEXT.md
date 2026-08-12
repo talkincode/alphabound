@@ -51,7 +51,14 @@
    - ✅ Dashboard 订单视图 API + 决策详情关联订单  
    - ✅ 部分成交再规划 + fills 投影  
    - ✅ Fault 矩阵单测骨架（AC-FD1..5/9）；FD6–8/10 仍需注入/演练  
-   - 挂单 limit  
+   - ✅ 挂单 limit（`LIMIT_ONLY` → tick-snapped limit；`LIMIT_OR_MARKET` 仍走市价）  
+   - ✅ LIMIT_ONLY `max_wait_ms` 超时撤单 + partial 余量撤单  
+   - ✅ FD6–8 存储策略纯函数（`storage/policy.zig`）+ fault matrix 单测  
+   - ✅ LLM 空闲连接：keep-alive off + HttpFailed 时 reset 重试一次  
+   - ✅ LLM **墙钟超时**（`decision_timeout_ms`，默认 120s；worker+detach，超时→HOLD 不堵 daemon）  
+   - ✅ OKX REST / egress 探测：keep-alive off + 一次 reset 重试  
+   - ✅ FD7 磁盘探测接入 daemon（statvfs → disk_ok / EXIT_ONLY / HALTED + `DISK_STATUS`）  
+   - ✅ FD8 已有库文件 open 失败 → refuse empty recreate  
    - Demo ≥7 天 soak
 
 ---

@@ -88,6 +88,29 @@ pub fn snapPrice(price: Decimal, tick: Decimal, side: orders.Side) PlanError!Dec
     };
 }
 
+/// Derive a limit price from mark + urgency in [0,1].
+/// urgency=1 → at mark (still tick-snapped, side-adversarial).
+/// urgency=0 → up to `max_passive_frac` away from mark (more passive).
+pub fn limitPriceFromMark(
+    mark: Decimal,
+    tick: Decimal,
+    side: orders.Side,
+    urgency: Decimal,
+    max_passive_frac: Decimal,
+) PlanError!Decimal {
+    if (!mark.gt(Decimal.zero)) return error.NonPositivePrice;
+    var u = urgency;
+    if (u.isNegative()) u = Decimal.zero;
+    if (u.gt(Decimal.one)) u = Decimal.one;
+    const one_minus = try Decimal.one.sub(u);
+    const passive = try max_passive_frac.mul(one_minus, .down);
+    const raw = switch (side) {
+        .buy => try mark.mul(try Decimal.one.sub(passive), .down),
+        .sell => try mark.mul(try Decimal.one.add(passive), .up),
+    };
+    return snapPrice(raw, tick, side);
+}
+
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
@@ -191,6 +214,18 @@ test "price snapping is side-adversarial" {
     try testing.expect(sell.eql(d("100000.2")));
     const exact = try snapPrice(d("100000.1"), d("0.1"), .sell);
     try testing.expect(exact.eql(d("100000.1")));
+}
+
+test "limitPriceFromMark urgency pulls toward mark" {
+    const tick = d("0.1");
+    const mark = d("100000");
+    const max_passive = d("0.001"); // 10 bps
+    const buy_passive = try limitPriceFromMark(mark, tick, .buy, d("0"), max_passive);
+    try testing.expect(buy_passive.lt(mark));
+    const buy_urgent = try limitPriceFromMark(mark, tick, .buy, d("1"), max_passive);
+    try testing.expect(buy_urgent.eql(try snapPrice(mark, tick, .buy)));
+    const sell_passive = try limitPriceFromMark(mark, tick, .sell, d("0"), max_passive);
+    try testing.expect(sell_passive.gt(mark));
 }
 
 test "property: planned qty always on lot grid and within caps" {

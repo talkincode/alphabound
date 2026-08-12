@@ -358,6 +358,10 @@ const RuntimeStatus = struct {
     last_bid: []const u8 = "",
     egress_ip: []const u8 = "",
     egress_ip_ms: i64 = 0,
+    /// FD7 disk free-space band for DB volume: ok | low | critical | unknown
+    disk: []const u8 = "unknown",
+    disk_free_bytes: u64 = 0,
+    disk_ms: i64 = 0,
     // LLM token totals since process start
     llm_calls: u64 = 0,
     prompt_tokens: u64 = 0,
@@ -439,6 +443,11 @@ const RuntimeStatus = struct {
         self.egress_ip = self.egress_buf[0..self.egress_len];
         self.egress_ip_ms = nowMs();
     }
+    fn setDisk(self: *RuntimeStatus, band: []const u8, free_bytes: u64) void {
+        self.disk = band;
+        self.disk_free_bytes = free_bytes;
+        self.disk_ms = nowMs();
+    }
 };
 
 pub fn main(init: std.process.Init) !u8 {
@@ -514,9 +523,23 @@ pub fn main(init: std.process.Init) !u8 {
     var db_path_buf: [512:0]u8 = undefined;
     const db_path = std.fmt.bufPrintZ(&db_path_buf, "{s}", .{cfg.db_path}) catch return 1;
 
+    // AC-FD8: if a DB file already exists and open fails, refuse boot — never
+    // silently recreate an empty trading database over a corrupted file.
+    const db_existed = blk: {
+        std.Io.Dir.cwd().access(io, cfg.db_path, .{}) catch break :blk false;
+        break :blk true;
+    };
+
     // Ensure parent dir for relative local db paths exists is caller's job;
     // open fails clearly if missing.
     var db = ab.storage.Db.open(db_path) catch |err| {
+        if (db_existed and ab.storage_policy.looksLikeCorruption(true, false)) {
+            std.debug.print(
+                "[boot] FATAL db open failed on existing file (refuse empty recreate) path={s} err={t} action={s}\n",
+                .{ cfg.db_path, err, @tagName(ab.storage_policy.onCorruptOpen()) },
+            );
+            return 1;
+        }
         std.debug.print("[boot] FATAL db open {s}: {t}\n", .{ cfg.db_path, err });
         return 1;
     };
@@ -647,6 +670,7 @@ pub fn main(init: std.process.Init) !u8 {
     if (cfg.agent_enabled) {
         if (llm_env) |l| {
             llm_client = ab.openai.Client.init(gpa, io, l.base_url, l.api_key, l.model);
+            llm_client.?.timeout_ms = cfg.decision_timeout_ms;
         }
     }
 
@@ -804,6 +828,7 @@ pub fn main(init: std.process.Init) !u8 {
     refreshWebCaches(&web_state, &db, &agent_runs, &equity_repo, &events_repo, &memories_repo, &orders_repo, &fills_repo, last_bh_cmp);
     refreshCandlesCache(gpa, &web_state, &okx, &cfg);
     refreshEgressIp(gpa, &okx, &runtime_status);
+    refreshDiskStatus(&cfg, &engine, &events_repo, &runtime_status);
     refreshSystemCache(&web_state, &db, &cfg, &mem_store, boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), llm_client != null, admin_paused, &runtime_status);
     logEvent(&events_repo, &engine, "STATE_READY", "core", "INFO", &cfg);
 
@@ -830,7 +855,10 @@ pub fn main(init: std.process.Init) !u8 {
     const private_ws_reprobe_ms: i64 = 300_000;
     const backup_interval_ms: i64 = 3_600_000;
     const egress_refresh_ms: i64 = 3_600_000;
+    // FD7: probe DB volume free space often enough to catch fill-ups.
+    const disk_refresh_ms: i64 = 60_000;
     var last_egress_ms: i64 = 0;
+    var last_disk_ms: i64 = 0;
     var last_private_ws_ms: i64 = now_boot;
     var last_backup_ms: i64 = 0;
 
@@ -1033,6 +1061,10 @@ pub fn main(init: std.process.Init) !u8 {
             if (last_egress_ms == 0 or tnow - last_egress_ms >= egress_refresh_ms) {
                 last_egress_ms = tnow;
                 refreshEgressIp(gpa, &okx, &runtime_status);
+            }
+            if (last_disk_ms == 0 or tnow - last_disk_ms >= disk_refresh_ms) {
+                last_disk_ms = tnow;
+                refreshDiskStatus(&cfg, &engine, &events_repo, &runtime_status);
             }
             if (last_backup_ms == 0 or tnow - last_backup_ms >= backup_interval_ms) {
                 last_backup_ms = tnow;
@@ -1703,6 +1735,7 @@ fn runAgentDecision(
     const chat_res = client.chat(default_system_prompt, user_msg) catch |err| {
         const tag: []const u8 = switch (err) {
             error.HttpFailed => "http_failed",
+            error.Timeout => "timeout",
             error.ApiError => "api_error",
             error.MalformedResponse => "malformed_response",
             error.EmptyContent => "empty_content",
@@ -1778,6 +1811,7 @@ fn runAgentDecision(
             admission,
             instrument,
             snap,
+            prop.order_policy,
         );
     }
     std.debug.print(
@@ -1859,11 +1893,14 @@ fn tryDemoExecute(
     admission: ShadowAdmission,
     instrument: ab.planner.Instrument,
     snap_in: ab.state.PortfolioState,
+    order_policy: ab.proposal.OrderPolicy,
 ) []const u8 {
     if (!std.mem.eql(u8, admission.verdict_txt, "APPROVE") and !std.mem.eql(u8, admission.verdict_txt, "REDUCE")) {
         return "skipped_reject";
     }
 
+    // LIMIT_ONLY → limit legs; LIMIT_OR_MARKET → market (demo default, fast fill).
+    const prefer_limit = order_policy.type == .limit_only;
     const max_legs = ab.okx_trade.max_replan_legs;
     var seq: u16 = 0;
     var last_note: []const u8 = "plan_hold";
@@ -1912,7 +1949,7 @@ fn tryDemoExecute(
             std.debug.print("[exec] replan leg={d} side={s} qty={s}\n", .{ seq, po.side.jsonName(), q_s });
         }
 
-        const leg = placeDemoMarketLeg(
+        const leg = placeDemoLeg(
             gpa,
             okx,
             cfg,
@@ -1924,6 +1961,11 @@ fn tryDemoExecute(
             snap.version,
             seq,
             po,
+            mark,
+            instrument,
+            prefer_limit,
+            order_policy.urgency,
+            order_policy.max_wait_ms,
         );
         last_note = leg;
 
@@ -1980,8 +2022,9 @@ fn refreshDemoPortfolio(
     }
 }
 
-/// Single market leg: place + query/resolve. `seq` differentiates client_order_id on replans.
-fn placeDemoMarketLeg(
+/// Single place + query/resolve leg. `seq` differentiates client_order_id on replans.
+/// When `prefer_limit`, posts a limit at urgency-adjusted mark (tick-snapped).
+fn placeDemoLeg(
     gpa: std.mem.Allocator,
     okx: *ab.okx_rest.Client,
     cfg: *const ab.config.Config,
@@ -1993,19 +2036,46 @@ fn placeDemoMarketLeg(
     snap_version: u64,
     seq: u16,
     po: ab.planner.PlannedOrder,
+    mark: ab.decimal.Decimal,
+    instrument: ab.planner.Instrument,
+    prefer_limit: bool,
+    urgency: ab.decimal.Decimal,
+    max_wait_ms: u32,
 ) []const u8 {
     var cl_buf: [32]u8 = undefined;
     const cl_id = ab.orders.clientOrderId(&cl_buf, decision_id, snap_version, seq);
+
+    var px_opt: ?ab.decimal.Decimal = null;
+    if (prefer_limit) {
+        const max_passive = ab.decimal.Decimal.parse("0.001") catch ab.decimal.Decimal.zero; // 10 bps
+        px_opt = ab.planner.limitPriceFromMark(mark, instrument.tick_size, po.side, urgency, max_passive) catch null;
+        if (px_opt == null) return "limit_price_error";
+    }
+
     var body_buf: [384]u8 = undefined;
-    const body = ab.okx_trade.formatPlaceMarketBody(&body_buf, .{
-        .inst_id = cfg.instrument,
-        .side = po.side,
-        .qty = po.qty,
-        .client_order_id = cl_id,
-    }) catch return "body_error";
+    const body = blk: {
+        if (px_opt) |px| {
+            break :blk ab.okx_trade.formatPlaceLimitBody(&body_buf, .{
+                .inst_id = cfg.instrument,
+                .side = po.side,
+                .qty = po.qty,
+                .price = px,
+                .client_order_id = cl_id,
+            }) catch return "body_error";
+        } else {
+            break :blk ab.okx_trade.formatPlaceMarketBody(&body_buf, .{
+                .inst_id = cfg.instrument,
+                .side = po.side,
+                .qty = po.qty,
+                .client_order_id = cl_id,
+            }) catch return "body_error";
+        }
+    };
 
     var qty_buf: [48]u8 = undefined;
     const qty_s = decFmt(&qty_buf, po.qty);
+    var price_buf: [48]u8 = undefined;
+    const price_s: []const u8 = if (px_opt) |px| decFmt(&price_buf, px) else "market";
     const ts_now = nowMs();
     var ts_buf: [32]u8 = undefined;
     const ts = ab.clock.formatRfc3339Ms(ts_now, &ts_buf) catch return "ts_error";
@@ -2016,7 +2086,7 @@ fn placeDemoMarketLeg(
         .decision_id = decision_id,
         .side = po.side.jsonName(),
         .qty = qty_s,
-        .price = "market",
+        .price = price_s,
         .status = ab.orders.OrderStatus.planned.jsonName(),
         .created_ts = ts,
         .updated_ts = ts,
@@ -2033,7 +2103,7 @@ fn placeDemoMarketLeg(
             .decision_id = decision_id,
             .side = po.side.jsonName(),
             .qty = qty_s,
-            .price = "market",
+            .price = price_s,
             .status = status.jsonName(),
             .created_ts = ts,
             .updated_ts = ts,
@@ -2059,16 +2129,16 @@ fn placeDemoMarketLeg(
             .decision_id = decision_id,
             .side = po.side.jsonName(),
             .qty = qty_s,
-            .price = "market",
+            .price = price_s,
             .status = status.jsonName(),
             .created_ts = ts,
             .updated_ts = ts,
         }) catch {};
-        var rbuf: [256]u8 = undefined;
+        var rbuf: [288]u8 = undefined;
         const rp = std.fmt.bufPrint(
             &rbuf,
-            "{{\"clOrdId\":\"{s}\",\"status\":\"REJECTED\",\"side\":\"{s}\",\"qty\":\"{s}\",\"seq\":{d}}}",
-            .{ cl_id, po.side.jsonName(), qty_s, seq },
+            "{{\"clOrdId\":\"{s}\",\"status\":\"REJECTED\",\"side\":\"{s}\",\"qty\":\"{s}\",\"px\":\"{s}\",\"seq\":{d}}}",
+            .{ cl_id, po.side.jsonName(), qty_s, price_s, seq },
         ) catch "{\"status\":\"REJECTED\"}";
         logEventPayload(events_repo, engine, "ORDER_REJECTED", "execution", "WARN", cfg, rp);
         return "rejected";
@@ -2082,21 +2152,122 @@ fn placeDemoMarketLeg(
         .decision_id = decision_id,
         .side = po.side.jsonName(),
         .qty = qty_s,
-        .price = "market",
+        .price = price_s,
         .status = status.jsonName(),
         .created_ts = ts,
         .updated_ts = ts,
     }) catch {};
 
-    var abuf: [320]u8 = undefined;
+    var abuf: [360]u8 = undefined;
     const ap = std.fmt.bufPrint(
         &abuf,
-        "{{\"clOrdId\":\"{s}\",\"ordId\":\"{s}\",\"side\":\"{s}\",\"qty\":\"{s}\",\"status\":\"ACKNOWLEDGED\",\"seq\":{d}}}",
-        .{ cl_id, ex_id, po.side.jsonName(), qty_s, seq },
+        "{{\"clOrdId\":\"{s}\",\"ordId\":\"{s}\",\"side\":\"{s}\",\"qty\":\"{s}\",\"px\":\"{s}\",\"status\":\"ACKNOWLEDGED\",\"seq\":{d}}}",
+        .{ cl_id, ex_id, po.side.jsonName(), qty_s, price_s, seq },
     ) catch "{\"status\":\"ACKNOWLEDGED\"}";
     logEventPayload(events_repo, engine, "ORDER_ACK", "execution", "INFO", cfg, ap);
 
-    return queryAndResolveOrder(gpa, okx, cfg, engine, orders_repo, fills_repo, events_repo, decision_id, cl_id, po.side.jsonName(), qty_s, ts);
+    var resolved = queryAndResolveOrder(gpa, okx, cfg, engine, orders_repo, fills_repo, events_repo, decision_id, cl_id, po.side.jsonName(), qty_s, ts);
+
+    // LIMIT_ONLY: do not leave working leaves when replan may fire.
+    if (prefer_limit and std.mem.eql(u8, resolved, "partial")) {
+        _ = cancelDemoClOrd(gpa, okx, cfg, engine, events_repo, cl_id, "partial_remainder", 0);
+        resolved = queryAndResolveOrder(gpa, okx, cfg, engine, orders_repo, fills_repo, events_repo, decision_id, cl_id, po.side.jsonName(), qty_s, ts);
+        if (std.mem.eql(u8, resolved, "canceled")) resolved = "partial";
+        return resolved;
+    }
+
+    // Poll until terminal or max_wait, then cancel remainder (no stuck leaves).
+    if (prefer_limit and isOpenOrderNote(resolved)) {
+        resolved = waitOrCancelLimit(
+            gpa,
+            okx,
+            cfg,
+            engine,
+            orders_repo,
+            fills_repo,
+            events_repo,
+            decision_id,
+            cl_id,
+            po.side.jsonName(),
+            qty_s,
+            ts,
+            max_wait_ms,
+        );
+    }
+    return resolved;
+}
+
+fn isOpenOrderNote(note: []const u8) bool {
+    return std.mem.eql(u8, note, "acked") or
+        std.mem.eql(u8, note, "open") or
+        std.mem.eql(u8, note, "partial");
+}
+
+fn cancelDemoClOrd(
+    gpa: std.mem.Allocator,
+    okx: *ab.okx_rest.Client,
+    cfg: *const ab.config.Config,
+    engine: *ab.state.Engine,
+    events_repo: *ab.storage.EventsRepo,
+    cl_id: []const u8,
+    reason: []const u8,
+    wait_ms: u32,
+) bool {
+    var cbuf: [192]u8 = undefined;
+    const cbody = ab.okx_trade.formatCancelBody(&cbuf, .{
+        .inst_id = cfg.instrument,
+        .client_order_id = cl_id,
+    }) catch return false;
+    const resp = okx.postPrivate("/api/v5/trade/cancel-order", cbody, nowMs()) catch return false;
+    defer gpa.free(resp);
+    var pbuf: [224]u8 = undefined;
+    const p = std.fmt.bufPrint(
+        &pbuf,
+        "{{\"clOrdId\":\"{s}\",\"reason\":\"{s}\",\"wait_ms\":{d}}}",
+        .{ cl_id, reason, wait_ms },
+    ) catch "{\"reason\":\"cancel\"}";
+    logEventPayload(events_repo, engine, "ORDER_CANCEL_SENT", "execution", "INFO", cfg, p);
+    return true;
+}
+
+/// Poll order state until terminal or deadline; cancel if still working.
+fn waitOrCancelLimit(
+    gpa: std.mem.Allocator,
+    okx: *ab.okx_rest.Client,
+    cfg: *const ab.config.Config,
+    engine: *ab.state.Engine,
+    orders_repo: *ab.storage.OrdersRepo,
+    fills_repo: *ab.storage.FillsRepo,
+    events_repo: *ab.storage.EventsRepo,
+    decision_id: []const u8,
+    cl_id: []const u8,
+    side: []const u8,
+    qty_s: []const u8,
+    ts: []const u8,
+    max_wait_ms: u32,
+) []const u8 {
+    const wait_cap_ms: u32 = if (max_wait_ms == 0) 30_000 else @min(max_wait_ms, 300_000);
+    const deadline = nowMs() + @as(i64, wait_cap_ms);
+    var last: []const u8 = "acked";
+
+    while (nowMs() < deadline) {
+        // Prefer the process Io clock (Zig 0.16); no Thread.sleep / posix.nanosleep.
+        okx.http.io.sleep(.{ .nanoseconds = 250_000_000 }, .awake) catch {};
+        last = queryAndResolveOrder(gpa, okx, cfg, engine, orders_repo, fills_repo, events_repo, decision_id, cl_id, side, qty_s, ts);
+        if (std.mem.eql(u8, last, "partial")) {
+            _ = cancelDemoClOrd(gpa, okx, cfg, engine, events_repo, cl_id, "partial_remainder", wait_cap_ms);
+            last = queryAndResolveOrder(gpa, okx, cfg, engine, orders_repo, fills_repo, events_repo, decision_id, cl_id, side, qty_s, ts);
+            if (std.mem.eql(u8, last, "canceled")) return "partial";
+            return last;
+        }
+        if (!isOpenOrderNote(last)) return last;
+    }
+
+    _ = cancelDemoClOrd(gpa, okx, cfg, engine, events_repo, cl_id, "max_wait_ms", wait_cap_ms);
+    last = queryAndResolveOrder(gpa, okx, cfg, engine, orders_repo, fills_repo, events_repo, decision_id, cl_id, side, qty_s, ts);
+    if (std.mem.eql(u8, last, "filled") or std.mem.eql(u8, last, "partial")) return last;
+    if (std.mem.eql(u8, last, "canceled")) return "limit_timeout";
+    return last;
 }
 
 fn queryAndResolveOrder(
@@ -2468,10 +2639,13 @@ fn refreshSystemCache(
         },
     ) catch return;
     w.print(
-        "\"egress_ip\":\"{s}\",\"egress_ip_ms\":{d},\"llm_calls\":{d},\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d},\"acct_usdt\":\"{s}\",\"acct_btc\":\"{s}\",\"last_decision\":\"{s}\",\"last_decision_ms\":{d}}}}}",
+        "\"egress_ip\":\"{s}\",\"egress_ip_ms\":{d},\"disk\":\"{s}\",\"disk_free_bytes\":{d},\"disk_ms\":{d},\"llm_calls\":{d},\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d},\"acct_usdt\":\"{s}\",\"acct_btc\":\"{s}\",\"last_decision\":\"{s}\",\"last_decision_ms\":{d}}}}}",
         .{
             st.egress_ip,
             st.egress_ip_ms,
+            st.disk,
+            st.disk_free_bytes,
+            st.disk_ms,
             st.llm_calls,
             st.prompt_tokens,
             st.completion_tokens,
@@ -2485,20 +2659,83 @@ fn refreshSystemCache(
     ws.setJson(.system, w.buffered());
 }
 
+/// AC-FD7: classify free space on the DB volume and feed the risk engine.
+fn refreshDiskStatus(
+    cfg: *const ab.config.Config,
+    engine: *ab.state.Engine,
+    events_repo: *ab.storage.EventsRepo,
+    st: *RuntimeStatus,
+) void {
+    const free = ab.storage_disk.freeBytes(cfg.db_path) catch {
+        st.setDisk("unknown", 0);
+        return;
+    };
+    const band = ab.storage_policy.classifyDiskFree(
+        free,
+        ab.storage_disk.default_low_bytes,
+        ab.storage_disk.default_critical_bytes,
+    );
+    const band_txt: []const u8 = switch (band) {
+        .ok => "ok",
+        .low => "low",
+        .critical => "critical",
+    };
+    st.setDisk(band_txt, free);
+
+    const prev = engine.snapshot();
+    // disk_ok false for low/critical so evaluateHealth stays degraded.
+    const disk_ok = band == .ok;
+    _ = engine.apply(.{ .disk_status = .{ .ok = disk_ok } }) catch {};
+    if (band == .critical) {
+        // Escalate to HALTED; sticky until operator_reset.
+        _ = engine.apply(.{ .risk_trigger = .fatal }) catch {};
+    }
+    const snap = engine.snapshot();
+    if (snap.risk_mode != prev.risk_mode or (!disk_ok and prev.disk_ok)) {
+        std.debug.print(
+            "[disk] band={s} free_bytes={d} risk_mode={s}\n",
+            .{ band_txt, free, snap.risk_mode.jsonName() },
+        );
+        var pbuf: [192]u8 = undefined;
+        const payload = std.fmt.bufPrint(
+            &pbuf,
+            "{{\"band\":\"{s}\",\"free_bytes\":{d},\"risk_mode\":\"{s}\"}}",
+            .{ band_txt, free, snap.risk_mode.jsonName() },
+        ) catch "{\"band\":\"?\"}";
+        const sev: []const u8 = if (band == .critical) "CRITICAL" else if (band == .low) "WARN" else "INFO";
+        logEventPayload(events_repo, engine, "DISK_STATUS", "storage", sev, cfg, payload);
+    }
+}
+
 fn refreshEgressIp(gpa: std.mem.Allocator, okx: *ab.okx_rest.Client, st: *RuntimeStatus) void {
-    var aw = std.Io.Writer.Allocating.init(gpa);
-    defer aw.deinit();
-    const result = okx.http.fetch(.{
-        .location = .{ .url = "https://api.ipify.org" },
-        .method = .GET,
-        .response_writer = &aw.writer,
-    }) catch return;
-    _ = result;
-    var list = aw.toArrayList();
-    const body = list.toOwnedSlice(gpa) catch return;
-    defer gpa.free(body);
-    const ip = std.mem.trim(u8, body, " \t\r\n");
-    if (ip.len > 0 and ip.len < 64) st.setEgress(ip);
+    // Best-effort; never let a half-closed pooled socket permanently block egress probe.
+    var attempt: u8 = 0;
+    while (attempt < 2) : (attempt += 1) {
+        var aw = std.Io.Writer.Allocating.init(gpa);
+        defer aw.deinit();
+        const result = okx.http.fetch(.{
+            .location = .{ .url = "https://api.ipify.org" },
+            .method = .GET,
+            .response_writer = &aw.writer,
+            .keep_alive = false,
+        }) catch {
+            if (attempt == 0) {
+                const io = okx.http.io;
+                const allocator = okx.http.allocator;
+                okx.http.deinit();
+                okx.http = .{ .allocator = allocator, .io = io };
+                continue;
+            }
+            return;
+        };
+        _ = result;
+        var list = aw.toArrayList();
+        const body = list.toOwnedSlice(gpa) catch return;
+        defer gpa.free(body);
+        const ip = std.mem.trim(u8, body, " \t\r\n");
+        if (ip.len > 0 and ip.len < 64) st.setEgress(ip);
+        return;
+    }
 }
 
 fn runSqliteBackup(

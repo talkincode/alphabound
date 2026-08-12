@@ -326,6 +326,17 @@ pub const Client = struct {
     }
 
     fn fetchRaw(self: *Client, method: auth.Method, path: []const u8, body: []const u8, extra_headers: []const std.http.Header) ![]u8 {
+        return self.fetchRawOnce(method, path, body, extra_headers) catch |err| {
+            if (err != Error.HttpFailed) return err;
+            // Zig may re-offer a half-closed pooled TLS socket after a blip; drop the
+            // pool and retry once so the daemon does not stay wedged until restart.
+            std.debug.print("[okx] transport_failed; reset_http_retry path={s}\n", .{path});
+            self.resetHttp();
+            return self.fetchRawOnce(method, path, body, extra_headers);
+        };
+    }
+
+    fn fetchRawOnce(self: *Client, method: auth.Method, path: []const u8, body: []const u8, extra_headers: []const std.http.Header) ![]u8 {
         var url_buf: [512]u8 = undefined;
         const url = std.fmt.bufPrint(&url_buf, "{s}{s}", .{ self.base_url, path }) catch return Error.HttpFailed;
 
@@ -339,7 +350,12 @@ pub const Client = struct {
             .response_writer = &alloc_writer.writer,
             .extra_headers = extra_headers,
             .headers = .{ .content_type = .{ .override = "application/json" } },
-        }) catch return Error.HttpFailed;
+            // Prefer fresh sockets for long-running daemons; OKX gateways idle-close.
+            .keep_alive = false,
+        }) catch |err| {
+            std.debug.print("[okx] transport_failed err={s} path={s}\n", .{ @errorName(err), path });
+            return Error.HttpFailed;
+        };
 
         // Return body even on non-2xx: OKX auth/IP errors are JSON {code,msg}.
         var list = alloc_writer.toArrayList();
@@ -349,6 +365,13 @@ pub const Client = struct {
             return Error.HttpFailed;
         }
         return owned;
+    }
+
+    fn resetHttp(self: *Client) void {
+        const io = self.http.io;
+        const allocator = self.http.allocator;
+        self.http.deinit();
+        self.http = .{ .allocator = allocator, .io = io };
     }
 };
 

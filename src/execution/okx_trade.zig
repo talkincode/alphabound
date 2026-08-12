@@ -14,6 +14,15 @@ pub const PlaceMarket = struct {
     client_order_id: []const u8,
 };
 
+pub const PlaceLimit = struct {
+    inst_id: []const u8,
+    side: orders.Side,
+    qty: Decimal,
+    /// Limit price already snapped to instrument tick.
+    price: Decimal,
+    client_order_id: []const u8,
+};
+
 /// Build POST /api/v5/trade/order body for a spot cash market order.
 /// Uses tgtCcy=base_ccy so `sz` is always BTC quantity for both buy and sell.
 pub fn formatPlaceMarketBody(buf: []u8, req: PlaceMarket) error{BufferTooSmall}![]const u8 {
@@ -23,6 +32,20 @@ pub fn formatPlaceMarketBody(buf: []u8, req: PlaceMarket) error{BufferTooSmall}!
         buf,
         "{{\"instId\":\"{s}\",\"tdMode\":\"cash\",\"side\":\"{s}\",\"ordType\":\"market\",\"sz\":\"{s}\",\"clOrdId\":\"{s}\",\"tgtCcy\":\"base_ccy\"}}",
         .{ req.inst_id, req.side.jsonName(), qty_s, req.client_order_id },
+    ) catch return error.BufferTooSmall;
+}
+
+/// Build POST /api/v5/trade/order body for a spot cash limit order.
+/// `px` is required; no tgtCcy (size is always base for spot limit).
+pub fn formatPlaceLimitBody(buf: []u8, req: PlaceLimit) error{BufferTooSmall}![]const u8 {
+    var qty_buf: [48]u8 = undefined;
+    const qty_s = req.qty.toString(&qty_buf) catch return error.BufferTooSmall;
+    var px_buf: [48]u8 = undefined;
+    const px_s = req.price.toString(&px_buf) catch return error.BufferTooSmall;
+    return std.fmt.bufPrint(
+        buf,
+        "{{\"instId\":\"{s}\",\"tdMode\":\"cash\",\"side\":\"{s}\",\"ordType\":\"limit\",\"sz\":\"{s}\",\"px\":\"{s}\",\"clOrdId\":\"{s}\"}}",
+        .{ req.inst_id, req.side.jsonName(), qty_s, px_s, req.client_order_id },
     ) catch return error.BufferTooSmall;
 }
 
@@ -108,6 +131,23 @@ test "place market body uses base_ccy and clOrdId" {
     try testing.expect(std.mem.indexOf(u8, body, "\"side\":\"buy\"") != null);
     try testing.expect(std.mem.indexOf(u8, body, "\"sz\":\"0.0001\"") != null);
     try testing.expect(std.mem.indexOf(u8, body, "ab00112233445566778899aabbccddee") != null);
+}
+
+test "place limit body includes px and ordType limit" {
+    var buf: [320]u8 = undefined;
+    const body = try formatPlaceLimitBody(&buf, .{
+        .inst_id = "BTC-USDT",
+        .side = .sell,
+        .qty = d("0.0002"),
+        .price = d("100000.1"),
+        .client_order_id = "abffeeddccbbaa998877665544332211",
+    });
+    try testing.expect(std.mem.indexOf(u8, body, "\"ordType\":\"limit\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"px\":\"100000.1\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"side\":\"sell\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"sz\":\"0.0002\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "tgtCcy") == null);
+    try testing.expect(std.mem.indexOf(u8, body, "abffeeddccbbaa998877665544332211") != null);
 }
 
 test "cancel and query path builders" {
