@@ -118,7 +118,17 @@ echo "backup_failed $(printf "%s\n" "$J" | grep -c "BACKUP_FAILED\|backup] faile
 echo "=== current process / latency ==="
 systemctl is-active alphabound
 ps -o pid,etime,rss --no-headers -C alphabound 2>/dev/null | head -1
-SYS="$(curl -sS --max-time 3 http://127.0.0.1:8080/api/v1/system 2>/dev/null)"
+# Dashboard auth: use token from env or secrets.env (never print it).
+API_AUTH=()
+_tok="${ALPHABOUND_API_TOKEN:-${DASHBOARD_API_TOKEN:-}}"
+if [ -z "$_tok" ] && [ -f /etc/alphabound/secrets.env ]; then
+  _tok=$(grep -E '^[[:space:]]*(export[[:space:]]+)?ALPHABOUND_API_TOKEN=' /etc/alphabound/secrets.env 2>/dev/null \
+    | tail -1 | sed -E 's/^[[:space:]]*(export[[:space:]]+)?ALPHABOUND_API_TOKEN=//' | tr -d '\r' \
+    | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+fi
+if [ -n "$_tok" ]; then API_AUTH=(-H "X-API-Token: ${_tok}"); fi
+unset _tok
+SYS="$(curl -sS --max-time 3 "${API_AUTH[@]}" http://127.0.0.1:8080/api/v1/system 2>/dev/null)"
 LAT_VERDICT="$(python3 - "$SYS" "${P99_BUDGET_US:-10000}" <<'PY'
 import json, sys
 budget = int(sys.argv[2])
@@ -126,14 +136,19 @@ try:
     d = json.loads(sys.argv[1])
 except Exception as e:
     print("system_parse_fail", e); raise SystemExit
+if d.get("error"):
+    print("system_error", d.get("error")); raise SystemExit
 st = d.get("status") or {}
 lat = st.get("latency_us") or {}
 ag = d.get("agent") or {}
 print(f"uptime_ms {d.get('uptime_ms')}")
+print(f"mode {d.get('mode')} ready {d.get('ready')}")
 print(f"latency_us p50={lat.get('p50')} p99={lat.get('p99')} max={lat.get('max')} samples={lat.get('samples')}")
 print(f"agent total={ag.get('total')} ok={ag.get('ok')} invalid={ag.get('invalid')} errors={ag.get('errors')} valid_rate={ag.get('valid_rate')}")
 print(f"tokens total={st.get('total_tokens')} llm_calls={st.get('llm_calls')}")
 print(f"disk {st.get('disk')} free_bytes {st.get('disk_free_bytes')}")
+ex = d.get("execution") or {}
+print(f"execution enabled={ex.get('enabled')} real_money={ex.get('real_money')}")
 # AC-NFR01: p99 must stay under budget once there is a real sample base.
 p99 = lat.get("p99") or 0
 samples = lat.get("samples") or 0

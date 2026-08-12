@@ -22,21 +22,23 @@
 
 ### P0 — 迁 live + 稳盘（本周）
 
-1. 生产配置改为 `mode = "live"`，保留 `OKX_REAL_MONEY_OK=1`，去掉误导性的 demo 命名  
-2. **滚动 soak**：`HOST=<host> ./scripts/soak-report.sh 24` + `check-remote.sh`  
-3. **控制面演练**：`cancel-all` → `flatten` → 拒增仓 → `target-weight=0.05` 恢复  
-4. **对账抽查**：cash/btc 与 OKX 一致；新单 `exchange_order_id` 非空  
+1. ✅ 生产 `mode = "live"` + `OKX_REAL_MONEY_OK=1`（2026-08-12）  
+2. ✅ 运维脚本带 Dashboard token：`check-remote` / `soak-report` / `gate2-report`  
+3. **滚动 soak**：继续 `HOST=<host> ./scripts/soak-report.sh 24`（24h PASS；向 7 日窗口滚）  
+4. **控制面演练**：`cancel-all` → `flatten` → 拒增仓 → `target-weight=0.05` 恢复（flatten 已验；cancel-all 有挂单时再验）  
+5. ✅ 对账：live balance applied；新单 `exchange_order_id` 非空（历史 5 笔 FILLED 空 id 为修前数据）  
 
 ### P1 — Gate3 收口
 
-1. Fault 矩阵 FD3/9/10 实网或注入补强（清单 #10）  
+1. ✅ Fault 矩阵单测 FD1–10 齐（含 FD10 restart fail-closed）；实网 WS/超时注入仍可选  
 2. 7 日滚动 soak 窗口继续积累（AC-GO8）  
-3. Dashboard：exchange_id 列非空验证  
+3. ✅ Dashboard/API：orders `exchange_order_id` 抽查（新单 8/8）  
 
 ### P2 — Phase 5 L1 观察
 
 1. 部署后 7 日：derivatives≈ticker；REBALANCE citation≥30%（`tool-value-report.sh`）  
 2. **不做** 外部 news/macro/onchain，直到 L1 引用闭环成立  
+
 
 ### P3 — 不做
 

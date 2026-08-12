@@ -74,7 +74,7 @@
 | AC-FD7 | 磁盘接近满 | 停新交易,清理可重建缓存;严重时 HALTED | Fault | ◐ `storage/disk` statvfs + `disk_ok` 进健康检查; low→EXIT_ONLY critical→HALTED; 缓存清理待做 |
 | AC-FD8 | 数据库损坏 | 仅保留退出能力+应急文本日志;禁止静默新建空库继续交易 | Fault | ◐ boot：已存在文件 open 失败 → FATAL refuse recreate; 应急文本日志/只退能力待扩 |
 | AC-FD9 | 回撤边界触发 | FLATTENING → HALTED;记录穿透与成本 | Fault + Replay | ◐ FLATTENING→HALTED + 无自动恢复（`fault/matrix`）;极端行情 replay 待做 |
-| AC-FD10 | 进程崩溃 | systemd 重启→重新对账→READY;重启前状态不被假定正确 | Fault(kill -9) | ◐ 生产 kill -9 演练 PASS(2026-08-12:SIGKILL→systemd 拉起→重新对账→10s READY;HWM/memories 从 DB 重建,`scripts/kill9-drill.sh` 可重复) |
+| AC-FD10 | 进程崩溃 | systemd 重启→重新对账→READY;重启前状态不被假定正确 | Fault(kill -9) | ☑ 生产 kill -9 演练 PASS(2026-08-12) + `fault/matrix` 单测：fresh engine EXIT_ONLY/未 reconcile 拒增仓，对账后才 NORMAL |
 
 ## F. 安全边界(§7.3 / §7.4)
 

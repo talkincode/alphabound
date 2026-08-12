@@ -21,7 +21,21 @@ if ! command -v curl >/dev/null 2>&1; then
   exit 2
 fi
 
-SYS_JSON="$(curl -fsS --max-time 5 "${BASE_URL}/api/v1/system" 2>/dev/null)" || {
+API_AUTH=()
+_tok="${ALPHABOUND_API_TOKEN:-${DASHBOARD_API_TOKEN:-}}"
+if [[ -z "$_tok" && -f /etc/alphabound/secrets.env ]]; then
+  _tok=$(grep -E '^[[:space:]]*(export[[:space:]]+)?ALPHABOUND_API_TOKEN=' /etc/alphabound/secrets.env 2>/dev/null \
+    | tail -1 | sed -E 's/^[[:space:]]*(export[[:space:]]+)?ALPHABOUND_API_TOKEN=//' | tr -d '\r' \
+    | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+elif [[ -z "$_tok" && -f secrets.env ]]; then
+  _tok=$(grep -E '^[[:space:]]*(export[[:space:]]+)?ALPHABOUND_API_TOKEN=' secrets.env 2>/dev/null \
+    | tail -1 | sed -E 's/^[[:space:]]*(export[[:space:]]+)?ALPHABOUND_API_TOKEN=//' | tr -d '\r' \
+    | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+fi
+if [[ -n "$_tok" ]]; then API_AUTH=(-H "X-API-Token: ${_tok}"); fi
+unset _tok
+
+SYS_JSON="$(curl -fsS --max-time 5 "${API_AUTH[@]}" "${BASE_URL}/api/v1/system" 2>/dev/null)" || {
   echo "[gate2] FAIL unreachable ${BASE_URL}/api/v1/system"
   exit 1
 }

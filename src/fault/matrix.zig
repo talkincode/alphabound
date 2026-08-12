@@ -180,6 +180,45 @@ test "AC-FD9 exit trigger flattens then halts; HALTED needs operator" {
     try testing.expectEqual(sm.RiskMode.exit_only, sm.next(m, .operator_reset));
 }
 
+// --- AC-FD10: process crash restart must not assume prior NORMAL ------------
+
+test "AC-FD10 fresh engine is fail-closed until reconcile (restart semantics)" {
+    // After kill -9 / systemd restart the process reconstructs Engine from
+    // defaults + DB HWM — never from a presumed in-memory NORMAL book.
+    var eng = state_mod.Engine.init(.{
+        .fee_rate = d("0.001"),
+        .slippage_rate = d("0.0005"),
+    }, d("0.10"));
+    try testing.expectEqual(sm.RiskMode.exit_only, eng.snapshot().risk_mode);
+    try testing.expect(!eng.snapshot().reconciled);
+    try testing.expect(!sm.allowsRiskIncrease(eng.snapshot().risk_mode));
+
+    var snap = baseSnap();
+    snap.reconciled = false;
+    snap.risk_mode = .exit_only;
+    snap.market_fresh = false;
+    snap.account_fresh = false;
+    const blocked = try admission.admit(snap, .{
+        .snapshot_version = snap.version,
+        .target_btc_weight = d("0.3"),
+    }, d("0.10"), stress());
+    try testing.expect(blocked.verdict == .reject);
+
+    // Only after clean reconcile + fresh market may risk increase resume.
+    _ = try eng.apply(.{ .market_tick = .{ .ts_ms = 1000, .bid = d("100000"), .mark = d("100000") } });
+    _ = try eng.apply(.{ .reconcile_result = .{
+        .ts_ms = 1000,
+        .cash_usdt = d("100"),
+        .btc_total = d("0"),
+        .btc_available = d("0"),
+        .hwm_from_db = d("100"),
+        .clean = true,
+    } });
+    try testing.expect(eng.snapshot().reconciled);
+    try testing.expectEqual(sm.RiskMode.normal, eng.snapshot().risk_mode);
+    try testing.expect(sm.allowsRiskIncrease(eng.snapshot().risk_mode));
+}
+
 // --- Cross-cutting: demo replan stays bounded --------------------------------
 
 test "AC-FR06 residual replan leg cap is hard" {
