@@ -352,6 +352,78 @@ test "property: admission never clears a weight whose stress equity is below flo
     }
 }
 
+test "AC-RK2 property: floor invariant holds under randomized stress params and drawdown" {
+    // Same invariant as above but with the *parameters* randomized too:
+    // shock, fees, slippage, exit reserve and max_drawdown all vary. No
+    // parameter regime may admit a weight whose stress equity is below floor.
+    var prng = std.Random.DefaultPrng.init(0xab5eed01);
+    const random = prng.random();
+    var i: usize = 0;
+    while (i < 2000) : (i += 1) {
+        var snap = baseSnapshot();
+        snap.cash_usdt = Decimal.fromRaw(random.intRangeAtMost(i128, 0, 500 * dec.ONE_RAW));
+        snap.btc_total = Decimal.fromRaw(random.intRangeAtMost(i128, 0, 500_000)); // up to 0.005 BTC
+        snap.liq_price = Decimal.fromRaw(random.intRangeAtMost(i128, 10_000 * dec.ONE_RAW, 200_000 * dec.ONE_RAW));
+        snap.mark_price = try snap.liq_price.mul(d("1.0005"), .nearest);
+        snap.high_watermark = Decimal.fromRaw(random.intRangeAtMost(i128, 1, 600 * dec.ONE_RAW));
+
+        const p = StressParams{
+            .price_shock = Decimal.fromRaw(random.intRangeAtMost(i128, 0, dec.ONE_RAW / 2)), // 0..50%
+            .trade_fee_rate = Decimal.fromRaw(random.intRangeAtMost(i128, 0, dec.ONE_RAW / 100)),
+            .trade_slippage_rate = Decimal.fromRaw(random.intRangeAtMost(i128, 0, dec.ONE_RAW / 100)),
+            .exit_costs = .{
+                .fee_rate = Decimal.fromRaw(random.intRangeAtMost(i128, 0, dec.ONE_RAW / 100)),
+                .slippage_rate = Decimal.fromRaw(random.intRangeAtMost(i128, 0, dec.ONE_RAW / 100)),
+            },
+            .exit_reserve = Decimal.fromRaw(random.intRangeAtMost(i128, 0, 5 * dec.ONE_RAW)),
+        };
+        const maxdd = Decimal.fromRaw(random.intRangeAtMost(i128, 0, dec.ONE_RAW / 2)); // 0..50%
+        const w = Decimal.fromRaw(random.intRangeAtMost(i128, 0, dec.ONE_RAW));
+        const prop = ProposalView{ .snapshot_version = snap.version, .target_btc_weight = w };
+        const r = try admit(snap, prop, maxdd, p);
+        switch (r.verdict) {
+            .approve => |aw| {
+                try testing.expect(aw.eql(w));
+                const e = try stressEquityAtWeight(snap, aw, p);
+                try testing.expect(e.gte(r.floor));
+            },
+            .approve_reduced => |aw| {
+                try testing.expect(aw.lt(w));
+                const e = try stressEquityAtWeight(snap, aw, p);
+                try testing.expect(e.gte(r.floor));
+            },
+            .reject => {},
+        }
+    }
+}
+
+test "AC-NFR03 property: snapshot_version mismatch always rejects, regardless of everything else" {
+    var prng = std.Random.DefaultPrng.init(0x5747a1e);
+    const random = prng.random();
+    var i: usize = 0;
+    while (i < 1000) : (i += 1) {
+        var snap = baseSnapshot();
+        snap.version = random.int(u32);
+        snap.reconciled = random.boolean();
+        snap.market_fresh = random.boolean();
+        snap.account_fresh = random.boolean();
+        snap.unresolved_orders = random.boolean();
+        snap.cash_usdt = Decimal.fromRaw(random.intRangeAtMost(i128, 0, 500 * dec.ONE_RAW));
+        snap.btc_total = Decimal.fromRaw(random.intRangeAtMost(i128, 0, 500_000));
+        var stale_version = random.int(u32);
+        while (stale_version == snap.version) stale_version = random.int(u32);
+        const prop = ProposalView{
+            .snapshot_version = stale_version,
+            .target_btc_weight = Decimal.fromRaw(random.intRangeAtMost(i128, 0, dec.ONE_RAW)),
+        };
+        const r = try admit(snap, prop, d("0.10"), baseParams());
+        switch (r.verdict) {
+            .reject => |reason| try testing.expectEqual(RejectReason.stale_snapshot, reason),
+            else => return error.TestUnexpectedResult,
+        }
+    }
+}
+
 test "property: halted and flattening reject risk-increasing weights" {
     var prng = std.Random.DefaultPrng.init(0xc0ffee);
     const random = prng.random();

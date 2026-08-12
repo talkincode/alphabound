@@ -18,7 +18,37 @@ fi
 # Secrets must never leak into data dir or backups.
 LEAK=$(grep -rl "OKX_API\|API_KEY" /var/lib/alphabound/ 2>/dev/null | grep -v '\.db' | head -3)
 if [ -n "$LEAK" ]; then echo "SEC2 FAIL: secret-like strings in data dir: $LEAK"; SEC_FAIL=1; else echo "data dir clean"; fi
+# Backup content spot-check: actual secret VALUES must not be inside DB/backup bytes.
+if [ -f /etc/alphabound/secrets.env ]; then
+  BAK_LEAK=0
+  while IFS='=' read -r k v; do
+    case "$k" in
+      OKX_API_KEY|OKX_API_SECRET|OKX_API_PASSPHRASE|LLM_API_KEY)
+        [ -z "$v" ] && continue
+        for f in /var/lib/alphabound/trading.db /var/lib/alphabound/trading.db.bak /var/lib/alphabound/trading.db-wal; do
+          [ -f "$f" ] || continue
+          if grep -qF -- "$v" "$f" 2>/dev/null; then echo "SEC2 FAIL: $k value present in $f"; BAK_LEAK=1; SEC_FAIL=1; fi
+        done ;;
+    esac
+  done < /etc/alphabound/secrets.env
+  [ "$BAK_LEAK" -eq 0 ] && echo "db+backup clean (no secret values)"
+fi
 [ "$SEC_FAIL" -eq 0 ] && echo "SEC2 OK"
+echo "=== dashboard redaction (AC-SEC3) ==="
+SEC3_FAIL=0
+DUMP=$(for ep in system state "events?limit=200" decisions "orders?limit=50" "memories?limit=100" shadow; do
+  curl -sS --max-time 5 "http://127.0.0.1:8080/api/v1/$ep"; done 2>/dev/null)
+if [ -f /etc/alphabound/secrets.env ]; then
+  while IFS='=' read -r k v; do
+    case "$k" in
+      OKX_API_KEY|OKX_API_SECRET|OKX_API_PASSPHRASE|LLM_API_KEY)
+        [ -z "$v" ] && continue
+        if printf '%s' "$DUMP" | grep -qF -- "$v"; then echo "SEC3 FAIL: $k value in dashboard response"; SEC3_FAIL=1; fi ;;
+    esac
+  done < /etc/alphabound/secrets.env
+fi
+printf '%s' "$DUMP" | grep -qE 'sk-[A-Za-z0-9]{16}' && { echo "SEC3 FAIL: sk- style token in dashboard responses"; SEC3_FAIL=1; }
+[ "$SEC3_FAIL" -eq 0 ] && echo "SEC3 OK (dashboard responses free of secret values)"
 echo "=== health ==="
 curl -sS --max-time 3 http://127.0.0.1:8080/health/live; echo
 curl -sS --max-time 3 http://127.0.0.1:8080/health/ready; echo

@@ -32,7 +32,7 @@
 |---|---|---|---|---|---|
 | AC-NFR01 | 延迟 | 行情事件进程内风险计算 p99 < 10ms(不含公网);有持续测量与告警 | Soak(基准测量) | P3 | ◐ `observability/latency.zig` Histogram(2048 环形窗口,nearest-rank 分位)+主循环 market_tick→engine.apply µs 测量,system JSON `latency_us{p50,p99,max,samples}` 持续可见;soak-report p99 门限告警已接(samples≥20 且 p99>P99_BUDGET_US 默认 10ms → SOAK FAIL);长窗口基准累积中 |
 | AC-NFR02 | 可用性 | 断开 LLM/新闻/链上/Dashboard 后,风险监控、订单对账与退出能力仍工作 | Fault Injection | P3 | ◐ LLM 断连注入演练 PASS(2026-08-12,`scripts/llm-outage-drill.sh`:不可达端点→tick/风险循环继续、HOLD 兜底、干净退出、DB verify PASS);新闻/链上无外呼路径;Dashboard 断开注入待做 |
-| AC-NFR03 | 一致性 | 提案未绑定当前 snapshot_version 即拒绝;状态变化后旧提案自动失效 | Property + Unit | P2 | ◐ admission 单测:`snapshot_version` 失配 → REJECT(stale_snapshot);property 广度待扩 |
+| AC-NFR03 | 一致性 | 提案未绑定当前 snapshot_version 即拒绝;状态变化后旧提案自动失效 | Property + Unit | P2 | ✅ admission 单测 + 随机化 property(1000 例:版本失配在任意快照状态组合下必 REJECT stale_snapshot) |
 | AC-NFR04 | 恢复 | 重启→恢复 DB→OKX 对账→READY;对账完成前不产生增仓提案 | Integration + Fault(kill -9 注入) | P3 | ◐ 生命周期 BOOTING→CONNECTING→RECONCILING→READY 已实现并实网验证;未对账时 fail-closed 起步 exit_only(单测);kill -9 演练 PASS(2026-08-12 生产 SIGKILL→systemd 拉起→10s 恢复 READY,`scripts/kill9-drill.sh` 可重复执行,soak-report 入账不误报) |
 | AC-NFR05 | 部署发布 | 生产 VM 无 Python/Node/Docker;核心二进制与 Dashboard 均可原子回滚;health fail 自动回滚 | Manual(发布演练) | P3 | ◐ 二进制 musl 静态链接(ldd "not a dynamic executable",daemon 零运行时依赖);releases+current symlink 原子回滚+health fail 自动回滚演练 PASS(2026-08-12);共享 VM 上存在他项目的 docker/python,daemon 不依赖 |
 | AC-NFR06 | 审计资源 | 关键事件带 state_version/software_version/config_hash/correlation_id;资源(CPU/RSS/fd/WAL/磁盘)有告警 | Unit(信封)+ Soak | P3 | ◐ `core/events.zig` 事件信封四字段已单测;daemon 落库事件实测含全部戳;soak-report 资源门限已接(RSS>256MB/fd>256/WAL>64MB → SOAK FAIL;磁盘 statvfs 已在 daemon 内) |
@@ -55,7 +55,7 @@
 | ID | 验收标准 | 验证方法 | 阶段 | 状态 |
 |---|---|---|---|---|
 | AC-RK1 | 保守净值 E_t 扣除退出费用/滑点/挂单风险;HWM 单调不减;DD 公式与设计一致 | Unit + Property | P3 | ☑ `risk/equity.zig`:保守估值扣费/滑点、HWM 单调、DD 公式、非负回撤全部单测通过 |
-| AC-RK2 | 任意输入下 Risk Kernel 不批准使压力净值 < HWM×90%+ExitReserve 的提案 | Property / Fuzz | P3 | ◐ 压力净值地板检查已实现并单测(REDUCE/REJECT 路径);随机化 property/fuzz 待扩 |
+| AC-RK2 | 任意输入下 Risk Kernel 不批准使压力净值 < HWM×90%+ExitReserve 的提案 | Property / Fuzz | P3 | ◐ 压力净值地板单测 + 随机化 property×2(2000 例固定参数 + 2000 例随机 shock/费率/滑点/exit_reserve/max_drawdown:任何 APPROVE/REDUCE 的压力净值 ≥ floor);结构化 fuzz(decimal 极值)待扩 |
 | AC-RK3 | 风险状态机转换(NORMAL/EXIT_ONLY/FLATTENING/HALTED)与 §5.3 条件表一致;HALTED 不自动恢复交易 | Unit(状态机)+ Fault | P3 | ◐ `risk/state_machine.zig` 转换表全路径单测,HALTED 无自动出边;Fault 注入待做 |
 | AC-RK4 | FLATTENING 先撤增险挂单,再退出,持续对账至 BTC 可用≈0 | Integration(Demo 演练) | P3 | ☐ |
 | AC-RK5 | 边界穿透时如实记录实际穿透幅度与成交成本(不掩饰) | Fault(极端行情 replay) | P3 | ☐ |
@@ -81,8 +81,8 @@
 | ID | 验收标准 | 验证方法 | 阶段 | 状态 |
 |---|---|---|---|---|
 | AC-SEC1 | OKX API Key 仅 Read+Trade(无 Withdraw),绑定 Azure 固定出口 IP 白名单 | Manual(配置审查) | P4 | ◐ boot 代码门禁:实盘授权时探测 /account/config,withdraw 权限直接拒绝启动;生产验证 read=true trade=true withdraw=false(2026-08-12);IP 白名单绑定为 OKX 侧人工配置 |
-| AC-SEC2 | 密钥文件 root 管理 0600;服务进程只读;密钥不进备份 | Manual + 脚本检查 | P4 | ◐ check-remote.sh SEC2 段自动检查(600 root:alphabound + 数据目录无密钥泄漏),生产 PASS(2026-08-12);备份内容抽查待做 |
-| AC-SEC3 | LLM Context/日志/错误栈/Dashboard 响应中无 secret/passphrase/签名材料(redaction 生效) | Unit(redaction)+ Manual 抽查 | P2 | ◐ `redaction.redact` 单测 + journal `logEventPayload` 落库前 redact/looksLeaky 拦截; Dashboard 抽查仍待 |
+| AC-SEC2 | 密钥文件 root 管理 0600;服务进程只读;密钥不进备份 | Manual + 脚本检查 | P4 | ✅ check-remote.sh SEC2 段自动检查:600 root:alphabound + 数据目录无密钥泄漏 + DB/备份/WAL 字节级抽查真实密钥值不存在,生产 PASS(2026-08-12) |
+| AC-SEC3 | LLM Context/日志/错误栈/Dashboard 响应中无 secret/passphrase/签名材料(redaction 生效) | Unit(redaction)+ Manual 抽查 | P2 | ◐ `redaction.redact` 单测 + `logEventPayload` 落库前 redact/looksLeaky 拦截;check-remote SEC3 段抽查全部 Dashboard API(system/state/events/decisions/orders/memories/shadow)不含真实密钥值,生产 PASS(2026-08-12);LLM context 出站抽查待做 |
 | AC-SEC4 | systemd 加固: NoNewPrivileges/PrivateTmp/ProtectSystem/受限写目录 | Manual(unit 审查) | P1 | ◐ `deploy/alphabound.service` 已含加固项；生产装机演练仍待 |
 | AC-SEC5 | 外部 HTTP 响应有大小/解压/超时/JSON 深度限制 | Unit + Fuzz | P2 | ◐ `security/limits.zig` 上限常量+`jsonStructureSane` 结构扫描(单测含深度炸弹/breakout/截断);OKX REST 512KB、LLM 1MB、egress 探针 4KB 固定容量 sink 接线,超限→记录并拒绝;解压炸弹面(gzip)待评审 |
 | AC-SEC6 | Agent 禁止项全部不可达: 读环境变量/密钥/DB 文件、执行 shell、任意 URL、直接获得 OKX client、修改风险配置/Prompt/二进制 | Manual(红队)+ Unit | P2 | ◐ `security/isolation.zig` @embedFile 源码扫描测试:agent 纯逻辑禁 std.http/net/fs/process/getenv/Child/exchange/execution/storage/risk-admission/凭证 token,openai.zig 仅白名单 std.http;人工红队评审待做 |
