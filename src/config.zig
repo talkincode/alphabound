@@ -44,7 +44,7 @@ pub const Config = struct {
     /// OpenAI-compatible API root (no trailing slash), e.g. https://api.openai.com/v1
     /// Overridable by LLM_API_URL / OPENAI_BASE_URL env.
     agent_base_url: []const u8 = "https://api.openai.com/v1",
-    decision_timeout_ms: u32 = 30_000,
+    decision_timeout_ms: u32 = 120_000,
     /// Slow-loop base cadence (active session); 0 disables scheduled agent
     /// ticks (manual/env only). Not a short-term strategy — default 10 min.
     decision_interval_ms: u32 = 600_000,

@@ -11,6 +11,7 @@ const std = @import("std");
 
 pub const Error = error{
     HttpFailed,
+    Timeout,
     ApiError,
     MalformedResponse,
     EmptyContent,
@@ -45,6 +46,9 @@ pub const Client = struct {
     api_key: []const u8,
     model: []const u8,
     auth_style: AuthStyle = .bearer,
+    /// Hard wall-clock budget for one chat() attempt (including one transport retry).
+    /// Slow Azure/DeepSeek completions often exceed 30s; production should use >=120s.
+    timeout_ms: u32 = 120_000,
 
     pub fn init(
         gpa: std.mem.Allocator,
@@ -78,6 +82,79 @@ pub const Client = struct {
         var url_buf: [1024]u8 = undefined;
         const url = std.fmt.bufPrint(&url_buf, "{s}/chat/completions", .{self.base_url}) catch return error.BufferTooSmall;
 
+        // Wall-clock budget guards against half-open TLS hangs that never surface as
+        // an error from std.http (observed in production after idle gateway drops).
+        return self.chatBudgeted(url, body) catch |err| {
+            // Retry only quick transport failures. Timeouts already consumed the full budget.
+            if (err != error.HttpFailed) return err;
+            std.debug.print("[llm] transport_failed; reset_http_retry\n", .{});
+            self.resetHttp();
+            return self.chatBudgeted(url, body);
+        };
+    }
+
+    fn chatBudgeted(self: *Client, url: []const u8, body: []const u8) Error!ChatResult {
+        const budget_ms: u32 = if (self.timeout_ms == 0) 120_000 else self.timeout_ms;
+
+        // Prefer a worker thread so a wedged socket cannot block the daemon forever.
+        // Fallback to sync if threads are unavailable.
+        const work = self.gpa.create(ChatWork) catch return self.chatOnce(url, body);
+        work.* = .{
+            .gpa = self.gpa,
+            .io = self.http.io,
+            .base_url = self.base_url,
+            .api_key = self.api_key,
+            .model = self.model,
+            .auth_style = self.auth_style,
+            .url = self.gpa.dupe(u8, url) catch {
+                self.gpa.destroy(work);
+                return error.OutOfMemory;
+            },
+            .body = self.gpa.dupe(u8, body) catch {
+                self.gpa.free(work.url);
+                self.gpa.destroy(work);
+                return error.OutOfMemory;
+            },
+        };
+
+        const thread = std.Thread.spawn(.{}, ChatWork.run, .{work}) catch {
+            const r = self.chatOnce(url, body);
+            self.gpa.free(work.url);
+            self.gpa.free(work.body);
+            self.gpa.destroy(work);
+            return r;
+        };
+
+        var waited_ms: u32 = 0;
+        while (waited_ms < budget_ms) {
+            if (work.phase.load(.acquire) == ChatWork.phase_done) {
+                const r = work.result;
+                thread.join();
+                self.gpa.free(work.url);
+                self.gpa.free(work.body);
+                self.gpa.destroy(work);
+                return r;
+            }
+            self.http.io.sleep(.{ .nanoseconds = 100_000_000 }, .awake) catch {};
+            waited_ms +|= 100;
+        }
+
+        // Timed out: try to abandon. If worker finished in the race window, take the result.
+        if (work.phase.cmpxchgStrong(ChatWork.phase_running, ChatWork.phase_abandoned, .acq_rel, .acquire)) |_| {
+            // phase was not running → must be done
+            const r = work.result;
+            thread.join();
+            self.gpa.free(work.url);
+            self.gpa.free(work.body);
+            self.gpa.destroy(work);
+            return r;
+        }
+        thread.detach();
+        std.debug.print("[llm] timeout budget_ms={d}\n", .{budget_ms});
+        return error.Timeout;
+    }
+
+    fn chatOnce(self: *Client, url: []const u8, body: []const u8) Error!ChatResult {
         var auth_buf: [600]u8 = undefined;
         const auth_headers: []const std.http.Header = switch (self.auth_style) {
             .bearer => blk: {
@@ -91,23 +168,6 @@ pub const Client = struct {
             },
         };
 
-        // Sparse LLM cadence (often many minutes). Azure/API gateways drop idle TLS
-        // sockets; Zig may re-offer a half-closed pooled connection and then keep
-        // failing until process restart. Disable keep-alive and hard-reset+retry once.
-        return self.chatOnce(url, body, auth_headers) catch |err| {
-            if (err != error.HttpFailed) return err;
-            std.debug.print("[llm] transport_failed; reset_http_retry\n", .{});
-            self.resetHttp();
-            return self.chatOnce(url, body, auth_headers);
-        };
-    }
-
-    fn chatOnce(
-        self: *Client,
-        url: []const u8,
-        body: []const u8,
-        auth_headers: []const std.http.Header,
-    ) Error!ChatResult {
         var resp_aw = std.Io.Writer.Allocating.init(self.gpa);
         defer resp_aw.deinit();
 
@@ -120,7 +180,6 @@ pub const Client = struct {
             .headers = .{ .content_type = .{ .override = "application/json" } },
             .keep_alive = false,
         }) catch |err| {
-            // No response body — DNS/TLS/timeout/connect/stale-socket. Never log secrets.
             std.debug.print("[llm] transport_failed err={s}\n", .{@errorName(err)});
             return error.HttpFailed;
         };
@@ -136,13 +195,11 @@ pub const Client = struct {
             return error.HttpFailed;
         }
 
-        // Non-2xx: classify without dumping body (may contain request ids only — still keep short).
         if (status_code < 200 or status_code >= 300) {
             const cls = classifyApiErrorBody(owned);
             std.debug.print("[llm] http_status={d} class={s}\n", .{ status_code, cls });
         }
 
-        // parseAssistantContent maps error object → ApiError; classify on ApiError path too.
         const parsed = parseChatResult(self.gpa, owned) catch |err| {
             if (err == error.ApiError) {
                 const cls = classifyApiErrorBody(owned);
@@ -163,6 +220,42 @@ pub const Client = struct {
         const allocator = self.http.allocator;
         self.http.deinit();
         self.http = .{ .allocator = allocator, .io = io };
+    }
+};
+
+/// Background chat attempt so the daemon can enforce a wall-clock budget.
+const ChatWork = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    base_url: []const u8,
+    api_key: []const u8,
+    model: []const u8,
+    auth_style: AuthStyle,
+    url: []u8,
+    body: []u8,
+    result: Error!ChatResult = error.HttpFailed,
+    /// 0 running, 1 done (result published), 2 abandoned by waiter.
+    phase: std.atomic.Value(u8) = .init(phase_running),
+
+    const phase_running: u8 = 0;
+    const phase_done: u8 = 1;
+    const phase_abandoned: u8 = 2;
+
+    fn run(self: *ChatWork) void {
+        var client = Client.init(self.gpa, self.io, self.base_url, self.api_key, self.model);
+        client.auth_style = self.auth_style;
+        defer client.deinit();
+
+        const r = client.chatOnce(self.url, self.body);
+        // Publish result before flipping phase to done (release).
+        self.result = r;
+        if (self.phase.cmpxchgStrong(phase_running, phase_done, .release, .monotonic)) |_| {
+            // Waiter abandoned us — free late success body and self.
+            if (r) |ok| self.gpa.free(ok.content) else |_| {}
+            self.gpa.free(self.url);
+            self.gpa.free(self.body);
+            self.gpa.destroy(self);
+        }
     }
 };
 

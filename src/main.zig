@@ -647,6 +647,7 @@ pub fn main(init: std.process.Init) !u8 {
     if (cfg.agent_enabled) {
         if (llm_env) |l| {
             llm_client = ab.openai.Client.init(gpa, io, l.base_url, l.api_key, l.model);
+            llm_client.?.timeout_ms = cfg.decision_timeout_ms;
         }
     }
 
@@ -1703,6 +1704,7 @@ fn runAgentDecision(
     const chat_res = client.chat(default_system_prompt, user_msg) catch |err| {
         const tag: []const u8 = switch (err) {
             error.HttpFailed => "http_failed",
+            error.Timeout => "timeout",
             error.ApiError => "api_error",
             error.MalformedResponse => "malformed_response",
             error.EmptyContent => "empty_content",
@@ -2624,19 +2626,34 @@ fn refreshSystemCache(
 }
 
 fn refreshEgressIp(gpa: std.mem.Allocator, okx: *ab.okx_rest.Client, st: *RuntimeStatus) void {
-    var aw = std.Io.Writer.Allocating.init(gpa);
-    defer aw.deinit();
-    const result = okx.http.fetch(.{
-        .location = .{ .url = "https://api.ipify.org" },
-        .method = .GET,
-        .response_writer = &aw.writer,
-    }) catch return;
-    _ = result;
-    var list = aw.toArrayList();
-    const body = list.toOwnedSlice(gpa) catch return;
-    defer gpa.free(body);
-    const ip = std.mem.trim(u8, body, " \t\r\n");
-    if (ip.len > 0 and ip.len < 64) st.setEgress(ip);
+    // Best-effort; never let a half-closed pooled socket permanently block egress probe.
+    var attempt: u8 = 0;
+    while (attempt < 2) : (attempt += 1) {
+        var aw = std.Io.Writer.Allocating.init(gpa);
+        defer aw.deinit();
+        const result = okx.http.fetch(.{
+            .location = .{ .url = "https://api.ipify.org" },
+            .method = .GET,
+            .response_writer = &aw.writer,
+            .keep_alive = false,
+        }) catch {
+            if (attempt == 0) {
+                const io = okx.http.io;
+                const allocator = okx.http.allocator;
+                okx.http.deinit();
+                okx.http = .{ .allocator = allocator, .io = io };
+                continue;
+            }
+            return;
+        };
+        _ = result;
+        var list = aw.toArrayList();
+        const body = list.toOwnedSlice(gpa) catch return;
+        defer gpa.free(body);
+        const ip = std.mem.trim(u8, body, " \t\r\n");
+        if (ip.len > 0 and ip.len < 64) st.setEgress(ip);
+        return;
+    }
 }
 
 fn runSqliteBackup(

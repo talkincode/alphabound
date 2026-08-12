@@ -55,6 +55,8 @@
    - ✅ LIMIT_ONLY `max_wait_ms` 超时撤单 + partial 余量撤单  
    - ✅ FD6–8 存储策略纯函数（`storage/policy.zig`）+ fault matrix 单测  
    - ✅ LLM 空闲连接：keep-alive off + HttpFailed 时 reset 重试一次  
+   - ✅ LLM **墙钟超时**（`decision_timeout_ms`，默认 120s；worker+detach，超时→HOLD 不堵 daemon）  
+   - ✅ OKX REST / egress 探测：keep-alive off + 一次 reset 重试  
    - Demo ≥7 天 soak
 
 ---

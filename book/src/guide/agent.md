@@ -58,7 +58,7 @@ Azure OpenAI：`LLM_MODEL` **必须是门户里的 Deployment 名称**（不是�
 provider = "openai"
 model = "gpt-4o-mini"                 # 可被 LLM_MODEL 覆盖
 base_url = "https://api.openai.com/v1" # 可被 LLM_API_URL 覆盖
-decision_timeout_ms = 30000
+decision_timeout_ms = 180000
 decision_interval_ms = 60000          # 慢环间隔；0=不按间隔调度
 prompt_dir = "prompts"
 enabled = true                        # false 则永不调模型

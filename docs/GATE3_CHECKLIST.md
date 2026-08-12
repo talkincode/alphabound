@@ -20,7 +20,9 @@
 - [x] Limit 挂单：`formatPlaceLimitBody` + `limitPriceFromMark`；demo `LIMIT_ONLY` 下 limit 腿
 - [x] LIMIT_ONLY：`max_wait_ms` 内轮询，超时/部分成交撤余量（`ORDER_CANCEL_SENT`）
 - [x] FD6–8 策略单测：`src/storage/policy.zig`（busy / disk / corrupt）
-- [x] LLM 传输：禁用 keep-alive + 一次 HTTP 客户端 reset 重试
+- [x] LLM 传输：禁用 keep-alive + 一次 HTTP 客户端 reset 重试  
+- [x] LLM 墙钟超时：`decision_timeout_ms`（默认 ≥120s）→ `Timeout` → HOLD；不阻塞主环  
+- [x] OKX REST：keep-alive off + transport reset 重试
 
 ## 配置最小集
 
