@@ -128,7 +128,7 @@ sqlite3 var/trading.db \
 
 - Key 不进 git、不进 Dashboard、不进 Agent Context  
 - 提案在 shadow **不进执行层**  
-- `mode=live` 仍被进程拒绝（Gate 4 前）
+- `mode=live` 需 `OKX_REAL_MONEY_OK=1`；shadow 默认仍不执行订单
 
 ## Reflection（决策后）
 

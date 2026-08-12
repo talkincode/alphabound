@@ -168,7 +168,7 @@ set -a && source ./secrets.env && set +a
 
 - `--self-check`：解析 TOML、打开 DB、migration、bind；若有 `OKX_*` 则做私有只读探测。
 - 每次启动计算 `config_hash`（SHA-256），写入事件信封。
-- `mode=live` 在 Gate 4 前启动即失败；`mode=demo` 无密钥失败。
+- `mode=live` 需要 `OKX_*` + `OKX_REAL_MONEY_OK=1`（且禁止 `OKX_SIMULATED`）；`mode=demo` 无密钥或无 venue 授权则失败。
 
 ## 热加载边界
 

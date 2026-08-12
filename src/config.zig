@@ -20,6 +20,12 @@ pub const Mode = enum {
         if (std.mem.eql(u8, s, "live")) return .live;
         return null;
     }
+
+    /// Demo (OKX simulated) or live (real small sub-account) — both use the
+    /// exchange book + optional order path. Shadow never does.
+    pub fn isTrading(self: Mode) bool {
+        return self == .demo or self == .live;
+    }
 };
 
 pub const Config = struct {
@@ -330,6 +336,9 @@ test "appendix B config parses" {
     defer cfg.deinit();
     try testing.expectEqualStrings("azure-btc-01", cfg.instance_id);
     try testing.expectEqual(Mode.shadow, cfg.mode);
+    try testing.expect(!Mode.shadow.isTrading());
+    try testing.expect(Mode.demo.isTrading());
+    try testing.expect(Mode.live.isTrading());
     try testing.expect(cfg.max_drawdown.eql(Decimal.parse("0.10") catch unreachable));
     try testing.expectEqual(@as(u32, 30000), cfg.decision_timeout_ms);
     try testing.expectEqualStrings("127.0.0.1:8080", cfg.web_bind);
