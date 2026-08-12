@@ -24,6 +24,9 @@ const migrations = [_][:0]const u8{
     migration_0001,
 };
 
+/// Expected user_version for a fully migrated database (restore drills).
+pub const expected_user_version: i64 = migrations.len;
+
 pub const Db = struct {
     handle: *c.sqlite3,
 
@@ -50,6 +53,20 @@ pub const Db = struct {
 
     pub fn close(self: *Db) void {
         _ = c.sqlite3_close(self.handle);
+    }
+
+    /// Open an existing database strictly read-only (no migrations, no WAL
+    /// conversion). For restore drills / backup verification (AC-OPS4).
+    pub fn openReadOnly(path: [:0]const u8) DbError!Db {
+        var handle: ?*c.sqlite3 = null;
+        if (c.sqlite3_open_v2(path.ptr, &handle, c.SQLITE_OPEN_READONLY, null) != c.SQLITE_OK) {
+            if (handle) |h| _ = c.sqlite3_close(h);
+            return DbError.OpenFailed;
+        }
+        var db = Db{ .handle = handle.? };
+        errdefer db.close();
+        try db.execAll("PRAGMA busy_timeout = 5000;");
+        return db;
     }
 
     /// Execute a multi-statement SQL string (no results expected).

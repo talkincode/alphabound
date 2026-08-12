@@ -115,6 +115,8 @@ const CliArgs = struct {
     agent_stats: bool = false,
     /// One-shot local admin command: pause|resume|reconcile|cancel-all|flatten|shutdown|status.
     control_cmd: ?[]const u8 = null,
+    /// Read-only backup/DB verification for restore drills (AC-OPS4).
+    verify_db_path: ?[]const u8 = null,
 };
 
 fn parseArgs(args: std.process.Args) !CliArgs {
@@ -138,6 +140,8 @@ fn parseArgs(args: std.process.Args) !CliArgs {
             out.agent_stats = true;
         } else if (std.mem.eql(u8, arg, "--control")) {
             out.control_cmd = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, arg, "--verify-db")) {
+            out.verify_db_path = it.next() orelse return error.MissingValue;
         } else {
             return error.UnknownFlag;
         }
@@ -457,7 +461,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     const cli = parseArgs(init.minimal.args) catch {
         std.debug.print(
-            "usage: alphabound [--config PATH] [--self-check] [--version] [--ticks N] [--agent-once] [--agent-stats] [--control pause|resume|reconcile|cancel-all|flatten|shutdown|status]\n",
+            "usage: alphabound [--config PATH] [--self-check] [--version] [--ticks N] [--agent-once] [--agent-stats] [--control pause|resume|reconcile|cancel-all|flatten|shutdown|status] [--verify-db PATH]\n",
             .{},
         );
         return 2;
@@ -467,6 +471,10 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("alphabound {s}\n", .{version_string});
         return 0;
     }
+
+    // Restore drill (AC-OPS4): verify a backup snapshot read-only and exit.
+    // Deliberately before config load — drills run against bare .bak files.
+    if (cli.verify_db_path) |vpath| return verifyDbSnapshot(vpath);
 
     // ---- BOOTING ---------------------------------------------------------
     std.debug.print("[boot] alphabound {s} loading {s}\n", .{ version_string, cli.config_path });
@@ -2744,6 +2752,109 @@ fn refreshEgressIp(okx: *ab.okx_rest.Client, st: *RuntimeStatus) void {
         if (ip.len > 0 and ip.len < 64) st.setEgress(ip);
         return;
     }
+}
+
+/// AC-OPS4 restore drill: read-only verification of a backup snapshot.
+/// Exit 0 = verifiable (integrity ok, schema current, projections readable).
+fn verifyDbSnapshot(path: []const u8) u8 {
+    var path_buf: [640:0]u8 = undefined;
+    const zpath = std.fmt.bufPrintZ(&path_buf, "{s}", .{path}) catch {
+        std.debug.print("[verify-db] path too long\n", .{});
+        return 1;
+    };
+    var db = ab.storage.Db.openReadOnly(zpath) catch {
+        std.debug.print("[verify-db] FAIL open read-only: {s}\n", .{path});
+        return 1;
+    };
+    defer db.close();
+
+    var fails: u8 = 0;
+
+    // 1. Page-level integrity.
+    {
+        var stmt = db.prepare("PRAGMA integrity_check") catch {
+            std.debug.print("[verify-db] FAIL integrity_check prepare\n", .{});
+            return 1;
+        };
+        defer stmt.finalize();
+        const row = stmt.step() catch false;
+        const verdict = if (row) stmt.columnText(0) else "no-result";
+        if (!std.mem.eql(u8, verdict, "ok")) {
+            std.debug.print("[verify-db] FAIL integrity_check: {s}\n", .{verdict});
+            fails += 1;
+        } else {
+            std.debug.print("[verify-db] integrity_check ok\n", .{});
+        }
+    }
+
+    // 2. Schema version matches this binary's migrations.
+    {
+        const uv = db.queryInt("PRAGMA user_version") catch -1;
+        if (uv != ab.storage.expected_user_version) {
+            std.debug.print("[verify-db] FAIL user_version {d} != expected {d}\n", .{ uv, ab.storage.expected_user_version });
+            fails += 1;
+        } else {
+            std.debug.print("[verify-db] user_version {d} ok\n", .{uv});
+        }
+    }
+
+    // 3. Core projections are present and readable.
+    const events = db.queryInt("SELECT COUNT(*) FROM events") catch -1;
+    const orders = db.queryInt("SELECT COUNT(*) FROM orders") catch -1;
+    const fills = db.queryInt("SELECT COUNT(*) FROM fills") catch -1;
+    const equity = db.queryInt("SELECT COUNT(*) FROM equity_samples") catch -1;
+    const runs = db.queryInt("SELECT COUNT(*) FROM agent_runs") catch -1;
+    const mems = db.queryInt("SELECT COUNT(*) FROM memories") catch -1;
+    std.debug.print(
+        "[verify-db] counts events={d} orders={d} fills={d} equity_samples={d} agent_runs={d} memories={d}\n",
+        .{ events, orders, fills, equity, runs, mems },
+    );
+    if (events < 0 or orders < 0 or fills < 0 or equity < 0 or runs < 0 or mems < 0) {
+        std.debug.print("[verify-db] FAIL missing core table(s)\n", .{});
+        fails += 1;
+    }
+
+    // 4. Event sequence sane: ids unique (PK) and seq strictly positive range.
+    if (events > 0) {
+        const min_seq = db.queryInt("SELECT MIN(seq) FROM events") catch -1;
+        const max_seq = db.queryInt("SELECT MAX(seq) FROM events") catch -1;
+        if (min_seq < 1 or max_seq < min_seq) {
+            std.debug.print("[verify-db] FAIL event seq range min={d} max={d}\n", .{ min_seq, max_seq });
+            fails += 1;
+        } else {
+            std.debug.print("[verify-db] event seq {d}..{d} ok\n", .{ min_seq, max_seq });
+        }
+    }
+
+    // 5. HWM restorable: latest sample parses as a non-negative decimal.
+    if (equity > 0) {
+        var stmt = db.prepare("SELECT hwm FROM equity_samples ORDER BY ts DESC LIMIT 1") catch {
+            std.debug.print("[verify-db] FAIL hwm query\n", .{});
+            return fails + 1;
+        };
+        defer stmt.finalize();
+        if (stmt.step() catch false) {
+            const hwm_text = stmt.columnText(0);
+            const hwm = ab.decimal.Decimal.parse(hwm_text) catch {
+                std.debug.print("[verify-db] FAIL hwm unparseable: {s}\n", .{hwm_text});
+                fails += 1;
+                return fails;
+            };
+            if (hwm.isNegative()) {
+                std.debug.print("[verify-db] FAIL hwm negative\n", .{});
+                fails += 1;
+            } else {
+                std.debug.print("[verify-db] hwm {s} restorable\n", .{hwm_text});
+            }
+        }
+    }
+
+    if (fails == 0) {
+        std.debug.print("[verify-db] PASS {s}\n", .{path});
+        return 0;
+    }
+    std.debug.print("[verify-db] FAIL {d} check(s): {s}\n", .{ fails, path });
+    return 1;
 }
 
 fn runSqliteBackup(

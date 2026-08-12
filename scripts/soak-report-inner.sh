@@ -15,19 +15,25 @@ echo "window_hours $WINDOW_H since_utc $SINCE now_utc $(date -u +%Y-%m-%dT%H:%M:
 
 echo "=== deploys in window (expected restarts) ==="
 DEPLOYS=0
+DRILL_KILLS=0
 if [[ -f "$DEPLOYS_LOG" ]]; then
   DEPLOYS=$(awk -v since="$SINCE" '$1 >= since' "$DEPLOYS_LOG" | tee /dev/stderr | wc -l | tr -d ' ')
+  DRILL_KILLS=$(awk -v since="$SINCE" '$1 >= since' "$DEPLOYS_LOG" | grep -c "drill kill-9")
 fi
 echo "deploys_in_window $DEPLOYS"
+echo "drill_kills_in_window $DRILL_KILLS"
 
 echo "=== service starts / unexpected exits (journal) ==="
 J="$(journalctl -u alphabound --since "${WINDOW_H} hours ago" --no-pager 2>/dev/null)"
 STARTS=$(printf "%s\n" "$J" | grep -c "Started AlphaBound")
-FAILED=$(printf "%s\n" "$J" | grep -cE "Failed with result|Main process exited, code=(killed|dumped)|oom-kill|Watchdog timeout")
+# "Failed with result" is emitted exactly once per failed unit cycle —
+# use it as the canonical unexpected-exit counter (kill/crash/oom/watchdog).
+FAILED=$(printf "%s\n" "$J" | grep -c "Failed with result")
+KILLED=$(printf "%s\n" "$J" | grep -cE "Main process exited, code=(killed|dumped)")
 CLEAN_STOPS=$(printf "%s\n" "$J" | grep -cE "Stopping AlphaBound|Deactivated successfully|Succeeded")
 echo "service_starts $STARTS"
 echo "clean_stops $CLEAN_STOPS"
-echo "unexpected_exits $FAILED"
+echo "unexpected_exits $FAILED (signal_or_dump $KILLED)"
 printf "%s\n" "$J" | grep -E "Failed with result|code=(killed|dumped)|oom-kill|Watchdog timeout" | tail -5
 
 echo "=== error counters (window) ==="
@@ -42,8 +48,9 @@ echo "=== current process / latency ==="
 systemctl is-active alphabound
 ps -o pid,etime,rss --no-headers -C alphabound 2>/dev/null | head -1
 SYS="$(curl -sS --max-time 3 http://127.0.0.1:8080/api/v1/system 2>/dev/null)"
-python3 - "$SYS" <<'PY'
+LAT_VERDICT="$(python3 - "$SYS" "${P99_BUDGET_US:-10000}" <<'PY'
 import json, sys
+budget = int(sys.argv[2])
 try:
     d = json.loads(sys.argv[1])
 except Exception as e:
@@ -56,15 +63,30 @@ print(f"latency_us p50={lat.get('p50')} p99={lat.get('p99')} max={lat.get('max')
 print(f"agent total={ag.get('total')} ok={ag.get('ok')} invalid={ag.get('invalid')} errors={ag.get('errors')} valid_rate={ag.get('valid_rate')}")
 print(f"tokens total={st.get('total_tokens')} llm_calls={st.get('llm_calls')}")
 print(f"disk {st.get('disk')} free_bytes {st.get('disk_free_bytes')}")
+# AC-NFR01: p99 must stay under budget once there is a real sample base.
+p99 = lat.get("p99") or 0
+samples = lat.get("samples") or 0
+if samples >= 20 and p99 > budget:
+    print(f"LATENCY_BREACH p99={p99}us budget={budget}us samples={samples}")
 PY
+)"
+printf "%s\n" "$LAT_VERDICT"
+LAT_BREACH=$(printf "%s\n" "$LAT_VERDICT" | grep -c "LATENCY_BREACH")
 
 echo "=== WAL / DB size ==="
 ls -l /var/lib/alphabound/trading.db* 2>/dev/null | awk '{print $5, $9}'
 ls /var/lib/alphabound/*.bak* 2>/dev/null | tail -5
 
 echo "=== verdict ==="
-if [[ "$FAILED" -gt 0 ]]; then
-  echo "SOAK FAIL unexpected_exits=$FAILED in ${WINDOW_H}h window"
+# Recorded kill -9 drills (NFR04) are expected: discount them.
+FAILED_ADJ=$((FAILED - DRILL_KILLS))
+[[ "$FAILED_ADJ" -lt 0 ]] && FAILED_ADJ=0
+if [[ "$FAILED_ADJ" -gt 0 ]]; then
+  echo "SOAK FAIL unexpected_exits=$FAILED_ADJ in ${WINDOW_H}h window (raw=$FAILED drills=$DRILL_KILLS)"
+  exit 1
+fi
+if [[ "$LAT_BREACH" -gt 0 ]]; then
+  echo "SOAK FAIL latency p99 over budget (AC-NFR01)"
   exit 1
 fi
 EXTRA=$((STARTS - DEPLOYS))

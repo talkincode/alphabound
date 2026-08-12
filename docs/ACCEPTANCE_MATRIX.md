@@ -30,10 +30,10 @@
 
 | ID | 属性 | 验收标准 | 验证方法 | 阶段 | 状态 |
 |---|---|---|---|---|---|
-| AC-NFR01 | 延迟 | 行情事件进程内风险计算 p99 < 10ms(不含公网);有持续测量与告警 | Soak(基准测量) | P3 | ◐ `observability/latency.zig` Histogram(2048 环形窗口,nearest-rank 分位)+主循环 market_tick→engine.apply µs 测量,system JSON `latency_us{p50,p99,max,samples}` 持续可见;p99 门限告警与 soak 基准待做 |
+| AC-NFR01 | 延迟 | 行情事件进程内风险计算 p99 < 10ms(不含公网);有持续测量与告警 | Soak(基准测量) | P3 | ◐ `observability/latency.zig` Histogram(2048 环形窗口,nearest-rank 分位)+主循环 market_tick→engine.apply µs 测量,system JSON `latency_us{p50,p99,max,samples}` 持续可见;soak-report p99 门限告警已接(samples≥20 且 p99>P99_BUDGET_US 默认 10ms → SOAK FAIL);长窗口基准累积中 |
 | AC-NFR02 | 可用性 | 断开 LLM/新闻/链上/Dashboard 后,风险监控、订单对账与退出能力仍工作 | Fault Injection | P3 | ☐ |
 | AC-NFR03 | 一致性 | 提案未绑定当前 snapshot_version 即拒绝;状态变化后旧提案自动失效 | Property + Unit | P2 | ◐ admission 单测:`snapshot_version` 失配 → REJECT(stale_snapshot);property 广度待扩 |
-| AC-NFR04 | 恢复 | 重启→恢复 DB→OKX 对账→READY;对账完成前不产生增仓提案 | Integration + Fault(kill -9 注入) | P3 | ◐ 生命周期 BOOTING→CONNECTING→RECONCILING→READY 已实现并实网验证;未对账时 fail-closed 起步 exit_only(单测);kill -9 注入待做 |
+| AC-NFR04 | 恢复 | 重启→恢复 DB→OKX 对账→READY;对账完成前不产生增仓提案 | Integration + Fault(kill -9 注入) | P3 | ◐ 生命周期 BOOTING→CONNECTING→RECONCILING→READY 已实现并实网验证;未对账时 fail-closed 起步 exit_only(单测);kill -9 演练 PASS(2026-08-12 生产 SIGKILL→systemd 拉起→10s 恢复 READY,`scripts/kill9-drill.sh` 可重复执行,soak-report 入账不误报) |
 | AC-NFR05 | 部署发布 | 生产 VM 无 Python/Node/Docker;核心二进制与 Dashboard 均可原子回滚;health fail 自动回滚 | Manual(发布演练) | P3 | ☐ |
 | AC-NFR06 | 审计资源 | 关键事件带 state_version/software_version/config_hash/correlation_id;资源(CPU/RSS/fd/WAL/磁盘)有告警 | Unit(信封)+ Soak | P3 | ◐ `core/events.zig` 事件信封四字段已单测;daemon 落库事件实测含全部戳;资源告警待做 |
 
@@ -96,9 +96,9 @@
 | AC-OPS1 | SQLite WAL 位于本地磁盘(非网络 FS);Journal Writer 唯一写者;关键事件限时提交 | Unit + Soak | P1 | ◐ WAL+单写者已落地;小时 Backup API→`.bak`;Soak 待做 |
 | AC-OPS2 | 事件信封顶层含 type/correlation_id/state_version/software_version/config_hash | Unit | P1 | ☐ |
 | AC-OPS3 | 每小时备份快照(留 24)+ 每日(留 30);备份失败不影响交易关键路径 | Fault + Manual | P1 | ◐ `storage/retention.zig` 命名/轮换/selectDoomed 纯函数(property 测试)+`rotateBackups` 接线:hourly(留24)/daily(留30)快照+latest `.bak`,全部 best-effort 只记日志不阻断主循环;生产恢复演练待做 |
-| AC-OPS4 | 每周 restore drill: 备份启动只读实例,校验 schema/事件序列/HWM/订单投影 | Manual(演练记录) | P3 起 | ☐ |
-| AC-OPS5 | 发布 8 步流程可执行;dashboard-only 更新不重启 daemon;核心更新 pause→checkpoint→切换→重启 | Manual(发布演练) | P3 | ☐ |
-| AC-OPS6 | ready health check 失败自动回滚上一 symlink 并重新对账 | Fault(坏版本注入) | P3 | ☐ |
+| AC-OPS4 | 每周 restore drill: 备份启动只读实例,校验 schema/事件序列/HWM/订单投影 | Manual(演练记录) | P3 起 | ◐ `--verify-db PATH`(只读打开,integrity_check/user_version/7 表行数/seq 连续/HWM 可解析)+`scripts/restore-drill.sh`(最新快照→scratch→校验→新鲜度<2h);生产演练 PASS(2026-08-12,hourly 快照 9s 新);周期化排程待做 |
+| AC-OPS5 | 发布 8 步流程可执行;dashboard-only 更新不重启 daemon;核心更新 pause→checkpoint→切换→重启 | Manual(发布演练) | P3 | ◐ 版本化部署上线:`/opt/alphabound/releases/<sha>-<ts>/`+`current` 原子 symlink 切换(ln+mv -T),保留 5 版;dashboard-only 免重启路径待做 |
+| AC-OPS6 | ready health check 失败自动回滚上一 symlink 并重新对账 | Fault(坏版本注入) | P3 | ◐ install-remote.sh health 门禁(15×2s 探测 /health/ready)失败自动回滚上一 release+记录 deploys.log;`scripts/rollback-remote.sh` 手动回滚演练 PASS(2026-08-12,双向);真实坏版本注入已发生一次(health grep bug 触发 auto-rollback 路径) |
 | AC-OPS7 | 配置热加载规则符合 §8.5 表(Prompt 可热载;max_drawdown 不可) | Unit + Manual | P2 | ☐ |
 | AC-OPS8 | 模型调用成本、基础设施成本可见可统计(成本 vs 本金一级指标) | Manual(Dashboard 走查) | P2 | ◐ system JSON 暴露 `llm_calls/prompt_tokens/completion_tokens/total_tokens` 会话累计;USD 折算与基础设施成本项待做 |
 | AC-OPS9 | equity_samples 保留策略生效(1s 保 7 天,1min 永久);tool_calls 原始 30 天 | Unit(保留任务) | P3 | ◐ `retention.zig` cutoff/prune SQL(单测)+每小时 `runRetentionSweep` 接线:tool_calls>30d、equity '1s'>7d 清理,'1m' 永久保留;长跑验证待做 |

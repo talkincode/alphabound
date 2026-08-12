@@ -9,6 +9,7 @@
 - ✅ 决策详情 **关联订单/成交**（decision_id → orders/fills）
 - ✅ FD6 关键写路径 `stepCritical` busy 重试
 - ✅ **安全/验收纯代码收口**: AC-SEC5(响应上限)/SEC6(隔离扫描)/SEC7(注入中和)、AC-FR04(proposal fuzz)、AC-GO3(费用/滑点/部分成交 property)、AC-OPS3/9(备份轮换+保留清理)、AC-NFR01(延迟直方图)、AC-OPS8(token 计数已可见)
+- ✅ **运维验收自动化**（2026-08-12 生产演练全 PASS）: 版本化部署 `releases/<sha>-<ts>` + `current` symlink + health 门禁自动回滚(AC-OPS5/6)、`--verify-db` + restore-drill(AC-OPS4)、kill -9 恢复演练 10s READY(AC-NFR04)、soak-report p99 门限告警(AC-NFR01)与演练入账
 
 ---
 

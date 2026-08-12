@@ -55,8 +55,8 @@ export LLM_API_KEY=...
 | 5 | `--control cancel-all` 清空 pending | ☐ |
 | 6 | `--control flatten` 后不再增仓（admission REJECT） | ☐ |
 | 7 | 滚动 24h 窗口 0 次非预期退出（`soak-report.sh 24` PASS；向 168h 窗口迈进） | ☐ |
-| 8 | 断线恢复演练 | ☐ |
-| 9 | 版本回滚演练 | ☐ |
+| 8 | 断线恢复演练 | ☐（kill -9 进程级恢复已 PASS：`scripts/kill9-drill.sh`；网络断连演练待做） |
+| 9 | 版本回滚演练 | ☑ 2026-08-12（`scripts/rollback-remote.sh` 双向 PASS；health 门禁自动回滚已真实触发过一次） |
 | 10 | 故障矩阵 AC-FD1..10 逐项 | ☐ |
 
 ## 安全提醒
