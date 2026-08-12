@@ -1,0 +1,20 @@
+{
+  "name": "alphabound-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Read-only AlphaBound analytics MCP (proxies authenticated Dashboard HTTP API)",
+  "bin": {
+    "alphabound-mcp": "./src/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "http": "node src/http.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1"
+  }
+}

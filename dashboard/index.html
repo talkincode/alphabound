@@ -151,10 +151,70 @@
   .dec-summary .k { color: var(--dim); }
   .chev { display: inline-block; width: 1em; color: var(--dim); }
   tr.dec-row.open .chev { color: var(--line); }
+
+  /* Auth gate */
+  #auth_gate {
+    display: none;
+    position: fixed; inset: 0; z-index: 1000;
+    background: rgba(13,17,23,.92);
+    align-items: center; justify-content: center;
+    padding: 24px;
+  }
+  #auth_gate.show { display: flex; }
+  #auth_gate .box {
+    width: min(420px, 100%);
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 22px 20px 18px;
+  }
+  #auth_gate h2 { margin: 0 0 8px; color: var(--text); font-size: 16px; letter-spacing: 0; }
+  #auth_gate p { color: var(--dim); font-size: 12px; margin-bottom: 14px; }
+  #auth_gate label { display: block; color: var(--dim); font-size: 11px; margin-bottom: 6px; }
+  #auth_gate input[type=password], #auth_gate input[type=text] {
+    width: 100%; background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px 12px; font: inherit; margin-bottom: 12px;
+  }
+  #auth_gate .row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
+  #auth_gate button.primary, #auth_gate button.secondary {
+    appearance: none; border-radius: 8px; padding: 9px 14px; font: inherit; cursor: pointer;
+    border: 1px solid var(--border);
+  }
+  #auth_gate button.primary { background: #238636; color: #fff; border-color: #2ea043; }
+  #auth_gate button.secondary { background: var(--tab); color: var(--text); }
+  #auth_gate .err { color: var(--bad); font-size: 12px; min-height: 18px; margin-top: 8px; }
+  #auth_bar { display: none; gap: 8px; align-items: center; margin: 0 0 8px; font-size: 12px; color: var(--dim); }
+  #auth_bar.show { display: flex; }
+  #auth_bar button {
+    appearance: none; background: var(--tab); color: var(--dim);
+    border: 1px solid var(--border); border-radius: 6px; padding: 4px 10px;
+    font: inherit; font-size: 12px; cursor: pointer;
+  }
 </style>
 </head>
 <body>
+
+<div id="auth_gate" aria-modal="true" role="dialog" aria-labelledby="auth_title">
+  <div class="box">
+    <h2 id="auth_title">登录 Dashboard</h2>
+    <p>API 已启用鉴权。使用 token 登录；登录后可注册 Passkey 以便下次免密。</p>
+    <label for="auth_token">API Token</label>
+    <input id="auth_token" type="password" autocomplete="current-password" placeholder="ALPHABOUND_API_TOKEN" />
+    <div class="row">
+      <button type="button" class="primary" id="auth_login_btn">Token 登录</button>
+      <button type="button" class="secondary" id="auth_passkey_btn">Passkey 登录</button>
+    </div>
+    <div class="err" id="auth_err"></div>
+  </div>
+</div>
+
   <h1>AlphaBound <span id="staleness" class="sub"></span></h1>
+  <div id="auth_bar">
+    <span id="auth_bar_text">已登录</span>
+    <button type="button" id="auth_register_passkey">注册 Passkey</button>
+    <button type="button" id="auth_logout_btn">退出</button>
+  </div>
   <div class="sub">有界自主交易 Agent — <span id="run_mode_banner">连接中…</span></div>
 
   <div class="tabs" role="tablist">
@@ -537,11 +597,192 @@ function zhStatus(s) {
 }
 function zhKind(k) { return KIND_ZH[k] || k || ""; }
 
+function b64urlToBuf(s) {
+  const pad = "=".repeat((4 - (s.length % 4)) % 4);
+  const b64 = (s + pad).replace(/-/g, "+").replace(/_/g, "/");
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out.buffer;
+}
+function bufToB64url(buf) {
+  const bytes = new Uint8Array(buf);
+  let s = "";
+  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+function bufToB64(buf) {
+  const bytes = new Uint8Array(buf);
+  let s = "";
+  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  return btoa(s);
+}
+
 async function jget(path) {
-  const r = await fetch(path, { cache: "no-store" });
+  const r = await fetch(path, { cache: "no-store", credentials: "same-origin" });
+  if (r.status === 401) {
+    showAuthGate("需要登录");
+    throw new Error(path + " HTTP 401");
+  }
   if (!r.ok) throw new Error(path + " HTTP " + r.status);
   return r.json();
 }
+async function jpost(path, body) {
+  const r = await fetch(path, {
+    method: "POST",
+    cache: "no-store",
+    credentials: "same-origin",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body || {}),
+  });
+  const text = await r.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch (_) { data = { raw: text }; }
+  if (!r.ok) {
+    const err = (data && data.error) ? data.error : ("HTTP " + r.status);
+    throw new Error(err);
+  }
+  return data;
+}
+
+let authRequired = false;
+let authReady = false;
+
+function showAuthGate(msg) {
+  const g = $("auth_gate");
+  if (!g) return;
+  g.classList.add("show");
+  if (msg) $("auth_err").textContent = msg;
+  document.body.style.overflow = "hidden";
+}
+function hideAuthGate() {
+  const g = $("auth_gate");
+  if (!g) return;
+  g.classList.remove("show");
+  $("auth_err").textContent = "";
+  document.body.style.overflow = "";
+}
+function setAuthBar(on) {
+  const b = $("auth_bar");
+  if (!b) return;
+  if (on) b.classList.add("show"); else b.classList.remove("show");
+}
+
+async function refreshAuthStatus() {
+  const st = await fetch("/api/v1/auth/status", { cache: "no-store", credentials: "same-origin" }).then(r => r.json());
+  authRequired = !!st.auth_required;
+  authReady = !!st.authenticated;
+  if (!authRequired || authReady) {
+    hideAuthGate();
+    setAuthBar(authRequired);
+    $("auth_bar_text").textContent = authRequired
+      ? ("已登录 · Passkey " + (st.passkeys || 0) + " · rp " + (st.rp_id || ""))
+      : "";
+    return true;
+  }
+  showAuthGate("");
+  setAuthBar(false);
+  return false;
+}
+
+async function loginWithToken() {
+  const token = ($("auth_token").value || "").trim();
+  if (!token) { $("auth_err").textContent = "请输入 token"; return; }
+  try {
+    await jpost("/api/v1/auth/login", { token });
+    $("auth_token").value = "";
+    await refreshAuthStatus();
+    if (authReady || !authRequired) poll();
+  } catch (e) {
+    $("auth_err").textContent = "登录失败: " + e.message;
+  }
+}
+
+async function loginWithPasskey() {
+  try {
+    if (!window.PublicKeyCredential) throw new Error("浏览器不支持 Passkey");
+    const opt = await fetch("/api/v1/auth/passkey/login/options", { credentials: "same-origin", cache: "no-store" }).then(r => {
+      if (!r.ok) throw new Error("options HTTP " + r.status);
+      return r.json();
+    });
+    const publicKey = {
+      challenge: b64urlToBuf(opt.challenge),
+      timeout: opt.timeout,
+      rpId: opt.rpId,
+      userVerification: opt.userVerification || "preferred",
+      allowCredentials: (opt.allowCredentials || []).map(c => ({
+        type: "public-key",
+        id: b64urlToBuf(c.id),
+      })),
+    };
+    const cred = await navigator.credentials.get({ publicKey });
+    if (!cred) throw new Error("已取消");
+    const resp = cred.response;
+    await jpost("/api/v1/auth/passkey/login", {
+      id: cred.id,
+      challenge: opt.challenge,
+      clientDataJSON: bufToB64url(resp.clientDataJSON),
+      authenticatorData: bufToB64url(resp.authenticatorData),
+      signature: bufToB64url(resp.signature),
+    });
+    await refreshAuthStatus();
+    if (authReady || !authRequired) poll();
+  } catch (e) {
+    $("auth_err").textContent = "Passkey 失败: " + e.message;
+  }
+}
+
+async function registerPasskey() {
+  try {
+    if (!window.PublicKeyCredential) throw new Error("浏览器不支持 Passkey");
+    const opt = await jget("/api/v1/auth/passkey/register/options");
+    const publicKey = {
+      challenge: b64urlToBuf(opt.challenge),
+      rp: opt.rp,
+      user: {
+        id: b64urlToBuf(opt.user.id),
+        name: opt.user.name,
+        displayName: opt.user.displayName,
+      },
+      pubKeyCredParams: opt.pubKeyCredParams,
+      timeout: opt.timeout,
+      attestation: opt.attestation || "none",
+      authenticatorSelection: opt.authenticatorSelection,
+    };
+    const cred = await navigator.credentials.create({ publicKey });
+    if (!cred) throw new Error("已取消");
+    const spki = cred.response.getPublicKey ? cred.response.getPublicKey() : null;
+    if (!spki) throw new Error("无法导出公钥（需要 ES256）");
+    await jpost("/api/v1/auth/passkey/register", {
+      id: cred.id,
+      publicKeySpki: bufToB64(spki),
+    });
+    await refreshAuthStatus();
+    alert("Passkey 已注册");
+  } catch (e) {
+    alert("注册失败: " + e.message);
+  }
+}
+
+async function logout() {
+  try { await jpost("/api/v1/auth/logout", {}); } catch (_) {}
+  await refreshAuthStatus();
+  if (authRequired && !authReady) showAuthGate("已退出");
+}
+
+function wireAuthUi() {
+  const lb = $("auth_login_btn");
+  if (lb) lb.addEventListener("click", loginWithToken);
+  const pb = $("auth_passkey_btn");
+  if (pb) pb.addEventListener("click", loginWithPasskey);
+  const rb = $("auth_register_passkey");
+  if (rb) rb.addEventListener("click", registerPasskey);
+  const ob = $("auth_logout_btn");
+  if (ob) ob.addEventListener("click", logout);
+  const tok = $("auth_token");
+  if (tok) tok.addEventListener("keydown", (ev) => { if (ev.key === "Enter") loginWithToken(); });
+}
+
 
 function lwAvailable() {
   return !window.__lwChartsLoadFailed && typeof LightweightCharts !== "undefined" && LightweightCharts.createChart;
@@ -1465,8 +1706,11 @@ async function poll() {
   $("staleness").textContent = "数据延迟 " + age + " 秒";
   $("staleness").className = lastOk && Date.now() - lastOk < 6000 ? "sub" : "sub err";
 }
-poll();
-setInterval(poll, 2000);
+wireAuthUi();
+refreshAuthStatus()
+  .then((ok) => { if (ok) poll(); })
+  .catch(() => { poll(); });
+setInterval(() => { if (!authRequired || authReady) poll(); }, 2000);
 </script>
 </body>
 </html>

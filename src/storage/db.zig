@@ -18,10 +18,12 @@ pub const DbError = error{
 };
 
 const migration_0001: [:0]const u8 = @embedFile("migration_0001");
+const migration_0002: [:0]const u8 = @embedFile("migration_0002");
 
 /// Ordered list of migrations; user_version tracks the applied count.
 const migrations = [_][:0]const u8{
     migration_0001,
+    migration_0002,
 };
 
 /// Expected user_version for a fully migrated database (restore drills).

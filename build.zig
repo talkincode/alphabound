@@ -36,6 +36,9 @@ pub fn build(b: *std.Build) void {
     mod.addAnonymousImport("migration_0001", .{
         .root_source_file = b.path("migrations/0001_init.sql"),
     });
+    mod.addAnonymousImport("migration_0002", .{
+        .root_source_file = b.path("migrations/0002_webauthn.sql"),
+    });
 
     const exe = b.addExecutable(.{
         .name = "alphabound",

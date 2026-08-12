@@ -30,3 +30,5 @@ var/
 
 # 本机/内网部署实情（含 IP、hostname）— 仅 Agent 本地使用，禁止提交
 DEPLOY.local.md
+node_modules/
+*.webauthn

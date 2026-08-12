@@ -41,6 +41,8 @@ llm_reflection_on_hold = false       # HOLD cycles: deterministic reflection onl
 path = "/var/lib/alphabound/trading.db"
 wal = true
 
+# Auth: set ALPHABOUND_API_TOKEN in secrets.env (not in this file).
+# Optional WebAuthn: ALPHABOUND_WEBAUTHN_RP_ID / ALPHABOUND_WEBAUTHN_ORIGIN.
 [web]
 # Prefer 127.0.0.1 and SSH tunnel; use 0.0.0.0 only on trusted private networks.
 bind = "127.0.0.1:8080"

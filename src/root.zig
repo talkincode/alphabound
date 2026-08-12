@@ -35,6 +35,7 @@ pub const shadow_bench = @import("core/shadow_bench.zig");
 pub const scheduler = @import("core/scheduler.zig");
 pub const admin_control = @import("admin/control.zig");
 pub const web = @import("web/server.zig");
+pub const web_auth = @import("web/auth.zig");
 pub const fault_matrix = @import("fault/matrix.zig");
 pub const security_isolation = @import("security/isolation.zig");
 

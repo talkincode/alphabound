@@ -183,6 +183,10 @@ const WebState = struct {
     /// Bundle: {"orders":[...],"fills":[...]}.
     orders_buf: [24576]u8 = undefined,
     orders_len: usize = 2,
+    /// Dashboard / MCP auth (optional; empty token = open).
+    auth_cfg: ab.web_auth.Config = .{},
+    cred_store: ?*ab.web_auth.CredStore = null,
+    challenges: ?*ab.web_auth.ChallengeBank = null,
 
     fn initEmpty(self: *WebState) void {
         @memcpy(self.agent_runs_buf[0..2], "[]");
@@ -289,6 +293,9 @@ const WebState = struct {
                     .decisions_json = Tls.decisions[0..Tls.decisions_len],
                     .orders_json = Tls.orders[0..Tls.orders_len],
                     .index_html = dashboard_html,
+                    .auth_cfg = self.auth_cfg,
+                    .cred_store = self.cred_store,
+                    .challenges = self.challenges,
                 };
             }
         }
@@ -683,6 +690,32 @@ pub fn main(init: std.process.Init) !u8 {
     web_state.initEmpty();
     @memcpy(&web_state.config_hash, cfg.hash());
     const boot_ms = nowMs();
+
+    // Dashboard / MCP auth: empty token keeps open (dev). Prefer ALPHABOUND_API_TOKEN.
+    const api_token = firstEnv(env, &.{ "ALPHABOUND_API_TOKEN", "DASHBOARD_API_TOKEN" }) orelse "";
+    var origin_buf: [256]u8 = undefined;
+    const default_origin = std.fmt.bufPrint(&origin_buf, "http://127.0.0.1:{d}", .{cfg.webPort()}) catch "http://127.0.0.1:8080";
+    const web_origin = env.get("ALPHABOUND_WEBAUTHN_ORIGIN") orelse default_origin;
+    const web_rp_id = env.get("ALPHABOUND_WEBAUTHN_RP_ID") orelse "localhost";
+    web_state.auth_cfg = .{
+        .api_token = api_token,
+        .session_secret = ab.web_auth.deriveSessionSecret(api_token),
+        .rp_id = web_rp_id,
+        .origin = web_origin,
+    };
+    var cred_path_buf: [512]u8 = undefined;
+    const cred_path = std.fmt.bufPrint(&cred_path_buf, "{s}.webauthn", .{cfg.db_path}) catch "trading.db.webauthn";
+    var cred_store = ab.web_auth.CredStore.init(gpa, io, cred_path);
+    defer cred_store.deinit();
+    cred_store.load();
+    var challenge_bank = ab.web_auth.ChallengeBank.init(io);
+    web_state.cred_store = &cred_store;
+    web_state.challenges = &challenge_bank;
+    if (web_state.auth_cfg.required()) {
+        std.debug.print("[boot] web auth enabled (token set; passkeys={d} rp_id={s})\n", .{ cred_store.count(), web_rp_id });
+    } else {
+        std.debug.print("[boot] web auth open (no ALPHABOUND_API_TOKEN)\n", .{});
+    }
 
     // Tool registry (observation only — no live tool providers yet).
     var tool_reg = ab.tools.Registry{};
