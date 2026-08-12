@@ -119,7 +119,7 @@ const CliArgs = struct {
     agent_once: bool = false,
     /// Print agent_runs / tool_calls validity stats and exit.
     agent_stats: bool = false,
-    /// One-shot local admin command: pause|resume|reconcile|cancel-all|flatten|shutdown|status.
+    /// One-shot local admin command: pause|resume|reconcile|cancel-all|flatten|target-weight=W|shutdown|status.
     control_cmd: ?[]const u8 = null,
     /// Read-only backup/DB verification for restore drills (AC-OPS4).
     verify_db_path: ?[]const u8 = null,
@@ -467,7 +467,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     const cli = parseArgs(init.minimal.args) catch {
         std.debug.print(
-            "usage: alphabound [--config PATH] [--self-check] [--version] [--ticks N] [--agent-once] [--agent-stats] [--control pause|resume|reconcile|cancel-all|flatten|shutdown|status] [--verify-db PATH]\n",
+            "usage: alphabound [--config PATH] [--self-check] [--version] [--ticks N] [--agent-once] [--agent-stats] [--control pause|resume|reconcile|cancel-all|flatten|target-weight=0.05|shutdown|status] [--verify-db PATH]\n",
             .{},
         );
         return 2;
@@ -495,6 +495,7 @@ pub fn main(init: std.process.Init) !u8 {
     if (cli.control_cmd) |cmd_name| {
         return runControlCli(io, cmd_name, cfg.db_path);
     }
+    // (weight forms like target-weight=0.05 are parsed inside runControlCli)
 
     const okx_env = OkxEnvCreds.load(env);
     if (okx_env) |c| {
@@ -963,6 +964,24 @@ pub fn main(init: std.process.Init) !u8 {
                         logEventPayload(&events_repo, &engine, "ADMIN_FLATTEN", "admin", "CRITICAL", &cfg, flp);
                         web_state.update(engine.snapshot(), true);
                     },
+                    .target_weight => {
+                        const w_s = req.weight() orelse "0";
+                        const note = runOperatorTargetWeight(
+                            gpa,
+                            &okx,
+                            &cfg,
+                            &engine,
+                            &orders_repo,
+                            &fills_repo,
+                            &events_repo,
+                            &runtime_status,
+                            trade_instrument,
+                            w_s,
+                        );
+                        std.debug.print("[admin] target-weight={s} exec={s}\n", .{ w_s, note });
+                        web_state.update(engine.snapshot(), true);
+                        refreshWebCaches(&web_state, &db, &agent_runs, &equity_repo, &events_repo, &memories_repo, &orders_repo, &fills_repo, last_bh_cmp);
+                    },
                     .shutdown => {
                         std.debug.print("[admin] safe-shutdown requested\n", .{});
                         shutdown_requested.store(true, .release);
@@ -1074,7 +1093,7 @@ pub fn main(init: std.process.Init) !u8 {
         // even while an LLM call blocks the loop for tens of seconds.
         refreshSystemCache(&web_state, &db, &cfg, &mem_store, boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), llm_client != null, admin_paused, &runtime_status, &risk_latency);
 
-        // Slow agent loop (shadow): proposals audited only — never sent to exchange.
+        // Slow agent loop: proposals always risk-admitted; demo may execute.
         // Paused: keep risk/market/reconcile; skip agent decisions.
         if (!admin_paused) {
             if (llm_client) |*client| {
@@ -1197,16 +1216,21 @@ fn runControlCli(io: std.Io, cmd_name: []const u8, db_path: []const u8) u8 {
         return 0;
     }
 
-    const cmd = ab.admin_control.Cmd.fromString(cmd_name) orelse {
-        std.debug.print("[control] unknown cmd '{s}' (pause|resume|reconcile|cancel-all|flatten|shutdown|status)\n", .{cmd_name});
+    const parsed = ab.admin_control.parseControlArg(cmd_name);
+    const cmd = parsed.cmd orelse {
+        std.debug.print("[control] unknown cmd '{s}' (pause|resume|reconcile|cancel-all|flatten|target-weight=0.05|shutdown|status)\n", .{cmd_name});
         return 2;
     };
     if (cmd == .none) {
         std.debug.print("[control] unknown cmd '{s}'\n", .{cmd_name});
         return 2;
     }
-    var body_buf: [128]u8 = undefined;
-    const body = ab.admin_control.formatRequest(&body_buf, cmd, nowMs()) catch {
+    if (cmd == .target_weight and parsed.weight == null) {
+        std.debug.print("[control] target-weight requires a value, e.g. target-weight=0.05\n", .{});
+        return 2;
+    }
+    var body_buf: [192]u8 = undefined;
+    const body = ab.admin_control.formatRequestWeight(&body_buf, cmd, nowMs(), parsed.weight) catch {
         std.debug.print("[control] format failed\n", .{});
         return 1;
     };
@@ -1214,7 +1238,11 @@ fn runControlCli(io: std.Io, cmd_name: []const u8, db_path: []const u8) u8 {
         std.debug.print("[control] write {s} failed: {t}\n", .{ cpath, err });
         return 1;
     };
-    std.debug.print("[control] wrote {s} -> {s}\n", .{ cmd.text(), cpath });
+    if (parsed.weight) |w| {
+        std.debug.print("[control] wrote {s} weight={s} -> {s}\n", .{ cmd.text(), w, cpath });
+    } else {
+        std.debug.print("[control] wrote {s} -> {s}\n", .{ cmd.text(), cpath });
+    }
     return 0;
 }
 
@@ -1734,6 +1762,114 @@ fn shadowAdmit(
     };
 }
 
+/// If the agent bound to the decision-start snapshot, rebind to the post-refresh
+/// version so a slow LLM call does not fail-closed on stale_data / version drift
+/// from market ticks that landed during the call. Mismatched versions stay as-is
+/// (still REJECT stale_snapshot).
+fn bindProposalVersion(proposal_version: u64, decision_start_version: u64, current_version: u64) u64 {
+    if (proposal_version == decision_start_version) return current_version;
+    return proposal_version;
+}
+
+/// Pull fresh ticker (+ demo private balances) into the engine immediately before
+/// admission/execution. LLM calls routinely exceed market_ttl_ms (10s).
+fn refreshBeforeAdmission(
+    gpa: std.mem.Allocator,
+    okx: *ab.okx_rest.Client,
+    cfg: *const ab.config.Config,
+    engine: *ab.state.Engine,
+) void {
+    var path_buf: [128]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "/api/v5/market/ticker?instId={s}", .{cfg.instrument}) catch return;
+    if (okx.getPublic(path)) |body| {
+        defer gpa.free(body);
+        if (ab.okx_rest.parseTicker(gpa, body)) |ticker| {
+            _ = engine.apply(.{ .market_tick = .{
+                .ts_ms = nowMs(),
+                .bid = ticker.bid,
+                .mark = ticker.last,
+            } }) catch {};
+        } else |_| {}
+    } else |_| {}
+    if (cfg.mode == .demo) {
+        _ = refreshDemoPortfolio(gpa, okx, engine);
+    }
+}
+
+/// Operator path probe: same admission + demo execution stack as agent REBALANCE.
+/// Used to unblock Gate3 order-path verification without waiting on LLM HOLD bias.
+fn runOperatorTargetWeight(
+    gpa: std.mem.Allocator,
+    okx: *ab.okx_rest.Client,
+    cfg: *const ab.config.Config,
+    engine: *ab.state.Engine,
+    orders_repo: *ab.storage.OrdersRepo,
+    fills_repo: *ab.storage.FillsRepo,
+    events_repo: *ab.storage.EventsRepo,
+    st: *RuntimeStatus,
+    instrument: ab.planner.Instrument,
+    weight_s: []const u8,
+) []const u8 {
+    const target = ab.decimal.Decimal.parse(weight_s) catch {
+        logEventPayload(events_repo, engine, "ADMIN_TARGET_WEIGHT", "admin", "WARN", cfg, "{\"error\":\"bad_weight\"}");
+        return "bad_weight";
+    };
+    if (target.isNegative() or target.gt(ab.decimal.Decimal.one)) {
+        logEventPayload(events_repo, engine, "ADMIN_TARGET_WEIGHT", "admin", "WARN", cfg, "{\"error\":\"weight_out_of_range\"}");
+        return "bad_weight";
+    }
+    if (!ab.okx_trade.executionAllowed(cfg.mode == .demo, exec_venue_authorized)) {
+        logEventPayload(events_repo, engine, "ADMIN_TARGET_WEIGHT", "admin", "WARN", cfg, "{\"error\":\"execution_not_allowed\"}");
+        return "exec_off";
+    }
+
+    refreshBeforeAdmission(gpa, okx, cfg, engine);
+    const snap = engine.snapshot();
+    const admit_now = nowMs();
+    const admission = shadowAdmit(snap, snap.version, target, cfg, admit_now);
+
+    var id_buf: [48]u8 = undefined;
+    const decision_id = std.fmt.bufPrint(&id_buf, "dec_op_tw_{d}", .{admit_now}) catch "dec_op_tw";
+    const policy = ab.proposal.OrderPolicy{
+        .type = .limit_or_market,
+        .urgency = ab.decimal.Decimal.parse("0.5") catch ab.decimal.Decimal.zero,
+        .max_wait_ms = 120_000,
+    };
+    const exec_note = tryDemoExecute(
+        gpa,
+        okx,
+        cfg,
+        engine,
+        orders_repo,
+        fills_repo,
+        events_repo,
+        decision_id,
+        admission,
+        instrument,
+        snap,
+        policy,
+    );
+
+    var wbuf: [48]u8 = undefined;
+    var awbuf: [48]u8 = undefined;
+    const ws = decFmt(&wbuf, target);
+    const aws = decFmt(&awbuf, admission.admitted_weight);
+    var pbuf: [384]u8 = undefined;
+    const payload = std.fmt.bufPrint(
+        &pbuf,
+        "{{\"decision_id\":\"{s}\",\"target_btc_weight\":\"{s}\",\"admission\":\"{s}\",\"reason\":\"{s}\",\"admitted_weight\":\"{s}\",\"exec\":\"{s}\",\"source\":\"operator\"}}",
+        .{ decision_id, ws, admission.verdict_txt, admission.reason_txt, aws, exec_note },
+    ) catch "{\"source\":\"operator\"}";
+    logEventPayload(events_repo, engine, "ADMIN_TARGET_WEIGHT", "admin", "CRITICAL", cfg, payload);
+    logEventPayload(events_repo, engine, "RISK_ADMISSION", "risk", "INFO", cfg, payload);
+    {
+        var dbuf: [160]u8 = undefined;
+        const dtxt = std.fmt.bufPrint(&dbuf, "OP_TW {s} conf=1 admit={s} exec={s}", .{ decision_id, admission.verdict_txt, exec_note }) catch "OP_TW";
+        st.setLastDecision(dtxt);
+    }
+    return exec_note;
+}
+
 /// One slow-loop decision: tools → context → LLM → proposal → admission → optional demo exec.
 fn runAgentDecision(
     gpa: std.mem.Allocator,
@@ -1755,6 +1891,7 @@ fn runAgentDecision(
     instrument: ab.planner.Instrument,
 ) void {
     const snap = engine.snapshot();
+    const decision_start_version = snap.version;
 
     var run_id_buf: [64]u8 = undefined;
     const run_id = std.fmt.bufPrint(&run_id_buf, "run_{d}", .{nowMs()}) catch return;
@@ -1786,7 +1923,7 @@ fn runAgentDecision(
 
     // Retrieve long-term memories into the decision envelope (§4.5 / FR-07).
     var scored = ab.memory.retrieve(mem_store, gpa, .{
-        .tags = &.{ cfg.instrument, "BTC", "shadow" },
+        .tags = &.{ cfg.instrument, "BTC", "demo" },
         .now_ms = nowMs(),
         .limit = 8,
     }, ab.memory.substringTagMatch) catch blk: {
@@ -1894,12 +2031,17 @@ fn runAgentDecision(
     defer prop.deinit();
 
     // Risk Kernel admission (always). Demo may execute; shadow never does.
+    // Refresh market/account first: LLM latency routinely exceeds market_ttl_ms,
+    // and ticks during the call bump version — rebind if agent matched start snap.
     const action_txt: []const u8 = switch (prop.action) {
         .hold => "HOLD",
         .rebalance => "REBALANCE",
     };
+    refreshBeforeAdmission(gpa, okx, cfg, engine);
+    const admit_snap = engine.snapshot();
     const admit_now = nowMs();
-    const admission = shadowAdmit(snap, prop.snapshot_version, prop.target_btc_weight, cfg, admit_now);
+    const bound_version = bindProposalVersion(prop.snapshot_version, decision_start_version, admit_snap.version);
+    const admission = shadowAdmit(admit_snap, bound_version, prop.target_btc_weight, cfg, admit_now);
     var exec_note: []const u8 = "not_executed";
     if (ab.okx_trade.executionAllowed(cfg.mode == .demo, exec_venue_authorized)) {
         exec_note = tryDemoExecute(
@@ -1913,7 +2055,7 @@ fn runAgentDecision(
             prop.decision_id,
             admission,
             instrument,
-            snap,
+            admit_snap,
             prop.order_policy,
         );
     }
@@ -2592,14 +2734,14 @@ fn seedBootstrapMemories(
         .kind = .working,
         .status = .active,
         .confidence = ab.decimal.Decimal.parse("0.95") catch ab.decimal.Decimal.one,
-        .content_json = "{\"summary\":\"Shadow mode never places orders; proposals are audited only.\",\"tags\":[\"shadow\",\"BTC-USDT\",\"policy\"]}",
+        .content_json = "{\"summary\":\"Execution is risk-gated: only admitted REBALANCE weights may trade; live mode stays locked until Gate4.\",\"tags\":[\"demo\",\"BTC-USDT\",\"policy\"]}",
     } }, now, &touched) catch {};
     store.applyOp(.{ .create = .{
         .memory_id = "H_btc_spot_default",
         .kind = .strategy,
         .status = .unverified,
         .confidence = ab.decimal.Decimal.parse("0.40") catch ab.decimal.Decimal.zero,
-        .content_json = "{\"hypothesis\":\"Default to HOLD until multi-hour evidence favors risk; prefer cash over forced BTC exposure in shadow.\",\"tags\":[\"BTC\",\"BTC-USDT\",\"shadow\"]}",
+        .content_json = "{\"hypothesis\":\"Cash-only + NORMAL + fresh data may take a small BTC weight (0.05-0.15); HOLD when evidence conflicts or risk mode degrades.\",\"tags\":[\"BTC\",\"BTC-USDT\",\"demo\"]}",
     } }, now, &touched) catch {};
     for (touched.items) |m| persistMemory(repo, m);
     logEventPayload(events_repo, engine, "MEMORY_BOOTSTRAP", "memory", "INFO", cfg, "{\"seeded\":true}");
@@ -2625,7 +2767,7 @@ fn recordProposalEpisode(
     var content_buf: [512]u8 = undefined;
     const content = std.fmt.bufPrint(
         &content_buf,
-        "{{\"type\":\"proposal_episode\",\"run_id\":\"{s}\",\"decision_id\":\"{s}\",\"action\":\"{s}\",\"target_btc_weight\":\"{s}\",\"confidence\":\"{s}\",\"tags\":[\"BTC-USDT\",\"shadow\",\"episode\"]}}",
+        "{{\"type\":\"proposal_episode\",\"run_id\":\"{s}\",\"decision_id\":\"{s}\",\"action\":\"{s}\",\"target_btc_weight\":\"{s}\",\"confidence\":\"{s}\",\"tags\":[\"BTC-USDT\",\"demo\",\"episode\"]}}",
         .{ run_id, decision_id, action, t_s, c_s },
     ) catch return;
     var touched: std.ArrayList(ab.memory.Memory) = .empty;
@@ -2643,7 +2785,7 @@ fn recordProposalEpisode(
     var w_content_buf: [256]u8 = undefined;
     const w_content = std.fmt.bufPrint(
         &w_content_buf,
-        "{{\"summary\":\"Last shadow proposal {s} action={s}\",\"decision_id\":\"{s}\",\"tags\":[\"BTC-USDT\",\"shadow\"]}}",
+        "{{\"summary\":\"Last proposal {s} action={s}\",\"decision_id\":\"{s}\",\"tags\":[\"BTC-USDT\",\"demo\"]}}",
         .{ run_id, action, decision_id },
     ) catch return;
     touched.clearRetainingCapacity();
@@ -3159,7 +3301,7 @@ fn tryLlmReflection(
     var user_buf: [8 * 1024]u8 = undefined;
     const user_msg = std.fmt.bufPrint(
         &user_buf,
-        \\Emit ONE Reflection JSON for this shadow proposal (not executed).
+        \\Emit ONE Reflection JSON for this proposal (execution is risk-gated, not assumed).
         \\run_id={s}
         \\decision_id={s}
         \\action={s}
@@ -3221,7 +3363,7 @@ fn tryLlmReflection(
     const expected0 = sanitizeJsonString(reflection.expected_outcome, &expected_buf);
     const content = std.fmt.bufPrint(
         &content_buf,
-        "{{\"episode_id\":\"{s}\",\"expected_outcome\":\"{s}\",\"actual_outcome\":{s},\"lesson\":\"{s}\",\"ops\":{d},\"source\":\"llm\",\"tags\":[\"BTC-USDT\",\"shadow\",\"reflection\"]}}",
+        "{{\"episode_id\":\"{s}\",\"expected_outcome\":\"{s}\",\"actual_outcome\":{s},\"lesson\":\"{s}\",\"ops\":{d},\"source\":\"llm\",\"tags\":[\"BTC-USDT\",\"demo\",\"reflection\"]}}",
         .{ reflection.episode_id, expected0, reflection.actual_outcome_json, lesson0, applied },
     ) catch null;
     if (content) |cj| {
@@ -3317,7 +3459,7 @@ fn applyShadowReflection(
     var content_buf: [640]u8 = undefined;
     const content = std.fmt.bufPrint(
         &content_buf,
-        "{{\"episode_id\":\"ep_{s}\",\"expected_outcome\":\"shadow audit only\",\"actual_outcome\":{{\"executed\":false,\"action\":\"{s}\",\"target_btc_weight\":\"{s}\"}},\"lessons\":[\"Proposals remain non-executing in shadow.\"],\"tags\":[\"BTC-USDT\",\"shadow\",\"reflection\"],\"decision_id\":\"{s}\",\"confidence\":\"{s}\"}}",
+        "{{\"episode_id\":\"ep_{s}\",\"expected_outcome\":\"risk-gated execution\",\"actual_outcome\":{{\"executed\":false,\"action\":\"{s}\",\"target_btc_weight\":\"{s}\"}},\"lessons\":[\"Only risk-admitted weights may execute.\"],\"tags\":[\"BTC-USDT\",\"demo\",\"reflection\"],\"decision_id\":\"{s}\",\"confidence\":\"{s}\"}}",
         .{ run_id, action, t_s, decision_id, c_s },
     ) catch return;
 
