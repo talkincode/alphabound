@@ -21,7 +21,24 @@ ALPHABOUND_WEBAUTHN_RP_ID=localhost          # hostname only
 ALPHABOUND_WEBAUTHN_ORIGIN=http://127.0.0.1:8080
 ```
 
-For SSH-tunnel access, origin must match the URL bar (e.g. `http://127.0.0.1:8080`).
+### Passkey / WebAuthn 限制（重要）
+
+浏览器要求 **secure context**：
+
+| 打开方式 | Token 登录 | Passkey |
+|----------|------------|---------|
+| `http://127.0.0.1:8080` / `http://localhost:8080` | ✅ | ✅ |
+| `https://your-host/...` | ✅ | ✅ |
+| `http://10.x.x.x:8080`（内网 HTTP IP） | ✅ | ❌ API 被禁用 |
+
+内网直连 IP 时请用 **Token**。要用 Passkey：
+
+```bash
+ssh -L 8080:127.0.0.1:8080 USER@HOST
+# 浏览器打开 http://127.0.0.1:8080/
+```
+
+服务端会按请求 `Host` 解析 `rpId`/`origin`；仍无法绕过浏览器对非 localhost HTTP 的限制。
 
 ## MCP (ideal remote path)
 

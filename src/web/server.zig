@@ -22,6 +22,10 @@ pub const RequestInfo = struct {
     authorization: ?[]const u8 = null,
     x_api_token: ?[]const u8 = null,
     cookie: ?[]const u8 = null,
+    /// Raw Host header (may include port).
+    host: ?[]const u8 = null,
+    /// X-Forwarded-Proto when behind TLS terminator.
+    forwarded_proto: ?[]const u8 = null,
     body: []const u8 = "",
     now_ms: i64 = 0,
 };
@@ -150,18 +154,77 @@ fn jsonGetString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     };
 }
 
+fn hostHeaderOk(host: []const u8) bool {
+    if (host.len == 0 or host.len > 253) return false;
+    for (host) |c| {
+        const ok = (c >= 'a' and c <= 'z') or
+            (c >= 'A' and c <= 'Z') or
+            (c >= '0' and c <= '9') or
+            c == '.' or c == '-' or c == ':' or c == '[' or c == ']';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+/// Resolve WebAuthn rpId + origin from the browser Host (preferred) or config fallback.
+fn resolveWebAuthn(
+    req: RequestInfo,
+    cfg: auth.Config,
+    origin_buf: []u8,
+    rp_buf: []u8,
+) struct { origin: []const u8, rp_id: []const u8 } {
+    const host_raw = req.host orelse {
+        return .{ .origin = cfg.origin, .rp_id = cfg.rp_id };
+    };
+    const host = std.mem.trim(u8, host_raw, " \t");
+    if (!hostHeaderOk(host)) return .{ .origin = cfg.origin, .rp_id = cfg.rp_id };
+
+    var hostname = host;
+    if (std.mem.lastIndexOfScalar(u8, host, ':')) |colon| {
+        // strip port; keep IPv6 untouched (rare for our binds)
+        if (std.mem.indexOfScalar(u8, host, ']') == null) {
+            hostname = host[0..colon];
+        }
+    }
+    if (hostname.len == 0 or hostname.len >= rp_buf.len) {
+        return .{ .origin = cfg.origin, .rp_id = cfg.rp_id };
+    }
+    @memcpy(rp_buf[0..hostname.len], hostname);
+    const rp_id = rp_buf[0..hostname.len];
+
+    var proto: []const u8 = "http";
+    if (req.forwarded_proto) |fp| {
+        const p = std.mem.trim(u8, fp, " \t");
+        if (std.ascii.eqlIgnoreCase(p, "https")) proto = "https";
+    } else if (std.mem.startsWith(u8, cfg.origin, "https://")) {
+        proto = "https";
+    }
+    const origin = std.fmt.bufPrint(origin_buf, "{s}://{s}", .{ proto, host }) catch cfg.origin;
+    return .{ .origin = origin, .rp_id = rp_id };
+}
+
+fn cookieSecureForOrigin(origin: []const u8) bool {
+    return std.mem.startsWith(u8, origin, "https://");
+}
+
 fn handleAuth(buf: []u8, req: RequestInfo, path: []const u8, ctx: Context) Response {
     const now = if (req.now_ms != 0) req.now_ms else clock.SystemClock.clock().wallMs();
+    var origin_buf: [256]u8 = undefined;
+    var rp_buf: [128]u8 = undefined;
+    const wa = resolveWebAuthn(req, ctx.auth_cfg, &origin_buf, &rp_buf);
+
     // status
     if (req.method == .GET and std.mem.eql(u8, path, "/api/v1/auth/status")) {
         const reqd = ctx.auth_cfg.required();
         const authed = if (!reqd) true else isAuthed(ctx, req);
         const ncred: usize = if (ctx.cred_store) |s| s.count() else 0;
-        const body = std.fmt.bufPrint(buf, "{{\"auth_required\":{},\"authenticated\":{},\"passkeys\":{d},\"rp_id\":\"{s}\"}}", .{
+        // passkey_hint: client still needs isSecureContext; we report expected rp/origin.
+        const body = std.fmt.bufPrint(buf, "{{\"auth_required\":{},\"authenticated\":{},\"passkeys\":{d},\"rp_id\":\"{s}\",\"origin\":\"{s}\",\"passkey_note\":\"requires_secure_context_https_or_localhost\"}}", .{
             reqd,
             authed,
             ncred,
-            ctx.auth_cfg.rp_id,
+            wa.rp_id,
+            wa.origin,
         }) catch return .{ .status = .internal_server_error, .body = "{\"error\":\"buf\"}" };
         return .{ .status = .ok, .body = body };
     }
@@ -184,7 +247,7 @@ fn handleAuth(buf: []u8, req: RequestInfo, path: []const u8, ctx: Context) Respo
         const sess = auth.mintSession(ctx.auth_cfg, now, &sess_buf) catch {
             return .{ .status = .internal_server_error, .body = "{\"error\":\"session\"}" };
         };
-        const sc = auth.setCookieHeader(sess, auth.cookieSecure(ctx.auth_cfg), ctx.cookie_buf) catch {
+        const sc = auth.setCookieHeader(sess, cookieSecureForOrigin(wa.origin), ctx.cookie_buf) catch {
             return .{ .status = .internal_server_error, .body = "{\"error\":\"cookie\"}" };
         };
         return .{ .status = .ok, .body = "{\"ok\":true}", .set_cookie = sc };
@@ -204,7 +267,7 @@ fn handleAuth(buf: []u8, req: RequestInfo, path: []const u8, ctx: Context) Respo
         const bank = ctx.challenges orelse return .{ .status = .service_unavailable, .body = "{\"error\":\"passkey_disabled\"}" };
         var ch_b64: [64]u8 = undefined;
         const ch = bank.issue(now, &ch_b64) catch return .{ .status = .internal_server_error, .body = "{\"error\":\"challenge\"}" };
-        const body = std.fmt.bufPrint(buf, "{{\"challenge\":\"{s}\",\"rp\":{{\"name\":\"AlphaBound\",\"id\":\"{s}\"}},\"user\":{{\"id\":\"YWRtaW4\",\"name\":\"admin\",\"displayName\":\"Admin\"}},\"pubKeyCredParams\":[{{\"type\":\"public-key\",\"alg\":-7}}],\"timeout\":60000,\"attestation\":\"none\",\"authenticatorSelection\":{{\"residentKey\":\"preferred\",\"userVerification\":\"preferred\"}}}}", .{ ch, ctx.auth_cfg.rp_id }) catch {
+        const body = std.fmt.bufPrint(buf, "{{\"challenge\":\"{s}\",\"rp\":{{\"name\":\"AlphaBound\",\"id\":\"{s}\"}},\"user\":{{\"id\":\"YWRtaW4\",\"name\":\"admin\",\"displayName\":\"Admin\"}},\"pubKeyCredParams\":[{{\"type\":\"public-key\",\"alg\":-7}}],\"timeout\":60000,\"attestation\":\"none\",\"authenticatorSelection\":{{\"residentKey\":\"preferred\",\"userVerification\":\"preferred\"}}}}", .{ ch, wa.rp_id }) catch {
             return .{ .status = .internal_server_error, .body = "{\"error\":\"buf\"}" };
         };
         return .{ .status = .ok, .body = body };
@@ -249,7 +312,7 @@ fn handleAuth(buf: []u8, req: RequestInfo, path: []const u8, ctx: Context) Respo
             return .{ .status = .internal_server_error, .body = "{\"error\":\"ids\"}" };
         const body = std.fmt.bufPrint(buf, "{{\"challenge\":\"{s}\",\"timeout\":60000,\"rpId\":\"{s}\",\"userVerification\":\"preferred\",\"allowCredentials\":{s}}}", .{
             ch,
-            ctx.auth_cfg.rp_id,
+            wa.rp_id,
             allow,
         }) catch return .{ .status = .internal_server_error, .body = "{\"error\":\"buf\"}" };
         return .{ .status = .ok, .body = body };
@@ -288,9 +351,9 @@ fn handleAuth(buf: []u8, req: RequestInfo, path: []const u8, ctx: Context) Respo
             if (n2 > cd_buf.len) return .{ .status = .bad_request, .body = "{\"error\":\"too_large\"}" };
             std.base64.standard.Decoder.decode(cd_buf[0..n2], client_data_b64) catch
                 return .{ .status = .bad_request, .body = "{\"error\":\"b64\"}" };
-            return finishPasskeyLogin(buf, ctx, now, bank, cred.pub_sec1, cd_buf[0..n2], auth_data_b64, sig_b64, challenge_b64);
+            return finishPasskeyLogin(buf, ctx, wa.origin, now, bank, cred.pub_sec1, cd_buf[0..n2], auth_data_b64, sig_b64, challenge_b64);
         };
-        return finishPasskeyLogin(buf, ctx, now, bank, cred.pub_sec1, cd_buf[0..cd_n], auth_data_b64, sig_b64, challenge_b64);
+        return finishPasskeyLogin(buf, ctx, wa.origin, now, bank, cred.pub_sec1, cd_buf[0..cd_n], auth_data_b64, sig_b64, challenge_b64);
     }
 
     return .{ .status = .not_found, .body = "{\"error\":\"not found\"}" };
@@ -313,6 +376,7 @@ fn decodeB64Flexible(out: []u8, in: []const u8) ?[]const u8 {
 fn finishPasskeyLogin(
     buf: []u8,
     ctx: Context,
+    expected_origin: []const u8,
     now: i64,
     bank: *auth.ChallengeBank,
     pub_sec1: [65]u8,
@@ -335,7 +399,7 @@ fn finishPasskeyLogin(
         client_data_json,
         sig,
         challenge_b64,
-        ctx.auth_cfg.origin,
+        expected_origin,
         bank,
         now,
     );
@@ -345,7 +409,7 @@ fn finishPasskeyLogin(
     const sess = auth.mintSession(ctx.auth_cfg, now, &sess_buf) catch {
         return .{ .status = .internal_server_error, .body = "{\"error\":\"session\"}" };
     };
-    const sc = auth.setCookieHeader(sess, auth.cookieSecure(ctx.auth_cfg), ctx.cookie_buf) catch {
+    const sc = auth.setCookieHeader(sess, cookieSecureForOrigin(expected_origin), ctx.cookie_buf) catch {
         return .{ .status = .internal_server_error, .body = "{\"error\":\"cookie\"}" };
     };
     return .{ .status = .ok, .body = "{\"ok\":true}", .set_cookie = sc };
@@ -499,9 +563,13 @@ fn handleConnection(io: std.Io, stream: std.Io.net.Stream, ctx_fn: ContextFn, us
     var authz_buf: [512]u8 = undefined;
     var x_tok_buf: [256]u8 = undefined;
     var cookie_hdr_buf: [1024]u8 = undefined;
+    var host_buf: [256]u8 = undefined;
+    var fwd_proto_buf: [32]u8 = undefined;
     const authorization = copyOptHeader(req.head_buffer, "authorization", &authz_buf);
     const x_api_token = copyOptHeader(req.head_buffer, "x-api-token", &x_tok_buf);
     const cookie_hdr = copyOptHeader(req.head_buffer, "cookie", &cookie_hdr_buf);
+    const host_hdr = copyOptHeader(req.head_buffer, "host", &host_buf);
+    const fwd_proto = copyOptHeader(req.head_buffer, "x-forwarded-proto", &fwd_proto_buf);
     const content_length = req.head.content_length;
 
     var body_storage: [8192]u8 = undefined;
@@ -547,6 +615,8 @@ fn handleConnection(io: std.Io, stream: std.Io.net.Stream, ctx_fn: ContextFn, us
         .authorization = authorization,
         .x_api_token = x_api_token,
         .cookie = cookie_hdr,
+        .host = host_hdr,
+        .forwarded_proto = fwd_proto,
         .body = body_storage[0..body_len],
         .now_ms = clock.SystemClock.clock().wallMs(),
     };
@@ -701,4 +771,44 @@ test "auth required blocks data APIs without token" {
     }, ctx);
     try testing.expectEqual(std.http.Status.ok, login.status);
     try testing.expect(login.set_cookie != null);
+}
+
+test "auth status rp_id follows Host header" {
+    var buf: [2048]u8 = undefined;
+    var ctx = testCtx();
+    ctx.auth_cfg = .{
+        .api_token = "t",
+        .rp_id = "localhost",
+        .origin = "http://127.0.0.1:8080",
+    };
+    ctx.auth_cfg.session_secret = auth.deriveSessionSecret(ctx.auth_cfg.api_token);
+
+    const r = handleReq(&buf, .{
+        .method = .GET,
+        .target = "/api/v1/auth/status",
+        .host = "10.0.0.5:8080",
+        .now_ms = 1,
+    }, ctx);
+    try testing.expectEqual(std.http.Status.ok, r.status);
+    try testing.expect(std.mem.indexOf(u8, r.body, "\"rp_id\":\"10.0.0.5\"") != null);
+    try testing.expect(std.mem.indexOf(u8, r.body, "\"origin\":\"http://10.0.0.5:8080\"") != null);
+
+    const r2 = handleReq(&buf, .{
+        .method = .GET,
+        .target = "/api/v1/auth/status",
+        .host = "dash.example.com",
+        .forwarded_proto = "https",
+        .now_ms = 1,
+    }, ctx);
+    try testing.expect(std.mem.indexOf(u8, r2.body, "\"rp_id\":\"dash.example.com\"") != null);
+    try testing.expect(std.mem.indexOf(u8, r2.body, "\"origin\":\"https://dash.example.com\"") != null);
+
+    // reject host chars that would break JSON
+    const r3 = handleReq(&buf, .{
+        .method = .GET,
+        .target = "/api/v1/auth/status",
+        .host = "evil\",\"x\":\"1",
+        .now_ms = 1,
+    }, ctx);
+    try testing.expect(std.mem.indexOf(u8, r3.body, "\"rp_id\":\"localhost\"") != null);
 }

@@ -198,13 +198,14 @@
 <div id="auth_gate" aria-modal="true" role="dialog" aria-labelledby="auth_title">
   <div class="box">
     <h2 id="auth_title">登录 Dashboard</h2>
-    <p>API 已启用鉴权。使用 token 登录；登录后可注册 Passkey 以便下次免密。</p>
+    <p id="auth_help">API 已启用鉴权。请先用 <strong>Token</strong> 登录（与 <code>ALPHABOUND_API_TOKEN</code> 相同）。</p>
     <label for="auth_token">API Token</label>
     <input id="auth_token" type="password" autocomplete="current-password" placeholder="ALPHABOUND_API_TOKEN" />
     <div class="row">
       <button type="button" class="primary" id="auth_login_btn">Token 登录</button>
-      <button type="button" class="secondary" id="auth_passkey_btn">Passkey 登录</button>
+      <button type="button" class="secondary" id="auth_passkey_btn" title="需要 HTTPS 或 localhost">Passkey 登录</button>
     </div>
+    <p id="auth_passkey_hint" class="err" style="margin-top:10px;min-height:0"></p>
     <div class="err" id="auth_err"></div>
   </div>
 </div>
@@ -648,11 +649,49 @@ async function jpost(path, body) {
 let authRequired = false;
 let authReady = false;
 
+/** WebAuthn only works in a secure context: https:// or http://localhost / 127.0.0.1 */
+function passkeySupport() {
+  const secure = window.isSecureContext === true;
+  const api = !!(window.PublicKeyCredential && navigator.credentials && navigator.credentials.get);
+  const host = (location.hostname || "").toLowerCase();
+  const loopback = host === "localhost" || host === "127.0.0.1" || host === "[::1]";
+  return { ok: secure && api, secure, api, loopback, host: location.host, href: location.origin };
+}
+function passkeyBlockReason() {
+  const s = passkeySupport();
+  if (s.ok) return "";
+  if (!s.secure) {
+    return "Passkey 需要安全上下文。你当前是 " + s.href +
+      "（HTTP 内网 IP 不行）。请用 Token 登录；若要用 Passkey：SSH 隧道到本机后打开 http://127.0.0.1:8080/ ，或上 HTTPS。";
+  }
+  if (!s.api) return "当前浏览器未提供 WebAuthn API，请用 Token 登录。";
+  return "Passkey 不可用，请用 Token 登录。";
+}
+function applyPasskeyUi() {
+  const reason = passkeyBlockReason();
+  const ok = !reason;
+  const pb = $("auth_passkey_btn");
+  const rb = $("auth_register_passkey");
+  const hint = $("auth_passkey_hint");
+  if (pb) {
+    pb.disabled = !ok;
+    pb.title = ok ? "使用本机 Passkey 登录" : reason;
+    pb.style.opacity = ok ? "1" : "0.45";
+  }
+  if (rb) {
+    rb.disabled = !ok;
+    rb.title = ok ? "注册 Passkey（需已登录）" : reason;
+    rb.style.opacity = ok ? "1" : "0.45";
+  }
+  if (hint) hint.textContent = ok ? "" : reason;
+}
+
 function showAuthGate(msg) {
   const g = $("auth_gate");
   if (!g) return;
   g.classList.add("show");
   if (msg) $("auth_err").textContent = msg;
+  applyPasskeyUi();
   document.body.style.overflow = "hidden";
 }
 function hideAuthGate() {
@@ -666,6 +705,7 @@ function setAuthBar(on) {
   const b = $("auth_bar");
   if (!b) return;
   if (on) b.classList.add("show"); else b.classList.remove("show");
+  applyPasskeyUi();
 }
 
 async function refreshAuthStatus() {
@@ -675,8 +715,11 @@ async function refreshAuthStatus() {
   if (!authRequired || authReady) {
     hideAuthGate();
     setAuthBar(authRequired);
+    const pk = passkeySupport();
     $("auth_bar_text").textContent = authRequired
-      ? ("已登录 · Passkey " + (st.passkeys || 0) + " · rp " + (st.rp_id || ""))
+      ? ("已登录 · Passkey " + (st.passkeys || 0) +
+        " · rp " + (st.rp_id || "") +
+        (pk.ok ? "" : " · Passkey 需 localhost/HTTPS"))
       : "";
     return true;
   }
@@ -700,7 +743,8 @@ async function loginWithToken() {
 
 async function loginWithPasskey() {
   try {
-    if (!window.PublicKeyCredential) throw new Error("浏览器不支持 Passkey");
+    const reason = passkeyBlockReason();
+    if (reason) throw new Error(reason);
     const opt = await fetch("/api/v1/auth/passkey/login/options", { credentials: "same-origin", cache: "no-store" }).then(r => {
       if (!r.ok) throw new Error("options HTTP " + r.status);
       return r.json();
@@ -734,7 +778,8 @@ async function loginWithPasskey() {
 
 async function registerPasskey() {
   try {
-    if (!window.PublicKeyCredential) throw new Error("浏览器不支持 Passkey");
+    const reason = passkeyBlockReason();
+    if (reason) throw new Error(reason);
     const opt = await jget("/api/v1/auth/passkey/register/options");
     const publicKey = {
       challenge: b64urlToBuf(opt.challenge),
@@ -781,6 +826,7 @@ function wireAuthUi() {
   if (ob) ob.addEventListener("click", logout);
   const tok = $("auth_token");
   if (tok) tok.addEventListener("keydown", (ev) => { if (ev.key === "Enter") loginWithToken(); });
+  applyPasskeyUi();
 }
 
 
