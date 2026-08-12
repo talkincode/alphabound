@@ -64,19 +64,25 @@ open http://127.0.0.1:18180/
 
 ### `GET /api/v1/shadow`
 
-影子 vs buy-and-hold 对比：
+实盘净值 vs **同起点** buy-and-hold 对照（非第二套仓）：
 
 ```json
 {
-  "shadow_equity": "100",
-  "bh_equity": "99.80",
-  "alpha": "0.20",
-  "entry_bid": "64600",
-  "bh_btc": "0.00154"
+  "shadow_equity": "400.12",
+  "bh_equity": "399.80",
+  "alpha": "0.32",
+  "entry_bid": "64191",
+  "bh_btc": "0.00622",
+  "baseline_capital": "400.00",
+  "shadow_return": "0.0003",
+  "bh_return": "-0.0005",
+  "alpha_return": "0.0008"
 }
 ```
 
-BH 在首个有效 bid 按 `initial_capital` 与 taker fee 初始化；shadow 仍可 HOLD 全现金，故短期 alpha 常为正（未承担 BTC 风险）。
+- 首次有效 bid + 已对账权益时，用**当时实盘净值**建 BH（全仓假想 BTC，扣 taker fee），不再死用 toml `initial_capital`。
+- 实盘权益相对基准跳变 ≥8% 且 ≥15 USDT（转入/转出）时 **自动重标定**（事件 `SHADOW_BH_REBASE`）。
+- 主指标看 `alpha_return`（实盘收益% − BH 收益%）；美元 `alpha` 仅作同本金参考。
 
 ## 规划中的 API
 

@@ -150,12 +150,16 @@
       <div class="card"><div class="label">状态版本</div><div class="value" id="version">—</div></div>
     </div>
 
-    <h2>影子账本（决策模拟基准）vs 买入持有</h2>
+    <h2>实盘 vs 同起点买入持有（对照，非第二套仓）</h2>
+    <p class="hint" style="margin:0 0 10px">两边用同一「基准本金」起步。大额转入/转出后会自动重标定，避免超额被入金刷爆。主看<strong>收益差 %</strong>。</p>
     <div class="grid">
-      <div class="card"><div class="label">影子净值</div><div class="value" id="sh_shadow">—</div></div>
-      <div class="card"><div class="label">买入持有净值</div><div class="value" id="sh_bh">—</div></div>
-      <div class="card"><div class="label">超额（影子 − 持有）</div><div class="value" id="sh_alpha">—</div></div>
+      <div class="card"><div class="label">实盘净值</div><div class="value" id="sh_shadow">—</div></div>
+      <div class="card"><div class="label">同起点 BH 净值</div><div class="value" id="sh_bh">—</div></div>
+      <div class="card"><div class="label">收益差 %（实盘 − BH）</div><div class="value" id="sh_alpha_ret">—</div></div>
+      <div class="card"><div class="label">实盘收益 % / BH 收益 %</div><div class="value" id="sh_rets" style="font-size:14px">—</div></div>
+      <div class="card"><div class="label">基准本金</div><div class="value" id="sh_base" style="font-size:14px">—</div></div>
       <div class="card"><div class="label">建仓价 / BH-BTC</div><div class="value" id="sh_entry" style="font-size:14px">—</div></div>
+      <div class="card"><div class="label">美元超额（参考）</div><div class="value" id="sh_alpha" style="font-size:14px">—</div></div>
     </div>
 
     <h2>行情与净值</h2>
@@ -1227,9 +1231,19 @@ async function poll() {
 
     $("sh_shadow").textContent = shadow.shadow_equity ?? "—";
     $("sh_bh").textContent = shadow.bh_equity ?? "—";
+    const ar = parseFloat(shadow.alpha_return);
+    const sr = parseFloat(shadow.shadow_return);
+    const br = parseFloat(shadow.bh_return);
+    $("sh_alpha_ret").textContent = Number.isFinite(ar) ? (ar * 100).toFixed(3) + "%" : "—";
+    $("sh_alpha_ret").className = alphaClass(shadow.alpha_return);
+    $("sh_rets").textContent =
+      (Number.isFinite(sr) ? (sr * 100).toFixed(3) + "%" : "—") +
+      " / " +
+      (Number.isFinite(br) ? (br * 100).toFixed(3) + "%" : "—");
+    $("sh_base").textContent = shadow.baseline_capital ?? "—";
+    $("sh_entry").textContent = (shadow.entry_bid || "—") + " / " + (shadow.bh_btc || "—");
     $("sh_alpha").textContent = shadow.alpha ?? "—";
     $("sh_alpha").className = alphaClass(shadow.alpha);
-    $("sh_entry").textContent = (shadow.entry_bid || "—") + " / " + (shadow.bh_btc || "—");
 
     updateCandleChart(candles || {});
     updateEquityChart(equity);

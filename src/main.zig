@@ -1064,14 +1064,44 @@ pub fn main(init: std.process.Init) !u8 {
                 const snap = engine.snapshot();
                 web_state.update(snap, true);
 
-                // Init BH on first valid bid after READY.
-                if (!bh.initialized and !ticker.bid.isZero()) {
+                // BH baseline: use live equity (demo real book), not stale toml initial_capital.
+                // Rebase on deposit/withdrawal-sized jumps so alpha is not dominated by inflows.
+                if (!ticker.bid.isZero() and snap.conservative_equity.gt(ab.decimal.Decimal.zero)) {
+                    const live_eq = snap.conservative_equity;
+                    if (!bh.initialized) {
+                        bh = ab.shadow_bench.init(live_eq, ticker.bid, cfg.taker_fee_rate);
+                        if (bh.initialized) {
+                            std.debug.print(
+                                "[shadow-bh] baseline capital={f} entry_bid={f} bh_btc={f} fee={f}\n",
+                                .{ bh.initial_capital, bh.entry_bid, bh.bh_btc, bh.fee_rate },
+                            );
+                            logEvent(&events_repo, &engine, "SHADOW_BH_INIT", "core", "INFO", &cfg);
+                        }
+                    } else if (ab.shadow_bench.needsRebase(bh.initial_capital, live_eq)) {
+                        const prev_cap = bh.initial_capital;
+                        bh = ab.shadow_bench.init(live_eq, ticker.bid, cfg.taker_fee_rate);
+                        if (bh.initialized) {
+                            std.debug.print(
+                                "[shadow-bh] rebased capital {f} -> {f} entry_bid={f}\n",
+                                .{ prev_cap, bh.initial_capital, bh.entry_bid },
+                            );
+                            var rb: [192]u8 = undefined;
+                            var a_buf: [48]u8 = undefined;
+                            var b_buf: [48]u8 = undefined;
+                            const as = decFmt(&a_buf, prev_cap);
+                            const bs = decFmt(&b_buf, bh.initial_capital);
+                            const rp = std.fmt.bufPrint(
+                                &rb,
+                                "{{\"from\":\"{s}\",\"to\":\"{s}\",\"reason\":\"capital_jump\"}}",
+                                .{ as, bs },
+                            ) catch "{\"reason\":\"capital_jump\"}";
+                            logEventPayload(&events_repo, &engine, "SHADOW_BH_REBASE", "core", "INFO", &cfg, rp);
+                        }
+                    }
+                } else if (!bh.initialized and !ticker.bid.isZero()) {
+                    // Fallback before first equity sample (shadow sim).
                     bh = ab.shadow_bench.init(cfg.initial_capital, ticker.bid, cfg.taker_fee_rate);
                     if (bh.initialized) {
-                        std.debug.print(
-                            "[shadow-bh] baseline entry_bid={f} bh_btc={f} fee={f}\n",
-                            .{ bh.entry_bid, bh.bh_btc, bh.fee_rate },
-                        );
                         logEvent(&events_repo, &engine, "SHADOW_BH_INIT", "core", "INFO", &cfg);
                     }
                 }
@@ -1084,7 +1114,7 @@ pub fn main(init: std.process.Init) !u8 {
                 }
                 // Push BH JSON every tick so /api/v1/shadow never lags on agent work.
                 {
-                    var bh_json_buf: [512]u8 = undefined;
+                    var bh_json_buf: [768]u8 = undefined;
                     if (ab.shadow_bench.formatJson(&bh_json_buf, last_bh_cmp)) |j| {
                         web_state.setJson(.shadow, j);
                     } else |_| {}
@@ -1388,7 +1418,7 @@ fn refreshWebCaches(
     var tmp_agent: [24576]u8 = undefined;
     var tmp_equity: [8192]u8 = undefined;
     var tmp_events: [12288]u8 = undefined;
-    var tmp_shadow: [512]u8 = undefined;
+    var tmp_shadow: [768]u8 = undefined;
     var tmp_mem: [8192]u8 = undefined;
     if (runs.listRecentJson(db, &tmp_agent, 50)) |j| {
         ws.setJson(.agent, j);
