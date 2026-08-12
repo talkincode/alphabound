@@ -2254,17 +2254,25 @@ fn runAgentDecision(
         applyShadowReflection(gpa, mem_store, memories_repo, events_repo, engine, cfg, run_id, prop.decision_id, action_txt, prop.target_btc_weight, prop.confidence);
     }
 
-    var ok_buf: [896]u8 = undefined;
+    var ok_buf: [4096]u8 = undefined;
     var w_buf: [48]u8 = undefined;
     var c_buf: [48]u8 = undefined;
     var aw_buf: [48]u8 = undefined;
     var se_buf: [48]u8 = undefined;
     var fl_buf: [48]u8 = undefined;
+    var thesis_buf: [1536]u8 = undefined;
+    var invalid_buf: [1024]u8 = undefined;
+    var review_buf: [48]u8 = undefined;
     const weight_s = decFmt(&w_buf, prop.target_btc_weight);
     const conf_s = decFmt(&c_buf, prop.confidence);
     const admitted_s = decFmt(&aw_buf, admission.admitted_weight);
     const stress_s = decFmt(&se_buf, admission.stress_equity);
     const floor_s = decFmt(&fl_buf, admission.floor);
+    const thesis_json = jsonStringArrayLimited(&thesis_buf, prop.thesis, 6, 180);
+    const invalid_json = jsonStringArrayLimited(&invalid_buf, prop.invalid_if, 6, 120);
+    const review_s: []const u8 = if (prop.review_after) |ra| blk: {
+        break :blk jsonEscapeInto(&review_buf, ra);
+    } else "";
     const executed = !std.mem.eql(u8, exec_note, "not_executed") and
         !std.mem.eql(u8, exec_note, "hold") and
         !std.mem.eql(u8, exec_note, "skipped_reject") and
@@ -2272,8 +2280,8 @@ fn runAgentDecision(
         !std.mem.eql(u8, exec_note, "plan_error");
     const ok_payload = std.fmt.bufPrint(
         &ok_buf,
-        "{{\"run_id\":\"{s}\",\"decision_id\":\"{s}\",\"action\":\"{s}\",\"target_btc_weight\":\"{s}\",\"confidence\":\"{s}\",\"snapshot_version\":{d},\"output_digest\":\"{s}\",\"tools\":{d},\"executed\":{},\"exec\":\"{s}\",\"admission\":{{\"verdict\":\"{s}\",\"reason\":\"{s}\",\"admitted_weight\":\"{s}\",\"stress_equity\":\"{s}\",\"floor\":\"{s}\"}},\"usage\":{{\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d}}}}}",
-        .{ run_id, prop.decision_id, action_txt, weight_s, conf_s, prop.snapshot_version, out_digest, obs_n, executed, exec_note, admission.verdict_txt, admission.reason_txt, admitted_s, stress_s, floor_s, chat_res.usage.prompt_tokens, chat_res.usage.completion_tokens, chat_res.usage.total_tokens },
+        "{{\"run_id\":\"{s}\",\"decision_id\":\"{s}\",\"action\":\"{s}\",\"target_btc_weight\":\"{s}\",\"confidence\":\"{s}\",\"snapshot_version\":{d},\"output_digest\":\"{s}\",\"tools\":{d},\"executed\":{},\"exec\":\"{s}\",\"thesis\":{s},\"invalid_if\":{s},\"review_after\":\"{s}\",\"admission\":{{\"verdict\":\"{s}\",\"reason\":\"{s}\",\"admitted_weight\":\"{s}\",\"stress_equity\":\"{s}\",\"floor\":\"{s}\"}},\"usage\":{{\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d}}}}}",
+        .{ run_id, prop.decision_id, action_txt, weight_s, conf_s, prop.snapshot_version, out_digest, obs_n, executed, exec_note, thesis_json, invalid_json, review_s, admission.verdict_txt, admission.reason_txt, admitted_s, stress_s, floor_s, chat_res.usage.prompt_tokens, chat_res.usage.completion_tokens, chat_res.usage.total_tokens },
     ) catch "{\"executed\":false}";
     {
         var dbuf: [160]u8 = undefined;
@@ -3815,6 +3823,62 @@ fn decFmt(buf: []u8, v: ab.decimal.Decimal) []const u8 {
     return w.buffered();
 }
 
+/// Escape a short string into `buf` for embedding in a JSON string value (no surrounding quotes).
+fn jsonEscapeInto(buf: []u8, s: []const u8) []const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    for (s) |c| {
+        switch (c) {
+            '"' => w.writeAll("\\\"") catch break,
+            '\\' => w.writeAll("\\\\") catch break,
+            '\n' => w.writeAll("\\n") catch break,
+            '\r' => w.writeAll("\\r") catch break,
+            '\t' => w.writeAll("\\t") catch break,
+            else => {
+                if (c < 0x20) continue;
+                w.writeByte(c) catch break;
+            },
+        }
+    }
+    return w.buffered();
+}
+
+/// JSON array of strings, truncated for event payload size.
+fn jsonStringArrayLimited(buf: []u8, items: []const []const u8, max_items: usize, max_item_len: usize) []const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    w.writeAll("[") catch return "[]";
+    const n = @min(items.len, max_items);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        if (i > 0) w.writeAll(",") catch break;
+        w.writeAll("\"") catch break;
+        const raw = items[i];
+        const slice = if (raw.len > max_item_len) raw[0..max_item_len] else raw;
+        for (slice) |c| {
+            switch (c) {
+                '"' => w.writeAll("\\\"") catch break,
+                '\\' => w.writeAll("\\\\") catch break,
+                '\n' => w.writeAll("\\n") catch break,
+                '\r' => w.writeAll("\\r") catch break,
+                '\t' => w.writeAll("\\t") catch break,
+                else => {
+                    if (c < 0x20) continue;
+                    w.writeByte(c) catch break;
+                },
+            }
+        }
+        w.writeAll("\"") catch break;
+    }
+    w.writeAll("]") catch return "[]";
+    return w.buffered();
+}
+
 test "version string sane" {
     try std.testing.expect(version_string.len >= 5);
+}
+
+test "jsonStringArrayLimited escapes and caps" {
+    var buf: [256]u8 = undefined;
+    const items = [_][]const u8{ "a\"b", "line\n2", "0123456789abcdef" };
+    const out = jsonStringArrayLimited(&buf, items[0..], 2, 8);
+    try std.testing.expectEqualStrings("[\"a\\\"b\",\"line\\n2\"]", out);
 }

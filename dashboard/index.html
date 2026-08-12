@@ -826,6 +826,15 @@ function renderDecisions(decisions, runs) {
       lines.push("目标 BTC 权重：" + p.target_btc_weight);
     if (p.confidence != null && p.confidence !== "")
       lines.push("置信度：" + p.confidence);
+    if (Array.isArray(p.thesis) && p.thesis.length) {
+      lines.push("推理 thesis：");
+      p.thesis.slice(0, 8).forEach((t, i) => lines.push("  " + (i + 1) + ". " + t));
+    }
+    if (Array.isArray(p.invalid_if) && p.invalid_if.length) {
+      lines.push("失效条件 invalid_if：");
+      p.invalid_if.slice(0, 8).forEach((t, i) => lines.push("  " + (i + 1) + ". " + t));
+    }
+    if (p.review_after) lines.push("复盘周期 review_after：" + p.review_after);
     if (p.snapshot_version != null)
       lines.push("绑定快照版本：" + p.snapshot_version);
     else if (e.state_version != null)
@@ -876,20 +885,30 @@ function renderDecisions(decisions, runs) {
     if (run.output_digest) lines.push("输出摘要：" + run.output_digest);
     if (p.output_digest && !run.output_digest) lines.push("输出摘要：" + p.output_digest);
 
-    // One-line human thesis-style blurb
+    // Prefer model thesis; fall back to structured template.
     let blurb = "";
     if (e.type === "AGENT_PROPOSAL_OK") {
       const act = String(p.action || "").toUpperCase();
-      if (act === "HOLD") {
+      const thesis0 = (Array.isArray(p.thesis) && p.thesis.length) ? String(p.thesis[0]) : "";
+      if (thesis0) {
+        blurb = "摘要：" + thesis0 +
+          (act === "REBALANCE"
+            ? " → 调仓目标权重 " + (p.target_btc_weight != null ? p.target_btc_weight : "—")
+            : " → HOLD") +
+          "（conf=" + (p.confidence != null ? p.confidence : "—") +
+          (p.exec ? " exec=" + p.exec : "") + "）";
+      } else if (act === "HOLD") {
         blurb = "摘要：Agent 建议继续持有现金/当前仓位，目标 BTC 权重 " +
           (p.target_btc_weight != null ? p.target_btc_weight : "0") +
           "，置信度 " + (p.confidence != null ? p.confidence : "—") +
-          (p.executed ? "。已执行。" : "。本轮未发订单。");
+          (p.executed ? "。已执行。" : "。本轮未发订单。") +
+          "（历史记录无 thesis 字段）";
       } else if (act === "REBALANCE") {
         blurb = "摘要：Agent 建议调仓至 BTC 权重 " +
           (p.target_btc_weight != null ? p.target_btc_weight : "—") +
           "，置信度 " + (p.confidence != null ? p.confidence : "—") +
-          (p.executed ? "。已进入执行。" : "。未执行（见准入/执行结果）。");
+          (p.executed ? "。已进入执行。" : "。未执行（见准入/执行结果）。") +
+          "（历史记录无 thesis 字段）";
       } else {
         blurb = "摘要：提案已通过 Schema 校验并落库审计。";
       }
@@ -919,7 +938,8 @@ function renderDecisions(decisions, runs) {
   const rowsHtml = list.slice(0, 60).map((e) => {
     const p = e.payload || {};
     const run = runById[p.run_id] || {};
-    const note = p.error || p.reason || p.source || run.model || "";
+    const thesisNote = (Array.isArray(p.thesis) && p.thesis.length) ? String(p.thesis[0]) : "";
+    const note = thesisNote || p.error || p.reason || p.source || run.model || "";
     const conf = p.confidence != null ? p.confidence : "";
     const target = p.target_btc_weight != null ? p.target_btc_weight : "";
     const snap = p.snapshot_version != null ? p.snapshot_version : (e.state_version ?? "");
