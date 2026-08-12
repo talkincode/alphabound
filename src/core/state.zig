@@ -42,6 +42,9 @@ pub const PortfolioState = struct {
     unresolved_orders: bool = false,
     /// False when the DB volume is in low/critical free-space band (FD7).
     disk_ok: bool = true,
+    /// False when the audit journal (events append) is failing (AC-GO6):
+    /// un-auditable trading must not continue increasing risk.
+    journal_ok: bool = true,
     freshness: FreshnessState = .{},
 };
 
@@ -69,6 +72,8 @@ pub const Message = union(enum) {
     risk_trigger: sm.Trigger,
     /// Disk free-space health for the DB volume (FD7). `ok=false` → degraded.
     disk_status: struct { ok: bool },
+    /// Audit journal write health (AC-GO6). `ok=false` → degraded.
+    journal_status: struct { ok: bool },
     clock_tick: struct { ts_ms: i64 }, // periodic freshness re-evaluation
 };
 
@@ -136,6 +141,10 @@ pub const Engine = struct {
                 self.state.disk_ok = dsk.ok;
                 self.evaluateHealth(self.state.as_of_ms);
             },
+            .journal_status => |j| {
+                self.state.journal_ok = j.ok;
+                self.evaluateHealth(self.state.as_of_ms);
+            },
             .clock_tick => |c| {
                 self.state.as_of_ms = c.ts_ms;
                 self.evaluateHealth(c.ts_ms);
@@ -185,6 +194,7 @@ pub const Engine = struct {
         const healthy = self.state.reconciled and
             !self.state.unresolved_orders and
             self.state.disk_ok and
+            self.state.journal_ok and
             self.state.freshness.marketFresh(now_ms) and
             self.state.freshness.accountFresh(now_ms);
         const trigger: sm.Trigger = if (healthy) .conditions_ok else .degraded;
@@ -256,6 +266,32 @@ test "disk not ok degrades to exit_only until cleared" {
     try testing.expectEqual(sm.RiskMode.exit_only, e.snapshot().risk_mode);
 
     _ = try e.apply(.{ .disk_status = .{ .ok = true } });
+    _ = try e.apply(.{ .market_tick = .{ .ts_ms = 3000, .bid = d("100000"), .mark = d("100000") } });
+    try testing.expectEqual(sm.RiskMode.normal, e.snapshot().risk_mode);
+}
+
+test "journal failure degrades to exit_only until writes recover (AC-GO6)" {
+    var e = testEngine();
+    _ = try e.apply(.{ .market_tick = .{ .ts_ms = 1000, .bid = d("100000"), .mark = d("100000") } });
+    _ = try e.apply(.{ .reconcile_result = .{
+        .ts_ms = 1000,
+        .cash_usdt = d("100"),
+        .btc_total = d("0"),
+        .btc_available = d("0"),
+        .hwm_from_db = d("100"),
+        .clean = true,
+    } });
+    try testing.expectEqual(sm.RiskMode.normal, e.snapshot().risk_mode);
+
+    _ = try e.apply(.{ .journal_status = .{ .ok = false } });
+    try testing.expectEqual(sm.RiskMode.exit_only, e.snapshot().risk_mode);
+    try testing.expect(!e.snapshot().journal_ok);
+
+    // Fresh market data must not clear a broken audit journal by itself.
+    _ = try e.apply(.{ .market_tick = .{ .ts_ms = 2000, .bid = d("100000"), .mark = d("100000") } });
+    try testing.expectEqual(sm.RiskMode.exit_only, e.snapshot().risk_mode);
+
+    _ = try e.apply(.{ .journal_status = .{ .ok = true } });
     _ = try e.apply(.{ .market_tick = .{ .ts_ms = 3000, .bid = d("100000"), .mark = d("100000") } });
     try testing.expectEqual(sm.RiskMode.normal, e.snapshot().risk_mode);
 }

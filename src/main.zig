@@ -3425,8 +3425,15 @@ fn logEventPayload(
         .config_hash = cfg.hash(),
         .payload_json = safe_payload,
     }) catch |err| {
-        std.debug.print("[journal] append failed: {t}\n", .{err});
+        std.debug.print("[journal] append failed: {t} — degrading (AC-GO6)\n", .{err});
+        // Un-auditable trading must not continue increasing risk.
+        _ = engine.apply(.{ .journal_status = .{ .ok = false } }) catch {};
+        return;
     };
+    if (!snap.journal_ok) {
+        std.debug.print("[journal] append recovered — clearing degrade\n", .{});
+        _ = engine.apply(.{ .journal_status = .{ .ok = true } }) catch {};
+    }
 }
 
 fn writeEquitySample(repo: *ab.storage.EquityRepo, snap: ab.state.PortfolioState) void {
