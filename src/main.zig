@@ -931,13 +931,14 @@ pub fn main(init: std.process.Init) !u8 {
             defer gpa.free(body);
             if (ab.okx_rest.parseTicker(gpa, body)) |ticker| {
                 const prev_mode = engine.snapshot().risk_mode;
-                const lat_t0 = std.time.microTimestamp();
+                const lat_t0 = ab.clock.SystemClock.clock().monotonicNs();
                 const res = engine.apply(.{ .market_tick = .{
                     .ts_ms = ticker.ts_ms,
                     .bid = ticker.bid,
                     .mark = ticker.last,
                 } }) catch continue;
-                risk_latency.record(@intCast(std.math.clamp(std.time.microTimestamp() - lat_t0, 0, std.math.maxInt(u32))));
+                const lat_us = (ab.clock.SystemClock.clock().monotonicNs() -| lat_t0) / 1000;
+                risk_latency.record(@intCast(@min(lat_us, std.math.maxInt(u32))));
                 // Shadow uses a simulated book: keep account freshness aligned with
                 // market ticks so the risk mode does not spuriously enter EXIT_ONLY
                 // after account_ttl without private WS updates.
@@ -1072,7 +1073,7 @@ pub fn main(init: std.process.Init) !u8 {
             }
             if (last_backup_ms == 0 or tnow - last_backup_ms >= backup_interval_ms) {
                 last_backup_ms = tnow;
-                runSqliteBackup(&db, &cfg, &engine, &events_repo);
+                runSqliteBackup(io, &db, &cfg, &engine, &events_repo);
             }
         }
 
@@ -2746,6 +2747,7 @@ fn refreshEgressIp(okx: *ab.okx_rest.Client, st: *RuntimeStatus) void {
 }
 
 fn runSqliteBackup(
+    io: std.Io,
     db: *ab.storage.Db,
     cfg: *const ab.config.Config,
     engine: *ab.state.Engine,
@@ -2770,21 +2772,21 @@ fn runSqliteBackup(
     logEventPayload(events_repo, engine, "BACKUP_DONE", "storage", "INFO", cfg, payload);
 
     // AC-OPS3/OPS9: rotated snapshots + retention sweep.
-    const now_ms = std.time.milliTimestamp();
-    rotateBackups(db, cfg, now_ms);
+    const now_ms = nowMs();
+    rotateBackups(io, db, cfg, now_ms);
     runRetentionSweep(db, now_ms);
 }
 
 /// Hourly/daily rotated snapshots next to the DB, pruned to the newest
 /// retention.keep_hourly / keep_daily. Best-effort: failures only log.
-fn rotateBackups(db: *ab.storage.Db, cfg: *const ab.config.Config, now_ms: i64) void {
+fn rotateBackups(io: std.Io, db: *ab.storage.Db, cfg: *const ab.config.Config, now_ms: i64) void {
     var name_buf: [600]u8 = undefined;
     var z_buf: [640:0]u8 = undefined;
 
     // Hourly snapshot (same stamp within the hour → cheap overwrite skip).
     if (ab.retention.hourlyName(&name_buf, cfg.db_path, now_ms)) |hourly| {
         if (std.fmt.bufPrintZ(&z_buf, "{s}", .{hourly})) |zdest| {
-            if (!fileExists(zdest)) {
+            if (!fileExists(io, zdest)) {
                 ab.storage.backupToPath(db, zdest) catch |err|
                     std.debug.print("[backup] hourly failed: {t}\n", .{err});
             }
@@ -2794,36 +2796,36 @@ fn rotateBackups(db: *ab.storage.Db, cfg: *const ab.config.Config, now_ms: i64) 
     // Daily snapshot: write once per UTC day.
     if (ab.retention.dailyName(&name_buf, cfg.db_path, now_ms)) |daily| {
         if (std.fmt.bufPrintZ(&z_buf, "{s}", .{daily})) |zdest| {
-            if (!fileExists(zdest)) {
+            if (!fileExists(io, zdest)) {
                 ab.storage.backupToPath(db, zdest) catch |err|
                     std.debug.print("[backup] daily failed: {t}\n", .{err});
             }
         } else |_| {}
     } else |_| {}
 
-    pruneRotated(cfg.db_path, ab.retention.hourly_infix, ab.retention.keep_hourly);
-    pruneRotated(cfg.db_path, ab.retention.daily_infix, ab.retention.keep_daily);
+    pruneRotated(io, cfg.db_path, ab.retention.hourly_infix, ab.retention.keep_hourly);
+    pruneRotated(io, cfg.db_path, ab.retention.daily_infix, ab.retention.keep_daily);
 }
 
-fn fileExists(path: [:0]const u8) bool {
-    std.fs.cwd().access(path, .{}) catch return false;
+fn fileExists(io: std.Io, path: [:0]const u8) bool {
+    std.Io.Dir.cwd().access(io, path, .{}) catch return false;
     return true;
 }
 
 /// Delete rotated backups beyond the newest `keep` for the given infix.
-fn pruneRotated(db_path: []const u8, infix: []const u8, keep: usize) void {
+fn pruneRotated(io: std.Io, db_path: []const u8, infix: []const u8, keep: usize) void {
     const dir_path = std.fs.path.dirname(db_path) orelse ".";
     const base_name = std.fs.path.basename(db_path);
 
-    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
-    defer dir.close();
+    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return;
+    defer dir.close(io);
 
     const max_names = 64;
     var storage: [max_names][320]u8 = undefined;
     var names: [max_names][]const u8 = undefined;
     var n: usize = 0;
     var it = dir.iterate();
-    while (it.next() catch null) |entry| {
+    while (it.next(io) catch null) |entry| {
         if (entry.kind != .file) continue;
         if (!ab.retention.isRotatedBackup(entry.name, base_name, infix)) continue;
         if (n >= max_names or entry.name.len > storage[n].len) continue;
@@ -2835,7 +2837,7 @@ fn pruneRotated(db_path: []const u8, infix: []const u8, keep: usize) void {
     var out: [max_names]usize = undefined;
     const doomed = ab.retention.selectDoomed(names[0..n], keep, &out);
     for (doomed) |idx| {
-        dir.deleteFile(names[idx]) catch |err|
+        dir.deleteFile(io, names[idx]) catch |err|
             std.debug.print("[backup] prune {s} failed: {t}\n", .{ names[idx], err });
     }
 }
