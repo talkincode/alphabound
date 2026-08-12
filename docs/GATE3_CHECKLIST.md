@@ -57,7 +57,7 @@ export LLM_API_KEY=...
 | 3 | 一轮决策出现 `exec=filled`（非 shadow `not_executed`） | ☑ 2026-08-12 operator `target-weight=0.05` → FILLED；agent HOLD 现为 `exec=hold` no-op |
 | 4 | Dashboard/events 可见 `ORDER_*` + orders/fills 投影 | ☑ 2026-08-12（多笔 buy/sell FILLED；exchange_order_id 保留修复随后） |
 | 5 | `--control cancel-all` 清空 pending | ☐ 脚本就绪；无挂单时 no-op |
-| 6 | `--control flatten` 后不再增仓（admission REJECT）+ 自动卖至 dust | ☐ 代码已补 flatten-drive；待部署演练 |
+| 6 | `--control flatten` 后不再增仓（admission REJECT）+ 自动卖至 dust | ☑ 2026-08-12：flatten-drive sell FILLED → btc=0 → sticky mode；resume→operator_reset→NORMAL |
 | 7 | 滚动 24h 窗口：当前 release 稳定窗 0 失败（`soak-report.sh 24`） | ☑ 2026-08-12（stable-window PASS；全窗 churn 仅作可见性） |
 | 8 | 断线恢复演练 | ◐（kill -9 恢复 + 重启对账×3 + LLM 断连均 PASS；OKX WS 断线注入待 demo） |
 | 9 | 版本回滚演练 | ☑ 2026-08-12（`scripts/rollback-remote.sh` 双向 PASS；health 门禁自动回滚已真实触发过一次） |
