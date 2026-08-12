@@ -53,13 +53,17 @@ try:
                     pass
 except FileNotFoundError:
     pass
+# Force UTC so local journal TZ (+0800 etc.) lines up with deploys.log (Zulu).
 j = subprocess.check_output(
-    ["journalctl", "-u", "alphabound", "--since", f"{window_h} hours ago",
+    ["journalctl", "-u", "alphabound", "--utc", "--since", f"{window_h} hours ago",
      "--no-pager", "-o", "short-iso"],
     text=True,
     stderr=subprocess.DEVNULL,
 )
-pat = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})")
+# short-iso may be "2026-08-12T09:06:04+0000" or "...Z" or with space.
+pat = re.compile(
+    r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})([+-]\d{2}:?\d{2}|Z)?"
+)
 fails = []
 for line in j.splitlines():
     if "Failed with result" not in line:
@@ -67,16 +71,29 @@ for line in j.splitlines():
     m = pat.match(line)
     if not m:
         continue
+    raw = m.group(1)
+    off = m.group(2) or "+00:00"
+    if off == "Z":
+        off = "+00:00"
+    elif len(off) == 5 and (off[0] in "+-"):  # +0000
+        off = off[:3] + ":" + off[3:]
     try:
-        fails.append(datetime.fromisoformat(m.group(1)).replace(tzinfo=timezone.utc))
+        fails.append(datetime.fromisoformat(raw + off))
     except ValueError:
-        pass
+        try:
+            fails.append(datetime.fromisoformat(raw).replace(tzinfo=timezone.utc))
+        except ValueError:
+            pass
 # Crash-loops after a bad deploy can trail the deploy stamp by several minutes;
 # count each failure whose nearest deploy/rollback is within churn_min.
 window = timedelta(minutes=churn_min)
 churn = 0
 for ft in fails:
+    if ft.tzinfo is None:
+        ft = ft.replace(tzinfo=timezone.utc)
     for a in anchors:
+        if a.tzinfo is None:
+            a = a.replace(tzinfo=timezone.utc)
         if abs((ft - a).total_seconds()) <= window.total_seconds():
             churn += 1
             break
