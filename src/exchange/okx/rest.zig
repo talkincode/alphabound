@@ -226,11 +226,13 @@ pub const Balance = struct {
 };
 
 /// Prefer cashBal; fall back to eq / availEq / availBal. Empty/missing → next key.
+/// OKX often returns >8 fractional digits on eq/cashBal — truncate (parseLossy),
+/// never fail the whole balance envelope on excess precision.
 fn balField(obj: std.json.ObjectMap, keys: []const []const u8) Error!Decimal {
     for (keys) |k| {
         const s = getString(obj, k) catch continue;
         if (s.len == 0) continue;
-        return Decimal.parse(s) catch Error.MalformedResponse;
+        return Decimal.parseLossy(s) catch Error.MalformedResponse;
     }
     return Decimal.zero;
 }
@@ -593,6 +595,19 @@ test "parse balance falls back to eq when cashBal empty" {
     try testing.expect(b.usdt_cash.eql(d("84.2")));
     try testing.expect(b.btc_cash.eql(d("0.000235")));
     try testing.expect(b.btc_avail.eql(d("0.000235")));
+}
+
+test "parse balance truncates excess fractional digits" {
+    // Live OKX eq/cashBal can exceed SCALE (8); must not reject whole envelope.
+    const body =
+        \\{"code":"0","msg":"","data":[{"details":[
+        \\  {"ccy":"USDT","cashBal":"84.123456789012","eq":"84.123456789012","availBal":"84.123456789012"},
+        \\  {"ccy":"BTC","cashBal":"0.000235111999","eq":"0.000235111999","availBal":"0.000235111999"}
+        \\]}]}
+    ;
+    const b = try parseBalance(testing.allocator, body);
+    try testing.expect(b.usdt_cash.eql(d("84.12345678")));
+    try testing.expect(b.btc_cash.eql(d("0.00023511")));
 }
 
 test "parse key perms flags withdraw" {

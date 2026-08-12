@@ -1183,11 +1183,11 @@ fn probePrivateBalance(gpa: std.mem.Allocator, client: *ab.okx_rest.Client) Priv
         return .{ .err = "http_failed" };
     };
     defer gpa.free(body);
-    const bal = ab.okx_rest.parseBalance(gpa, body) catch {
+    const bal = ab.okx_rest.parseBalance(gpa, body) catch |err| {
         const token = ab.okx_rest.classifyErrorBody(body);
         // One-line body snippet for ops (no secrets expected in OKX error JSON).
-        const snip_n = @min(body.len, 160);
-        std.debug.print("[okx] balance_err token={s} body={s}\n", .{ token, body[0..snip_n] });
+        const snip_n = @min(body.len, 240);
+        std.debug.print("[okx] balance_err token={s} err={s} len={d} body={s}\n", .{ token, @errorName(err), body.len, body[0..snip_n] });
         return .{ .err = token };
     };
     return .{ .ok = bal };
