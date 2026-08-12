@@ -397,6 +397,78 @@ test "AC-RK2 property: floor invariant holds under randomized stress params and 
     }
 }
 
+test "AC-RK2 fuzz: decimal extremes never panic; overflow fails closed; floor invariant survives" {
+    // Structured extreme-value fuzz: draw every numeric field from a pool of
+    // adversarial extremes (0, 1 raw unit, i64/i128-boundary magnitudes) mixed
+    // with random values. admit() must either return a verdict (whose APPROVE/
+    // REDUCE branches still satisfy the floor invariant) or error.Overflow —
+    // it must never panic, wrap, or admit below floor.
+    var prng = std.Random.DefaultPrng.init(0xfa22ed9e);
+    const random = prng.random();
+    const huge: i128 = 1_000_000_000_000 * dec.ONE_RAW; // 1e12 units
+    const extremes = [_]i128{
+        0,                       1, // smallest positive raw
+        dec.ONE_RAW - 1,         dec.ONE_RAW,
+        dec.ONE_RAW + 1,         std.math.maxInt(i64),
+        huge,                    huge * 1_000_000, // 1e18 units
+    };
+    var pick = struct {
+        r: std.Random,
+        pool: []const i128,
+        fn next(self: *@This()) i128 {
+            if (self.r.boolean()) return self.pool[self.r.uintLessThan(usize, self.pool.len)];
+            return self.r.intRangeAtMost(i128, 0, 1_000_000 * dec.ONE_RAW);
+        }
+    }{ .r = random, .pool = &extremes };
+
+    var overflow_count: usize = 0;
+    var i: usize = 0;
+    while (i < 4000) : (i += 1) {
+        var snap = baseSnapshot();
+        snap.cash_usdt = Decimal.fromRaw(pick.next());
+        snap.btc_total = Decimal.fromRaw(pick.next());
+        snap.liq_price = Decimal.fromRaw(@max(1, pick.next()));
+        snap.mark_price = Decimal.fromRaw(@max(1, pick.next()));
+        snap.high_watermark = Decimal.fromRaw(pick.next());
+
+        const p = StressParams{
+            .price_shock = Decimal.fromRaw(random.intRangeAtMost(i128, 0, dec.ONE_RAW)), // 0..100%
+            .trade_fee_rate = Decimal.fromRaw(random.intRangeAtMost(i128, 0, dec.ONE_RAW / 10)),
+            .trade_slippage_rate = Decimal.fromRaw(random.intRangeAtMost(i128, 0, dec.ONE_RAW / 10)),
+            .exit_costs = .{
+                .fee_rate = Decimal.fromRaw(random.intRangeAtMost(i128, 0, dec.ONE_RAW / 10)),
+                .slippage_rate = Decimal.fromRaw(random.intRangeAtMost(i128, 0, dec.ONE_RAW / 10)),
+            },
+            .exit_reserve = Decimal.fromRaw(pick.next()),
+        };
+        const maxdd = Decimal.fromRaw(random.intRangeAtMost(i128, 0, dec.ONE_RAW));
+        const w = Decimal.fromRaw(random.intRangeAtMost(i128, 0, dec.ONE_RAW));
+        const prop = ProposalView{ .snapshot_version = snap.version, .target_btc_weight = w };
+
+        const r = admit(snap, prop, maxdd, p) catch |err| {
+            // Overflow is the only acceptable failure and callers map it to a
+            // non-executing ERROR verdict (fail-closed) — never an approval.
+            try testing.expectEqual(AdmissionError.Overflow, err);
+            overflow_count += 1;
+            continue;
+        };
+        switch (r.verdict) {
+            .approve => |aw| {
+                const e = try stressEquityAtWeight(snap, aw, p);
+                try testing.expect(e.gte(r.floor));
+            },
+            .approve_reduced => |aw| {
+                const e = try stressEquityAtWeight(snap, aw, p);
+                try testing.expect(e.gte(r.floor));
+                try testing.expect(aw.lt(w));
+            },
+            .reject => {},
+        }
+    }
+    // The extreme pool must actually exercise the overflow path.
+    try testing.expect(overflow_count > 0);
+}
+
 test "AC-NFR03 property: snapshot_version mismatch always rejects, regardless of everything else" {
     var prng = std.Random.DefaultPrng.init(0x5747a1e);
     const random = prng.random();

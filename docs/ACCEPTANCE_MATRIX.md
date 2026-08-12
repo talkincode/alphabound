@@ -55,8 +55,8 @@
 | ID | 验收标准 | 验证方法 | 阶段 | 状态 |
 |---|---|---|---|---|
 | AC-RK1 | 保守净值 E_t 扣除退出费用/滑点/挂单风险;HWM 单调不减;DD 公式与设计一致 | Unit + Property | P3 | ☑ `risk/equity.zig`:保守估值扣费/滑点、HWM 单调、DD 公式、非负回撤全部单测通过 |
-| AC-RK2 | 任意输入下 Risk Kernel 不批准使压力净值 < HWM×90%+ExitReserve 的提案 | Property / Fuzz | P3 | ◐ 压力净值地板单测 + 随机化 property×2(2000 例固定参数 + 2000 例随机 shock/费率/滑点/exit_reserve/max_drawdown:任何 APPROVE/REDUCE 的压力净值 ≥ floor);结构化 fuzz(decimal 极值)待扩 |
-| AC-RK3 | 风险状态机转换(NORMAL/EXIT_ONLY/FLATTENING/HALTED)与 §5.3 条件表一致;HALTED 不自动恢复交易 | Unit(状态机)+ Fault | P3 | ◐ `risk/state_machine.zig` 转换表全路径单测,HALTED 无自动出边;Fault 注入待做 |
+| AC-RK2 | 任意输入下 Risk Kernel 不批准使压力净值 < HWM×90%+ExitReserve 的提案 | Property / Fuzz | P3 | ● 压力净值地板单测 + 随机化 property×2(2000+2000 例)+ decimal 极值 fuzz(4000 例:0/1/i64max/1e18 单位级 raw 组合,不 panic、Overflow fail-closed、APPROVE/REDUCE 压力净值 ≥ floor) |
+| AC-RK3 | 风险状态机转换(NORMAL/EXIT_ONLY/FLATTENING/HALTED)与 §5.3 条件表一致;HALTED 不自动恢复交易 | Unit(状态机)+ Fault | P3 | ◐ 转换表全路径单测 + 随机序列 property(500 walk×64 步:HALTED 无 reset 不出、出边仅 EXIT_ONLY、FLATTENING 不被健康信号中止);进程级 Fault 注入待做 |
 | AC-RK4 | FLATTENING 先撤增险挂单,再退出,持续对账至 BTC 可用≈0 | Integration(Demo 演练) | P3 | ☐ |
 | AC-RK5 | 边界穿透时如实记录实际穿透幅度与成交成本(不掩饰) | Fault(极端行情 replay) | P3 | ☐ |
 | AC-RK6 | max_drawdown 与 Risk Kernel 参数不可热加载、Agent 不可修改 | Unit + Manual(配置评审) | P3 | ◐ config 仅启动时解析,`allow_runtime_override=false` 强制;Agent 模块无 config 写路径;评审待做 |

@@ -130,3 +130,37 @@ test "property: fatal always lands in halted; no transition relaxes past rules" 
         if (allowsRiskIncrease(n)) try testing.expectEqual(RiskMode.normal, n);
     }
 }
+
+test "AC-RK3 property: random trigger walks — HALTED never auto-recovers, flattening never aborts to normal" {
+    // Sequence-level invariants over 500 random walks × 64 steps:
+    //  1. After any `fatal`, mode stays HALTED until an `operator_reset`.
+    //  2. Leaving HALTED lands exactly in EXIT_ONLY (never straight NORMAL).
+    //  3. From FLATTENING, healthy signals never abort back to NORMAL —
+    //     only flatten_complete/fatal (→HALTED) leave it.
+    //  4. allowsRiskIncrease(mode) implies mode == NORMAL at every step.
+    var prng = std.Random.DefaultPrng.init(0x5e63a11);
+    const random = prng.random();
+    const triggers = [_]Trigger{ .conditions_ok, .degraded, .exit_trigger, .fatal, .flatten_complete, .operator_reset };
+    var walk: usize = 0;
+    while (walk < 500) : (walk += 1) {
+        var mode: RiskMode = .normal;
+        var halted_pending_reset = false;
+        var step: usize = 0;
+        while (step < 64) : (step += 1) {
+            const t = triggers[random.intRangeLessThan(usize, 0, triggers.len)];
+            const prev = mode;
+            mode = next(mode, t);
+
+            if (halted_pending_reset and t != .operator_reset)
+                try testing.expectEqual(RiskMode.halted, mode);
+            if (prev == .halted and t == .operator_reset)
+                try testing.expectEqual(RiskMode.exit_only, mode);
+            if (prev == .flattening and (t == .conditions_ok or t == .degraded or t == .exit_trigger or t == .operator_reset))
+                try testing.expectEqual(RiskMode.flattening, mode);
+            if (allowsRiskIncrease(mode)) try testing.expectEqual(RiskMode.normal, mode);
+
+            if (mode == .halted) halted_pending_reset = true;
+            if (prev == .halted and t == .operator_reset) halted_pending_reset = false;
+        }
+    }
+}
