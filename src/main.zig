@@ -928,6 +928,8 @@ pub fn main(init: std.process.Init) !u8 {
     var last_disk_ms: i64 = 0;
     var last_private_ws_ms: i64 = now_boot;
     var last_backup_ms: i64 = 0;
+    // Cooldown between auto flatten market sells while risk_mode=FLATTENING.
+    var last_flatten_exec_ms: i64 = 0;
 
     while (!shutdown_requested.load(.acquire)) {
         if (cli.max_ticks > 0 and tick_count >= cli.max_ticks) break;
@@ -945,8 +947,17 @@ pub fn main(init: std.process.Init) !u8 {
                     },
                     .unpause => {
                         admin_paused = false;
-                        std.debug.print("[admin] resumed\n", .{});
+                        // Leave HALTED only via explicit operator resume (AC-RK3).
+                        const rm = engine.snapshot().risk_mode;
+                        if (rm == .halted) {
+                            _ = engine.apply(.{ .risk_trigger = .operator_reset }) catch {};
+                            std.debug.print("[admin] resumed (+operator_reset halted -> {t})\n", .{engine.snapshot().risk_mode});
+                            logEvent(&events_repo, &engine, "ADMIN_OPERATOR_RESET", "admin", "CRITICAL", &cfg);
+                        } else {
+                            std.debug.print("[admin] resumed\n", .{});
+                        }
                         logEvent(&events_repo, &engine, "ADMIN_RESUMED", "admin", "CRITICAL", &cfg);
+                        web_state.update(engine.snapshot(), true);
                     },
                     .reconcile => {
                         std.debug.print("[admin] reconcile requested\n", .{});
@@ -979,7 +990,23 @@ pub fn main(init: std.process.Init) !u8 {
                             .{ prev, now_mode },
                         ) catch "{\"trigger\":\"operator_exit\"}";
                         logEventPayload(&events_repo, &engine, "ADMIN_FLATTEN", "admin", "CRITICAL", &cfg, flp);
+                        // Drive position to cash immediately (mode alone does not sell).
+                        last_flatten_exec_ms = 0;
+                        driveFlattenPosition(
+                            gpa,
+                            &okx,
+                            &cfg,
+                            &engine,
+                            &orders_repo,
+                            &fills_repo,
+                            &events_repo,
+                            &runtime_status,
+                            trade_instrument,
+                            &last_flatten_exec_ms,
+                            true,
+                        );
                         web_state.update(engine.snapshot(), true);
+                        refreshWebCaches(&web_state, &db, &agent_runs, &equity_repo, &events_repo, &memories_repo, &orders_repo, &fills_repo, last_bh_cmp);
                     },
                     .target_weight => {
                         const w_s = req.weight() orelse "0";
@@ -1106,13 +1133,32 @@ pub fn main(init: std.process.Init) !u8 {
             }
         }
 
+        // Operator flatten must sell to cash and complete → HALTED (not mode-only).
+        if (cfg.mode == .demo and engine.snapshot().risk_mode == .flattening) {
+            driveFlattenPosition(
+                gpa,
+                &okx,
+                &cfg,
+                &engine,
+                &orders_repo,
+                &fills_repo,
+                &events_repo,
+                &runtime_status,
+                trade_instrument,
+                &last_flatten_exec_ms,
+                false,
+            );
+            web_state.update(engine.snapshot(), true);
+        }
+
         // Publish connectivity status before slow agent work so Dashboard stays fresh
         // even while an LLM call blocks the loop for tens of seconds.
         refreshSystemCache(&web_state, &db, &cfg, &mem_store, boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), llm_client != null, admin_paused, &runtime_status, &risk_latency);
 
         // Slow agent loop: proposals always risk-admitted; demo may execute.
         // Paused: keep risk/market/reconcile; skip agent decisions.
-        if (!admin_paused) {
+        // While FLATTENING/HALTED, skip agent so it cannot fight the exit path.
+        if (!admin_paused and engine.snapshot().risk_mode != .flattening and engine.snapshot().risk_mode != .halted) {
             if (llm_client) |*client| {
                 const tnow = nowMs();
                 const snap_now = engine.snapshot();
@@ -1845,6 +1891,68 @@ fn refreshBeforeAdmission(
 
 /// Operator path probe: same admission + demo execution stack as agent REBALANCE.
 /// Used to unblock Gate3 order-path verification without waiting on LLM HOLD bias.
+/// While risk_mode=FLATTENING: market-sell toward weight 0; when dust, emit flatten_complete → HALTED.
+fn driveFlattenPosition(
+    gpa: std.mem.Allocator,
+    okx: *ab.okx_rest.Client,
+    cfg: *const ab.config.Config,
+    engine: *ab.state.Engine,
+    orders_repo: *ab.storage.OrdersRepo,
+    fills_repo: *ab.storage.FillsRepo,
+    events_repo: *ab.storage.EventsRepo,
+    st: *RuntimeStatus,
+    instrument: ab.planner.Instrument,
+    last_exec_ms: *i64,
+    force: bool,
+) void {
+    const snap0 = engine.snapshot();
+    if (snap0.risk_mode != .flattening) return;
+
+    const dust = if (instrument.min_size.gt(ab.decimal.Decimal.zero)) instrument.min_size else (ab.decimal.Decimal.parse("0.00001") catch ab.decimal.Decimal.zero);
+    if (snap0.btc_total.isZero() or snap0.btc_total.lt(dust)) {
+        const prev = snap0.risk_mode;
+        _ = engine.apply(.{ .risk_trigger = .flatten_complete }) catch {};
+        const now_mode = engine.snapshot().risk_mode;
+        std.debug.print("[admin] flatten-complete {t} -> {t} (btc dust)\n", .{ prev, now_mode });
+        var fb: [192]u8 = undefined;
+        const fp = std.fmt.bufPrint(
+            &fb,
+            "{{\"from\":\"{t}\",\"to\":\"{t}\",\"trigger\":\"flatten_complete\"}}",
+            .{ prev, now_mode },
+        ) catch "{\"trigger\":\"flatten_complete\"}";
+        logEventPayload(events_repo, engine, "ADMIN_FLATTEN_COMPLETE", "admin", "CRITICAL", cfg, fp);
+        return;
+    }
+
+    const tnow = nowMs();
+    const cooldown_ms: i64 = 15_000;
+    if (!force and last_exec_ms.* != 0 and tnow - last_exec_ms.* < cooldown_ms) return;
+    last_exec_ms.* = tnow;
+
+    const note = runOperatorTargetWeight(
+        gpa,
+        okx,
+        cfg,
+        engine,
+        orders_repo,
+        fills_repo,
+        events_repo,
+        st,
+        instrument,
+        "0",
+    );
+    std.debug.print("[admin] flatten-drive btc={f} exec={s}\n", .{ snap0.btc_total, note });
+    var pb: [256]u8 = undefined;
+    var btc_buf: [48]u8 = undefined;
+    const bs = decFmt(&btc_buf, snap0.btc_total);
+    const payload = std.fmt.bufPrint(
+        &pb,
+        "{{\"btc_total\":\"{s}\",\"exec\":\"{s}\",\"source\":\"flatten_drive\"}}",
+        .{ bs, note },
+    ) catch "{\"source\":\"flatten_drive\"}";
+    logEventPayload(events_repo, engine, "ADMIN_FLATTEN_DRIVE", "admin", "CRITICAL", cfg, payload);
+}
+
 fn runOperatorTargetWeight(
     gpa: std.mem.Allocator,
     okx: *ab.okx_rest.Client,

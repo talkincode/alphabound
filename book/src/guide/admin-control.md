@@ -20,7 +20,8 @@ AlphaBound 管理命令**不走网络**：CLI 写入 DB 同目录控制文件，
 | `resume` | 恢复 agent |
 | `reconcile` | 立即触发一次私有 REST 余额对账 |
 | `cancel-all` | 取消开放订单。Shadow：只记审计事件；**Demo**（`OKX_SIMULATED=1`）：拉 pending 并逐笔 `cancel-order` |
-| `flatten` | 操作员退出：`risk_trigger=exit_trigger` → 倾向 `FLATTENING`，事件 `ADMIN_FLATTEN` |
+| `flatten` | 操作员退出：进入 `FLATTENING`，主环自动市价卖向 weight=0；BTC 低于 lot dust 后 `flatten_complete` → `HALTED` |
+| `resume` | 恢复 agent；若风险态为 `HALTED`，同时 `operator_reset` → `EXIT_ONLY`（再经对账回到 NORMAL） |
 | `shutdown` | 等价安全停机（与 SIGTERM 相同排空路径） |
 | `status` | 读 `*.control.state`（daemon 写入） |
 
