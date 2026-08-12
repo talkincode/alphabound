@@ -80,7 +80,7 @@
 
 | ID | 验收标准 | 验证方法 | 阶段 | 状态 |
 |---|---|---|---|---|
-| AC-SEC1 | OKX API Key 仅 Read+Trade(无 Withdraw),绑定 Azure 固定出口 IP 白名单 | Manual(配置审查) | P4 | ☐ |
+| AC-SEC1 | OKX API Key 仅 Read+Trade(无 Withdraw),绑定 Azure 固定出口 IP 白名单 | Manual(配置审查) | P4 | ◐ boot 代码门禁:实盘授权时探测 /account/config,withdraw 权限直接拒绝启动;生产验证 read=true trade=true withdraw=false(2026-08-12);IP 白名单绑定为 OKX 侧人工配置 |
 | AC-SEC2 | 密钥文件 root 管理 0600;服务进程只读;密钥不进备份 | Manual + 脚本检查 | P4 | ◐ check-remote.sh SEC2 段自动检查(600 root:alphabound + 数据目录无密钥泄漏),生产 PASS(2026-08-12);备份内容抽查待做 |
 | AC-SEC3 | LLM Context/日志/错误栈/Dashboard 响应中无 secret/passphrase/签名材料(redaction 生效) | Unit(redaction)+ Manual 抽查 | P2 | ◐ `redaction.redact` 单测 + journal `logEventPayload` 落库前 redact/looksLeaky 拦截; Dashboard 抽查仍待 |
 | AC-SEC4 | systemd 加固: NoNewPrivileges/PrivateTmp/ProtectSystem/受限写目录 | Manual(unit 审查) | P1 | ◐ `deploy/alphabound.service` 已含加固项；生产装机演练仍待 |
