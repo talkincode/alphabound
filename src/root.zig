@@ -17,6 +17,9 @@ pub const state = @import("core/state.zig");
 pub const storage = @import("storage/db.zig");
 pub const storage_policy = @import("storage/policy.zig");
 pub const storage_disk = @import("storage/disk.zig");
+pub const retention = @import("storage/retention.zig");
+pub const security_limits = @import("security/limits.zig");
+pub const latency = @import("observability/latency.zig");
 pub const okx_auth = @import("exchange/okx/auth.zig");
 pub const okx_rest = @import("exchange/okx/rest.zig");
 pub const okx_ws = @import("exchange/okx/ws.zig");
@@ -33,6 +36,7 @@ pub const scheduler = @import("core/scheduler.zig");
 pub const admin_control = @import("admin/control.zig");
 pub const web = @import("web/server.zig");
 pub const fault_matrix = @import("fault/matrix.zig");
+pub const security_isolation = @import("security/isolation.zig");
 
 pub const Decimal = decimal.Decimal;
 

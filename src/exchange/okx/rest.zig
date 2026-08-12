@@ -6,6 +6,7 @@
 const std = @import("std");
 const auth = @import("auth.zig");
 const dec = @import("../../core/decimal.zig");
+const limits = @import("../../security/limits.zig");
 const Decimal = dec.Decimal;
 
 pub const Error = error{
@@ -340,31 +341,35 @@ pub const Client = struct {
         var url_buf: [512]u8 = undefined;
         const url = std.fmt.bufPrint(&url_buf, "{s}{s}", .{ self.base_url, path }) catch return Error.HttpFailed;
 
-        var alloc_writer = std.Io.Writer.Allocating.init(self.gpa);
-        defer alloc_writer.deinit();
+        // AC-SEC5: fixed-capacity sink — a hostile/broken gateway cannot balloon memory.
+        const sink = self.gpa.alloc(u8, limits.max_okx_response_bytes) catch return Error.OutOfMemory;
+        defer self.gpa.free(sink);
+        var fixed_writer: std.Io.Writer = .fixed(sink);
 
         const result = self.http.fetch(.{
             .location = .{ .url = url },
             .method = if (method == .GET) .GET else .POST,
             .payload = if (body.len > 0) body else null,
-            .response_writer = &alloc_writer.writer,
+            .response_writer = &fixed_writer,
             .extra_headers = extra_headers,
             .headers = .{ .content_type = .{ .override = "application/json" } },
             // Prefer fresh sockets for long-running daemons; OKX gateways idle-close.
             .keep_alive = false,
         }) catch |err| {
+            if (err == error.WriteFailed) {
+                std.debug.print("[okx] response_too_large cap={d} path={s}\n", .{ limits.max_okx_response_bytes, path });
+                return Error.HttpFailed;
+            }
             std.debug.print("[okx] transport_failed err={s} path={s}\n", .{ @errorName(err), path });
             return Error.HttpFailed;
         };
 
         // Return body even on non-2xx: OKX auth/IP errors are JSON {code,msg}.
-        var list = alloc_writer.toArrayList();
-        const owned = list.toOwnedSlice(self.gpa) catch return Error.OutOfMemory;
-        if (owned.len == 0 and result.status != .ok) {
-            self.gpa.free(owned);
+        const received = fixed_writer.buffered();
+        if (received.len == 0 and result.status != .ok) {
             return Error.HttpFailed;
         }
-        return owned;
+        return self.gpa.dupe(u8, received) catch Error.OutOfMemory;
     }
 
     fn resetHttp(self: *Client) void {

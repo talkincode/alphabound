@@ -135,6 +135,31 @@ pub const Stmt = struct {
         };
     }
 
+    /// AC-FD6: retry on SQLITE_BUSY for critical writers (events/orders/fills).
+    /// Does **not** reset bindings — only re-steps after busy_timeout already waited.
+    pub fn stepCritical(self: *Stmt) DbError!bool {
+        const policy = @import("policy.zig");
+        const max_retries: u32 = 8;
+        var attempt: u32 = 0;
+        while (true) {
+            const rc = c.sqlite3_step(self.handle);
+            switch (rc) {
+                c.SQLITE_ROW => return true,
+                c.SQLITE_DONE => return false,
+                c.SQLITE_BUSY, c.SQLITE_LOCKED => {
+                    switch (policy.onBusy(attempt, max_retries)) {
+                        .retry => {
+                            attempt += 1;
+                            continue;
+                        },
+                        .degrade_telemetry => return DbError.Busy,
+                    }
+                },
+                else => return DbError.StepFailed,
+            }
+        }
+    }
+
     pub fn columnInt(self: *Stmt, idx: c_int) i64 {
         return c.sqlite3_column_int64(self.handle, idx);
     }
@@ -198,7 +223,7 @@ pub const EventsRepo = struct {
         try self.insert.bindText(9, row.config_hash);
         try self.insert.bindText(10, row.payload_json);
         try self.insert.bindText(11, row.content_hash);
-        _ = try self.insert.step();
+        _ = try self.insert.stepCritical();
     }
 
     /// Newest events as a JSON array (newest first). payload_json must already be valid JSON object.
@@ -388,7 +413,7 @@ pub const OrdersRepo = struct {
         try self.upsert_stmt.bindText(7, row.status);
         try self.upsert_stmt.bindText(8, row.created_ts);
         try self.upsert_stmt.bindText(9, row.updated_ts);
-        _ = try self.upsert_stmt.step();
+        _ = try self.upsert_stmt.stepCritical();
     }
 
     /// Newest orders as JSON array (newest first by updated_ts).
@@ -459,7 +484,7 @@ pub const FillsRepo = struct {
         try self.insert.bindText(5, row.fee);
         try self.insert.bindText(6, row.fee_ccy);
         try self.insert.bindText(7, row.ts);
-        _ = try self.insert.step();
+        _ = try self.insert.stepCritical();
     }
 
     /// Newest fills as JSON array (newest first).
@@ -527,7 +552,7 @@ pub const EquityRepo = struct {
         try self.insert.bindText(5, row.drawdown);
         try self.insert.bindText(6, row.cash);
         try self.insert.bindText(7, row.btc_value);
-        _ = try self.insert.step();
+        _ = try self.insert.stepCritical();
     }
 
     /// Latest HWM recorded (for BOOTING restore). Zero string when empty.
@@ -623,7 +648,7 @@ pub const AgentRunsRepo = struct {
         try self.insert.bindText(7, row.status);
         try self.insert.bindText(8, row.started_ts);
         try self.insert.bindText(9, row.finished_ts);
-        _ = try self.insert.step();
+        _ = try self.insert.stepCritical();
     }
 
     pub fn complete(
@@ -650,7 +675,7 @@ pub const AgentRunsRepo = struct {
         try self.finish.bindText(3, output_digest);
         try self.finish.bindText(4, finished_ts);
         try self.finish.bindText(5, input_digest);
-        _ = try self.finish.step();
+        _ = try self.finish.stepCritical();
     }
 
     /// Newest agent runs as JSON array (newest first).
@@ -723,7 +748,7 @@ pub const ToolCallsRepo = struct {
         try self.insert.bindText(6, row.cost);
         try self.insert.bindText(7, row.result_digest);
         try self.insert.bindText(8, row.ts);
-        _ = try self.insert.step();
+        _ = try self.insert.stepCritical();
     }
 };
 
@@ -763,7 +788,7 @@ pub const MemoriesRepo = struct {
         try self.insert.bindInt(6, row.evidence_count);
         try self.insert.bindText(7, row.content_json);
         try self.insert.bindText(8, row.created_ts);
-        _ = try self.insert.step();
+        _ = try self.insert.stepCritical();
     }
 
     /// Latest version per memory_id as a JSON array (newest first).
