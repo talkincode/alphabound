@@ -38,6 +38,31 @@ pub fn formatCandlesData(
     return w.buffered();
 }
 
+/// Perp derivatives snapshot (funding + open interest). `oi` may be null when
+/// the open-interest fetch failed; funding alone is still a valid observation.
+pub fn formatDerivativesData(
+    buf: []u8,
+    swap_instrument: []const u8,
+    fr: rest.FundingRate,
+    oi: ?rest.OpenInterest,
+) error{BufferTooSmall}![]const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    w.print(
+        "{{\"instrument\":\"{s}\",\"funding_rate\":\"{f}\",\"next_funding_ms\":{d}",
+        .{ swap_instrument, fr.funding_rate, fr.next_funding_ms },
+    ) catch return error.BufferTooSmall;
+    if (oi) |v| {
+        w.print(
+            ",\"oi_contracts\":\"{f}\",\"oi_ccy\":\"{f}\"",
+            .{ v.oi_contracts, v.oi_ccy },
+        ) catch return error.BufferTooSmall;
+    } else {
+        w.writeAll(",\"oi_contracts\":null,\"oi_ccy\":null") catch return error.BufferTooSmall;
+    }
+    w.print(",\"ts_ms\":{d}}}", .{fr.ts_ms}) catch return error.BufferTooSmall;
+    return w.buffered();
+}
+
 pub fn okResult(
     source: []const u8,
     as_of_ms: i64,
@@ -129,4 +154,25 @@ test "formatCandlesData joins rows" {
     const s = try formatCandlesData(&buf, "BTC-USDT", &candles);
     try testing.expect(std.mem.indexOf(u8, s, "\"candles\":[") != null);
     try testing.expect(std.mem.indexOf(u8, s, "\"vol\":\"10\"") != null);
+}
+
+test "formatDerivativesData with and without open interest" {
+    var buf: [512]u8 = undefined;
+    const fr = rest.FundingRate{
+        .funding_rate = d("0.0001"),
+        .next_funding_ms = 1786291200000,
+        .ts_ms = 1786264264482,
+    };
+    const full = try formatDerivativesData(&buf, "BTC-USDT-SWAP", fr, .{
+        .oi_contracts = d("2895813.4"),
+        .oi_ccy = d("28958.134"),
+        .ts_ms = 1786264264482,
+    });
+    try testing.expect(std.mem.indexOf(u8, full, "\"funding_rate\":\"0.0001\"") != null);
+    try testing.expect(std.mem.indexOf(u8, full, "\"oi_contracts\":\"2895813.4\"") != null);
+
+    var buf2: [512]u8 = undefined;
+    const partial = try formatDerivativesData(&buf2, "BTC-USDT-SWAP", fr, null);
+    try testing.expect(std.mem.indexOf(u8, partial, "\"oi_contracts\":null") != null);
+    try testing.expect(std.mem.indexOf(u8, partial, "\"next_funding_ms\":1786291200000") != null);
 }

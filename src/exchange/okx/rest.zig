@@ -172,6 +172,52 @@ pub fn parseCandles(gpa: std.mem.Allocator, body: []const u8, out: []Candle) Err
     return n;
 }
 
+/// Perpetual swap funding snapshot from /api/v5/public/funding-rate.
+pub const FundingRate = struct {
+    funding_rate: Decimal,
+    next_funding_ms: i64,
+    ts_ms: i64,
+};
+
+fn getDecimalLossy(obj: std.json.ObjectMap, key: []const u8) Error!Decimal {
+    const s = try getString(obj, key);
+    return Decimal.parseLossy(s) catch Error.MalformedResponse;
+}
+
+pub fn parseFundingRate(gpa: std.mem.Allocator, body: []const u8) Error!FundingRate {
+    var parsed = std.json.parseFromSlice(std.json.Value, gpa, body, .{}) catch return Error.MalformedResponse;
+    defer parsed.deinit();
+    const data = try unwrapEnvelope(parsed.value);
+    const obj = try firstObject(data);
+    const next_s = try getString(obj, "nextFundingTime");
+    const ts_s = try getString(obj, "ts");
+    return .{
+        .funding_rate = try getDecimalLossy(obj, "fundingRate"),
+        .next_funding_ms = std.fmt.parseInt(i64, next_s, 10) catch return Error.MalformedResponse,
+        .ts_ms = std.fmt.parseInt(i64, ts_s, 10) catch return Error.MalformedResponse,
+    };
+}
+
+/// Open interest snapshot from /api/v5/public/open-interest.
+pub const OpenInterest = struct {
+    oi_contracts: Decimal,
+    oi_ccy: Decimal,
+    ts_ms: i64,
+};
+
+pub fn parseOpenInterest(gpa: std.mem.Allocator, body: []const u8) Error!OpenInterest {
+    var parsed = std.json.parseFromSlice(std.json.Value, gpa, body, .{}) catch return Error.MalformedResponse;
+    defer parsed.deinit();
+    const data = try unwrapEnvelope(parsed.value);
+    const obj = try firstObject(data);
+    const ts_s = try getString(obj, "ts");
+    return .{
+        .oi_contracts = try getDecimalLossy(obj, "oi"),
+        .oi_ccy = try getDecimalLossy(obj, "oiCcy"),
+        .ts_ms = std.fmt.parseInt(i64, ts_s, 10) catch return Error.MalformedResponse,
+    };
+}
+
 pub const Balance = struct {
     usdt_cash: Decimal,
     usdt_avail: Decimal,
@@ -476,6 +522,26 @@ test "parse candles array rows" {
     try testing.expectEqual(@as(i64, 1700000000000), out[0].ts_ms);
     try testing.expect(out[0].close.eql(d("105")));
     try testing.expect(out[1].open.eql(d("98")));
+}
+
+test "parse funding rate snapshot (venue precision beyond SCALE)" {
+    const body =
+        \\{"code":"0","msg":"","data":[{"instId":"BTC-USDT-SWAP","fundingRate":"0.0000692845813775","nextFundingTime":"1786291200000","ts":"1786264264482"}]}
+    ;
+    const fr = try parseFundingRate(testing.allocator, body);
+    try testing.expect(fr.funding_rate.eql(d("0.00006928")));
+    try testing.expectEqual(@as(i64, 1786291200000), fr.next_funding_ms);
+    try testing.expectEqual(@as(i64, 1786264264482), fr.ts_ms);
+}
+
+test "parse open interest snapshot (venue precision beyond SCALE)" {
+    const body =
+        \\{"code":"0","msg":"","data":[{"instId":"BTC-USDT-SWAP","instType":"SWAP","oi":"3211230.11000001958","oiCcy":"32112.3011000001958","ts":"1786264264482"}]}
+    ;
+    const oi = try parseOpenInterest(testing.allocator, body);
+    try testing.expect(oi.oi_contracts.eql(d("3211230.11000001")));
+    try testing.expect(oi.oi_ccy.eql(d("32112.30110000")));
+    try testing.expectEqual(@as(i64, 1786264264482), oi.ts_ms);
 }
 
 test "parse balance extracts USDT and BTC details" {

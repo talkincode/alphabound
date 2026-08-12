@@ -1167,6 +1167,13 @@ fn registerDefaultTools(reg: *ab.tools.Registry) !void {
         .max_age_ms = 120_000,
         .schema_note = "1H OHLCV array (newest first)",
     });
+    try reg.register(.{
+        .name = "market.derivatives",
+        .domain = .market,
+        .source = "okx",
+        .max_age_ms = 60_000,
+        .schema_note = "SWAP funding_rate + open_interest",
+    });
 }
 
 fn runControlCli(io: std.Io, cmd_name: []const u8, db_path: []const u8) u8 {
@@ -1491,7 +1498,8 @@ fn runPrivateReconcile(
     }
 }
 
-/// Fetch market.ticker + market.candles; journal tool_calls; return observation JSON lines.
+/// Fetch market.ticker + market.candles + market.derivatives; journal
+/// tool_calls; return observation JSON lines.
 fn collectMarketTools(
     gpa: std.mem.Allocator,
     okx: *ab.okx_rest.Client,
@@ -1499,8 +1507,8 @@ fn collectMarketTools(
     registry: *const ab.tools.Registry,
     run_id: []const u8,
     tools_repo: *ab.storage.ToolCallsRepo,
-    obs_bufs: *[2][2048]u8,
-    obs_out: *[2][]const u8,
+    obs_bufs: *[3][2048]u8,
+    obs_out: *[3][]const u8,
 ) usize {
     var n: usize = 0;
 
@@ -1578,6 +1586,49 @@ fn collectMarketTools(
                 n += 1;
             } else |_| {}
         }
+    }
+
+    // market.derivatives — SWAP funding rate + open interest (sentiment context).
+    if (registry.find("market.derivatives")) |spec| {
+        if (n >= obs_out.len) return n;
+        var swap_buf: [48]u8 = undefined;
+        const swap_inst = std.fmt.bufPrint(&swap_buf, "{s}-SWAP", .{cfg.instrument}) catch return n;
+        var path_buf: [128]u8 = undefined;
+        var data_buf: [512]u8 = undefined;
+        var result: ab.tools.ToolResult = undefined;
+        const t_start = nowMs();
+        const fr_path = std.fmt.bufPrint(&path_buf, "/api/v5/public/funding-rate?instId={s}", .{swap_inst}) catch return n;
+        if (okx.getPublic(fr_path)) |body| {
+            defer gpa.free(body);
+            if (ab.okx_rest.parseFundingRate(gpa, body)) |fr| {
+                // Open interest is best-effort: funding alone still observes.
+                var oi: ?ab.okx_rest.OpenInterest = null;
+                var oi_path_buf: [128]u8 = undefined;
+                if (std.fmt.bufPrint(&oi_path_buf, "/api/v5/public/open-interest?instId={s}", .{swap_inst})) |oi_path| {
+                    if (okx.getPublic(oi_path)) |oi_body| {
+                        defer gpa.free(oi_body);
+                        oi = ab.okx_rest.parseOpenInterest(gpa, oi_body) catch null;
+                    } else |_| {}
+                } else |_| {}
+                const latency: u32 = @intCast(@max(@as(i64, 0), nowMs() - t_start));
+                if (ab.market_tools.formatDerivativesData(&data_buf, swap_inst, fr, oi)) |data| {
+                    result = ab.market_tools.okResult("okx", fr.ts_ms, latency, data);
+                } else |_| {
+                    result = ab.market_tools.errResult("okx", nowMs(), latency, "buffer");
+                }
+            } else |_| {
+                const latency: u32 = @intCast(@max(@as(i64, 0), nowMs() - t_start));
+                result = ab.market_tools.errResult("okx", nowMs(), latency, "parse");
+            }
+        } else |_| {
+            result = ab.market_tools.unavailableResult("okx", nowMs());
+        }
+        const rec = ab.tools.auditRecord(spec, result, nowMs());
+        journalToolCall(tools_repo, run_id, rec);
+        if (ab.market_tools.formatObservation(&obs_bufs[n], spec.name, rec, result.data_json)) |line| {
+            obs_out[n] = line;
+            n += 1;
+        } else |_| {}
     }
 
     return n;
@@ -1727,8 +1778,8 @@ fn runAgentDecision(
         return;
     };
 
-    var obs_bufs: [2][2048]u8 = undefined;
-    var obs_ptrs: [2][]const u8 = .{ "", "" };
+    var obs_bufs: [3][2048]u8 = undefined;
+    var obs_ptrs: [3][]const u8 = .{ "", "", "" };
     const obs_n = collectMarketTools(gpa, okx, cfg, registry, run_id, tools_repo, &obs_bufs, &obs_ptrs);
     const observations = obs_ptrs[0..obs_n];
 

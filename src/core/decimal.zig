@@ -87,6 +87,17 @@ pub const Decimal = struct {
         return .{ .raw = raw };
     }
 
+    /// Like `parse`, but truncates (toward zero) fractional digits beyond
+    /// SCALE instead of rejecting. For observation-only data (funding rates,
+    /// open interest) whose venue precision exceeds ours; never use for
+    /// order-critical quantities.
+    pub fn parseLossy(s: []const u8) DecimalError!Decimal {
+        const dot = std.mem.indexOfScalar(u8, s, '.') orelse return parse(s);
+        const frac_len = s.len - dot - 1;
+        if (frac_len <= SCALE) return parse(s);
+        return parse(s[0 .. dot + 1 + SCALE]);
+    }
+
     pub fn add(a: Decimal, b: Decimal) DecimalError!Decimal {
         return .{ .raw = std.math.add(i128, a.raw, b.raw) catch return error.Overflow };
     }
@@ -268,6 +279,19 @@ test "floorToStep lot size" {
     const lot = try Decimal.parse("0.0001");
     const floored = try qty.floorToStep(lot);
     try testing.expect(floored.eql(try Decimal.parse("0.0012")));
+}
+
+test "parseLossy truncates beyond scale, parse still rejects" {
+    // Venue precision (16 fract digits) exceeds SCALE=8: strict parse rejects.
+    try testing.expectError(error.InvalidFormat, Decimal.parse("0.0000692845813775"));
+    const lossy = try Decimal.parseLossy("0.0000692845813775");
+    try testing.expect(lossy.eql(try Decimal.parse("0.00006928")));
+    // Negative truncation goes toward zero.
+    const neg = try Decimal.parseLossy("-0.0000692845813775");
+    try testing.expect(neg.eql(try Decimal.parse("-0.00006928")));
+    // Within-scale strings pass through identically.
+    const same = try Decimal.parseLossy("123.45");
+    try testing.expect(same.eql(try Decimal.parse("123.45")));
 }
 
 test "property: add/sub inverse and mul monotonicity" {
