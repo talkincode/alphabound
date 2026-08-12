@@ -1,4 +1,4 @@
-# Gate 3 验收清单（Demo Trading）
+# Gate 3 验收清单（Trading path）
 
 > 目标：Risk Kernel + Execution 在 **授权交易场所** 全链路可跑，故障可降级。  
 > 授权场所 = OKX 模拟盘（`mode=demo` + `OKX_SIMULATED=1`）**或** 小额实盘子账号（`mode=live` + `OKX_REAL_MONEY_OK=1`）。  
@@ -17,7 +17,7 @@
 - [x] 事件：`ORDER_ACK` / `ORDER_REJECTED` / `ORDER_UNKNOWN` / `ORDER_QUERY` / `ORDER_CANCEL_SENT`
 - [x] Dashboard：`/api/v1/orders`（orders+fills 投影）+ 订单标签页
 - [x] 部分成交再规划：resolve=`partial`/`filled` 后 REST 刷新仓位 → 残差 plan → 新 `clOrdId`(seq++)；最多 3 腿；`EXEC_REPLAN`
-- [x] Fault 矩阵单测骨架：`src/fault/matrix.zig`（FD1–5/9）
+- [x] Fault 矩阵单测：`src/fault/matrix.zig`（FD1–10 + SEC7 + replan cap）
 - [x] Dashboard 决策详情关联 orders/fills（decision_id）
 - [x] Limit 挂单：`formatPlaceLimitBody` + `limitPriceFromMark`；demo `LIMIT_ONLY` 下 limit 腿
 - [x] LIMIT_ONLY：`max_wait_ms` 内轮询，超时/部分成交撤余量（`ORDER_CANCEL_SENT`）
@@ -54,7 +54,7 @@ export LLM_API_KEY=...
 | # | 项 | 状态 |
 |---|---|---|
 | 1 | 执行场所就绪（`mode=live` + 实盘子账号 ≈100 USDT + `OKX_REAL_MONEY_OK=1`） | ☑ 2026-08-12（配置迁 live） |
-| 2 | 私有余额对账 ok（`[reconcile] demo balance applied usdt=… btc=…`） | ☑ 2026-08-12（含 excess-decimal 修复后对账） |
+| 2 | 私有余额对账 ok（`[reconcile] live balance applied usdt=… btc=…`） | ☑ 2026-08-12（含 excess-decimal；live 日志前缀） |
 | 3 | 一轮决策出现 `exec=filled`（非 shadow `not_executed`） | ☑ 2026-08-12 operator `target-weight=0.05` → FILLED；agent HOLD 现为 `exec=hold` no-op |
 | 4 | Dashboard/events 可见 `ORDER_*` + orders/fills 投影 | ☑ 2026-08-12（多笔 buy/sell FILLED；exchange_order_id 保留修复随后） |
 | 5 | `--control cancel-all` 清空 pending | ☐ 脚本就绪；无挂单时 no-op |
@@ -62,7 +62,7 @@ export LLM_API_KEY=...
 | 7 | 滚动 24h 窗口：当前 release 稳定窗 0 失败（`soak-report.sh 24`） | ☑ 2026-08-12（stable-window PASS；全窗 churn 仅作可见性） |
 | 8 | 断线恢复演练 | ◐（kill -9 恢复 + 重启对账×3 + LLM 断连均 PASS；OKX WS 断线注入待 demo） |
 | 9 | 版本回滚演练 | ☑ 2026-08-12（`scripts/rollback-remote.sh` 双向 PASS；health 门禁自动回滚已真实触发过一次） |
-| 10 | 故障矩阵 AC-FD1..10 逐项 | ☐ |
+| 10 | 故障矩阵 AC-FD1..10 逐项 | ◐ 单测 FD1–10 全绿；FD1/10 实网演练 PASS；FD3/4/5 WS·超时实网注入仍可选 |
 | 11 | HOLD 不交易 / 仅 REBALANCE 改仓 | ☑ 2026-08-12（曾误把 HOLD weight=0 当清仓，已修） |
 | 12 | 残差 replan 不在余额滞后时连买 | ☑ 2026-08-12 |
 
