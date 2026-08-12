@@ -373,3 +373,88 @@ test "property: halted and flattening reject risk-increasing weights" {
         }
     }
 }
+
+test "AC-GO3 property: stress equity is monotone non-increasing in costs and shock" {
+    // Raising any cost dial (shock / trade fee / trade slippage / exit costs)
+    // can never *improve* the stressed equity — no parameter regime exists
+    // where being charged more looks safer to the kernel.
+    var prng = std.Random.DefaultPrng.init(0x5eed6003);
+    const random = prng.random();
+    var i: usize = 0;
+    while (i < 2000) : (i += 1) {
+        var snap = baseSnapshot();
+        snap.cash_usdt = Decimal.fromRaw(random.intRangeAtMost(i128, 0, 200 * dec.ONE_RAW));
+        snap.btc_total = Decimal.fromRaw(random.intRangeAtMost(i128, 0, 200_000));
+        snap.liq_price = Decimal.fromRaw(random.intRangeAtMost(i128, 50_000 * dec.ONE_RAW, 150_000 * dec.ONE_RAW));
+        snap.mark_price = try snap.liq_price.mul(d("1.0005"), .nearest);
+        const w = Decimal.fromRaw(random.intRangeAtMost(i128, 0, dec.ONE_RAW));
+
+        var lo = baseParams();
+        lo.price_shock = Decimal.fromRaw(random.intRangeAtMost(i128, 0, dec.ONE_RAW / 5)); // 0..20%
+        lo.trade_fee_rate = Decimal.fromRaw(random.intRangeAtMost(i128, 0, dec.ONE_RAW / 100));
+        lo.trade_slippage_rate = Decimal.fromRaw(random.intRangeAtMost(i128, 0, dec.ONE_RAW / 100));
+        lo.exit_costs = .{
+            .fee_rate = Decimal.fromRaw(random.intRangeAtMost(i128, 0, dec.ONE_RAW / 100)),
+            .slippage_rate = Decimal.fromRaw(random.intRangeAtMost(i128, 0, dec.ONE_RAW / 100)),
+        };
+
+        // hi = lo with one random dial bumped upward.
+        var hi = lo;
+        const bump = Decimal.fromRaw(random.intRangeAtMost(i128, 1, dec.ONE_RAW / 20)); // +0..5%
+        switch (random.intRangeAtMost(u8, 0, 4)) {
+            0 => hi.price_shock = try hi.price_shock.add(bump),
+            1 => hi.trade_fee_rate = try hi.trade_fee_rate.add(bump),
+            2 => hi.trade_slippage_rate = try hi.trade_slippage_rate.add(bump),
+            3 => hi.exit_costs.fee_rate = try hi.exit_costs.fee_rate.add(bump),
+            else => hi.exit_costs.slippage_rate = try hi.exit_costs.slippage_rate.add(bump),
+        }
+
+        const e_lo = try stressEquityAtWeight(snap, w, lo);
+        const e_hi = try stressEquityAtWeight(snap, w, hi);
+        try testing.expect(e_hi.lte(e_lo));
+    }
+}
+
+test "AC-GO3 property: tightening max_drawdown never admits a larger weight" {
+    // A stricter boundary (smaller allowed drawdown) can only shrink what the
+    // kernel lets through — approve set is monotone in the risk budget.
+    var prng = std.Random.DefaultPrng.init(0x600d0dd);
+    const random = prng.random();
+    var i: usize = 0;
+    while (i < 1000) : (i += 1) {
+        var snap = baseSnapshot();
+        snap.cash_usdt = Decimal.fromRaw(random.intRangeAtMost(i128, dec.ONE_RAW, 200 * dec.ONE_RAW));
+        snap.btc_total = Decimal.fromRaw(random.intRangeAtMost(i128, 0, 200_000));
+        snap.liq_price = Decimal.fromRaw(random.intRangeAtMost(i128, 50_000 * dec.ONE_RAW, 150_000 * dec.ONE_RAW));
+        snap.mark_price = try snap.liq_price.mul(d("1.0005"), .nearest);
+        const pre = try equity_mod.conservativeEquity(.{
+            .cash_usdt = snap.cash_usdt,
+            .btc_total = snap.btc_total,
+            .liq_price = snap.liq_price,
+            .exit_costs = baseParams().exit_costs,
+        });
+        snap.high_watermark = pre.equity;
+
+        const w = Decimal.fromRaw(random.intRangeAtMost(i128, 0, dec.ONE_RAW));
+        const prop = ProposalView{ .snapshot_version = snap.version, .target_btc_weight = w };
+        const dd_loose = Decimal.fromRaw(random.intRangeAtMost(i128, dec.ONE_RAW / 20, dec.ONE_RAW / 5)); // 5%..20%
+        const dd_tight = Decimal.fromRaw(random.intRangeAtMost(i128, 0, dd_loose.raw));
+
+        const r_loose = try admit(snap, prop, dd_loose, baseParams());
+        const r_tight = try admit(snap, prop, dd_tight, baseParams());
+
+        const admitted_loose: ?Decimal = switch (r_loose.verdict) {
+            .approve, .approve_reduced => |aw| aw,
+            .reject => null,
+        };
+        const admitted_tight: ?Decimal = switch (r_tight.verdict) {
+            .approve, .approve_reduced => |aw| aw,
+            .reject => null,
+        };
+        if (admitted_tight) |at| {
+            // Anything the tight budget admits, the loose budget must admit at least as much.
+            try testing.expect(admitted_loose != null);
+            try testing.expect(at.lte(admitted_loose.?));
+        }
+    }
+}

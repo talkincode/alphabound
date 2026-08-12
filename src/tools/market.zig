@@ -5,6 +5,7 @@
 const std = @import("std");
 const rest = @import("../exchange/okx/rest.zig");
 const registry = @import("registry.zig");
+const limits = @import("../security/limits.zig");
 const Decimal = @import("../core/decimal.zig").Decimal;
 
 pub fn formatTickerData(
@@ -75,16 +76,23 @@ pub fn unavailableResult(source: []const u8, now_ms: i64) registry.ToolResult {
 }
 
 /// Observation JSON line for agent context (status + digest + data).
+/// data_json is untrusted (AC-SEC7): unless it passes the structural scan it
+/// is replaced by null so it can never break out of the `data` field or
+/// smuggle sibling keys into the context document.
 pub fn formatObservation(
     buf: []u8,
     tool_name: []const u8,
     rec: registry.AuditRecord,
     data_json: []const u8,
 ) error{BufferTooSmall}![]const u8 {
+    const safe_data = if (limits.jsonStructureSane(data_json, limits.max_json_depth))
+        data_json
+    else
+        "null";
     return std.fmt.bufPrint(
         buf,
         "{{\"tool\":\"{s}\",\"status\":\"{s}\",\"source\":\"{s}\",\"as_of_ms\":{d},\"latency_ms\":{d},\"result_digest\":\"{s}\",\"data\":{s}}}",
-        .{ tool_name, rec.status, rec.source, rec.as_of_ms, rec.latency_ms, &rec.result_digest, data_json },
+        .{ tool_name, rec.status, rec.source, rec.as_of_ms, rec.latency_ms, &rec.result_digest, safe_data },
     ) catch return error.BufferTooSmall;
 }
 

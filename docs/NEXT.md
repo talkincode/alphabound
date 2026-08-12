@@ -8,6 +8,7 @@
 - ✅ Gate3 **故障矩阵单测** `src/fault/matrix.zig`（AC-FD1..5/9 + replan cap）
 - ✅ 决策详情 **关联订单/成交**（decision_id → orders/fills）
 - ✅ FD6 关键写路径 `stepCritical` busy 重试
+- ✅ **安全/验收纯代码收口**: AC-SEC5(响应上限)/SEC6(隔离扫描)/SEC7(注入中和)、AC-FR04(proposal fuzz)、AC-GO3(费用/滑点/部分成交 property)、AC-OPS3/9(备份轮换+保留清理)、AC-NFR01(延迟直方图)、AC-OPS8(token 计数已可见)
 
 ---
 
@@ -60,6 +61,13 @@
    - ✅ OKX REST / egress 探测：keep-alive off + 一次 reset 重试  
    - ✅ FD7 磁盘探测接入 daemon（statvfs → disk_ok / EXIT_ONLY / HALTED + `DISK_STATUS`）  
    - ✅ FD8 已有库文件 open 失败 → refuse empty recreate  
+   - ✅ AC-SEC5 固定容量响应 sink（OKX 512KB / LLM 1MB / 探针 4KB）+ `security/limits.zig` 结构扫描  
+   - ✅ AC-SEC6 `security/isolation.zig` agent 源码隔离扫描测试  
+   - ✅ AC-SEC7 工具 data_json 注入中和（结构坏→null）+ fault 注入测试  
+   - ✅ AC-FR04 proposal fuzz（截断/字节翻转不 crash、不变量保持）  
+   - ✅ AC-GO3 property 扩展（成本单调性 + 部分成交收敛）  
+   - ✅ AC-OPS3/9 hourly/daily 备份轮换（留 24/30）+ tool_calls/equity_1s 保留清理  
+   - ✅ AC-NFR01 risk apply 延迟直方图 → system JSON `latency_us`  
    - Demo ≥7 天 soak
 
 ---

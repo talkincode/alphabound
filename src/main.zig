@@ -825,11 +825,13 @@ pub fn main(init: std.process.Init) !u8 {
         },
     );
     web_state.update(engine.snapshot(), true);
+    // AC-NFR01: market tick → risk state update latency (µs), in-process.
+    var risk_latency = ab.latency.Histogram{};
     refreshWebCaches(&web_state, &db, &agent_runs, &equity_repo, &events_repo, &memories_repo, &orders_repo, &fills_repo, last_bh_cmp);
     refreshCandlesCache(gpa, &web_state, &okx, &cfg);
-    refreshEgressIp(gpa, &okx, &runtime_status);
+    refreshEgressIp(&okx, &runtime_status);
     refreshDiskStatus(&cfg, &engine, &events_repo, &runtime_status);
-    refreshSystemCache(&web_state, &db, &cfg, &mem_store, boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), llm_client != null, admin_paused, &runtime_status);
+    refreshSystemCache(&web_state, &db, &cfg, &mem_store, boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), llm_client != null, admin_paused, &runtime_status, &risk_latency);
     logEvent(&events_repo, &engine, "STATE_READY", "core", "INFO", &cfg);
 
     var tick_count: u64 = 0;
@@ -929,11 +931,13 @@ pub fn main(init: std.process.Init) !u8 {
             defer gpa.free(body);
             if (ab.okx_rest.parseTicker(gpa, body)) |ticker| {
                 const prev_mode = engine.snapshot().risk_mode;
+                const lat_t0 = std.time.microTimestamp();
                 const res = engine.apply(.{ .market_tick = .{
                     .ts_ms = ticker.ts_ms,
                     .bid = ticker.bid,
                     .mark = ticker.last,
                 } }) catch continue;
+                risk_latency.record(@intCast(std.math.clamp(std.time.microTimestamp() - lat_t0, 0, std.math.maxInt(u32))));
                 // Shadow uses a simulated book: keep account freshness aligned with
                 // market ticks so the risk mode does not spuriously enter EXIT_ONLY
                 // after account_ttl without private WS updates.
@@ -1020,7 +1024,7 @@ pub fn main(init: std.process.Init) !u8 {
 
         // Publish connectivity status before slow agent work so Dashboard stays fresh
         // even while an LLM call blocks the loop for tens of seconds.
-        refreshSystemCache(&web_state, &db, &cfg, &mem_store, boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), llm_client != null, admin_paused, &runtime_status);
+        refreshSystemCache(&web_state, &db, &cfg, &mem_store, boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), llm_client != null, admin_paused, &runtime_status, &risk_latency);
 
         // Slow agent loop (shadow): proposals audited only — never sent to exchange.
         // Paused: keep risk/market/reconcile; skip agent decisions.
@@ -1044,7 +1048,7 @@ pub fn main(init: std.process.Init) !u8 {
                     logEventPayload(&events_repo, &engine, "AGENT_TRIGGER", "agent", "INFO", &cfg, trig_payload);
                     runAgentDecision(gpa, client, &okx, &cfg, &engine, &tool_reg, &agent_runs, &tool_calls, &events_repo, &orders_repo, &fills_repo, &db, &mem_store, &memories_repo, env, &runtime_status, trade_instrument);
                     refreshWebCaches(&web_state, &db, &agent_runs, &equity_repo, &events_repo, &memories_repo, &orders_repo, &fills_repo, last_bh_cmp);
-                    refreshSystemCache(&web_state, &db, &cfg, &mem_store, boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), llm_client != null, admin_paused, &runtime_status);
+                    refreshSystemCache(&web_state, &db, &cfg, &mem_store, boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), llm_client != null, admin_paused, &runtime_status, &risk_latency);
                 }
             }
         }
@@ -1056,11 +1060,11 @@ pub fn main(init: std.process.Init) !u8 {
                 last_dashboard_ms = tnow;
                 refreshWebCaches(&web_state, &db, &agent_runs, &equity_repo, &events_repo, &memories_repo, &orders_repo, &fills_repo, last_bh_cmp);
                 refreshCandlesCache(gpa, &web_state, &okx, &cfg);
-                refreshSystemCache(&web_state, &db, &cfg, &mem_store, boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), llm_client != null, admin_paused, &runtime_status);
+                refreshSystemCache(&web_state, &db, &cfg, &mem_store, boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), llm_client != null, admin_paused, &runtime_status, &risk_latency);
             }
             if (last_egress_ms == 0 or tnow - last_egress_ms >= egress_refresh_ms) {
                 last_egress_ms = tnow;
-                refreshEgressIp(gpa, &okx, &runtime_status);
+                refreshEgressIp(&okx, &runtime_status);
             }
             if (last_disk_ms == 0 or tnow - last_disk_ms >= disk_refresh_ms) {
                 last_disk_ms = tnow;
@@ -2575,6 +2579,7 @@ fn refreshSystemCache(
     agent_on: bool,
     paused: bool,
     st: *const RuntimeStatus,
+    risk_lat: *const ab.latency.Histogram,
 ) void {
     const total = ab.storage.Db.queryInt(db, "SELECT COUNT(*) FROM agent_runs") catch 0;
     const ok = ab.storage.Db.queryInt(db, "SELECT COUNT(*) FROM agent_runs WHERE status = 'ok'") catch 0;
@@ -2637,6 +2642,10 @@ fn refreshSystemCache(
             st.llm_detail,
             st.last_bid,
         },
+    ) catch return;
+    w.print(
+        "\"latency_us\":{{\"p50\":{d},\"p99\":{d},\"max\":{d},\"samples\":{d}}},",
+        .{ risk_lat.percentile(50), risk_lat.percentile(99), risk_lat.maxUs(), risk_lat.count() },
     ) catch return;
     w.print(
         "\"egress_ip\":\"{s}\",\"egress_ip_ms\":{d},\"disk\":\"{s}\",\"disk_free_bytes\":{d},\"disk_ms\":{d},\"llm_calls\":{d},\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d},\"acct_usdt\":\"{s}\",\"acct_btc\":\"{s}\",\"last_decision\":\"{s}\",\"last_decision_ms\":{d}}}}}",
@@ -2707,16 +2716,16 @@ fn refreshDiskStatus(
     }
 }
 
-fn refreshEgressIp(gpa: std.mem.Allocator, okx: *ab.okx_rest.Client, st: *RuntimeStatus) void {
+fn refreshEgressIp(okx: *ab.okx_rest.Client, st: *RuntimeStatus) void {
     // Best-effort; never let a half-closed pooled socket permanently block egress probe.
     var attempt: u8 = 0;
     while (attempt < 2) : (attempt += 1) {
-        var aw = std.Io.Writer.Allocating.init(gpa);
-        defer aw.deinit();
+        var sink: [ab.security_limits.max_probe_response_bytes]u8 = undefined;
+        var fixed_writer: std.Io.Writer = .fixed(&sink);
         const result = okx.http.fetch(.{
             .location = .{ .url = "https://api.ipify.org" },
             .method = .GET,
-            .response_writer = &aw.writer,
+            .response_writer = &fixed_writer,
             .keep_alive = false,
         }) catch {
             if (attempt == 0) {
@@ -2729,9 +2738,7 @@ fn refreshEgressIp(gpa: std.mem.Allocator, okx: *ab.okx_rest.Client, st: *Runtim
             return;
         };
         _ = result;
-        var list = aw.toArrayList();
-        const body = list.toOwnedSlice(gpa) catch return;
-        defer gpa.free(body);
+        const body = fixed_writer.buffered();
         const ip = std.mem.trim(u8, body, " \t\r\n");
         if (ip.len > 0 and ip.len < 64) st.setEgress(ip);
         return;
@@ -2744,7 +2751,7 @@ fn runSqliteBackup(
     engine: *ab.state.Engine,
     events_repo: *ab.storage.EventsRepo,
 ) void {
-    // dest = <db_path>.bak (same directory); online Backup API.
+    // Latest pointer: <db_path>.bak (same directory); online Backup API.
     var dest_buf: [640:0]u8 = undefined;
     const dest = std.fmt.bufPrintZ(&dest_buf, "{s}.bak", .{cfg.db_path}) catch {
         std.debug.print("[backup] path too long\n", .{});
@@ -2761,6 +2768,97 @@ fn runSqliteBackup(
     var ok_buf: [200]u8 = undefined;
     const payload = std.fmt.bufPrint(&ok_buf, "{{\"dest\":\"{s}\",\"ok\":true}}", .{dest}) catch "{\"ok\":true}";
     logEventPayload(events_repo, engine, "BACKUP_DONE", "storage", "INFO", cfg, payload);
+
+    // AC-OPS3/OPS9: rotated snapshots + retention sweep.
+    const now_ms = std.time.milliTimestamp();
+    rotateBackups(db, cfg, now_ms);
+    runRetentionSweep(db, now_ms);
+}
+
+/// Hourly/daily rotated snapshots next to the DB, pruned to the newest
+/// retention.keep_hourly / keep_daily. Best-effort: failures only log.
+fn rotateBackups(db: *ab.storage.Db, cfg: *const ab.config.Config, now_ms: i64) void {
+    var name_buf: [600]u8 = undefined;
+    var z_buf: [640:0]u8 = undefined;
+
+    // Hourly snapshot (same stamp within the hour → cheap overwrite skip).
+    if (ab.retention.hourlyName(&name_buf, cfg.db_path, now_ms)) |hourly| {
+        if (std.fmt.bufPrintZ(&z_buf, "{s}", .{hourly})) |zdest| {
+            if (!fileExists(zdest)) {
+                ab.storage.backupToPath(db, zdest) catch |err|
+                    std.debug.print("[backup] hourly failed: {t}\n", .{err});
+            }
+        } else |_| {}
+    } else |_| {}
+
+    // Daily snapshot: write once per UTC day.
+    if (ab.retention.dailyName(&name_buf, cfg.db_path, now_ms)) |daily| {
+        if (std.fmt.bufPrintZ(&z_buf, "{s}", .{daily})) |zdest| {
+            if (!fileExists(zdest)) {
+                ab.storage.backupToPath(db, zdest) catch |err|
+                    std.debug.print("[backup] daily failed: {t}\n", .{err});
+            }
+        } else |_| {}
+    } else |_| {}
+
+    pruneRotated(cfg.db_path, ab.retention.hourly_infix, ab.retention.keep_hourly);
+    pruneRotated(cfg.db_path, ab.retention.daily_infix, ab.retention.keep_daily);
+}
+
+fn fileExists(path: [:0]const u8) bool {
+    std.fs.cwd().access(path, .{}) catch return false;
+    return true;
+}
+
+/// Delete rotated backups beyond the newest `keep` for the given infix.
+fn pruneRotated(db_path: []const u8, infix: []const u8, keep: usize) void {
+    const dir_path = std.fs.path.dirname(db_path) orelse ".";
+    const base_name = std.fs.path.basename(db_path);
+
+    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
+    defer dir.close();
+
+    const max_names = 64;
+    var storage: [max_names][320]u8 = undefined;
+    var names: [max_names][]const u8 = undefined;
+    var n: usize = 0;
+    var it = dir.iterate();
+    while (it.next() catch null) |entry| {
+        if (entry.kind != .file) continue;
+        if (!ab.retention.isRotatedBackup(entry.name, base_name, infix)) continue;
+        if (n >= max_names or entry.name.len > storage[n].len) continue;
+        @memcpy(storage[n][0..entry.name.len], entry.name);
+        names[n] = storage[n][0..entry.name.len];
+        n += 1;
+    }
+
+    var out: [max_names]usize = undefined;
+    const doomed = ab.retention.selectDoomed(names[0..n], keep, &out);
+    for (doomed) |idx| {
+        dir.deleteFile(names[idx]) catch |err|
+            std.debug.print("[backup] prune {s} failed: {t}\n", .{ names[idx], err });
+    }
+}
+
+/// AC-OPS9: prune old tool_calls rows and '1s' equity samples.
+fn runRetentionSweep(db: *ab.storage.Db, now_ms: i64) void {
+    var cut_buf: [40]u8 = undefined;
+
+    if (ab.retention.cutoffRfc3339(&cut_buf, now_ms, ab.retention.tool_calls_days)) |cutoff| {
+        var stmt = db.prepare(ab.retention.prune_tool_calls_sql) catch return;
+        defer stmt.finalize();
+        stmt.bindText(1, cutoff) catch return;
+        _ = stmt.step() catch |err|
+            std.debug.print("[retention] tool_calls prune failed: {t}\n", .{err});
+    } else |_| {}
+
+    if (ab.retention.cutoffRfc3339(&cut_buf, now_ms, ab.retention.equity_1s_days)) |cutoff| {
+        var stmt = db.prepare(ab.retention.prune_equity_1s_sql) catch return;
+        defer stmt.finalize();
+        stmt.bindText(1, cutoff) catch return;
+        _ = stmt.step() catch |err|
+            std.debug.print("[retention] equity_1s prune failed: {t}\n", .{err});
+    } else |_| {}
 }
 
 fn llmReflectionWanted(env: *const std.process.Environ.Map) bool {

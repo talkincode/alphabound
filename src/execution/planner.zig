@@ -262,3 +262,63 @@ test "property: planned qty always on lot grid and within caps" {
         }
     }
 }
+
+test "AC-GO3 property: partial-fill replan converges without flipping side" {
+    // Simulate the residual-replan loop: plan → random partial fill →
+    // update holdings → replan. Remaining qty must shrink monotonically,
+    // the side must never flip, and the loop must reach HOLD.
+    var prng = std.Random.DefaultPrng.init(0xf111ed);
+    const random = prng.random();
+    var round: usize = 0;
+    while (round < 500) : (round += 1) {
+        var cash = Decimal.fromRaw(random.intRangeAtMost(i128, 0, 200 * dec.ONE_RAW));
+        var btc = Decimal.fromRaw(random.intRangeAtMost(i128, 0, 300_000));
+        const price = Decimal.fromRaw(random.intRangeAtMost(i128, 50_000 * dec.ONE_RAW, 150_000 * dec.ONE_RAW));
+        const w = Decimal.fromRaw(random.intRangeAtMost(i128, 0, dec.ONE_RAW));
+
+        var first_side: ?orders.Side = null;
+        var prev_qty: ?Decimal = null;
+        var steps: usize = 0;
+        while (steps < 200) : (steps += 1) {
+            const btc_value = try btc.mul(price, .down);
+            const equity = try cash.add(btc_value);
+            if (!equity.gt(Decimal.zero)) break;
+            const p = try plan(.{
+                .cash_usdt = cash,
+                .btc_total = btc,
+                .equity = equity,
+                .mark_price = price,
+                .admitted_btc_weight = w,
+                .instrument = btc_usdt,
+            });
+            const o = switch (p) {
+                .hold => break, // converged
+                .order => |o| o,
+            };
+            if (first_side) |fs| {
+                try testing.expectEqual(fs, o.side); // never flips direction
+            } else first_side = o.side;
+            if (prev_qty) |pq| try testing.expect(o.qty.lte(pq)); // monotone shrink
+            prev_qty = o.qty;
+
+            // Fill 25%..100% of the order, snapped to lot grid; guarantee
+            // at least one lot so the loop always makes progress.
+            const frac = Decimal.fromRaw(random.intRangeAtMost(i128, dec.ONE_RAW / 4, dec.ONE_RAW));
+            var fill = try (try o.qty.mul(frac, .down)).floorToStep(btc_usdt.lot_size);
+            if (fill.isZero()) fill = btc_usdt.lot_size;
+            fill = Decimal.min(fill, o.qty);
+            const notional = try fill.mul(price, .down);
+            switch (o.side) {
+                .buy => {
+                    cash = try cash.sub(notional);
+                    btc = try btc.add(fill);
+                },
+                .sell => {
+                    cash = try cash.add(notional);
+                    btc = try btc.sub(fill);
+                },
+            }
+        }
+        try testing.expect(steps < 200); // always converges to HOLD
+    }
+}

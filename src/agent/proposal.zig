@@ -286,3 +286,45 @@ test "fuzz: random bytes never crash the parser" {
         p.deinit(); // in the absurd case random bytes parse, it must still be well-formed
     }
 }
+
+test "AC-FR04 fuzz: truncations of a valid proposal fail closed, never crash" {
+    // Every prefix of a valid document is either rejected or (for the full
+    // document) parses cleanly. No prefix may panic or leak.
+    var len: usize = 0;
+    while (len <= valid_json.len) : (len += 1) {
+        var p = parse(testing.allocator, valid_json[0..len]) catch continue;
+        defer p.deinit();
+        try testing.expectEqual(valid_json.len, len); // only the full doc may parse
+    }
+}
+
+test "AC-FR04 fuzz: byte flips keep invariants when they parse at all" {
+    var prng = std.Random.DefaultPrng.init(0xabad1dea);
+    const random = prng.random();
+    var buf: [valid_json.len]u8 = undefined;
+    var round: usize = 0;
+    while (round < 4000) : (round += 1) {
+        @memcpy(&buf, valid_json);
+        // Flip 1-4 random bytes to arbitrary values.
+        const flips = random.intRangeAtMost(usize, 1, 4);
+        var f: usize = 0;
+        while (f < flips) : (f += 1) {
+            buf[random.intRangeAtMost(usize, 0, buf.len - 1)] = random.int(u8);
+        }
+        var p = parse(testing.allocator, &buf) catch continue;
+        defer p.deinit();
+        // Mutants that still parse must uphold every schema invariant.
+        try testing.expect(std.mem.startsWith(u8, p.decision_id, "dec_"));
+        try testing.expect(p.decision_id.len >= 4 and p.decision_id.len <= 64);
+        try testing.expect(!p.target_btc_weight.isNegative());
+        try testing.expect(!p.target_btc_weight.gt(Decimal.one));
+        try testing.expect(!p.confidence.isNegative());
+        try testing.expect(!p.confidence.gt(Decimal.one));
+        try testing.expect(!p.order_policy.urgency.isNegative());
+        try testing.expect(!p.order_policy.urgency.gt(Decimal.one));
+        try testing.expect(p.order_policy.max_wait_ms <= 3_600_000);
+        try testing.expect(p.thesis.len <= MAX_LIST_ITEMS);
+        try testing.expect(p.invalid_if.len <= MAX_LIST_ITEMS);
+        if (p.action == .hold) try testing.expect(p.target_btc_weight.isZero());
+    }
+}

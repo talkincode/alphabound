@@ -8,6 +8,7 @@
 //! Credentials stay in this adapter; agent context/proposal layers never see them.
 
 const std = @import("std");
+const limits = @import("../security/limits.zig");
 
 pub const Error = error{
     HttpFailed,
@@ -168,30 +169,33 @@ pub const Client = struct {
             },
         };
 
-        var resp_aw = std.Io.Writer.Allocating.init(self.gpa);
-        defer resp_aw.deinit();
+        // AC-SEC5: fixed-capacity sink — a hostile endpoint cannot balloon memory.
+        const sink = self.gpa.alloc(u8, limits.max_llm_response_bytes) catch return error.OutOfMemory;
+        defer self.gpa.free(sink);
+        var fixed_writer: std.Io.Writer = .fixed(sink);
 
         const result = self.http.fetch(.{
             .location = .{ .url = url },
             .method = .POST,
             .payload = body,
-            .response_writer = &resp_aw.writer,
+            .response_writer = &fixed_writer,
             .extra_headers = auth_headers,
             .headers = .{ .content_type = .{ .override = "application/json" } },
             .keep_alive = false,
         }) catch |err| {
+            if (err == error.WriteFailed) {
+                std.debug.print("[llm] response_too_large cap={d}\n", .{limits.max_llm_response_bytes});
+                return error.HttpFailed;
+            }
             std.debug.print("[llm] transport_failed err={s}\n", .{@errorName(err)});
             return error.HttpFailed;
         };
 
-        var list = resp_aw.toArrayList();
-        const owned = list.toOwnedSlice(self.gpa) catch return error.OutOfMemory;
-        errdefer self.gpa.free(owned);
+        const owned = fixed_writer.buffered();
 
         const status_code: u16 = @intFromEnum(result.status);
         if (owned.len == 0) {
             std.debug.print("[llm] empty_body status={d}\n", .{status_code});
-            self.gpa.free(owned);
             return error.HttpFailed;
         }
 
@@ -207,10 +211,8 @@ pub const Client = struct {
             } else if (err == error.MalformedResponse) {
                 std.debug.print("[llm] malformed_response status={d} bytes={d}\n", .{ status_code, owned.len });
             }
-            self.gpa.free(owned);
             return err;
         };
-        self.gpa.free(owned);
         return parsed;
     }
 
