@@ -55,7 +55,16 @@
 3. Fault 矩阵 FD3/9/10 实网或注入补强（清单 #10）
 4. Dashboard：exchange_id 列非空验证（新单已通）
 
-### P2 — 不做
+### P2 — Phase 5 L1（基本面/情绪薄切片，已开工）
+
+1. ✅ 审计与计划: `docs/PHASE5_DATA_PLAN.md`（ACCEPT 窄范围；拒一次性 news/macro）
+2. ✅ 扩 `market.derivatives`: 多空比 + taker 主买主卖 + mark/index 基差（仍 tools=3，零新密钥）
+3. ✅ prompt: REBALANCE thesis 必须引用 derivatives 具体数值
+4. ✅ `HOST=… ./scripts/tool-value-report.sh` 引用率快照
+5. ☐ 部署后看 7 日: derivatives≈ticker 调用；REBALANCE citation≥30%
+6. ☐ **不做** 外部 news/macro/onchain，直到 L1 引用闭环成立
+
+### P3 — 不做
 
 - `mode=live`（Gate 4）
 - 私有 WS 作主路径
@@ -67,7 +76,8 @@
 
 - `mode=live` / 主账户大资金  
 - 私有 WS 长连作为主路径（REST 对账为主）  
-- Phase 5 扩展数据源（derivatives 价值评估待 2026-09） 
+- 无引用度量前接入 news/macro/onchain 供应商  
+
 
 ---
 

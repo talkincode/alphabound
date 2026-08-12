@@ -169,10 +169,13 @@ Phase 0 ──► Phase 1 ──► Phase 2 ──► Phase 3 ──► Phase 4 
 
 **进展**
 - [x] `market.derivatives`(2026-08-12): SWAP 资金费率 + 未平仓量,OKX 公共端点、零新增外部依赖;Agent 上下文 tools=3
-- [ ] 4 周价值评估(至 ~2026-09-09): derivatives 引用进 evidence 的频率、对非 HOLD 决策的贡献
+- [x] **L1 持仓/情绪包**(2026-08-12): 同工具扩 `long_short_ratio` / `taker_buy_vol`/`taker_sell_vol` / `mark_px`/`index_px`/`basis_bps`; prompt 强制 REBALANCE 引用数值; `scripts/tool-value-report.sh`
+- [ ] 计划全文: [PHASE5_DATA_PLAN.md](PHASE5_DATA_PLAN.md)（L0 理想 → L1 本切片 → 外部 news/macro/onchain 延后）
+- [ ] 滚动价值评估: 部署后 7 日 citation 门限 + 至 ~2026-09-09 四周评估
 
 **退出条件(滚动)**
-- [ ] 每个新工具上线 4 周后完成使用率与增量价值评估,低价值工具降级或下线
+- [ ] 每个新工具/字段上线后完成使用率与 thesis 引用率评估,低价值降级或下线
+- [ ] L1: `derivatives_vs_ticker_ratio≈1` 且 REBALANCE citation_rate≥30%（见 tool-value-report）
 
 ---
 

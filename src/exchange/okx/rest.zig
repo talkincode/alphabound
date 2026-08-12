@@ -218,6 +218,120 @@ pub fn parseOpenInterest(gpa: std.mem.Allocator, body: []const u8) Error!OpenInt
     };
 }
 
+/// Latest long/short account ratio from rubik stat
+/// `/api/v5/rubik/stat/contracts/long-short-account-ratio` — rows `[ts, ratio]`.
+pub const LongShortRatio = struct {
+    ratio: Decimal,
+    ts_ms: i64,
+};
+
+fn parseJsonNumberish(v: std.json.Value) Error!Decimal {
+    return switch (v) {
+        .string => |s| Decimal.parseLossy(s) catch Error.MalformedResponse,
+        .integer => |i| Decimal.fromInt(std.math.cast(i64, i) orelse return Error.MalformedResponse),
+        .float => |f| blk: {
+            if (!std.math.isFinite(f)) return Error.MalformedResponse;
+            var buf: [64]u8 = undefined;
+            const s = std.fmt.bufPrint(&buf, "{d}", .{f}) catch return Error.MalformedResponse;
+            break :blk Decimal.parseLossy(s) catch Error.MalformedResponse;
+        },
+        else => Error.MalformedResponse,
+    };
+}
+
+fn parseJsonTsMs(v: std.json.Value) Error!i64 {
+    return switch (v) {
+        .string => |s| std.fmt.parseInt(i64, s, 10) catch Error.MalformedResponse,
+        .integer => |i| std.math.cast(i64, i) orelse Error.MalformedResponse,
+        else => Error.MalformedResponse,
+    };
+}
+
+/// First row is newest for OKX rubik contract stats.
+pub fn parseLongShortRatio(gpa: std.mem.Allocator, body: []const u8) Error!LongShortRatio {
+    var parsed = std.json.parseFromSlice(std.json.Value, gpa, body, .{}) catch return Error.MalformedResponse;
+    defer parsed.deinit();
+    const data = try unwrapEnvelope(parsed.value);
+    if (data.items.len == 0) return Error.MalformedResponse;
+    const row = switch (data.items[0]) {
+        .array => |a| a,
+        else => return Error.MalformedResponse,
+    };
+    if (row.items.len < 2) return Error.MalformedResponse;
+    return .{
+        .ts_ms = try parseJsonTsMs(row.items[0]),
+        .ratio = try parseJsonNumberish(row.items[1]),
+    };
+}
+
+/// Taker buy/sell notional from rubik
+/// `/api/v5/rubik/stat/taker-volume` — rows `[ts, sellVol, buyVol]` (OKX order).
+pub const TakerVolume = struct {
+    sell_vol: Decimal,
+    buy_vol: Decimal,
+    ts_ms: i64,
+};
+
+pub fn parseTakerVolume(gpa: std.mem.Allocator, body: []const u8) Error!TakerVolume {
+    var parsed = std.json.parseFromSlice(std.json.Value, gpa, body, .{}) catch return Error.MalformedResponse;
+    defer parsed.deinit();
+    const data = try unwrapEnvelope(parsed.value);
+    if (data.items.len == 0) return Error.MalformedResponse;
+    const row = switch (data.items[0]) {
+        .array => |a| a,
+        else => return Error.MalformedResponse,
+    };
+    if (row.items.len < 3) return Error.MalformedResponse;
+    return .{
+        .ts_ms = try parseJsonTsMs(row.items[0]),
+        .sell_vol = try parseJsonNumberish(row.items[1]),
+        .buy_vol = try parseJsonNumberish(row.items[2]),
+    };
+}
+
+pub const MarkPrice = struct {
+    mark_px: Decimal,
+    ts_ms: i64,
+};
+
+pub fn parseMarkPrice(gpa: std.mem.Allocator, body: []const u8) Error!MarkPrice {
+    var parsed = std.json.parseFromSlice(std.json.Value, gpa, body, .{}) catch return Error.MalformedResponse;
+    defer parsed.deinit();
+    const data = try unwrapEnvelope(parsed.value);
+    const obj = try firstObject(data);
+    const ts_s = try getString(obj, "ts");
+    return .{
+        .mark_px = try getDecimalLossy(obj, "markPx"),
+        .ts_ms = std.fmt.parseInt(i64, ts_s, 10) catch return Error.MalformedResponse,
+    };
+}
+
+pub const IndexTicker = struct {
+    index_px: Decimal,
+    ts_ms: i64,
+};
+
+pub fn parseIndexTicker(gpa: std.mem.Allocator, body: []const u8) Error!IndexTicker {
+    var parsed = std.json.parseFromSlice(std.json.Value, gpa, body, .{}) catch return Error.MalformedResponse;
+    defer parsed.deinit();
+    const data = try unwrapEnvelope(parsed.value);
+    const obj = try firstObject(data);
+    const ts_s = try getString(obj, "ts");
+    return .{
+        .index_px = try getDecimalLossy(obj, "idxPx"),
+        .ts_ms = std.fmt.parseInt(i64, ts_s, 10) catch return Error.MalformedResponse,
+    };
+}
+
+/// Basis in bps: (mark - index) / index * 10000. Null-safe when index is 0.
+pub fn basisBps(mark: Decimal, index: Decimal) ?Decimal {
+    if (!index.gt(Decimal.zero)) return null;
+    const diff = mark.sub(index) catch return null;
+    const ratio = diff.div(index, .down) catch return null;
+    const ten_k = Decimal.fromInt(10_000);
+    return ratio.mul(ten_k, .down) catch null;
+}
+
 pub const Balance = struct {
     usdt_cash: Decimal,
     usdt_avail: Decimal,
@@ -569,6 +683,42 @@ test "parse funding rate snapshot (venue precision beyond SCALE)" {
     try testing.expect(fr.funding_rate.eql(d("0.00006928")));
     try testing.expectEqual(@as(i64, 1786291200000), fr.next_funding_ms);
     try testing.expectEqual(@as(i64, 1786264264482), fr.ts_ms);
+}
+
+test "parse long-short ratio rubik rows" {
+    const body =
+        \\{"code":"0","data":[["1786536000000","1.71"],["1786532400000","1.68"]]}
+    ;
+    const ls = try parseLongShortRatio(testing.allocator, body);
+    try testing.expect(ls.ratio.eql(Decimal.parse("1.71") catch unreachable));
+    try testing.expectEqual(@as(i64, 1786536000000), ls.ts_ms);
+}
+
+test "parse taker volume rubik rows" {
+    const body =
+        \\{"code":"0","data":[["1786536000000","65367936.9228","67208279.4258"]]}
+    ;
+    const tv = try parseTakerVolume(testing.allocator, body);
+    try testing.expectEqual(@as(i64, 1786536000000), tv.ts_ms);
+    try testing.expect(tv.sell_vol.eql(Decimal.parse("65367936.9228") catch unreachable));
+    try testing.expect(tv.buy_vol.eql(Decimal.parse("67208279.4258") catch unreachable));
+}
+
+test "parse mark and index; basis bps sign" {
+    const mk_body =
+        \\{"code":"0","data":[{"instId":"BTC-USDT-SWAP","markPx":"64010","ts":"1"}],"msg":""}
+    ;
+    const ix_body =
+        \\{"code":"0","data":[{"instId":"BTC-USDT","idxPx":"64000","ts":"1"}],"msg":""}
+    ;
+    const mk = try parseMarkPrice(testing.allocator, mk_body);
+    const ix = try parseIndexTicker(testing.allocator, ix_body);
+    try testing.expect(mk.mark_px.eql(Decimal.parse("64010") catch unreachable));
+    try testing.expect(ix.index_px.eql(Decimal.parse("64000") catch unreachable));
+    const bps = basisBps(mk.mark_px, ix.index_px) orelse unreachable;
+    // (10/64000)*10000 ≈ 1.5625
+    try testing.expect(bps.gt(Decimal.parse("1.5") catch unreachable));
+    try testing.expect(bps.gt(Decimal.zero));
 }
 
 test "parse open interest snapshot (venue precision beyond SCALE)" {

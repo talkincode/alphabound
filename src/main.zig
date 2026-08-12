@@ -1315,7 +1315,7 @@ fn registerDefaultTools(reg: *ab.tools.Registry) !void {
         .domain = .market,
         .source = "okx",
         .max_age_ms = 60_000,
-        .schema_note = "SWAP funding_rate + open_interest",
+        .schema_note = "SWAP funding/OI + long_short + taker + basis_bps",
     });
 }
 
@@ -1740,21 +1740,27 @@ fn collectMarketTools(
         }
     }
 
-    // market.derivatives — SWAP funding rate + open interest (sentiment context).
+    // market.derivatives — funding/OI + positioning (LSR, taker, basis).
     if (registry.find("market.derivatives")) |spec| {
         if (n >= obs_out.len) return n;
         var swap_buf: [48]u8 = undefined;
         const swap_inst = std.fmt.bufPrint(&swap_buf, "{s}-SWAP", .{cfg.instrument}) catch return n;
-        var path_buf: [128]u8 = undefined;
-        var data_buf: [512]u8 = undefined;
+        // Base ccy for rubik stats (BTC-USDT → BTC).
+        const base_ccy = blk: {
+            if (std.mem.indexOfScalar(u8, cfg.instrument, '-')) |dash| break :blk cfg.instrument[0..dash];
+            break :blk cfg.instrument;
+        };
+        var path_buf: [160]u8 = undefined;
+        var data_buf: [1024]u8 = undefined;
         var result: ab.tools.ToolResult = undefined;
         const t_start = nowMs();
         const fr_path = std.fmt.bufPrint(&path_buf, "/api/v5/public/funding-rate?instId={s}", .{swap_inst}) catch return n;
         if (okx.getPublic(fr_path)) |body| {
             defer gpa.free(body);
             if (ab.okx_rest.parseFundingRate(gpa, body)) |fr| {
-                // Open interest is best-effort: funding alone still observes.
+                // Best-effort extras: any failure leaves null fields.
                 var oi: ?ab.okx_rest.OpenInterest = null;
+                var extras: ab.market_tools.PositioningExtras = .{};
                 var oi_path_buf: [128]u8 = undefined;
                 if (std.fmt.bufPrint(&oi_path_buf, "/api/v5/public/open-interest?instId={s}", .{swap_inst})) |oi_path| {
                     if (okx.getPublic(oi_path)) |oi_body| {
@@ -1762,8 +1768,55 @@ fn collectMarketTools(
                         oi = ab.okx_rest.parseOpenInterest(gpa, oi_body) catch null;
                     } else |_| {}
                 } else |_| {}
+                var ls_path_buf: [160]u8 = undefined;
+                if (std.fmt.bufPrint(&ls_path_buf, "/api/v5/rubik/stat/contracts/long-short-account-ratio?ccy={s}&period=1H", .{base_ccy})) |ls_path| {
+                    if (okx.getPublic(ls_path)) |ls_body| {
+                        defer gpa.free(ls_body);
+                        if (ab.okx_rest.parseLongShortRatio(gpa, ls_body)) |ls| {
+                            extras.long_short_ratio = ls.ratio;
+                        } else |_| {}
+                    } else |_| {}
+                } else |_| {}
+                var tv_path_buf: [180]u8 = undefined;
+                if (std.fmt.bufPrint(&tv_path_buf, "/api/v5/rubik/stat/taker-volume?ccy={s}&instType=CONTRACTS&period=1H", .{base_ccy})) |tv_path| {
+                    if (okx.getPublic(tv_path)) |tv_body| {
+                        defer gpa.free(tv_body);
+                        if (ab.okx_rest.parseTakerVolume(gpa, tv_body)) |tv| {
+                            extras.taker_buy_vol = tv.buy_vol;
+                            extras.taker_sell_vol = tv.sell_vol;
+                        } else |_| {}
+                    } else |_| {}
+                } else |_| {}
+                var mk_path_buf: [128]u8 = undefined;
+                var mark_px: ?ab.decimal.Decimal = null;
+                if (std.fmt.bufPrint(&mk_path_buf, "/api/v5/public/mark-price?instId={s}", .{swap_inst})) |mk_path| {
+                    if (okx.getPublic(mk_path)) |mk_body| {
+                        defer gpa.free(mk_body);
+                        if (ab.okx_rest.parseMarkPrice(gpa, mk_body)) |mk| {
+                            mark_px = mk.mark_px;
+                            extras.mark_px = mk.mark_px;
+                        } else |_| {}
+                    } else |_| {}
+                } else |_| {}
+                var ix_path_buf: [128]u8 = undefined;
+                var index_px: ?ab.decimal.Decimal = null;
+                // Spot index ticker uses the configured spot instrument id.
+                if (std.fmt.bufPrint(&ix_path_buf, "/api/v5/market/index-tickers?instId={s}", .{cfg.instrument})) |ix_path| {
+                    if (okx.getPublic(ix_path)) |ix_body| {
+                        defer gpa.free(ix_body);
+                        if (ab.okx_rest.parseIndexTicker(gpa, ix_body)) |ix| {
+                            index_px = ix.index_px;
+                            extras.index_px = ix.index_px;
+                        } else |_| {}
+                    } else |_| {}
+                } else |_| {}
+                if (mark_px) |m| {
+                    if (index_px) |ix| {
+                        extras.basis_bps = ab.okx_rest.basisBps(m, ix);
+                    }
+                }
                 const latency: u32 = @intCast(@max(@as(i64, 0), nowMs() - t_start));
-                if (ab.market_tools.formatDerivativesData(&data_buf, swap_inst, fr, oi)) |data| {
+                if (ab.market_tools.formatDerivativesData(&data_buf, swap_inst, fr, oi, extras)) |data| {
                     result = ab.market_tools.okResult("okx", fr.ts_ms, latency, data);
                 } else |_| {
                     result = ab.market_tools.errResult("okx", nowMs(), latency, "buffer");

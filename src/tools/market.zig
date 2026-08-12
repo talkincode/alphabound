@@ -38,13 +38,32 @@ pub fn formatCandlesData(
     return w.buffered();
 }
 
-/// Perp derivatives snapshot (funding + open interest). `oi` may be null when
-/// the open-interest fetch failed; funding alone is still a valid observation.
+/// Optional positioning extras (all best-effort; null when fetch/parse failed).
+pub const PositioningExtras = struct {
+    long_short_ratio: ?Decimal = null,
+    taker_buy_vol: ?Decimal = null,
+    taker_sell_vol: ?Decimal = null,
+    mark_px: ?Decimal = null,
+    index_px: ?Decimal = null,
+    basis_bps: ?Decimal = null,
+};
+
+fn writeOptDec(w: *std.Io.Writer, key: []const u8, v: ?Decimal) error{BufferTooSmall}!void {
+    if (v) |val| {
+        w.print(",\"{s}\":\"{f}\"", .{ key, val }) catch return error.BufferTooSmall;
+    } else {
+        w.print(",\"{s}\":null", .{key}) catch return error.BufferTooSmall;
+    }
+}
+
+/// Perp derivatives + positioning snapshot. Funding is required; other fields
+/// may be null when their fetch failed (still a valid observation).
 pub fn formatDerivativesData(
     buf: []u8,
     swap_instrument: []const u8,
     fr: rest.FundingRate,
     oi: ?rest.OpenInterest,
+    extras: PositioningExtras,
 ) error{BufferTooSmall}![]const u8 {
     var w: std.Io.Writer = .fixed(buf);
     w.print(
@@ -59,6 +78,12 @@ pub fn formatDerivativesData(
     } else {
         w.writeAll(",\"oi_contracts\":null,\"oi_ccy\":null") catch return error.BufferTooSmall;
     }
+    try writeOptDec(&w, "long_short_ratio", extras.long_short_ratio);
+    try writeOptDec(&w, "taker_buy_vol", extras.taker_buy_vol);
+    try writeOptDec(&w, "taker_sell_vol", extras.taker_sell_vol);
+    try writeOptDec(&w, "mark_px", extras.mark_px);
+    try writeOptDec(&w, "index_px", extras.index_px);
+    try writeOptDec(&w, "basis_bps", extras.basis_bps);
     w.print(",\"ts_ms\":{d}}}", .{fr.ts_ms}) catch return error.BufferTooSmall;
     return w.buffered();
 }
@@ -157,7 +182,7 @@ test "formatCandlesData joins rows" {
 }
 
 test "formatDerivativesData with and without open interest" {
-    var buf: [512]u8 = undefined;
+    var buf: [768]u8 = undefined;
     const fr = rest.FundingRate{
         .funding_rate = d("0.0001"),
         .next_funding_ms = 1786291200000,
@@ -167,12 +192,22 @@ test "formatDerivativesData with and without open interest" {
         .oi_contracts = d("2895813.4"),
         .oi_ccy = d("28958.134"),
         .ts_ms = 1786264264482,
+    }, .{
+        .long_short_ratio = d("1.71"),
+        .taker_buy_vol = d("100"),
+        .taker_sell_vol = d("90"),
+        .mark_px = d("64000"),
+        .index_px = d("63990"),
+        .basis_bps = d("1.56"),
     });
     try testing.expect(std.mem.indexOf(u8, full, "\"funding_rate\":\"0.0001\"") != null);
     try testing.expect(std.mem.indexOf(u8, full, "\"oi_contracts\":\"2895813.4\"") != null);
+    try testing.expect(std.mem.indexOf(u8, full, "\"long_short_ratio\":\"1.71\"") != null);
+    try testing.expect(std.mem.indexOf(u8, full, "\"basis_bps\":\"1.56\"") != null);
 
-    var buf2: [512]u8 = undefined;
-    const partial = try formatDerivativesData(&buf2, "BTC-USDT-SWAP", fr, null);
+    var buf2: [768]u8 = undefined;
+    const partial = try formatDerivativesData(&buf2, "BTC-USDT-SWAP", fr, null, .{});
     try testing.expect(std.mem.indexOf(u8, partial, "\"oi_contracts\":null") != null);
+    try testing.expect(std.mem.indexOf(u8, partial, "\"long_short_ratio\":null") != null);
     try testing.expect(std.mem.indexOf(u8, partial, "\"next_funding_ms\":1786291200000") != null);
 }
