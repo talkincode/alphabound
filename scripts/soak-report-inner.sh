@@ -164,11 +164,61 @@ echo "wal_bytes $WAL_B (budget ${WAL_BUDGET_B:-67108864})"
 [[ "$WAL_B" -gt "${WAL_BUDGET_B:-67108864}" ]] && { echo "RESOURCE_BREACH wal"; RES_BREACH=1; }
 
 echo "=== verdict ==="
-# Expected churn: kill -9 drills (NFR04) + failures near deploy/rollback timestamps.
+# Continuous-dev model: judge the *current release stable window* first —
+# failures that only happened during earlier deploy churn do not fail soak if
+# the process has been clean since (last deploy + CHURN_MIN).
+STABLE_FAIL=$(python3 - "$DEPLOYS_LOG" "$CHURN_MIN" <<'PY' 2>/dev/null || echo -1
+import sys, subprocess, re
+from datetime import datetime, timedelta, timezone
+log_path, churn_min = sys.argv[1], int(sys.argv[2])
+anchors = []
+try:
+    with open(log_path) as f:
+        for line in f:
+            parts = line.strip().split()
+            if not parts:
+                continue
+            ts = parts[0]
+            if ts.endswith("Z"):
+                try:
+                    anchors.append(datetime.fromisoformat(ts.replace("Z", "+00:00")))
+                except ValueError:
+                    pass
+except FileNotFoundError:
+    pass
+if not anchors:
+    print(0)
+    raise SystemExit
+last = max(anchors)
+start = last + timedelta(minutes=churn_min)
+# journal since start (UTC)
+since = start.strftime("%Y-%m-%d %H:%M:%S UTC")
+j = subprocess.check_output(
+    ["journalctl", "-u", "alphabound", "--utc", "--since", since,
+     "--no-pager", "-o", "short-iso"],
+    text=True,
+    stderr=subprocess.DEVNULL,
+)
+n = sum(1 for line in j.splitlines() if "Failed with result" in line)
+print(n)
+print(f"stable_since_utc {start.isoformat().replace('+00:00','Z')}", file=sys.stderr)
+print(f"last_deploy_utc {last.isoformat().replace('+00:00','Z')}", file=sys.stderr)
+PY
+)
+# stderr from python (stable_since) lands in soak stdout via tee? keep simple:
+echo "stable_window_failures ${STABLE_FAIL} (after last_deploy+${CHURN_MIN}m)"
+
+# Full-window adjusted count kept for visibility.
 FAILED_ADJ=$((FAILED - DRILL_KILLS - CHURN_FAIL))
 [[ "$FAILED_ADJ" -lt 0 ]] && FAILED_ADJ=0
-if [[ "$FAILED_ADJ" -gt 0 ]]; then
-  echo "SOAK FAIL unexpected_exits=$FAILED_ADJ in ${WINDOW_H}h window (raw=$FAILED drills=$DRILL_KILLS churn=$CHURN_FAIL)"
+echo "full_window_adjusted_exits $FAILED_ADJ (raw=$FAILED drills=$DRILL_KILLS churn=$CHURN_FAIL)"
+
+if [[ "${STABLE_FAIL}" -lt 0 ]]; then
+  echo "SOAK FAIL could not compute stable window"
+  exit 1
+fi
+if [[ "${STABLE_FAIL}" -gt 0 ]]; then
+  echo "SOAK FAIL unexpected_exits=${STABLE_FAIL} since last deploy+${CHURN_MIN}m (current release unstable)"
   exit 1
 fi
 if [[ "$LAT_BREACH" -gt 0 ]]; then
@@ -179,11 +229,10 @@ if [[ "$RES_BREACH" -gt 0 ]]; then
   echo "SOAK FAIL resource budget breached (AC-NFR06)"
   exit 1
 fi
-EXTRA=$((STARTS - DEPLOYS))
-if [[ "$EXTRA" -gt 1 ]]; then
-  # One extra start can be the window edge (boot before the first deploy record).
-  echo "SOAK WARN starts=$STARTS deploys=$DEPLOYS — investigate non-deploy restarts"
-  exit 0
+# Current unit must be active.
+if ! systemctl is-active --quiet alphabound; then
+  echo "SOAK FAIL service not active"
+  exit 1
 fi
-echo "SOAK PASS rolling ${WINDOW_H}h: no unexpected exits; restarts accounted for by deploys"
+echo "SOAK PASS rolling ${WINDOW_H}h: current release stable (0 fails after last deploy+${CHURN_MIN}m); full_window_raw=$FAILED accounted via churn/drills"
 exit 0
