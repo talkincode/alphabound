@@ -71,8 +71,8 @@
 | AC-FD4 | 私有账户 WS 断开 | EXIT_ONLY + REST 对账;未知期间不自主开仓 | Fault | ◐ unresolved/stale account 拒增仓单测; WS 断线注入待做 |
 | AC-FD5 | 下单超时 | 订单 UNKNOWN→查询后处置;禁止直接重发 | Fault + Integration | ◐ UNKNOWN 禁止 submit 单测 + demo query 路径; 实网超时注入待做 |
 | AC-FD6 | SQLite busy | 短暂重试+降采样遥测;关键事件优先落库 | Fault | ◐ `storage/policy.onBusy` + PRAGMA busy_timeout; 实盘注入待做 |
-| AC-FD7 | 磁盘接近满 | 停新交易,清理可重建缓存;严重时 HALTED | Fault | ◐ `classifyDiskFree`/`riskModeForDisk` 单测; daemon 周期探测待接 |
-| AC-FD8 | 数据库损坏 | 仅保留退出能力+应急文本日志;禁止静默新建空库继续交易 | Fault | ◐ `looksLikeCorruption`/`refuse_and_halt` 单测; boot 接线待做 |
+| AC-FD7 | 磁盘接近满 | 停新交易,清理可重建缓存;严重时 HALTED | Fault | ◐ `storage/disk` statvfs + `disk_ok` 进健康检查; low→EXIT_ONLY critical→HALTED; 缓存清理待做 |
+| AC-FD8 | 数据库损坏 | 仅保留退出能力+应急文本日志;禁止静默新建空库继续交易 | Fault | ◐ boot：已存在文件 open 失败 → FATAL refuse recreate; 应急文本日志/只退能力待扩 |
 | AC-FD9 | 回撤边界触发 | FLATTENING → HALTED;记录穿透与成本 | Fault + Replay | ◐ FLATTENING→HALTED + 无自动恢复（`fault/matrix`）;极端行情 replay 待做 |
 | AC-FD10 | 进程崩溃 | systemd 重启→重新对账→READY;重启前状态不被假定正确 | Fault(kill -9) | ☐ |
 

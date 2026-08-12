@@ -57,6 +57,8 @@
    - ✅ LLM 空闲连接：keep-alive off + HttpFailed 时 reset 重试一次  
    - ✅ LLM **墙钟超时**（`decision_timeout_ms`，默认 120s；worker+detach，超时→HOLD 不堵 daemon）  
    - ✅ OKX REST / egress 探测：keep-alive off + 一次 reset 重试  
+   - ✅ FD7 磁盘探测接入 daemon（statvfs → disk_ok / EXIT_ONLY / HALTED + `DISK_STATUS`）  
+   - ✅ FD8 已有库文件 open 失败 → refuse empty recreate  
    - Demo ≥7 天 soak
 
 ---

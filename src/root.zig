@@ -16,6 +16,7 @@ pub const config = @import("config.zig");
 pub const state = @import("core/state.zig");
 pub const storage = @import("storage/db.zig");
 pub const storage_policy = @import("storage/policy.zig");
+pub const storage_disk = @import("storage/disk.zig");
 pub const okx_auth = @import("exchange/okx/auth.zig");
 pub const okx_rest = @import("exchange/okx/rest.zig");
 pub const okx_ws = @import("exchange/okx/ws.zig");
