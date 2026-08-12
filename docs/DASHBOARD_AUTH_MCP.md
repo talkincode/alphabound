@@ -16,10 +16,37 @@
 ## Env
 
 ```bash
-ALPHABOUND_API_TOKEN=...
+ALPHABOUND_API_TOKEN=...                    # long random (≥24 chars; 32+ recommended for public)
 ALPHABOUND_WEBAUTHN_RP_ID=localhost          # hostname only
 ALPHABOUND_WEBAUTHN_ORIGIN=http://127.0.0.1:8080
+ALPHABOUND_TRUST_PROXY=1                    # Azure/App Gateway: key lockouts on X-Forwarded-For
 ```
+
+## Brute-force / rate limits
+
+When token auth is enabled, the single-threaded web loop keeps an in-memory **FailGuard**:
+
+| Signal | Counts as failure? | Effect |
+|--------|--------------------|--------|
+| `POST /api/v1/auth/login` wrong token | yes | per-IP fail counter |
+| `POST .../passkey/login` bad assertion | yes | per-IP fail counter |
+| `Authorization` / `X-API-Token` wrong | yes | per-IP fail counter |
+| Missing credential (browser first paint) | **no** | plain 401 |
+| Successful token/passkey login | clears IP slot | |
+
+Defaults (compile-time in `src/web/auth.zig`):
+
+- **8** failures / IP / **15 min** window → lockout **15 min** → HTTP **429** + `Retry-After`
+- Global login flood: **60** login POSTs / rolling minute (all IPs) → 429
+
+This is process-local (resets on restart). Put Azure Front Door / WAF / nginx in front for edge rate limits; FailGuard is the in-process last line.
+
+Public exposure checklist:
+
+1. Long random `ALPHABOUND_API_TOKEN` (e.g. `openssl rand -hex 32`)
+2. HTTPS terminator; set `ALPHABOUND_TRUST_PROXY=1` only behind a trusted proxy
+3. Prefer session cookie / passkey after first login; do not put the raw token in browser JS storage
+4. Keep `/health/*` open for probes; never put secrets in health bodies
 
 ### Passkey / WebAuthn 限制（重要）
 

@@ -187,6 +187,8 @@ const WebState = struct {
     auth_cfg: ab.web_auth.Config = .{},
     cred_store: ?*ab.web_auth.CredStore = null,
     challenges: ?*ab.web_auth.ChallengeBank = null,
+    fail_guard: ?*ab.web_auth.FailGuard = null,
+    trust_proxy: bool = false,
 
     fn initEmpty(self: *WebState) void {
         @memcpy(self.agent_runs_buf[0..2], "[]");
@@ -296,6 +298,8 @@ const WebState = struct {
                     .auth_cfg = self.auth_cfg,
                     .cred_store = self.cred_store,
                     .challenges = self.challenges,
+                    .fail_guard = self.fail_guard,
+                    .trust_proxy = self.trust_proxy,
                 };
             }
         }
@@ -709,10 +713,24 @@ pub fn main(init: std.process.Init) !u8 {
     defer cred_store.deinit();
     cred_store.load();
     var challenge_bank = ab.web_auth.ChallengeBank.init(io);
+    var fail_guard = ab.web_auth.FailGuard{};
     web_state.cred_store = &cred_store;
     web_state.challenges = &challenge_bank;
+    web_state.fail_guard = &fail_guard;
+    // Azure / reverse-proxy: set ALPHABOUND_TRUST_PROXY=1 to key lockouts on X-Forwarded-For.
+    const trust_proxy_raw = env.get("ALPHABOUND_TRUST_PROXY") orelse "";
+    web_state.trust_proxy = std.mem.eql(u8, trust_proxy_raw, "1") or
+        std.ascii.eqlIgnoreCase(trust_proxy_raw, "true") or
+        std.ascii.eqlIgnoreCase(trust_proxy_raw, "yes");
     if (web_state.auth_cfg.required()) {
-        std.debug.print("[boot] web auth enabled (token set; passkeys={d} rp_id={s})\n", .{ cred_store.count(), web_rp_id });
+        if (api_token.len < 24) {
+            std.debug.print("[boot] WARN ALPHABOUND_API_TOKEN is short (<24); use a long random token before public exposure\n", .{});
+        }
+        std.debug.print("[boot] web auth enabled (token set; passkeys={d} rp_id={s} trust_proxy={} fail_guard=on)\n", .{
+            cred_store.count(),
+            web_rp_id,
+            web_state.trust_proxy,
+        });
     } else {
         std.debug.print("[boot] web auth open (no ALPHABOUND_API_TOKEN)\n", .{});
     }

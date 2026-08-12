@@ -640,6 +640,10 @@ async function jpost(path, body) {
   let data = null;
   try { data = text ? JSON.parse(text) : null; } catch (_) { data = { raw: text }; }
   if (!r.ok) {
+    if (r.status === 429) {
+      const ra = r.headers.get("retry-after") || "";
+      throw new Error("尝试过多，已临时锁定" + (ra ? ("，约 " + ra + " 秒后重试") : "，请稍后再试"));
+    }
     const err = (data && data.error) ? data.error : ("HTTP " + r.status);
     throw new Error(err);
   }

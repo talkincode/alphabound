@@ -43,6 +43,8 @@ wal = true
 
 # Auth: set ALPHABOUND_API_TOKEN in secrets.env (not in this file).
 # Optional WebAuthn: ALPHABOUND_WEBAUTHN_RP_ID / ALPHABOUND_WEBAUTHN_ORIGIN.
+# Public/Azure: ALPHABOUND_TRUST_PROXY=1 when X-Forwarded-For is set by a trusted edge.
+# In-process fail guard locks an IP after repeated bad tokens (see docs/DASHBOARD_AUTH_MCP.md).
 [web]
 # Prefer 127.0.0.1 and SSH tunnel; use 0.0.0.0 only on trusted private networks.
 bind = "127.0.0.1:8080"

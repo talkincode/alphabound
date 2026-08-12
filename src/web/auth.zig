@@ -407,9 +407,146 @@ pub fn verifyWebAuthnAssertion(
     return true;
 }
 
+// -- Brute-force guard (single-threaded web loop) ----------------------------
+//
+// Tracks failed *credential presentations* per client key (IP). Missing auth
+// (browser first paint) does not count. Success clears the slot.
+
+pub const fail_window_ms: i64 = 15 * 60 * 1000;
+pub const fail_lockout_ms: i64 = 15 * 60 * 1000;
+pub const fail_max_per_window: u32 = 8;
+/// Soft global ceiling on login POSTs (all clients) per rolling minute.
+pub const login_global_max_per_min: u32 = 60;
+
+pub const FailGuard = struct {
+    const max_slots = 128;
+    const Slot = struct {
+        key: u64 = 0,
+        fails: u32 = 0,
+        window_start_ms: i64 = 0,
+        locked_until_ms: i64 = 0,
+        last_ms: i64 = 0,
+    };
+
+    slots: [max_slots]Slot = [_]Slot{.{}} ** max_slots,
+    login_window_start_ms: i64 = 0,
+    login_count: u32 = 0,
+
+    fn hashKey(key: []const u8) u64 {
+        // FNV-1a 64
+        var h: u64 = 0xcbf29ce484222325;
+        for (key) |c| {
+            h ^= c;
+            h *%= 0x100000001b3;
+        }
+        return if (h == 0) 1 else h;
+    }
+
+    fn findSlot(self: *FailGuard, key_h: u64) *Slot {
+        var free_i: ?usize = null;
+        var oldest_i: usize = 0;
+        var oldest_ms: i64 = std.math.maxInt(i64);
+        for (&self.slots, 0..) |*s, i| {
+            if (s.key == key_h) return s;
+            if (s.key == 0 and free_i == null) free_i = i;
+            if (s.last_ms < oldest_ms) {
+                oldest_ms = s.last_ms;
+                oldest_i = i;
+            }
+        }
+        if (free_i) |i| return &self.slots[i];
+        return &self.slots[oldest_i];
+    }
+
+    /// Seconds remaining in lockout, or 0 if allowed.
+    pub fn lockedSeconds(self: *FailGuard, key: []const u8, now_ms: i64) u32 {
+        if (key.len == 0) return 0;
+        const h = hashKey(key);
+        const s = self.findSlot(h);
+        if (s.key != h) return 0;
+        if (now_ms >= s.locked_until_ms) return 0;
+        const left = s.locked_until_ms - now_ms;
+        const sec = @divTrunc(left + 999, 1000);
+        return @intCast(@min(sec, std.math.maxInt(u32)));
+    }
+
+    pub fn recordFailure(self: *FailGuard, key: []const u8, now_ms: i64) u32 {
+        if (key.len == 0) return 0;
+        const h = hashKey(key);
+        const s = self.findSlot(h);
+        if (s.key != h) {
+            s.* = .{ .key = h, .fails = 0, .window_start_ms = now_ms, .locked_until_ms = 0, .last_ms = now_ms };
+        }
+        s.last_ms = now_ms;
+        // Unlock expired lockouts and roll the failure window.
+        if (s.locked_until_ms != 0 and now_ms >= s.locked_until_ms) {
+            s.fails = 0;
+            s.window_start_ms = now_ms;
+            s.locked_until_ms = 0;
+        }
+        if (now_ms - s.window_start_ms > fail_window_ms) {
+            s.fails = 0;
+            s.window_start_ms = now_ms;
+        }
+        s.fails +|= 1;
+        if (s.fails >= fail_max_per_window) {
+            s.locked_until_ms = now_ms + fail_lockout_ms;
+        }
+        return self.lockedSeconds(key, now_ms);
+    }
+
+    pub fn recordSuccess(self: *FailGuard, key: []const u8, now_ms: i64) void {
+        if (key.len == 0) return;
+        const h = hashKey(key);
+        const s = self.findSlot(h);
+        if (s.key != h) return;
+        s.* = .{ .key = 0, .fails = 0, .window_start_ms = 0, .locked_until_ms = 0, .last_ms = now_ms };
+    }
+
+    /// Count a login POST. Returns true when over the global per-minute cap.
+    pub fn noteLoginAttempt(self: *FailGuard, now_ms: i64) bool {
+        if (self.login_window_start_ms == 0 or now_ms - self.login_window_start_ms >= 60_000) {
+            self.login_window_start_ms = now_ms;
+            self.login_count = 0;
+        }
+        self.login_count +|= 1;
+        return self.login_count > login_global_max_per_min;
+    }
+};
+
 // -- tests -------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "fail guard locks after max failures and clears on success" {
+    var g = FailGuard{};
+    const ip = "203.0.113.9";
+    var now: i64 = 1_000_000;
+    var i: u32 = 0;
+    while (i < fail_max_per_window - 1) : (i += 1) {
+        const left = g.recordFailure(ip, now);
+        try testing.expectEqual(@as(u32, 0), left);
+        now += 1000;
+    }
+    const locked = g.recordFailure(ip, now);
+    try testing.expect(locked > 0);
+    try testing.expect(g.lockedSeconds(ip, now) > 0);
+    // other IP not locked
+    try testing.expectEqual(@as(u32, 0), g.lockedSeconds("198.51.100.1", now));
+    g.recordSuccess(ip, now);
+    try testing.expectEqual(@as(u32, 0), g.lockedSeconds(ip, now));
+}
+
+test "fail guard global login flood" {
+    var g = FailGuard{};
+    const now: i64 = 60_000 * 42;
+    var n: u32 = 0;
+    var flooded = false;
+    while (n < login_global_max_per_min + 5) : (n += 1) {
+        if (g.noteLoginAttempt(now)) flooded = true;
+    }
+    try testing.expect(flooded);
+}
 
 test "token header parse and constant time" {
     try testing.expect(constantTimeEql("abc", "abc"));

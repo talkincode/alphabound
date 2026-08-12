@@ -14,6 +14,8 @@ pub const Response = struct {
     body: []const u8,
     /// Optional full Set-Cookie header value (name=value; attrs…).
     set_cookie: ?[]const u8 = null,
+    /// Optional Retry-After seconds (rate limit / lockout).
+    retry_after_sec: ?u32 = null,
 };
 
 pub const RequestInfo = struct {
@@ -26,6 +28,8 @@ pub const RequestInfo = struct {
     host: ?[]const u8 = null,
     /// X-Forwarded-Proto when behind TLS terminator.
     forwarded_proto: ?[]const u8 = null,
+    /// Client IP for fail guard (peer or trusted X-Forwarded-For).
+    client_ip: []const u8 = "",
     body: []const u8 = "",
     now_ms: i64 = 0,
 };
@@ -55,6 +59,9 @@ pub const Context = struct {
     auth_cfg: auth.Config = .{},
     cred_store: ?*auth.CredStore = null,
     challenges: ?*auth.ChallengeBank = null,
+    fail_guard: ?*auth.FailGuard = null,
+    /// When true, prefer left-most X-Forwarded-For over peer IP (Azure / reverse proxy).
+    trust_proxy: bool = false,
     /// Scratch for Set-Cookie (owned by connection handler).
     cookie_buf: []u8 = &.{},
     /// Scratch for auth JSON bodies.
@@ -74,6 +81,38 @@ fn unauthorized() Response {
     return .{ .status = .unauthorized, .body = "{\"error\":\"unauthorized\"}" };
 }
 
+fn rateLimited(retry_after: u32) Response {
+    return .{
+        .status = .too_many_requests,
+        .body = "{\"error\":\"rate_limited\",\"hint\":\"too_many_auth_failures\"}",
+        .retry_after_sec = if (retry_after == 0) 60 else retry_after,
+    };
+}
+
+fn clientKey(req: RequestInfo) []const u8 {
+    if (req.client_ip.len > 0) return req.client_ip;
+    return "unknown";
+}
+
+/// Record failed credential presentation; return lockout response if locked.
+fn noteAuthFailure(ctx: Context, req: RequestInfo) ?Response {
+    const g = ctx.fail_guard orelse return null;
+    const left = g.recordFailure(clientKey(req), req.now_ms);
+    if (left > 0) return rateLimited(left);
+    return null;
+}
+
+fn noteAuthSuccess(ctx: Context, req: RequestInfo) void {
+    if (ctx.fail_guard) |g| g.recordSuccess(clientKey(req), req.now_ms);
+}
+
+fn guardLocked(ctx: Context, req: RequestInfo) ?Response {
+    const g = ctx.fail_guard orelse return null;
+    const left = g.lockedSeconds(clientKey(req), req.now_ms);
+    if (left > 0) return rateLimited(left);
+    return null;
+}
+
 fn pathOnly(target: []const u8) []const u8 {
     return if (std.mem.indexOfScalar(u8, target, '?')) |i| target[0..i] else target;
 }
@@ -89,6 +128,25 @@ fn isPublicPath(path: []const u8) bool {
 fn isAuthed(ctx: Context, req: RequestInfo) bool {
     const r = auth.authorize(ctx.auth_cfg, req.authorization, req.x_api_token, req.cookie, req.now_ms);
     return r == .ok or r == .disabled_open;
+}
+
+/// Authorize protected routes: lockout → wrong presented token counts as fail.
+fn checkProtectedAuth(ctx: Context, req: RequestInfo) ?Response {
+    if (!ctx.auth_cfg.required()) return null;
+    if (guardLocked(ctx, req)) |r| return r;
+    const r = auth.authorize(ctx.auth_cfg, req.authorization, req.x_api_token, req.cookie, req.now_ms);
+    if (r == .ok or r == .disabled_open) {
+        // Only clear on successful *token* presentation; session cookies stay quiet.
+        if (auth.tokenFromHeaders(req.authorization, req.x_api_token) != null) {
+            noteAuthSuccess(ctx, req);
+        }
+        return null;
+    }
+    // Wrong token presented → count; bare 401 (no credential) does not.
+    if (auth.tokenFromHeaders(req.authorization, req.x_api_token) != null) {
+        if (noteAuthFailure(ctx, req)) |lim| return lim;
+    }
+    return unauthorized();
 }
 
 /// Route a request. `buf` backs the response body; must outlive the response.
@@ -123,8 +181,8 @@ pub fn handleReq(buf: []u8, req: RequestInfo, ctx: Context) Response {
     }
 
     // --- protected data APIs ---
-    if (!isPublicPath(path) and !isAuthed(ctx, req)) {
-        return unauthorized();
+    if (!isPublicPath(path)) {
+        if (checkProtectedAuth(ctx, req)) |denied| return denied;
     }
 
     if (method != .GET) {
@@ -207,8 +265,10 @@ fn cookieSecureForOrigin(origin: []const u8) bool {
     return std.mem.startsWith(u8, origin, "https://");
 }
 
-fn handleAuth(buf: []u8, req: RequestInfo, path: []const u8, ctx: Context) Response {
-    const now = if (req.now_ms != 0) req.now_ms else clock.SystemClock.clock().wallMs();
+fn handleAuth(buf: []u8, req_in: RequestInfo, path: []const u8, ctx: Context) Response {
+    var req = req_in;
+    if (req.now_ms == 0) req.now_ms = clock.SystemClock.clock().wallMs();
+    const now = req.now_ms;
     var origin_buf: [256]u8 = undefined;
     var rp_buf: [128]u8 = undefined;
     const wa = resolveWebAuthn(req, ctx.auth_cfg, &origin_buf, &rp_buf);
@@ -234,6 +294,10 @@ fn handleAuth(buf: []u8, req: RequestInfo, path: []const u8, ctx: Context) Respo
         if (!ctx.auth_cfg.required()) {
             return .{ .status = .ok, .body = "{\"ok\":true,\"auth_required\":false}" };
         }
+        if (guardLocked(ctx, req)) |r| return r;
+        if (ctx.fail_guard) |g| {
+            if (g.noteLoginAttempt(now)) return rateLimited(60);
+        }
         var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, req.body, .{}) catch {
             return .{ .status = .bad_request, .body = "{\"error\":\"bad_json\"}" };
         };
@@ -241,7 +305,11 @@ fn handleAuth(buf: []u8, req: RequestInfo, path: []const u8, ctx: Context) Respo
         if (parsed.value != .object) return .{ .status = .bad_request, .body = "{\"error\":\"bad_json\"}" };
         const token = jsonGetString(parsed.value.object, "token") orelse
             return .{ .status = .bad_request, .body = "{\"error\":\"missing_token\"}" };
-        if (!auth.tokenValid(ctx.auth_cfg, token)) return unauthorized();
+        if (!auth.tokenValid(ctx.auth_cfg, token)) {
+            if (noteAuthFailure(ctx, req)) |lim| return lim;
+            return unauthorized();
+        }
+        noteAuthSuccess(ctx, req);
         if (ctx.cookie_buf.len == 0) return .{ .status = .internal_server_error, .body = "{\"error\":\"cookie_buf\"}" };
         var sess_buf: [128]u8 = undefined;
         const sess = auth.mintSession(ctx.auth_cfg, now, &sess_buf) catch {
@@ -323,6 +391,10 @@ fn handleAuth(buf: []u8, req: RequestInfo, path: []const u8, ctx: Context) Respo
         if (!ctx.auth_cfg.required()) {
             return .{ .status = .ok, .body = "{\"ok\":true,\"auth_required\":false}" };
         }
+        if (guardLocked(ctx, req)) |r| return r;
+        if (ctx.fail_guard) |g| {
+            if (g.noteLoginAttempt(now)) return rateLimited(60);
+        }
         const bank = ctx.challenges orelse return .{ .status = .service_unavailable, .body = "{\"error\":\"passkey_disabled\"}" };
         const store = ctx.cred_store orelse return .{ .status = .service_unavailable, .body = "{\"error\":\"passkey_disabled\"}" };
         var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, req.body, .{}) catch {
@@ -337,7 +409,10 @@ fn handleAuth(buf: []u8, req: RequestInfo, path: []const u8, ctx: Context) Respo
         const sig_b64 = jsonGetString(obj, "signature") orelse return .{ .status = .bad_request, .body = "{\"error\":\"missing_signature\"}" };
         const challenge_b64 = jsonGetString(obj, "challenge") orelse return .{ .status = .bad_request, .body = "{\"error\":\"missing_challenge\"}" };
 
-        const cred = store.find(id_b64) orelse return unauthorized();
+        const cred = store.find(id_b64) orelse {
+            if (noteAuthFailure(ctx, req)) |lim| return lim;
+            return unauthorized();
+        };
 
         var cd_buf: [4096]u8 = undefined;
         const cd_n = std.base64.url_safe_no_pad.Decoder.calcSizeForSlice(client_data_b64) catch
@@ -351,9 +426,9 @@ fn handleAuth(buf: []u8, req: RequestInfo, path: []const u8, ctx: Context) Respo
             if (n2 > cd_buf.len) return .{ .status = .bad_request, .body = "{\"error\":\"too_large\"}" };
             std.base64.standard.Decoder.decode(cd_buf[0..n2], client_data_b64) catch
                 return .{ .status = .bad_request, .body = "{\"error\":\"b64\"}" };
-            return finishPasskeyLogin(buf, ctx, wa.origin, now, bank, cred.pub_sec1, cd_buf[0..n2], auth_data_b64, sig_b64, challenge_b64);
+            return finishPasskeyLogin(buf, ctx, req, wa.origin, now, bank, cred.pub_sec1, cd_buf[0..n2], auth_data_b64, sig_b64, challenge_b64);
         };
-        return finishPasskeyLogin(buf, ctx, wa.origin, now, bank, cred.pub_sec1, cd_buf[0..cd_n], auth_data_b64, sig_b64, challenge_b64);
+        return finishPasskeyLogin(buf, ctx, req, wa.origin, now, bank, cred.pub_sec1, cd_buf[0..cd_n], auth_data_b64, sig_b64, challenge_b64);
     }
 
     return .{ .status = .not_found, .body = "{\"error\":\"not found\"}" };
@@ -376,6 +451,7 @@ fn decodeB64Flexible(out: []u8, in: []const u8) ?[]const u8 {
 fn finishPasskeyLogin(
     buf: []u8,
     ctx: Context,
+    req: RequestInfo,
     expected_origin: []const u8,
     now: i64,
     bank: *auth.ChallengeBank,
@@ -403,7 +479,11 @@ fn finishPasskeyLogin(
         bank,
         now,
     );
-    if (!ok) return unauthorized();
+    if (!ok) {
+        if (noteAuthFailure(ctx, req)) |lim| return lim;
+        return unauthorized();
+    }
+    noteAuthSuccess(ctx, req);
     if (ctx.cookie_buf.len == 0) return .{ .status = .internal_server_error, .body = "{\"error\":\"cookie_buf\"}" };
     var sess_buf: [128]u8 = undefined;
     const sess = auth.mintSession(ctx.auth_cfg, now, &sess_buf) catch {
@@ -542,6 +622,50 @@ fn copyOptHeader(head_buf: []const u8, name: []const u8, out: []u8) ?[]const u8 
     return out[0..v.len];
 }
 
+fn formatPeerIp(stream: std.Io.net.Stream, out: []u8) []const u8 {
+    var addr: std.posix.sockaddr.storage = undefined;
+    var len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
+    std.posix.getpeername(stream.socket.handle, @ptrCast(&addr), &len) catch return "unknown";
+    const sa: *align(1) const std.posix.sockaddr = @ptrCast(&addr);
+    if (sa.family == std.posix.AF.INET) {
+        const in4: *align(1) const std.posix.sockaddr.in = @ptrCast(&addr);
+        const b: *const [4]u8 = @ptrCast(&in4.addr);
+        return std.fmt.bufPrint(out, "{d}.{d}.{d}.{d}", .{ b[0], b[1], b[2], b[3] }) catch "unknown";
+    }
+    if (sa.family == std.posix.AF.INET6) {
+        const in6: *align(1) const std.posix.sockaddr.in6 = @ptrCast(&addr);
+        const p = in6.addr;
+        // Fixed hex key (not pretty-print); enough for fail-guard identity.
+        if (out.len < 32) return "unknown";
+        const hex = "0123456789abcdef";
+        var i: usize = 0;
+        while (i < 16) : (i += 1) {
+            out[i * 2] = hex[p[i] >> 4];
+            out[i * 2 + 1] = hex[p[i] & 0xf];
+        }
+        return out[0..32];
+    }
+    return "unknown";
+}
+
+fn firstForwardedIp(xff: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, xff, " \t");
+    if (std.mem.indexOfScalar(u8, trimmed, ',')) |i| {
+        return std.mem.trim(u8, trimmed[0..i], " \t");
+    }
+    return trimmed;
+}
+
+fn clientIpOk(ip: []const u8) bool {
+    if (ip.len == 0 or ip.len > 64) return false;
+    for (ip) |c| {
+        const ok = (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F') or
+            (c >= '0' and c <= '9') or c == '.' or c == ':' or c == '%';
+        if (!ok) return false;
+    }
+    return true;
+}
+
 fn handleConnection(io: std.Io, stream: std.Io.net.Stream, ctx_fn: ContextFn, userdata: ?*anyopaque) !void {
     defer stream.close(io);
     var in_buf: [8192]u8 = undefined;
@@ -565,11 +689,15 @@ fn handleConnection(io: std.Io, stream: std.Io.net.Stream, ctx_fn: ContextFn, us
     var cookie_hdr_buf: [1024]u8 = undefined;
     var host_buf: [256]u8 = undefined;
     var fwd_proto_buf: [32]u8 = undefined;
+    var xff_buf: [256]u8 = undefined;
+    var peer_ip_buf: [64]u8 = undefined;
     const authorization = copyOptHeader(req.head_buffer, "authorization", &authz_buf);
     const x_api_token = copyOptHeader(req.head_buffer, "x-api-token", &x_tok_buf);
     const cookie_hdr = copyOptHeader(req.head_buffer, "cookie", &cookie_hdr_buf);
     const host_hdr = copyOptHeader(req.head_buffer, "host", &host_buf);
     const fwd_proto = copyOptHeader(req.head_buffer, "x-forwarded-proto", &fwd_proto_buf);
+    const xff_hdr = copyOptHeader(req.head_buffer, "x-forwarded-for", &xff_buf);
+    const peer_ip = formatPeerIp(stream, &peer_ip_buf);
     const content_length = req.head.content_length;
 
     var body_storage: [8192]u8 = undefined;
@@ -609,6 +737,14 @@ fn handleConnection(io: std.Io, stream: std.Io.net.Stream, ctx_fn: ContextFn, us
     ctx.cookie_buf = &cookie_buf;
     ctx.auth_buf = &auth_buf;
 
+    var client_ip: []const u8 = peer_ip;
+    if (ctx.trust_proxy) {
+        if (xff_hdr) |xff| {
+            const first = firstForwardedIp(xff);
+            if (clientIpOk(first)) client_ip = first;
+        }
+    }
+
     const info = RequestInfo{
         .method = method,
         .target = target_buf[0..target_len],
@@ -617,6 +753,7 @@ fn handleConnection(io: std.Io, stream: std.Io.net.Stream, ctx_fn: ContextFn, us
         .cookie = cookie_hdr,
         .host = host_hdr,
         .forwarded_proto = fwd_proto,
+        .client_ip = client_ip,
         .body = body_storage[0..body_len],
         .now_ms = clock.SystemClock.clock().wallMs(),
     };
@@ -624,13 +761,40 @@ fn handleConnection(io: std.Io, stream: std.Io.net.Stream, ctx_fn: ContextFn, us
     var body_buf: [196608]u8 = undefined;
     const resp = handleReq(&body_buf, info, ctx);
 
+    var retry_buf: [16]u8 = undefined;
+    const retry_hdr: ?[]const u8 = if (resp.retry_after_sec) |sec|
+        std.fmt.bufPrint(&retry_buf, "{d}", .{sec}) catch null
+    else
+        null;
+
     if (resp.set_cookie) |sc| {
+        if (retry_hdr) |ra| {
+            try req.respond(resp.body, .{
+                .status = resp.status,
+                .extra_headers = &.{
+                    .{ .name = "content-type", .value = resp.content_type },
+                    .{ .name = "cache-control", .value = "no-store" },
+                    .{ .name = "set-cookie", .value = sc },
+                    .{ .name = "retry-after", .value = ra },
+                },
+            });
+        } else {
+            try req.respond(resp.body, .{
+                .status = resp.status,
+                .extra_headers = &.{
+                    .{ .name = "content-type", .value = resp.content_type },
+                    .{ .name = "cache-control", .value = "no-store" },
+                    .{ .name = "set-cookie", .value = sc },
+                },
+            });
+        }
+    } else if (retry_hdr) |ra| {
         try req.respond(resp.body, .{
             .status = resp.status,
             .extra_headers = &.{
                 .{ .name = "content-type", .value = resp.content_type },
                 .{ .name = "cache-control", .value = "no-store" },
-                .{ .name = "set-cookie", .value = sc },
+                .{ .name = "retry-after", .value = ra },
             },
         });
     } else {
@@ -811,4 +975,81 @@ test "auth status rp_id follows Host header" {
         .now_ms = 1,
     }, ctx);
     try testing.expect(std.mem.indexOf(u8, r3.body, "\"rp_id\":\"localhost\"") != null);
+}
+
+test "auth fail guard locks login after repeated bad tokens" {
+    var buf: [2048]u8 = undefined;
+    var guard = auth.FailGuard{};
+    var ctx = testCtx();
+    ctx.auth_cfg = .{ .api_token = "correct-token-value-ok" };
+    ctx.auth_cfg.session_secret = auth.deriveSessionSecret(ctx.auth_cfg.api_token);
+    ctx.fail_guard = &guard;
+    var cookie_scratch: [256]u8 = undefined;
+    ctx.cookie_buf = &cookie_scratch;
+
+    var now: i64 = 5_000_000;
+    var i: u32 = 0;
+    while (i < auth.fail_max_per_window) : (i += 1) {
+        const r = handleReq(&buf, .{
+            .method = .POST,
+            .target = "/api/v1/auth/login",
+            .client_ip = "198.51.100.20",
+            .body = "{\"token\":\"wrong\"}",
+            .now_ms = now,
+        }, ctx);
+        now += 10;
+        if (i + 1 < auth.fail_max_per_window) {
+            try testing.expectEqual(std.http.Status.unauthorized, r.status);
+        } else {
+            try testing.expectEqual(std.http.Status.too_many_requests, r.status);
+            try testing.expect(r.retry_after_sec != null);
+        }
+    }
+    // still locked
+    const locked = handleReq(&buf, .{
+        .method = .POST,
+        .target = "/api/v1/auth/login",
+        .client_ip = "198.51.100.20",
+        .body = "{\"token\":\"correct-token-value-ok\"}",
+        .now_ms = now,
+    }, ctx);
+    try testing.expectEqual(std.http.Status.too_many_requests, locked.status);
+
+    // other IP can still login
+    const ok = handleReq(&buf, .{
+        .method = .POST,
+        .target = "/api/v1/auth/login",
+        .client_ip = "198.51.100.99",
+        .body = "{\"token\":\"correct-token-value-ok\"}",
+        .now_ms = now,
+    }, ctx);
+    try testing.expectEqual(std.http.Status.ok, ok.status);
+
+    // bare 401 without credential does not consume budget
+    var guard2 = auth.FailGuard{};
+    ctx.fail_guard = &guard2;
+    var j: u32 = 0;
+    while (j < auth.fail_max_per_window + 3) : (j += 1) {
+        const r = handleReq(&buf, .{
+            .method = .GET,
+            .target = "/api/v1/state",
+            .client_ip = "203.0.113.1",
+            .now_ms = now + j,
+        }, ctx);
+        try testing.expectEqual(std.http.Status.unauthorized, r.status);
+    }
+    try testing.expectEqual(@as(u32, 0), guard2.lockedSeconds("203.0.113.1", now + 100));
+
+    // wrong bearer does consume budget
+    var k: u32 = 0;
+    while (k < auth.fail_max_per_window) : (k += 1) {
+        _ = handleReq(&buf, .{
+            .method = .GET,
+            .target = "/api/v1/state",
+            .client_ip = "203.0.113.1",
+            .x_api_token = "nope",
+            .now_ms = now + 1000 + k,
+        }, ctx);
+    }
+    try testing.expect(guard2.lockedSeconds("203.0.113.1", now + 2000) > 0);
 }
