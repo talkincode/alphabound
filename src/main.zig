@@ -1286,7 +1286,7 @@ pub fn main(init: std.process.Init) !u8 {
                         .{ reason_txt, ab.scheduler.hourUtc(tnow), agent_sched.params.effectiveInterval(ab.scheduler.hourUtc(tnow)) },
                     ) catch "{\"reason\":\"unknown\"}";
                     logEventPayload(&events_repo, &engine, "AGENT_TRIGGER", "agent", "INFO", &cfg, trig_payload);
-                    runAgentDecision(gpa, client, &okx, &cfg, &engine, &tool_reg, &agent_runs, &tool_calls, &events_repo, &orders_repo, &fills_repo, &db, &mem_store, &memories_repo, env, &runtime_status, trade_instrument);
+                    runAgentDecision(gpa, client, &okx, &cfg, &engine, &tool_reg, &agent_runs, &tool_calls, &events_repo, &orders_repo, &fills_repo, &equity_repo, &db, &mem_store, &memories_repo, env, &runtime_status, trade_instrument);
                     refreshWebCaches(&web_state, &db, &agent_runs, &equity_repo, &events_repo, &memories_repo, &orders_repo, &fills_repo, last_bh_cmp);
                     refreshSystemCache(&web_state, &db, &cfg, &mem_store, boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), llm_client != null, admin_paused, &runtime_status, &risk_latency);
                 }
@@ -2236,6 +2236,65 @@ fn runOperatorTargetWeight(
 }
 
 /// One slow-loop decision: tools → context → LLM → proposal → admission → optional demo exec.
+/// Compact own AGENT_PROPOSAL_OK payloads into small self-review JSON lines
+/// (decision, sizing, confidence, risk verdict, execution outcome). Rows that
+/// fail to parse are skipped — self-review is best-effort, never fatal.
+fn compactProposalLines(
+    gpa: std.mem.Allocator,
+    rows: []const ab.storage.EventsRepo.ProposalRow,
+    backing: []u8,
+    out_ptrs: [][]const u8,
+) usize {
+    var n: usize = 0;
+    var off: usize = 0;
+    for (rows) |row| {
+        if (n >= out_ptrs.len) break;
+        var parsed = std.json.parseFromSlice(std.json.Value, gpa, row.payload, .{}) catch continue;
+        defer parsed.deinit();
+        const obj = switch (parsed.value) {
+            .object => |o| o,
+            else => continue,
+        };
+        const decision_id = jsonStr(obj, "decision_id") orelse continue;
+        const action = jsonStr(obj, "action") orelse continue;
+        const target = jsonStr(obj, "target_btc_weight") orelse "";
+        const conf = jsonStr(obj, "confidence") orelse "";
+        const exec_note = jsonStr(obj, "exec") orelse "";
+        const executed = if (obj.get("executed")) |v| (v == .bool and v.bool) else false;
+        var verdict: []const u8 = "";
+        var admitted: []const u8 = "";
+        if (obj.get("admission")) |adm| {
+            if (adm == .object) {
+                verdict = jsonStr(adm.object, "verdict") orelse "";
+                admitted = jsonStr(adm.object, "admitted_weight") orelse "";
+            }
+        }
+        var w: std.Io.Writer = .fixed(backing[off..]);
+        w.print(
+            "{{\"ts\":\"{s}\",\"decision_id\":\"{s}\",\"action\":\"{s}\",\"target_btc_weight\":\"{s}\",\"confidence\":\"{s}\",\"admission\":\"{s}\",\"admitted_weight\":\"{s}\",\"executed\":{},\"exec\":\"{s}\"}}",
+            .{ row.ts, decision_id, action, target, conf, verdict, admitted, executed, exec_note },
+        ) catch break;
+        const piece = w.buffered();
+        out_ptrs[n] = piece;
+        off += piece.len;
+        if (off < backing.len) {
+            backing[off] = 0;
+            off += 1;
+        }
+        n += 1;
+    }
+    return n;
+}
+
+/// Field accessor: string value from a parsed JSON object, else null.
+fn jsonStr(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const v = obj.get(key) orelse return null;
+    return switch (v) {
+        .string => |s| s,
+        else => null,
+    };
+}
+
 fn runAgentDecision(
     gpa: std.mem.Allocator,
     client: *ab.openai.Client,
@@ -2248,6 +2307,7 @@ fn runAgentDecision(
     events_repo: *ab.storage.EventsRepo,
     orders_repo: *ab.storage.OrdersRepo,
     fills_repo: *ab.storage.FillsRepo,
+    equity_repo: *ab.storage.EquityRepo,
     db: *ab.storage.Db,
     mem_store: *ab.memory.Store,
     memories_repo: *ab.storage.MemoriesRepo,
@@ -2302,6 +2362,41 @@ fn runAgentDecision(
     const ev_n = events_repo.listCompactForContext(db, &ev_backing, &ev_ptrs) catch 0;
     const recent_events = ev_ptrs[0..ev_n];
 
+    // Self-review: own recent proposals compacted from the audit log,
+    // executions (fills joined to orders), and equity marks at fixed horizons.
+    var prop_raw_backing: [24 * 1024]u8 = undefined;
+    var prop_rows: [6]ab.storage.EventsRepo.ProposalRow = undefined;
+    const prop_raw_n = events_repo.listProposalsForContext(db, &prop_raw_backing, &prop_rows) catch 0;
+    var prop_backing: [2048]u8 = undefined;
+    var prop_ptrs: [6][]const u8 = undefined;
+    const prop_n = compactProposalLines(gpa, prop_rows[0..prop_raw_n], &prop_backing, &prop_ptrs);
+    const recent_proposals = prop_ptrs[0..prop_n];
+
+    var fill_backing: [2048]u8 = undefined;
+    var fill_ptrs: [6][]const u8 = undefined;
+    const fill_n = fills_repo.listCompactForContext(db, &fill_backing, &fill_ptrs) catch 0;
+    const recent_fills = fill_ptrs[0..fill_n];
+
+    const eq_horizons = [_]struct { label: []const u8, ms: i64 }{
+        .{ .label = "1h", .ms = 3_600_000 },
+        .{ .label = "6h", .ms = 21_600_000 },
+        .{ .label = "24h", .ms = 86_400_000 },
+        .{ .label = "3d", .ms = 259_200_000 },
+        .{ .label = "7d", .ms = 604_800_000 },
+    };
+    var eq_bufs: [eq_horizons.len][128]u8 = undefined;
+    var eq_ptrs: [eq_horizons.len][]const u8 = undefined;
+    var eq_n: usize = 0;
+    for (eq_horizons, 0..) |h, hi| {
+        var cutoff_buf: [32]u8 = undefined;
+        const cutoff = ab.clock.formatRfc3339Ms(nowMs() - h.ms, &cutoff_buf) catch continue;
+        if (equity_repo.equityMarkJson(db, h.label, cutoff, &eq_bufs[hi])) |mark| {
+            eq_ptrs[eq_n] = mark;
+            eq_n += 1;
+        } else |_| {}
+    }
+    const equity_marks = eq_ptrs[0..eq_n];
+
     var ctx_buf: [32 * 1024]u8 = undefined;
     const ctx_json = ab.context.render(&ctx_buf, .{
         .snapshot = snap,
@@ -2309,6 +2404,9 @@ fn runAgentDecision(
         .memories = scored.items,
         .registry = registry,
         .tool_observations = observations,
+        .recent_proposals = recent_proposals,
+        .recent_fills = recent_fills,
+        .equity_marks = equity_marks,
         .max_drawdown = cfg.max_drawdown,
         .instrument = cfg.instrument,
         .now_ms = nowMs(),

@@ -363,6 +363,55 @@ pub const EventsRepo = struct {
         }
         return n;
     }
+
+    /// One own past proposal row for the self-review context section.
+    pub const ProposalRow = struct { ts: []const u8, payload: []const u8 };
+
+    /// Own recent decision proposals (oldest first) with raw payload JSON.
+    /// First-party audit data for the agent's self-review section.
+    pub fn listProposalsForContext(
+        self: *EventsRepo,
+        db: *Db,
+        backing: []u8,
+        out: []ProposalRow,
+    ) DbError!usize {
+        _ = self;
+        if (out.len == 0) return 0;
+        const limit: i64 = @intCast(out.len);
+        var stmt = try db.prepare(
+            \\SELECT ts, payload_json
+            \\FROM events
+            \\WHERE type = 'AGENT_PROPOSAL_OK'
+            \\ORDER BY ts DESC
+            \\LIMIT ?1
+        );
+        defer stmt.finalize();
+        try stmt.bindInt(1, limit);
+
+        var tmp: [16]EventsRepo.ProposalRow = undefined;
+        var n: usize = 0;
+        var off: usize = 0;
+        while (try stmt.step()) {
+            if (n >= out.len) break;
+            const ts = stmt.columnText(0);
+            const payload = stmt.columnText(1);
+            if (off + ts.len + payload.len > backing.len) break;
+            @memcpy(backing[off .. off + ts.len], ts);
+            const ts_slice = backing[off .. off + ts.len];
+            off += ts.len;
+            @memcpy(backing[off .. off + payload.len], payload);
+            const pl_slice = backing[off .. off + payload.len];
+            off += payload.len;
+            tmp[n] = .{ .ts = ts_slice, .payload = pl_slice };
+            n += 1;
+        }
+        // Oldest first for deterministic context narrative.
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            out[i] = tmp[n - 1 - i];
+        }
+        return n;
+    }
 };
 
 /// Online backup via SQLite Backup API (§6.1). Safe with WAL; single writer.
@@ -539,6 +588,60 @@ pub const FillsRepo = struct {
         w.writeAll("]") catch return DbError.StepFailed;
         return w.buffered();
     }
+
+    /// Compact own executions (oldest first) for the agent self-review section:
+    /// fill joined to its order for side and decision linkage.
+    pub fn listCompactForContext(
+        self: *FillsRepo,
+        db: *Db,
+        backing: []u8,
+        out_ptrs: [][]const u8,
+    ) DbError!usize {
+        _ = self;
+        if (out_ptrs.len == 0) return 0;
+        const limit: i64 = @intCast(out_ptrs.len);
+        var stmt = try db.prepare(
+            \\SELECT f.ts, COALESCE(o.side,''), f.qty, f.price, f.fee, COALESCE(o.decision_id,'')
+            \\FROM fills f LEFT JOIN orders o ON o.client_order_id = f.order_id
+            \\ORDER BY f.ts DESC
+            \\LIMIT ?1
+        );
+        defer stmt.finalize();
+        try stmt.bindInt(1, limit);
+
+        var tmp_ptrs: [16][]const u8 = undefined;
+        var n: usize = 0;
+        var off: usize = 0;
+        while (try stmt.step()) {
+            if (n >= out_ptrs.len) break;
+            var w: std.Io.Writer = .fixed(backing[off..]);
+            w.print(
+                "{{\"ts\":\"{s}\",\"side\":\"{s}\",\"qty\":\"{s}\",\"price\":\"{s}\",\"fee\":\"{s}\",\"decision_id\":\"{s}\"}}",
+                .{
+                    stmt.columnText(0),
+                    stmt.columnText(1),
+                    stmt.columnText(2),
+                    stmt.columnText(3),
+                    stmt.columnText(4),
+                    stmt.columnText(5),
+                },
+            ) catch return DbError.StepFailed;
+            const piece = w.buffered();
+            tmp_ptrs[n] = piece;
+            off += piece.len;
+            if (off < backing.len) {
+                backing[off] = 0;
+                off += 1;
+            }
+            n += 1;
+        }
+        // Oldest first for deterministic context narrative.
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            out_ptrs[i] = tmp_ptrs[n - 1 - i];
+        }
+        return n;
+    }
 };
 
 pub const EquitySampleRow = struct {
@@ -620,6 +723,34 @@ pub const EquityRepo = struct {
         }
         w.writeAll("]") catch return DbError.StepFailed;
         return w.buffered();
+    }
+
+    /// Latest equity sample at or before `cutoff_ts` (RFC3339, lexicographically
+    /// comparable), rendered as one labelled JSON mark for the self-review
+    /// section: `{"ago":"24h","ts":"...","equity":"..."}`.
+    pub fn equityMarkJson(
+        self: *EquityRepo,
+        db: *Db,
+        label: []const u8,
+        cutoff_ts: []const u8,
+        out: []u8,
+    ) DbError![]const u8 {
+        _ = self;
+        var stmt = try db.prepare(
+            \\SELECT ts, equity FROM equity_samples
+            \\WHERE ts <= ?1 ORDER BY ts DESC LIMIT 1
+        );
+        defer stmt.finalize();
+        try stmt.bindText(1, cutoff_ts);
+        if (try stmt.step()) {
+            var w: std.Io.Writer = .fixed(out);
+            w.print(
+                "{{\"ago\":\"{s}\",\"ts\":\"{s}\",\"equity\":\"{s}\"}}",
+                .{ label, stmt.columnText(0), stmt.columnText(1) },
+            ) catch return DbError.StepFailed;
+            return w.buffered();
+        }
+        return DbError.NotFound;
     }
 };
 
@@ -1358,4 +1489,78 @@ test "events compact context order and sqlite backup" {
     var bak_db = try Db.open(bak);
     defer bak_db.close();
     try testing.expectEqual(@as(i64, 3), try bak_db.queryInt("SELECT COUNT(*) FROM events"));
+}
+
+test "self-review queries: proposals, fills join, equity marks" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const path = try tmpDbPath(&tmp, &buf);
+    var db = try Db.open(path);
+    defer db.close();
+
+    var events = try EventsRepo.init(&db);
+    defer events.deinit();
+    try events.append(.{ .event_id = "e1", .ts = "2026-08-13T10:00:00.000Z", .type = "AGENT_PROPOSAL_OK", .source = "agent", .severity = "INFO", .state_version = 1, .payload_json = "{\"decision_id\":\"dec_a\",\"action\":\"HOLD\"}" });
+    try events.append(.{ .event_id = "e2", .ts = "2026-08-13T11:00:00.000Z", .type = "AGENT_TRIGGER", .source = "core", .severity = "DEBUG", .state_version = 2, .payload_json = "{}" });
+    try events.append(.{ .event_id = "e3", .ts = "2026-08-13T12:00:00.000Z", .type = "AGENT_PROPOSAL_OK", .source = "agent", .severity = "INFO", .state_version = 3, .payload_json = "{\"decision_id\":\"dec_b\",\"action\":\"REBALANCE\"}" });
+
+    var prop_backing: [2048]u8 = undefined;
+    var prop_rows: [4]EventsRepo.ProposalRow = undefined;
+    const pn = try events.listProposalsForContext(&db, &prop_backing, &prop_rows);
+    // Only AGENT_PROPOSAL_OK rows, oldest first.
+    try testing.expectEqual(@as(usize, 2), pn);
+    try testing.expect(std.mem.indexOf(u8, prop_rows[0].payload, "dec_a") != null);
+    try testing.expect(std.mem.indexOf(u8, prop_rows[1].payload, "dec_b") != null);
+    try testing.expectEqualStrings("2026-08-13T10:00:00.000Z", prop_rows[0].ts);
+
+    var orders = try OrdersRepo.init(&db);
+    defer orders.deinit();
+    try orders.upsert(.{
+        .client_order_id = "ab01",
+        .decision_id = "dec_b",
+        .side = "buy",
+        .qty = "0.0001",
+        .price = "64000",
+        .status = "FILLED",
+        .created_ts = "2026-08-13T12:01:00.000Z",
+        .updated_ts = "2026-08-13T12:01:05.000Z",
+    });
+    var fills = try FillsRepo.init(&db);
+    defer fills.deinit();
+    try fills.append(.{ .fill_id = "f1", .order_id = "ab01", .price = "64000", .qty = "0.0001", .fee = "0.006", .ts = "2026-08-13T12:01:05.000Z" });
+    try orders.upsert(.{
+        .client_order_id = "ab00",
+        .decision_id = "dec_a",
+        .side = "sell",
+        .qty = "0.0002",
+        .price = "63000",
+        .status = "FILLED",
+        .created_ts = "2026-08-13T09:00:00.000Z",
+        .updated_ts = "2026-08-13T09:00:05.000Z",
+    });
+    try fills.append(.{ .fill_id = "f0", .order_id = "ab00", .price = "63000", .qty = "0.0002", .fee = "0.01", .ts = "2026-08-13T09:00:00.000Z" });
+
+    var fill_backing: [1024]u8 = undefined;
+    var fill_ptrs: [4][]const u8 = undefined;
+    const fn_ = try fills.listCompactForContext(&db, &fill_backing, &fill_ptrs);
+    try testing.expectEqual(@as(usize, 2), fn_);
+    // Oldest first; each row carries side + decision_id from the joined order.
+    try testing.expect(std.mem.indexOf(u8, fill_ptrs[0], "\"side\":\"sell\"") != null);
+    try testing.expect(std.mem.indexOf(u8, fill_ptrs[0], "\"decision_id\":\"dec_a\"") != null);
+    try testing.expect(std.mem.indexOf(u8, fill_ptrs[1], "\"side\":\"buy\"") != null);
+    try testing.expect(std.mem.indexOf(u8, fill_ptrs[1], "\"decision_id\":\"dec_b\"") != null);
+
+    var equity = try EquityRepo.init(&db);
+    defer equity.deinit();
+    try equity.append(.{ .ts = "2026-08-13T08:00:00.000Z", .interval = "1m", .equity = "99.0", .hwm = "100", .drawdown = "0.01", .cash = "50", .btc_value = "49" });
+    try equity.append(.{ .ts = "2026-08-13T11:30:00.000Z", .interval = "1m", .equity = "99.7", .hwm = "100", .drawdown = "0.003", .cash = "50", .btc_value = "49.7" });
+
+    var mark_buf: [128]u8 = undefined;
+    const mark = try equity.equityMarkJson(&db, "1h", "2026-08-13T11:45:00.000Z", &mark_buf);
+    try testing.expect(std.mem.indexOf(u8, mark, "\"ago\":\"1h\"") != null);
+    try testing.expect(std.mem.indexOf(u8, mark, "\"equity\":\"99.7\"") != null);
+    // Cutoff before any sample → NotFound.
+    var mark_buf2: [128]u8 = undefined;
+    try testing.expectError(DbError.NotFound, equity.equityMarkJson(&db, "7d", "2026-08-13T07:00:00.000Z", &mark_buf2));
 }
