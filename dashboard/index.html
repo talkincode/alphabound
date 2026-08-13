@@ -123,6 +123,8 @@
   .stat .v { font-size: 18px; margin-top: 2px; }
   .hint { color: var(--dim); font-size: 12px; margin-bottom: 10px; }
   .filters { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 12px; }
+  .filters .range-label { align-self: center; font-size: 12px; color: var(--muted); }
+  .filters .range-count { align-self: center; font-size: 12px; color: var(--muted); margin-left: auto; }
   .filters button {
     appearance: none; background: var(--panel); color: var(--dim);
     border: 1px solid var(--border); border-radius: 999px;
@@ -378,6 +380,19 @@
       <button type="button" data-filter="reflection">仅反思</button>
       <button type="button" data-filter="fail">仅失败</button>
     </div>
+    <div class="filters" id="dec_range">
+      <span class="range-label">条数</span>
+      <button type="button" data-limit="10">10</button>
+      <button type="button" data-limit="20">20</button>
+      <button type="button" data-limit="50">50</button>
+      <button type="button" data-limit="0">全部</button>
+      <span class="range-label">时间</span>
+      <button type="button" data-hours="1">1 小时</button>
+      <button type="button" data-hours="6">6 小时</button>
+      <button type="button" data-hours="24">24 小时</button>
+      <button type="button" data-hours="0">全部</button>
+      <span class="range-count" id="dec_count"></span>
+    </div>
     <table>
       <thead>
         <tr>
@@ -407,6 +422,19 @@
       <div class="stat"><div class="k">成交笔数</div><div class="v" id="ord_fills">—</div></div>
     </div>
     <p class="hint">订单与成交来自 SQLite 投影（events 为源）。Shadow 模式通常为空；Demo 下单后在此可见 clOrdId、状态与 decision 关联。</p>
+    <div class="filters" id="ord_range">
+      <span class="range-label">条数</span>
+      <button type="button" data-limit="10">10</button>
+      <button type="button" data-limit="20">20</button>
+      <button type="button" data-limit="50">50</button>
+      <button type="button" data-limit="0">全部</button>
+      <span class="range-label">时间</span>
+      <button type="button" data-hours="1">1 小时</button>
+      <button type="button" data-hours="6">6 小时</button>
+      <button type="button" data-hours="24">24 小时</button>
+      <button type="button" data-hours="0">全部</button>
+      <span class="range-count" id="ord_count"></span>
+    </div>
     <h2>订单投影</h2>
     <table>
       <thead>
@@ -493,6 +521,10 @@ let activeTab = "overview";
 let openDecisionId = null;
 let lastDecisionsSig = "";
 let decFilter = localStorage.getItem("ab_dec_filter") || "all";
+let decLimit = parseInt(localStorage.getItem("ab_dec_limit") || "20", 10);
+let decHours = parseInt(localStorage.getItem("ab_dec_hours") || "0", 10);
+let ordLimit = parseInt(localStorage.getItem("ab_ord_limit") || "20", 10);
+let ordHours = parseInt(localStorage.getItem("ab_ord_hours") || "0", 10);
 let cachedDecisions = [];
 let cachedRuns = [];
 let cachedOrdersBundle = { orders: [], fills: [] };
@@ -1186,6 +1218,7 @@ function renderDecisions(decisions, runs) {
 
   const all = Array.isArray(decisions) ? decisions : [];
   const list = all.filter(e => {
+    if (!withinHours(e.ts, decHours)) return false;
     const ty = e.type || "";
     if (decFilter === "proposal") return ty.indexOf("PROPOSAL") >= 0 || ty.indexOf("INVALID") >= 0 || ty === "AGENT_LLM_FAILED";
     if (decFilter === "reflection") return ty.indexOf("REFLECTION") >= 0;
@@ -1351,7 +1384,9 @@ function renderDecisions(decisions, runs) {
     return lines.join("\n");
   }
 
-  const rowsHtml = list.slice(0, 60).map((e) => {
+  const shown = decLimit > 0 ? list.slice(0, decLimit) : list.slice(0, 200);
+  { const c = $("dec_count"); if (c) c.textContent = "显示 " + shown.length + " / 匹配 " + list.length; }
+  const rowsHtml = shown.map((e) => {
     const p = e.payload || {};
     const run = runById[p.run_id] || {};
     const thesisNote = (Array.isArray(p.thesis) && p.thesis.length) ? String(p.thesis[0]) : "";
@@ -1467,6 +1502,30 @@ document.querySelectorAll("#dec_filters button").forEach(btn => {
   });
 });
 
+// Row-count / time-range bars for decisions & orders tables.
+function withinHours(ts, hours) {
+  if (!hours) return true;
+  const t = Date.parse(ts || "");
+  if (isNaN(t)) return true; // never hide rows with unparseable timestamps
+  return (Date.now() - t) <= hours * 3600 * 1000;
+}
+function wireRangeBar(barId, attr, storageKey, getVal, setVal, rerender) {
+  const btns = document.querySelectorAll("#" + barId + " button[" + attr + "]");
+  btns.forEach(btn => {
+    btn.classList.toggle("active", parseInt(btn.getAttribute(attr), 10) === getVal());
+    btn.addEventListener("click", () => {
+      setVal(parseInt(btn.getAttribute(attr), 10) || 0);
+      try { localStorage.setItem(storageKey, String(getVal())); } catch (_) {}
+      btns.forEach(b => b.classList.toggle("active", b === btn));
+      rerender();
+    });
+  });
+}
+wireRangeBar("dec_range", "data-limit", "ab_dec_limit", () => decLimit, v => { decLimit = v; }, () => renderDecisions(cachedDecisions, cachedRuns));
+wireRangeBar("dec_range", "data-hours", "ab_dec_hours", () => decHours, v => { decHours = v; }, () => renderDecisions(cachedDecisions, cachedRuns));
+wireRangeBar("ord_range", "data-limit", "ab_ord_limit", () => ordLimit, v => { ordLimit = v; }, () => renderOrders(cachedOrdersBundle));
+wireRangeBar("ord_range", "data-hours", "ab_ord_hours", () => ordHours, v => { ordHours = v; }, () => renderOrders(cachedOrdersBundle));
+
 syncBarFilterButtons();
 document.querySelectorAll("#bar_filters button[data-bar]").forEach(btn => {
   btn.addEventListener("click", () => setSelectedBar(btn.getAttribute("data-bar") || "1H"));
@@ -1556,26 +1615,36 @@ function renderStatus(system, state) {
 }
 
 function renderOrders(bundle) {
-  const orders = (bundle && Array.isArray(bundle.orders)) ? bundle.orders : [];
-  const fills = (bundle && Array.isArray(bundle.fills)) ? bundle.fills : [];
+  const allOrders = (bundle && Array.isArray(bundle.orders)) ? bundle.orders : [];
+  const allFills = (bundle && Array.isArray(bundle.fills)) ? bundle.fills : [];
   let filled = 0, open = 0, dead = 0;
-  for (const o of orders) {
+  // stats always from full stream
+  for (const o of allOrders) {
     const st = (o.status || "").toUpperCase();
     if (st === "FILLED") filled++;
     else if (st === "REJECTED" || st === "CANCELED") dead++;
     else open++;
   }
-  $("ord_total").textContent = String(orders.length);
+  $("ord_total").textContent = String(allOrders.length);
   $("ord_filled").textContent = String(filled);
   $("ord_open").textContent = String(open);
   $("ord_dead").textContent = String(dead);
-  $("ord_fills").textContent = String(fills.length);
+  $("ord_fills").textContent = String(allFills.length);
+
+  const ordersT = allOrders.filter(o => withinHours(o.updated_ts || o.created_ts, ordHours));
+  const fillsT = allFills.filter(f => withinHours(f.ts, ordHours));
+  const orders = ordLimit > 0 ? ordersT.slice(0, ordLimit) : ordersT;
+  const fills = ordLimit > 0 ? fillsT.slice(0, ordLimit) : fillsT;
+  {
+    const c = $("ord_count");
+    if (c) c.textContent = "订单 " + orders.length + " / " + ordersT.length + " · 成交 " + fills.length + " / " + fillsT.length;
+  }
 
   const ob = $("ord_body");
   if (orders.length === 0) {
     ob.innerHTML = '<tr><td colspan="8" class="muted">暂无订单</td></tr>';
   } else {
-    ob.innerHTML = orders.slice(0, 80).map(o => {
+    ob.innerHTML = orders.map(o => {
       const st = (o.status || "").toUpperCase();
       const cls = st === "FILLED" ? "ok" : (st === "REJECTED" || st === "UNKNOWN" ? "bad" : (st === "CANCELED" ? "muted" : "warn"));
       return `<tr>
@@ -1595,7 +1664,7 @@ function renderOrders(bundle) {
   if (fills.length === 0) {
     fb.innerHTML = '<tr><td colspan="6" class="muted">暂无成交明细</td></tr>';
   } else {
-    fb.innerHTML = fills.slice(0, 80).map(f =>
+    fb.innerHTML = fills.map(f =>
       `<tr>
         <td>${f.ts || ""}</td>
         <td title="${f.fill_id || ""}">${short(f.fill_id, 16)}</td>
