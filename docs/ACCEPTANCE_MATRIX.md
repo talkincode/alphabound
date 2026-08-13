@@ -7,9 +7,9 @@
 > - **阶段** 指该条目必须通过的最晚阶段闸门(见 [ROADMAP.md](ROADMAP.md));进入 Phase 4 实盘前,P0–P3 条目必须全绿
 > - **状态**: ☐ 未开始 · ◐ 进行中 · ☑ 通过
 >
-> **状态快照(2026-08)**: 核心软件 + shadow 在线路径已验证(`zig build test` 全绿; Dashboard 提案/BH; 本机 OKX
-> 公共行情、只读私有余额、Azure LLM 提案、market 工具落库)。下表 ◐ = 代码+单测/部分实网已落地,
-> 但设计要求的完整 Integration/Fault/Soak/Manual 尚未全部执行(Demo/Live 与长稳仍缺)。
+> **状态快照(2026-08-13)**: 核心软件 + shadow/demo/live 主路径已验证(`zig build test` 全绿; Dashboard 提案/BH/订单;
+> 鉴权+MCP; 本机/生产 OKX 公共行情与私有余额、LLM 提案、market/derivatives 工具落库; 小额 live 下单与 flatten)。
+> 下表 ◐ = 代码+单测/部分实网已落地, 完整 7 日 Soak 与部分实网 Fault 仍缺。
 
 ## A. 功能需求(FR)
 

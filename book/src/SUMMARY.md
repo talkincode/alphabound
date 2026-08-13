@@ -9,6 +9,7 @@
 - [Agent 配置（OpenAI）](guide/agent.md)
 - [CLI 参考](guide/cli.md)
 - [Dashboard 与 API](guide/dashboard-api.md)
+- [鉴权与 MCP](guide/auth-mcp.md)
 - [运行模式](guide/modes.md)
 - [运维部署](guide/operations.md)
   - [Admin control](guide/admin-control.md)
@@ -32,4 +33,5 @@
 
 - [设计分析](planning/design-analysis.md)
 - [路线图](planning/roadmap.md)
+- [下一步](planning/next.md)
 - [验收矩阵](planning/acceptance.md)

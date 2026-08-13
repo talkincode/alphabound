@@ -6,10 +6,11 @@
 
 | | |
 |---|---|
-| 范围 | OKX BTC-USDT 现货 · 100 USDT 实验资金 |
+| 范围 | OKX BTC-USDT 现货 · 约 100 USDT 实验资金 |
 | 硬边界 | 基于历史高水位 (HWM) 的 **10% 最大回撤** |
-| 技术栈 | Zig 0.16.0 · SQLite WAL · Azure Linux VM · systemd |
+| 技术栈 | Zig 0.16.0 · SQLite WAL · systemd · 嵌入式 Dashboard |
 | 仓库 | [talkincode/alphabound](https://github.com/talkincode/alphabound) |
+| 当前 | Shadow 默认；**小额 `mode=live` 已解锁**（`OKX_REAL_MONEY_OK=1`）；Dashboard 鉴权 + 只读 MCP |
 
 ## 一句话理解
 
@@ -24,16 +25,19 @@ Agent 可以提出任何交易观点，但**不能**直接调用交易凭证，�
 结构化 Proposal → Risk Kernel 准入 → Execution Engine 幂等下单
 ```
 
+管理动作（pause / flatten / target-weight）只走**本机 CLI**；Dashboard 与 MCP 是**只读**观察面。
+
 ## 本手册怎么读
 
 | 你是… | 从这里开始 |
 |---|---|
 | 想在本机先跑起来 | [快速开始](guide/quickstart.md) |
 | 要改配置 / 接密钥 | [配置参考](guide/configuration.md) · [CLI 参考](guide/cli.md) |
+| 要保护 Dashboard / 接 IDE | [鉴权与 MCP](guide/auth-mcp.md) |
 | 要上 VM 常驻 | [运维部署](guide/operations.md) |
 | 要理解安全边界 | [四支柱架构](concepts/pillars.md) · [风险模型](concepts/risk.md) |
 | 要改代码 / 写测试 | [构建与测试](dev/build.md) · [关键不变量](dev/invariants.md) |
-| 要对齐阶段闸门 | [路线图](planning/roadmap.md) · [验收矩阵](planning/acceptance.md) |
+| 要对齐阶段闸门 | [路线图](planning/roadmap.md) · [下一步](planning/next.md) · [验收矩阵](planning/acceptance.md) |
 
 ## 风险说明
 
@@ -46,7 +50,7 @@ Agent 可以提出任何交易观点，但**不能**直接调用交易凭证，�
 ```bash
 # 需要 mdbook ≥ 0.4（本机可用 Homebrew: brew install mdbook）
 ./scripts/build-docs.sh          # 构建到 book/book/
-./scripts/build-docs.sh serve    # 本地预览 http://localhost:3000
+./scripts/build-docs.sh serve    # 本地预览 http://127.0.0.1:3000
 ```
 
 CI 在每次 push / PR 会执行 `mdbook build`，保证链接与语法不过期。

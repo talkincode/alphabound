@@ -109,6 +109,10 @@ open http://127.0.0.1:18180/
 | `GET /health/ready` | READY 后 200 |
 | `GET /api/v1/state` | 版本化状态快照 |
 | `GET /api/v1/events` | 最近事件 |
+| `GET /api/v1/orders` | 订单/fills 投影 |
+| `GET /api/v1/system` | 进程与 agent 统计 |
+
+若设置了 `ALPHABOUND_API_TOKEN`，数据 API 需 `Authorization: Bearer …` 或先登录；见 [鉴权与 MCP](auth-mcp.md)。
 
 ## 7. 查库
 
@@ -149,5 +153,6 @@ set -a && source ./secrets.env && set +a
 - 配置项 → [配置参考](configuration.md)
 - Agent → [Agent 配置（OpenAI）](agent.md)
 - 模式差异 → [运行模式](modes.md)
+- Dashboard / 鉴权 / MCP → [Dashboard 与 API](dashboard-api.md) · [鉴权与 MCP](auth-mcp.md)
 - Docker/GHCR → [Docker 与 GHCR](docker.md)
 - 运维 → [运维部署](operations.md)

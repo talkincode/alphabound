@@ -4,12 +4,13 @@
 > 阶段串行推进,**退出条件未满足不得进入下一阶段**;各条目与
 > [验收矩阵](ACCEPTANCE_MATRIX.md) 的 AC 编号对应。
 
-**当前进度(2026-08)**: Phase 0–3 代码主路径已通；**小额 `mode=live` 已解锁**（`OKX_REAL_MONEY_OK=1`）。
-**本机/生产已验证**: OKX 公共行情 + 私有余额 REST 对账、Agent 提案/反思、Dashboard、
-小额实盘下单（operator + agent REBALANCE → FILLED）、flatten/cancel-all、部署回滚与 soak 脚本。
+**当前进度(2026-08-13)**: Phase 0–3 代码主路径已通；**小额 `mode=live` 已解锁**（`OKX_REAL_MONEY_OK=1`）。
+**本机/生产已验证**: OKX 公共行情 + 私有余额 REST 对账、Agent 提案/反思、Dashboard（Token/Session/Passkey）、
+只读 Analytics MCP、小额实盘下单（operator + agent REBALANCE → FILLED）、flatten/cancel-all/target-weight、
+部署回滚与 soak/drill 脚本、故障矩阵单测 FD1–10、L1 `market.derivatives` 持仓包。
 私有 WS 仍 opt-in；REST 对账为主路径。
-**尚未完成**: Gate3 故障矩阵逐项 + ≥7 日滚动 soak（AC-GO8）、Phase 5 L1 引用率观察。
-**下一步**: 配置迁 `mode=live`、稳盘证据、故障矩阵收口；见 [NEXT.md](NEXT.md)。
+**尚未完成**: ≥7 日滚动 soak（AC-GO8）、部分故障场景实网注入、Phase 5 L1 引用率观察。
+**下一步**: 稳盘证据与 Gate3 收口；见 [NEXT.md](NEXT.md)。
 
 ```
 Phase 0 ──► Phase 1 ──► Phase 2 ──► Phase 3 ──► Phase 4 ──► Phase 5
@@ -127,7 +128,7 @@ Phase 0 ──► Phase 1 ──► Phase 2 ──► Phase 3 ──► Phase 4 
 **退出条件(Gate 3)**
 - [ ] 交易模式（demo 或小额 live）连续稳定运行 ≥ 7 天(soak)
 - [x] 至少一次断线恢复演练 + 一次版本回滚演练通过（2026-08-12）
-- [ ] 故障降级矩阵(§7.2)10 项场景逐项验证
+- [x] 故障降级矩阵(§7.2)单测 FD1–10 齐（`src/fault/matrix.zig`）；部分实网注入仍可选
 - [x] Risk Kernel property / 费用滑点部分成交相关验收项已落地（见 ACCEPTANCE_MATRIX）
 - [x] **`mode=live` 小额路径解锁**（`OKX_REAL_MONEY_OK=1`，非主账户）
 

@@ -7,7 +7,8 @@
 ```text
 alphabound [--config PATH] [--self-check] [--version] [--ticks N]
            [--agent-once] [--agent-stats]
-           [--control pause|resume|reconcile|cancel-all|flatten|shutdown|status]
+           [--control pause|resume|reconcile|cancel-all|flatten|target-weight=W|shutdown|status]
+           [--verify-db PATH]
 ```
 
 无参或非法参数时打印 usage 并以非零退出。
@@ -23,6 +24,7 @@ alphabound [--config PATH] [--self-check] [--version] [--ticks N]
 | `--agent-once` | 否 | READY 后强制一轮 Agent（shadow 只审计，需 `LLM_*`） |
 | `--agent-stats` | 否 | 打印 agent_runs 有效率与 tool_calls 计数后退出 |
 | `--control CMD` | 否 | 本机管理（写控制文件后退出，不启 daemon）。见 [Admin control](admin-control.md) |
+| `--verify-db PATH` | 否 | 离线审计链抽查（订单 → 决策锚点 / fills），不启 daemon |
 
 ## 退出码
 
@@ -37,11 +39,12 @@ alphabound [--config PATH] [--self-check] [--version] [--ticks N]
 
 | 前缀 | 阶段 |
 |---|---|
-| `[boot]` | 加载配置、开库、恢复 HWM、起 web |
+| `[boot]` | 加载配置、开库、恢复 HWM、起 web；live 醒目 banner |
 | `[connect]` | 探测交易所 REST（时间同步） |
 | `[ready]` | 对账完成，进入主循环 |
-| `[reconcile]` | 私有余额只读探针（有 OKX 密钥时） |
+| `[reconcile]` | 私有余额只读探针 / live balance applied |
 | `[agent]` | 慢环决策 / 工具 / 降级 HOLD |
+| `[admin]` | 本机控制命令生效 |
 | `[tick N]` | 单次行情处理摘要（bid / equity / dd / mode） |
 | `[risk]` | 风险模式切换 |
 | `[loop]` | 行情拉取失败等可恢复错误 |
@@ -56,19 +59,22 @@ alphabound [--config PATH] [--self-check] [--version] [--ticks N]
 # 版本
 ./zig-out/bin/alphabound --version
 
-# 配置与 DB 冒烟（无外网也可部分通过；self-check 当前会开库写 migration）
+# 配置与 DB 冒烟
 ./zig-out/bin/alphabound --config /etc/alphabound/alphabound.toml --self-check
 
 # 本地有界验证
-./zig-out/bin/alphabound --config /tmp/ab-dev/dev.toml --ticks 10
+./zig-out/bin/alphabound --config config/local.toml --ticks 10
 
 # Agent 一轮 + 统计（需 secrets.env）
 set -a && source ./secrets.env && set +a
 ./zig-out/bin/alphabound --config config/local.toml --agent-once --ticks 5
 ./zig-out/bin/alphabound --config config/local.toml --agent-stats
 
+# 审计链
+./zig-out/bin/alphabound --verify-db var/trading.db
+
 # 常驻（前台）；生产用 systemd，见运维章
-./zig-out/bin/alphabound --config /tmp/ab-dev/dev.toml
+./zig-out/bin/alphabound --config config/local.toml
 ```
 
 ## 信号处理
@@ -80,10 +86,12 @@ set -a && source ./secrets.env && set +a
 
 ## 管理命令
 
-设计要求 pause / resume / reconcile / cancel-all / flatten / safe-shutdown 走**本机 CLI**（控制文件），不走公网 HTTP。详见 [Admin control](admin-control.md)。
+设计要求 pause / resume / reconcile / cancel-all / flatten / target-weight / safe-shutdown 走**本机 CLI**（控制文件），不走公网 HTTP。详见 [Admin control](admin-control.md)。
 
-Gate 2 阈值快照（daemon 已在跑时）：
+运维报告（daemon 已在跑时）：
 
 ```bash
 ./scripts/gate2-report.sh
+HOST=<sshx-name> ./scripts/soak-report.sh 24
+HOST=<sshx-name> ./scripts/check-remote.sh
 ```

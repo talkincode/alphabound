@@ -10,6 +10,7 @@ AlphaBound 管理命令**不走网络**：CLI 写入 DB 同目录控制文件，
 ./zig-out/bin/alphabound --config config/local.toml --control reconcile
 ./zig-out/bin/alphabound --config config/local.toml --control cancel-all
 ./zig-out/bin/alphabound --config config/local.toml --control flatten
+./zig-out/bin/alphabound --config config/local.toml --control 'target-weight=0.05'
 ./zig-out/bin/alphabound --config config/local.toml --control shutdown
 ./zig-out/bin/alphabound --config config/local.toml --control status
 ```
@@ -17,11 +18,11 @@ AlphaBound 管理命令**不走网络**：CLI 写入 DB 同目录控制文件，
 | 命令 | 行为 |
 |---|---|
 | `pause` | 停止 agent 决策环；行情/风险/对账继续 |
-| `resume` | 恢复 agent |
-| `reconcile` | 立即触发一次私有 REST 余额对账 |
-| `cancel-all` | 取消开放订单。Shadow：只记审计事件；**Demo**（`OKX_SIMULATED=1`）：拉 pending 并逐笔 `cancel-order` |
-| `flatten` | 操作员退出：进入 `FLATTENING`，主环自动市价卖向 weight=0；BTC 低于 lot dust 后 `flatten_complete` → `HALTED` |
 | `resume` | 恢复 agent；若风险态为 `HALTED`，同时 `operator_reset` → `EXIT_ONLY`（再经对账回到 NORMAL） |
+| `reconcile` | 立即触发一次私有 REST 余额对账 |
+| `cancel-all` | 取消开放订单。Shadow：只记审计事件；**demo/live**（交易模式）：拉 pending 并逐笔 `cancel-order` |
+| `flatten` | 操作员退出：进入 `FLATTENING`，主环自动市价卖向 weight=0；BTC 低于 lot dust 后 `flatten_complete` → `HALTED` |
+| `target-weight=W` | 操作员目标仓位（0–1 小数）；经同一 planner/执行栈；写审计锚点 `ADMIN_TARGET_WEIGHT` |
 | `shutdown` | 等价安全停机（与 SIGTERM 相同排空路径） |
 | `status` | 读 `*.control.state`（daemon 写入） |
 
@@ -29,3 +30,9 @@ AlphaBound 管理命令**不走网络**：CLI 写入 DB 同目录控制文件，
 状态文件：`var/trading.control.state`
 
 Dashboard `/api/v1/system` 含 `"paused": true|false`。
+
+## 安全
+
+- 控制面**不**暴露为 HTTP API；MCP 也**不能** pause/flatten/下单。
+- `target-weight` / `flatten` 在 shadow 下不触达交易所；demo/live 会真实发单（live 须已 opt-in）。
+- 生产操作请用服务用户：`sudo -u alphabound /opt/alphabound/current/alphabound --config ... --control ...`
