@@ -363,6 +363,17 @@ pub fn sec1FromSpki(spki: []const u8) ?[65]u8 {
     return null;
 }
 
+/// Extract a JSON string field value by exact key. Byte-exact match only —
+/// no unescaping, which is fine for type/origin/challenge fields the browser
+/// emits without escapes.
+fn clientDataField(client_data_json: []const u8, comptime name: []const u8) ?[]const u8 {
+    const key = "\"" ++ name ++ "\":\"";
+    const pos = std.mem.indexOf(u8, client_data_json, key) orelse return null;
+    const start = pos + key.len;
+    const end = std.mem.indexOfScalar(u8, client_data_json[start..], '"') orelse return null;
+    return client_data_json[start .. start + end];
+}
+
 pub fn verifyWebAuthnAssertion(
     pub_sec1: [65]u8,
     authenticator_data: []const u8,
@@ -370,20 +381,26 @@ pub fn verifyWebAuthnAssertion(
     sig_der: []const u8,
     expected_challenge_b64: []const u8,
     expected_origin: []const u8,
+    expected_rp_id: []const u8,
     challenge_bank: *ChallengeBank,
     now_ms: i64,
 ) bool {
-    if (std.mem.indexOf(u8, client_data_json, "webauthn.get") == null) return false;
-    if (std.mem.indexOf(u8, client_data_json, expected_origin) == null) return false;
-    const key = "\"challenge\":\"";
-    const cpos = std.mem.indexOf(u8, client_data_json, key) orelse return false;
-    const cstart = cpos + key.len;
-    const cend = std.mem.indexOfScalar(u8, client_data_json[cstart..], '"') orelse return false;
-    const ch_b64 = client_data_json[cstart .. cstart + cend];
+    // Exact field matches — substring search would let `webauthn.create`
+    // ceremonies or origin-prefix lookalikes (`http://host.evil.com`) pass.
+    const typ = clientDataField(client_data_json, "type") orelse return false;
+    if (!std.mem.eql(u8, typ, "webauthn.get")) return false;
+    const origin = clientDataField(client_data_json, "origin") orelse return false;
+    if (!std.mem.eql(u8, origin, expected_origin)) return false;
+    const ch_b64 = clientDataField(client_data_json, "challenge") orelse return false;
     if (!std.mem.eql(u8, ch_b64, expected_challenge_b64)) return false;
     // Challenge must be one we issued (single-use).
     if (!challenge_bank.consume(ch_b64, now_ms)) return false;
     if (authenticator_data.len < 37) return false;
+    // rpIdHash must match SHA-256(rpId) and the User Present flag must be set.
+    var rp_hash: [32]u8 = undefined;
+    crypto.hash.sha2.Sha256.hash(expected_rp_id, &rp_hash, .{});
+    if (!constantTimeEql(authenticator_data[0..32], &rp_hash)) return false;
+    if (authenticator_data[32] & 0x01 == 0) return false;
 
     var cd_hash: [32]u8 = undefined;
     crypto.hash.sha2.Sha256.hash(client_data_json, &cd_hash, .{});
@@ -394,7 +411,6 @@ pub fn verifyWebAuthnAssertion(
     @memcpy(msg_buf[authenticator_data.len..][0..cd_hash.len], &cd_hash);
     const msg = msg_buf[0 .. authenticator_data.len + cd_hash.len];
 
-    const Ecdsa = crypto.sign.ecdsa.EcdsaP256Sha256;
     const pk = Ecdsa.PublicKey.fromSec1(&pub_sec1) catch return false;
     // WebAuthn ES256 signatures are commonly DER; some platforms emit raw r||s (64).
     const sig = if (Ecdsa.Signature.fromDer(sig_der)) |s| s else |_| blk: {
@@ -591,4 +607,275 @@ test "sec1 from spki trailing" {
     @memset(spki2[1..], 0x11);
     const got = sec1FromSpki(&spki2).?;
     try testing.expect(got[0] == 0x04);
+}
+
+// -- WebAuthn assertion verification (positive + negative) --------------------
+
+const Ecdsa = crypto.sign.ecdsa.EcdsaP256Sha256;
+
+/// Offline test rig: deterministic key, self-issued challenge, valid assertion.
+/// Stores lengths (not slices) so the struct stays trivially copyable.
+const WebAuthnRig = struct {
+    const rp_id = "localhost";
+    const origin = "http://127.0.0.1:8080";
+    const now: i64 = 1_000_000;
+
+    kp: Ecdsa.KeyPair,
+    pub_sec1: [65]u8,
+    challenge_b64_buf: [64]u8,
+    challenge_b64_len: usize,
+    auth_data: [37]u8,
+    client_data_buf: [256]u8,
+    client_data_len: usize,
+    sig_der_buf: [Ecdsa.Signature.der_encoded_length_max]u8,
+    sig_der_len: usize,
+
+    fn challenge(rig: *const WebAuthnRig) []const u8 {
+        return rig.challenge_b64_buf[0..rig.challenge_b64_len];
+    }
+    fn clientData(rig: *const WebAuthnRig) []const u8 {
+        return rig.client_data_buf[0..rig.client_data_len];
+    }
+    fn sigDer(rig: *const WebAuthnRig) []const u8 {
+        return rig.sig_der_buf[0..rig.sig_der_len];
+    }
+
+    fn init() !WebAuthnRig {
+        var rig: WebAuthnRig = undefined;
+        rig.kp = try Ecdsa.KeyPair.generateDeterministic([_]u8{7} ** 32);
+        rig.pub_sec1 = rig.kp.public_key.toUncompressedSec1();
+
+        const raw_challenge = [_]u8{0xA5} ** 32;
+        const n = std.base64.url_safe_no_pad.Encoder.calcSize(raw_challenge.len);
+        _ = std.base64.url_safe_no_pad.Encoder.encode(rig.challenge_b64_buf[0..n], &raw_challenge);
+        rig.challenge_b64_len = n;
+
+        crypto.hash.sha2.Sha256.hash(rp_id, rig.auth_data[0..32], .{});
+        rig.auth_data[32] = 0x01; // UP flag
+        @memset(rig.auth_data[33..37], 0); // counter
+
+        const cd = try std.fmt.bufPrint(
+            &rig.client_data_buf,
+            "{{\"type\":\"webauthn.get\",\"challenge\":\"{s}\",\"origin\":\"{s}\",\"crossOrigin\":false}}",
+            .{ rig.challenge_b64_buf[0..n], origin },
+        );
+        rig.client_data_len = cd.len;
+        try rig.signOver(rig.clientData());
+        return rig;
+    }
+
+    /// Sign auth_data ++ SHA256(client_data_json) with the rig key.
+    fn signOver(rig: *WebAuthnRig, client_data_json: []const u8) !void {
+        var cd_hash: [32]u8 = undefined;
+        crypto.hash.sha2.Sha256.hash(client_data_json, &cd_hash, .{});
+        var msg: [69]u8 = undefined;
+        @memcpy(msg[0..37], &rig.auth_data);
+        @memcpy(msg[37..69], &cd_hash);
+        const sig = try rig.kp.sign(&msg, null);
+        rig.sig_der_len = sig.toDer(&rig.sig_der_buf).len;
+    }
+
+    /// Bank pre-seeded with the rig challenge (bypasses io-backed issue()).
+    fn seededBank(rig: *const WebAuthnRig) ChallengeBank {
+        var bank = ChallengeBank{ .io = undefined };
+        var raw: [32]u8 = undefined;
+        std.base64.url_safe_no_pad.Decoder.decode(&raw, rig.challenge()) catch unreachable;
+        bank.slots[0] = .{ .bytes = raw, .exp_ms = now + 60_000, .used = true };
+        return bank;
+    }
+
+    fn verify(rig: *const WebAuthnRig, bank: *ChallengeBank) bool {
+        return verifyWebAuthnAssertion(
+            rig.pub_sec1,
+            &rig.auth_data,
+            rig.clientData(),
+            rig.sigDer(),
+            rig.challenge(),
+            origin,
+            rp_id,
+            bank,
+            now,
+        );
+    }
+};
+
+test "webauthn assertion valid signature passes" {
+    var rig = try WebAuthnRig.init();
+    var bank = rig.seededBank();
+    try testing.expect(rig.verify(&bank));
+}
+
+test "webauthn assertion raw r||s signature passes" {
+    var rig = try WebAuthnRig.init();
+    // Re-encode the DER signature as raw 64-byte r||s (some platforms emit this).
+    const sig = try Ecdsa.Signature.fromDer(rig.sigDer());
+    const raw = sig.toBytes();
+    var bank = rig.seededBank();
+    try testing.expect(verifyWebAuthnAssertion(
+        rig.pub_sec1,
+        &rig.auth_data,
+        rig.clientData(),
+        &raw,
+        rig.challenge(),
+        WebAuthnRig.origin,
+        WebAuthnRig.rp_id,
+        &bank,
+        WebAuthnRig.now,
+    ));
+}
+
+test "webauthn assertion rejects corrupted signature" {
+    var rig = try WebAuthnRig.init();
+    var bad_sig: [Ecdsa.Signature.der_encoded_length_max]u8 = undefined;
+    @memcpy(bad_sig[0..rig.sigDer().len], rig.sigDer());
+    bad_sig[rig.sigDer().len - 1] ^= 0x01;
+    var bank = rig.seededBank();
+    try testing.expect(!verifyWebAuthnAssertion(
+        rig.pub_sec1,
+        &rig.auth_data,
+        rig.clientData(),
+        bad_sig[0..rig.sigDer().len],
+        rig.challenge(),
+        WebAuthnRig.origin,
+        WebAuthnRig.rp_id,
+        &bank,
+        WebAuthnRig.now,
+    ));
+}
+
+test "webauthn assertion rejects tampered challenge" {
+    var rig = try WebAuthnRig.init();
+    // Attacker swaps the signed-over challenge for one we never issued.
+    var forged: [256]u8 = undefined;
+    const fc = "FORGED_CHALLENGE_AAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const cd = try std.fmt.bufPrint(
+        &forged,
+        "{{\"type\":\"webauthn.get\",\"challenge\":\"{s}\",\"origin\":\"{s}\",\"crossOrigin\":false}}",
+        .{ fc, WebAuthnRig.origin },
+    );
+    try rig.signOver(cd); // even a *validly signed* wrong challenge must fail
+    var bank = rig.seededBank();
+    try testing.expect(!verifyWebAuthnAssertion(
+        rig.pub_sec1,
+        &rig.auth_data,
+        cd,
+        rig.sigDer(),
+        rig.challenge(),
+        WebAuthnRig.origin,
+        WebAuthnRig.rp_id,
+        &bank,
+        WebAuthnRig.now,
+    ));
+}
+
+test "webauthn assertion challenge is single use (replay)" {
+    var rig = try WebAuthnRig.init();
+    var bank = rig.seededBank();
+    try testing.expect(rig.verify(&bank));
+    // Identical, fully valid assertion replayed: challenge already consumed.
+    try testing.expect(!rig.verify(&bank));
+}
+
+test "webauthn assertion rejects expired challenge" {
+    var rig = try WebAuthnRig.init();
+    var bank = rig.seededBank();
+    bank.slots[0].exp_ms = WebAuthnRig.now - 1;
+    try testing.expect(!rig.verify(&bank));
+}
+
+test "webauthn assertion rejects wrong origin" {
+    var rig = try WebAuthnRig.init();
+    // Signed client data claims a lookalike origin with the real one as prefix.
+    var cd_buf: [256]u8 = undefined;
+    const cd = try std.fmt.bufPrint(
+        &cd_buf,
+        "{{\"type\":\"webauthn.get\",\"challenge\":\"{s}\",\"origin\":\"{s}.evil.example\",\"crossOrigin\":false}}",
+        .{ rig.challenge(), WebAuthnRig.origin },
+    );
+    try rig.signOver(cd);
+    var bank = rig.seededBank();
+    try testing.expect(!verifyWebAuthnAssertion(
+        rig.pub_sec1,
+        &rig.auth_data,
+        cd,
+        rig.sigDer(),
+        rig.challenge(),
+        WebAuthnRig.origin,
+        WebAuthnRig.rp_id,
+        &bank,
+        WebAuthnRig.now,
+    ));
+}
+
+test "webauthn assertion rejects wrong ceremony type" {
+    var rig = try WebAuthnRig.init();
+    // webauthn.create (registration) response must not authenticate a login.
+    var cd_buf: [256]u8 = undefined;
+    const cd = try std.fmt.bufPrint(
+        &cd_buf,
+        "{{\"type\":\"webauthn.create\",\"challenge\":\"{s}\",\"origin\":\"{s}\",\"crossOrigin\":false}}",
+        .{ rig.challenge(), WebAuthnRig.origin },
+    );
+    try rig.signOver(cd);
+    var bank = rig.seededBank();
+    try testing.expect(!verifyWebAuthnAssertion(
+        rig.pub_sec1,
+        &rig.auth_data,
+        cd,
+        rig.sigDer(),
+        rig.challenge(),
+        WebAuthnRig.origin,
+        WebAuthnRig.rp_id,
+        &bank,
+        WebAuthnRig.now,
+    ));
+}
+
+test "webauthn assertion rejects wrong rpIdHash" {
+    var rig = try WebAuthnRig.init();
+    crypto.hash.sha2.Sha256.hash("attacker.example", rig.auth_data[0..32], .{});
+    try rig.signOver(rig.clientData()); // resign so only rpIdHash is at fault
+    var bank = rig.seededBank();
+    try testing.expect(!rig.verify(&bank));
+}
+
+test "webauthn assertion rejects missing user-present flag" {
+    var rig = try WebAuthnRig.init();
+    rig.auth_data[32] = 0x00;
+    try rig.signOver(rig.clientData()); // resign so only the UP flag is at fault
+    var bank = rig.seededBank();
+    try testing.expect(!rig.verify(&bank));
+}
+
+test "webauthn assertion rejects truncated authenticator data" {
+    var rig = try WebAuthnRig.init();
+    var bank = rig.seededBank();
+    try testing.expect(!verifyWebAuthnAssertion(
+        rig.pub_sec1,
+        rig.auth_data[0..36],
+        rig.clientData(),
+        rig.sigDer(),
+        rig.challenge(),
+        WebAuthnRig.origin,
+        WebAuthnRig.rp_id,
+        &bank,
+        WebAuthnRig.now,
+    ));
+}
+
+test "webauthn assertion rejects wrong public key" {
+    var rig = try WebAuthnRig.init();
+    const other = try Ecdsa.KeyPair.generateDeterministic([_]u8{9} ** 32);
+    var bank = rig.seededBank();
+    try testing.expect(!verifyWebAuthnAssertion(
+        other.public_key.toUncompressedSec1(),
+        &rig.auth_data,
+        rig.clientData(),
+        rig.sigDer(),
+        rig.challenge(),
+        WebAuthnRig.origin,
+        WebAuthnRig.rp_id,
+        &bank,
+        WebAuthnRig.now,
+    ));
 }
