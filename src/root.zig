@@ -28,6 +28,7 @@ pub const okx_private_ws_client = @import("exchange/okx/private_ws_client.zig");
 pub const tools = @import("tools/registry.zig");
 pub const market_tools = @import("tools/market.zig");
 pub const indicators = @import("tools/indicators.zig");
+pub const external_tools = @import("tools/external.zig");
 pub const memory = @import("memory/store.zig");
 pub const reflection = @import("agent/reflection.zig");
 pub const context = @import("agent/context.zig");

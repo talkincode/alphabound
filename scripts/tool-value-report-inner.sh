@@ -22,6 +22,9 @@ keys = {
     "long_short": re.compile(r"long[_ -]?short|ls_ratio|long_short_ratio", re.I),
     "taker": re.compile(r"taker", re.I),
     "basis": re.compile(r"basis", re.I),
+    "indicator": re.compile(r"\brsi\b|\batr\b|\bsma\b|\bema\b|bollinger|donchian|realized vol", re.I),
+    "onchain": re.compile(r"mempool|sat/vB|fee[s]?_sat|difficulty|retarget|on[- ]?chain", re.I),
+    "sentiment": re.compile(r"fear|greed|sentiment", re.I),
 }
 any_pat = re.compile(
     r"funding|open[_ ]?interest|\boi\b|long[_ -]?short|taker|basis_bps|basis",

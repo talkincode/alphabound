@@ -555,6 +555,13 @@ pub const Client = struct {
         return self.request(.GET, path, "", false);
     }
 
+    /// GET an absolute https URL on a non-OKX host (public, unsigned data
+    /// sources only). Same fixed-capacity sink and pool-reset retry as OKX
+    /// paths — a hostile third-party host cannot balloon memory.
+    pub fn getAbsoluteUrl(self: *Client, url: []const u8) ![]u8 {
+        return self.fetchRawUrl(.GET, url, "", &.{});
+    }
+
     /// Signed GET (账户/订单查询).
     pub fn getPrivate(self: *Client, path: []const u8, now_ms: i64) ![]u8 {
         return self.requestSigned(.GET, path, "", now_ms);
@@ -586,19 +593,23 @@ pub const Client = struct {
     }
 
     fn fetchRaw(self: *Client, method: auth.Method, path: []const u8, body: []const u8, extra_headers: []const std.http.Header) ![]u8 {
-        return self.fetchRawOnce(method, path, body, extra_headers) catch |err| {
+        var url_buf: [512]u8 = undefined;
+        const url = std.fmt.bufPrint(&url_buf, "{s}{s}", .{ self.base_url, path }) catch return Error.HttpFailed;
+        return self.fetchRawUrl(method, url, body, extra_headers);
+    }
+
+    fn fetchRawUrl(self: *Client, method: auth.Method, url: []const u8, body: []const u8, extra_headers: []const std.http.Header) ![]u8 {
+        return self.fetchRawOnce(method, url, body, extra_headers) catch |err| {
             if (err != Error.HttpFailed) return err;
             // Zig may re-offer a half-closed pooled TLS socket after a blip; drop the
             // pool and retry once so the daemon does not stay wedged until restart.
-            std.debug.print("[okx] transport_failed; reset_http_retry path={s}\n", .{path});
+            std.debug.print("[okx] transport_failed; reset_http_retry url={s}\n", .{url});
             self.resetHttp();
-            return self.fetchRawOnce(method, path, body, extra_headers);
+            return self.fetchRawOnce(method, url, body, extra_headers);
         };
     }
 
-    fn fetchRawOnce(self: *Client, method: auth.Method, path: []const u8, body: []const u8, extra_headers: []const std.http.Header) ![]u8 {
-        var url_buf: [512]u8 = undefined;
-        const url = std.fmt.bufPrint(&url_buf, "{s}{s}", .{ self.base_url, path }) catch return Error.HttpFailed;
+    fn fetchRawOnce(self: *Client, method: auth.Method, url: []const u8, body: []const u8, extra_headers: []const std.http.Header) ![]u8 {
 
         // AC-SEC5: fixed-capacity sink — a hostile/broken gateway cannot balloon memory.
         const sink = self.gpa.alloc(u8, limits.max_okx_response_bytes) catch return Error.OutOfMemory;
@@ -616,10 +627,10 @@ pub const Client = struct {
             .keep_alive = false,
         }) catch |err| {
             if (err == error.WriteFailed) {
-                std.debug.print("[okx] response_too_large cap={d} path={s}\n", .{ limits.max_okx_response_bytes, path });
+                std.debug.print("[okx] response_too_large cap={d} url={s}\n", .{ limits.max_okx_response_bytes, url });
                 return Error.HttpFailed;
             }
-            std.debug.print("[okx] transport_failed err={s} path={s}\n", .{ @errorName(err), path });
+            std.debug.print("[okx] transport_failed err={s} url={s}\n", .{ @errorName(err), url });
             return Error.HttpFailed;
         };
 
