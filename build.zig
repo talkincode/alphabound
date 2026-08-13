@@ -39,6 +39,24 @@ pub fn build(b: *std.Build) void {
     mod.addAnonymousImport("migration_0002", .{
         .root_source_file = b.path("migrations/0002_webauthn.sql"),
     });
+    mod.addAnonymousImport("favicon_svg", .{
+        .root_source_file = b.path("dashboard/favicon.svg"),
+    });
+    mod.addAnonymousImport("favicon_ico", .{
+        .root_source_file = b.path("dashboard/favicon.ico"),
+    });
+    mod.addAnonymousImport("favicon_png", .{
+        .root_source_file = b.path("dashboard/favicon.png"),
+    });
+    mod.addAnonymousImport("apple_touch_icon_png", .{
+        .root_source_file = b.path("dashboard/apple-touch-icon.png"),
+    });
+    mod.addAnonymousImport("icon_192_png", .{
+        .root_source_file = b.path("dashboard/icon-192.png"),
+    });
+    mod.addAnonymousImport("icon_512_png", .{
+        .root_source_file = b.path("dashboard/icon-512.png"),
+    });
 
     const exe = b.addExecutable(.{
         .name = "alphabound",

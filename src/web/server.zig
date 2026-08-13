@@ -8,6 +8,13 @@ const sm = @import("../risk/state_machine.zig");
 const clock = @import("../core/clock.zig");
 const auth = @import("auth.zig");
 
+const favicon_svg: []const u8 = @embedFile("favicon_svg");
+const favicon_ico: []const u8 = @embedFile("favicon_ico");
+const favicon_png: []const u8 = @embedFile("favicon_png");
+const apple_touch_icon_png: []const u8 = @embedFile("apple_touch_icon_png");
+const icon_192_png: []const u8 = @embedFile("icon_192_png");
+const icon_512_png: []const u8 = @embedFile("icon_512_png");
+
 pub const Response = struct {
     status: std.http.Status,
     content_type: []const u8 = "application/json",
@@ -119,12 +126,44 @@ fn pathOnly(target: []const u8) []const u8 {
     return if (std.mem.indexOfScalar(u8, target, '?')) |i| target[0..i] else target;
 }
 
+fn isBrandIconPath(path: []const u8) bool {
+    return std.mem.eql(u8, path, "/favicon.ico") or
+        std.mem.eql(u8, path, "/favicon.svg") or
+        std.mem.eql(u8, path, "/favicon.png") or
+        std.mem.eql(u8, path, "/apple-touch-icon.png") or
+        std.mem.eql(u8, path, "/icon-192.png") or
+        std.mem.eql(u8, path, "/icon-512.png");
+}
+
 fn isPublicPath(path: []const u8) bool {
     if (std.mem.eql(u8, path, "/health/live")) return true;
     if (std.mem.eql(u8, path, "/health/ready")) return true;
     if (std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, "/index.html")) return true;
+    if (isBrandIconPath(path)) return true;
     if (std.mem.startsWith(u8, path, "/api/v1/auth/")) return true;
     return false;
+}
+
+fn brandIconResponse(path: []const u8) ?Response {
+    if (std.mem.eql(u8, path, "/favicon.svg")) {
+        return .{ .status = .ok, .content_type = "image/svg+xml", .body = favicon_svg };
+    }
+    if (std.mem.eql(u8, path, "/favicon.ico")) {
+        return .{ .status = .ok, .content_type = "image/x-icon", .body = favicon_ico };
+    }
+    if (std.mem.eql(u8, path, "/favicon.png")) {
+        return .{ .status = .ok, .content_type = "image/png", .body = favicon_png };
+    }
+    if (std.mem.eql(u8, path, "/apple-touch-icon.png")) {
+        return .{ .status = .ok, .content_type = "image/png", .body = apple_touch_icon_png };
+    }
+    if (std.mem.eql(u8, path, "/icon-192.png")) {
+        return .{ .status = .ok, .content_type = "image/png", .body = icon_192_png };
+    }
+    if (std.mem.eql(u8, path, "/icon-512.png")) {
+        return .{ .status = .ok, .content_type = "image/png", .body = icon_512_png };
+    }
+    return null;
 }
 
 fn isAuthed(ctx: Context, req: RequestInfo) bool {
@@ -180,6 +219,11 @@ pub fn handleReq(buf: []u8, req: RequestInfo, ctx: Context) Response {
             return .{ .status = .ok, .content_type = "text/html; charset=utf-8", .body = ctx.index_html };
         }
         return .{ .status = .not_found, .body = "{\"error\":\"not found\"}" };
+    }
+
+    // --- brand icons (public; browsers request before login) ---
+    if (method == .GET) {
+        if (brandIconResponse(path)) |icon| return icon;
     }
 
     // --- protected data APIs ---
@@ -936,6 +980,36 @@ test "agent-runs equity shadow endpoints serve context blobs" {
     try testing.expectEqualStrings("{\"ready\":true}", handle(&buf, .GET, "/api/v1/system", ctx).body);
     try testing.expectEqualStrings("[{\"type\":\"AGENT_PROPOSAL_OK\"}]", handle(&buf, .GET, "/api/v1/decisions", ctx).body);
     try testing.expectEqualStrings("{\"orders\":[{\"status\":\"FILLED\"}],\"fills\":[]}", handle(&buf, .GET, "/api/v1/orders", ctx).body);
+}
+
+test "brand icons are public and embedded" {
+    var buf: [256]u8 = undefined;
+    var ctx = testCtx();
+    ctx.auth_cfg = .{ .api_token = "secret-token" };
+    ctx.auth_cfg.session_secret = auth.deriveSessionSecret(ctx.auth_cfg.api_token);
+
+    const svg = handle(&buf, .GET, "/favicon.svg", ctx);
+    try testing.expectEqual(std.http.Status.ok, svg.status);
+    try testing.expectEqualStrings("image/svg+xml", svg.content_type);
+    try testing.expect(svg.body.len > 32);
+    try testing.expect(std.mem.indexOf(u8, svg.body, "<svg") != null);
+
+    const ico = handle(&buf, .GET, "/favicon.ico", ctx);
+    try testing.expectEqual(std.http.Status.ok, ico.status);
+    try testing.expectEqualStrings("image/x-icon", ico.content_type);
+    try testing.expect(ico.body.len > 16);
+
+    const png = handle(&buf, .GET, "/favicon.png", ctx);
+    try testing.expectEqual(std.http.Status.ok, png.status);
+    try testing.expectEqualStrings("image/png", png.content_type);
+    try testing.expect(png.body.len > 16);
+    // PNG magic
+    try testing.expectEqual(@as(u8, 0x89), png.body[0]);
+    try testing.expectEqualStrings("PNG", png.body[1..4]);
+
+    try testing.expectEqual(std.http.Status.ok, handle(&buf, .GET, "/apple-touch-icon.png", ctx).status);
+    try testing.expectEqual(std.http.Status.ok, handle(&buf, .GET, "/icon-192.png", ctx).status);
+    try testing.expectEqual(std.http.Status.ok, handle(&buf, .GET, "/icon-512.png", ctx).status);
 }
 
 test "auth required blocks data APIs without token" {

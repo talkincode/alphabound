@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="AlphaBound">
+  <defs>
+    <linearGradient id="g" x1="16" y1="4" x2="16" y2="28" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#3fb950"/>
+      <stop offset="1" stop-color="#238636"/>
+    </linearGradient>
+  </defs>
+  <!-- dark squircle -->
+  <rect width="32" height="32" rx="8" fill="#0d1117"/>
+  <rect x="1.5" y="1.5" width="29" height="29" rx="7" fill="#161b22"/>
+  <!-- bound ring -->
+  <rect x="4.5" y="4.5" width="23" height="23" rx="5.5" fill="none" stroke="#58a6ff" stroke-width="2.2"/>
+  <!-- risk floor / HWM -->
+  <path d="M7.5 22.5h17" stroke="#d29922" stroke-width="2" stroke-linecap="round"/>
+  <!-- alpha peak -->
+  <path d="M16 21.5V9.2" stroke="url(#g)" stroke-width="2.4" stroke-linecap="round"/>
+  <path d="M9.8 15.2 16 8.2l6.2 7" fill="none" stroke="url(#g)" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M16 8.2V6.4" stroke="#3fb950" stroke-width="1.8" stroke-linecap="round"/>
+</svg>
