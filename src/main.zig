@@ -1397,6 +1397,13 @@ fn registerDefaultTools(reg: *ab.tools.Registry) !void {
         .max_age_ms = 60_000,
         .schema_note = "SWAP funding (+history) / OI + long_short (now/4h/24h) + taker + basis_bps",
     });
+    try reg.register(.{
+        .name = "market.indicators",
+        .domain = .market,
+        .source = "local-calc",
+        .max_age_ms = 120_000,
+        .schema_note = "on-demand calculator: instead of a proposal, reply {\"tool_requests\":[{\"name\":\"sma|ema|rsi|atr|vol|bollinger|range\",\"bar\":\"1m|5m|15m|1H|4H|1D\",\"period\":N}]} (max 6, one round); results arrive as an observation and you then produce the final proposal",
+    });
 }
 
 fn runControlCli(io: std.Io, cmd_name: []const u8, db_path: []const u8) u8 {
@@ -1987,6 +1994,83 @@ fn journalToolCall(repo: *ab.storage.ToolCallsRepo, run_id: []const u8, rec: ab.
     };
 }
 
+/// Serve the agent's `tool_requests` round: fetch candles per requested
+/// timeframe, run the deterministic indicator calculator, journal the call,
+/// and return one `market.indicators` observation line. Fetch or compute
+/// failures become per-request `error` entries — never fabricated values.
+fn computeIndicatorObservation(
+    gpa: std.mem.Allocator,
+    okx: *ab.okx_rest.Client,
+    cfg: *const ab.config.Config,
+    registry: *const ab.tools.Registry,
+    run_id: []const u8,
+    tools_repo: *ab.storage.ToolCallsRepo,
+    reqs: []const ab.indicators.Request,
+    obs_buf: []u8,
+) ?[]const u8 {
+    const spec = registry.find("market.indicators") orelse return null;
+    const t_start = nowMs();
+
+    var data_buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&data_buf);
+    w.writeAll("{\"results\":[") catch return null;
+
+    var done = [_]bool{false} ** ab.indicators.MAX_REQUESTS;
+    var first = true;
+    for (reqs, 0..) |req, i| {
+        if (done[i]) continue;
+        // Group all requests sharing this bar into one candle fetch.
+        var limit: usize = 60;
+        for (reqs, 0..) |r, j| {
+            if (!done[j] and std.mem.eql(u8, r.bar, req.bar)) {
+                limit = @max(limit, ab.indicators.candlesNeeded(r));
+            }
+        }
+        limit = @min(limit, 300);
+
+        var ordered: [300]ab.okx_rest.Candle = undefined;
+        var count: usize = 0;
+        var path_buf: [192]u8 = undefined;
+        if (std.fmt.bufPrint(
+            &path_buf,
+            "/api/v5/market/candles?instId={s}&bar={s}&limit={d}",
+            .{ cfg.instrument, req.bar, limit },
+        )) |path| {
+            if (okx.getPublic(path)) |body| {
+                defer gpa.free(body);
+                var raw: [300]ab.okx_rest.Candle = undefined;
+                if (ab.okx_rest.parseCandles(gpa, body, raw[0..limit])) |n| {
+                    // newest-first → oldest-first for the calculator
+                    for (0..n) |k| ordered[k] = raw[n - 1 - k];
+                    count = n;
+                } else |_| {}
+            } else |_| {}
+        } else |_| {}
+
+        for (reqs, 0..) |r, j| {
+            if (done[j] or !std.mem.eql(u8, r.bar, req.bar)) continue;
+            done[j] = true;
+            if (!first) w.writeByte(',') catch return null;
+            first = false;
+            if (count == 0) {
+                ab.indicators.writeError(&w, r, "fetch_failed") catch return null;
+            } else {
+                ab.indicators.compute(&w, r, ordered[0..count]) catch |err| switch (err) {
+                    error.InsufficientData => ab.indicators.writeError(&w, r, "insufficient_data") catch return null,
+                    else => return null,
+                };
+            }
+        }
+    }
+    w.writeAll("]}") catch return null;
+
+    const latency: u32 = @intCast(@max(@as(i64, 0), nowMs() - t_start));
+    const result = ab.market_tools.okResult("local-calc", nowMs(), latency, w.buffered());
+    const rec = ab.tools.auditRecord(spec, result, nowMs());
+    journalToolCall(tools_repo, run_id, rec);
+    return ab.market_tools.formatObservation(obs_buf[0..obs_buf.len], spec.name, rec, result.data_json) catch null;
+}
+
 /// Shadow-path Risk Kernel admission (audit only — never places orders).
 const ShadowAdmission = struct {
     verdict_txt: []const u8,
@@ -2479,7 +2563,99 @@ fn runAgentDecision(
         return;
     };
 
-    var prop = ab.proposal.parse(gpa, json_slice) catch |err| {
+    // Optional single indicator round (market.indicators): the model may ask
+    // the local calculator for values before committing to a proposal. Bounded
+    // to ONE round — if the second reply is again a tool request it fails
+    // proposal validation below and degrades to HOLD.
+    var final_json: []const u8 = json_slice;
+    var usage = chat_res.usage;
+    var tools_used = obs_n;
+    var raw2: ?[]u8 = null;
+    defer if (raw2) |r| gpa.free(r);
+    tool_round: {
+        var req_backing: [64]u8 = undefined;
+        var reqs: [ab.indicators.MAX_REQUESTS]ab.indicators.Request = undefined;
+        const req_n = ab.indicators.parseRequests(gpa, json_slice, &req_backing, &reqs) catch |err| switch (err) {
+            error.NotToolRequest => break :tool_round,
+            // Malformed tool request falls through to proposal parsing → HOLD.
+            else => break :tool_round,
+        };
+
+        std.debug.print("[agent] tool_requests: {d} indicator(s) → local calc\n", .{req_n});
+        var ind_obs_buf: [8192]u8 = undefined;
+        const ind_line = computeIndicatorObservation(gpa, okx, cfg, registry, run_id, tools_repo, reqs[0..req_n], &ind_obs_buf) orelse break :tool_round;
+
+        var all_obs: [4][]const u8 = undefined;
+        for (observations, 0..) |o, i| all_obs[i] = o;
+        all_obs[obs_n] = ind_line;
+        tools_used = obs_n + 1;
+
+        var ctx_buf2: [40 * 1024]u8 = undefined;
+        const ctx_json2 = ab.context.render(&ctx_buf2, .{
+            .snapshot = snap,
+            .recent_events = recent_events,
+            .memories = scored.items,
+            .registry = registry,
+            .tool_observations = all_obs[0 .. obs_n + 1],
+            .recent_proposals = recent_proposals,
+            .recent_fills = recent_fills,
+            .equity_marks = equity_marks,
+            .max_drawdown = cfg.max_drawdown,
+            .instrument = cfg.instrument,
+            .now_ms = nowMs(),
+        }) catch {
+            std.debug.print("[agent] context render (tool round) failed\n", .{});
+            break :tool_round;
+        };
+        ab.context.digest(ctx_json2, &digest_hex);
+
+        var user_buf2: [44 * 1024]u8 = undefined;
+        const user_msg2 = std.fmt.bufPrint(&user_buf2, "{s}{s}", .{ user_msg_prefix, ctx_json2 }) catch break :tool_round;
+
+        const chat2 = client.chat(default_system_prompt, user_msg2) catch |err| {
+            const tag: []const u8 = switch (err) {
+                error.HttpFailed => "http_failed",
+                error.Timeout => "timeout",
+                error.ApiError => "api_error",
+                error.MalformedResponse => "malformed_response",
+                error.EmptyContent => "empty_content",
+                error.OutOfMemory => "oom",
+                error.BufferTooSmall => "buffer",
+            };
+            std.debug.print("[agent] LLM failed (tool round): {s} → HOLD\n", .{tag});
+            st.setLlm("error", tag);
+            completeRun(runs, run_id, "error_llm", "", input_digest, nowMs());
+            var fail_buf: [256]u8 = undefined;
+            const fail_payload = std.fmt.bufPrint(
+                &fail_buf,
+                "{{\"run_id\":\"{s}\",\"model\":\"{s}\",\"error\":\"{s}\",\"phase\":\"tool_round\",\"degraded\":\"HOLD\"}}",
+                .{ run_id, client.model, tag },
+            ) catch "{\"degraded\":\"HOLD\"}";
+            logEventPayload(events_repo, engine, "AGENT_LLM_FAILED", "agent", "WARN", cfg, fail_payload);
+            return;
+        };
+        raw2 = chat2.content;
+        st.addUsage(chat2.usage);
+        usage.prompt_tokens += chat2.usage.prompt_tokens;
+        usage.completion_tokens += chat2.usage.completion_tokens;
+        usage.total_tokens += chat2.usage.total_tokens;
+        ab.context.digest(chat2.content, &out_digest_buf);
+
+        final_json = ab.openai.extractJsonObject(chat2.content) orelse {
+            std.debug.print("[agent] no JSON object after tool round → HOLD\n", .{});
+            completeRun(runs, run_id, "invalid_output", out_digest, input_digest, nowMs());
+            var inv_buf: [320]u8 = undefined;
+            const inv_payload = std.fmt.bufPrint(
+                &inv_buf,
+                "{{\"run_id\":\"{s}\",\"output_digest\":\"{s}\",\"reason\":\"no_json_after_tool_round\",\"degraded\":\"HOLD\"}}",
+                .{ run_id, out_digest },
+            ) catch "{\"degraded\":\"HOLD\"}";
+            logEventPayload(events_repo, engine, "AGENT_INVALID_OUTPUT", "agent", "WARN", cfg, inv_payload);
+            return;
+        };
+    }
+
+    var prop = ab.proposal.parse(gpa, final_json) catch |err| {
         std.debug.print("[agent] proposal invalid ({t}) → HOLD\n", .{err});
         completeRun(runs, run_id, "invalid_proposal", out_digest, input_digest, nowMs());
         var invp_buf: [320]u8 = undefined;
@@ -2589,7 +2765,7 @@ fn runAgentDecision(
     const ok_payload = std.fmt.bufPrint(
         &ok_buf,
         "{{\"run_id\":\"{s}\",\"decision_id\":\"{s}\",\"action\":\"{s}\",\"target_btc_weight\":\"{s}\",\"confidence\":\"{s}\",\"snapshot_version\":{d},\"output_digest\":\"{s}\",\"tools\":{d},\"executed\":{},\"exec\":\"{s}\",\"thesis\":{s},\"invalid_if\":{s},\"review_after\":\"{s}\",\"admission\":{{\"verdict\":\"{s}\",\"reason\":\"{s}\",\"admitted_weight\":\"{s}\",\"stress_equity\":\"{s}\",\"floor\":\"{s}\"}},\"usage\":{{\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d}}}}}",
-        .{ run_id, prop.decision_id, action_txt, weight_s, conf_s, prop.snapshot_version, out_digest, obs_n, executed, exec_note, thesis_json, invalid_json, review_s, admission.verdict_txt, admission.reason_txt, admitted_s, stress_s, floor_s, chat_res.usage.prompt_tokens, chat_res.usage.completion_tokens, chat_res.usage.total_tokens },
+        .{ run_id, prop.decision_id, action_txt, weight_s, conf_s, prop.snapshot_version, out_digest, tools_used, executed, exec_note, thesis_json, invalid_json, review_s, admission.verdict_txt, admission.reason_txt, admitted_s, stress_s, floor_s, usage.prompt_tokens, usage.completion_tokens, usage.total_tokens },
     ) catch "{\"executed\":false}";
     {
         var dbuf: [160]u8 = undefined;
