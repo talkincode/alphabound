@@ -1404,6 +1404,20 @@ fn registerDefaultTools(reg: *ab.tools.Registry) !void {
         .max_age_ms = 120_000,
         .schema_note = "on-demand calculator: instead of a proposal, reply {\"tool_requests\":[{\"name\":\"sma|ema|rsi|atr|vol|bollinger|range\",\"bar\":\"1m|5m|15m|1H|4H|1D\",\"period\":N}]} (max 6, one round); results arrive as an observation and you then produce the final proposal",
     });
+    try reg.register(.{
+        .name = "onchain.btc",
+        .domain = .onchain,
+        .source = "mempool.space",
+        .max_age_ms = 600_000,
+        .schema_note = "BTC mempool fees_sat_vb (fastest/half_hour/hour/economy/minimum) + difficulty {progress_pct,change_pct,retarget_days}",
+    });
+    try reg.register(.{
+        .name = "macro.sentiment",
+        .domain = .macro,
+        .source = "alternative.me",
+        .max_age_ms = 172_800_000,
+        .schema_note = "crowd Fear & Greed index 0..100 (now + class + history_daily newest-first, daily granularity)",
+    });
 }
 
 fn runControlCli(io: std.Io, cmd_name: []const u8, db_path: []const u8) u8 {
@@ -1759,8 +1773,8 @@ fn collectMarketTools(
     registry: *const ab.tools.Registry,
     run_id: []const u8,
     tools_repo: *ab.storage.ToolCallsRepo,
-    obs_bufs: *[3][8192]u8,
-    obs_out: *[3][]const u8,
+    obs_bufs: *[5][8192]u8,
+    obs_out: *[5][]const u8,
 ) usize {
     var n: usize = 0;
 
@@ -1961,6 +1975,69 @@ fn collectMarketTools(
             }
         } else |_| {
             result = ab.market_tools.unavailableResult("okx", nowMs());
+        }
+        const rec = ab.tools.auditRecord(spec, result, nowMs());
+        journalToolCall(tools_repo, run_id, rec);
+        if (ab.market_tools.formatObservation(&obs_bufs[n], spec.name, rec, result.data_json)) |line| {
+            obs_out[n] = line;
+            n += 1;
+        } else |_| {}
+    }
+
+    // onchain.btc — mempool congestion + difficulty (zero-key, best-effort).
+    if (registry.find("onchain.btc")) |spec| {
+        if (n >= obs_out.len) return n;
+        var data_buf: [512]u8 = undefined;
+        var result: ab.tools.ToolResult = undefined;
+        const t_start = nowMs();
+        var fees: ?ab.external_tools.RecommendedFees = null;
+        var diff: ?ab.external_tools.DifficultyAdjustment = null;
+        if (okx.getAbsoluteUrl("https://mempool.space/api/v1/fees/recommended")) |body| {
+            defer gpa.free(body);
+            fees = ab.external_tools.parseRecommendedFees(gpa, body) catch null;
+        } else |_| {}
+        if (okx.getAbsoluteUrl("https://mempool.space/api/v1/difficulty-adjustment")) |body| {
+            defer gpa.free(body);
+            diff = ab.external_tools.parseDifficultyAdjustment(gpa, body) catch null;
+        } else |_| {}
+        const latency: u32 = @intCast(@max(@as(i64, 0), nowMs() - t_start));
+        if (fees == null and diff == null) {
+            result = ab.market_tools.unavailableResult("mempool.space", nowMs());
+        } else if (ab.external_tools.formatOnchainData(&data_buf, fees, diff)) |data| {
+            result = ab.market_tools.okResult("mempool.space", nowMs(), latency, data);
+        } else |_| {
+            result = ab.market_tools.errResult("mempool.space", nowMs(), latency, "buffer");
+        }
+        const rec = ab.tools.auditRecord(spec, result, nowMs());
+        journalToolCall(tools_repo, run_id, rec);
+        if (ab.market_tools.formatObservation(&obs_bufs[n], spec.name, rec, result.data_json)) |line| {
+            obs_out[n] = line;
+            n += 1;
+        } else |_| {}
+    }
+
+    // macro.sentiment — Fear & Greed index (zero-key, daily granularity).
+    if (registry.find("macro.sentiment")) |spec| {
+        if (n >= obs_out.len) return n;
+        var data_buf: [512]u8 = undefined;
+        var result: ab.tools.ToolResult = undefined;
+        const t_start = nowMs();
+        if (okx.getAbsoluteUrl("https://api.alternative.me/fng/?limit=8")) |body| {
+            defer gpa.free(body);
+            var pts: [ab.external_tools.MAX_FNG_POINTS]ab.external_tools.FearGreedPoint = undefined;
+            const latency: u32 = @intCast(@max(@as(i64, 0), nowMs() - t_start));
+            if (ab.external_tools.parseFearGreed(gpa, body, &pts)) |pn| {
+                if (ab.external_tools.formatSentimentData(&data_buf, pts[0..pn])) |data| {
+                    // as_of = newest point's own timestamp (daily data, honest age).
+                    result = ab.market_tools.okResult("alternative.me", pts[0].ts_s * 1000, latency, data);
+                } else |_| {
+                    result = ab.market_tools.errResult("alternative.me", nowMs(), latency, "buffer");
+                }
+            } else |_| {
+                result = ab.market_tools.errResult("alternative.me", nowMs(), latency, "parse");
+            }
+        } else |_| {
+            result = ab.market_tools.unavailableResult("alternative.me", nowMs());
         }
         const rec = ab.tools.auditRecord(spec, result, nowMs());
         journalToolCall(tools_repo, run_id, rec);
@@ -2425,8 +2502,8 @@ fn runAgentDecision(
         return;
     };
 
-    var obs_bufs: [3][8192]u8 = undefined;
-    var obs_ptrs: [3][]const u8 = .{ "", "", "" };
+    var obs_bufs: [5][8192]u8 = undefined;
+    var obs_ptrs: [5][]const u8 = .{ "", "", "", "", "" };
     const obs_n = collectMarketTools(gpa, okx, cfg, registry, run_id, tools_repo, &obs_bufs, &obs_ptrs);
     const observations = obs_ptrs[0..obs_n];
 
@@ -2585,7 +2662,7 @@ fn runAgentDecision(
         var ind_obs_buf: [8192]u8 = undefined;
         const ind_line = computeIndicatorObservation(gpa, okx, cfg, registry, run_id, tools_repo, reqs[0..req_n], &ind_obs_buf) orelse break :tool_round;
 
-        var all_obs: [4][]const u8 = undefined;
+        var all_obs: [6][]const u8 = undefined;
         for (observations, 0..) |o, i| all_obs[i] = o;
         all_obs[obs_n] = ind_line;
         tools_used = obs_n + 1;
