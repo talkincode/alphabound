@@ -695,6 +695,8 @@ pub fn main(init: std.process.Init) !u8 {
     loadMemoriesFromDb(&memories_repo, &db, &mem_store);
     if (mem_store.count() == 0) {
         seedBootstrapMemories(gpa, &mem_store, &memories_repo, &events_repo, &engine, &cfg);
+    } else {
+        migrateBootstrapMemories(gpa, &mem_store, &memories_repo, &events_repo, &engine, &cfg);
     }
     std.debug.print("[boot] memories loaded count={d}\n", .{mem_store.count()});
 
@@ -3130,11 +3132,43 @@ fn seedBootstrapMemories(
         .kind = .strategy,
         .status = .unverified,
         .confidence = ab.decimal.Decimal.parse("0.40") catch ab.decimal.Decimal.zero,
-        .content_json = "{\"hypothesis\":\"No validated sizing strategy yet. Form hypotheses from market evidence, test them via proposals, and revise them through reflection.\",\"tags\":[\"BTC\",\"BTC-USDT\",\"demo\"]}",
+        .content_json = neutral_hypothesis_json,
     } }, now, &touched) catch {};
     for (touched.items) |m| persistMemory(repo, m);
     logEventPayload(events_repo, engine, "MEMORY_BOOTSTRAP", "memory", "INFO", cfg, "{\"seeded\":true}");
     std.debug.print("[boot] seeded bootstrap memories n={d}\n", .{touched.items.len});
+}
+
+/// Neutral hypothesis text shared by seed and migration: no sizing recipe.
+const neutral_hypothesis_json = "{\"hypothesis\":\"No validated sizing strategy yet. Form hypotheses from market evidence, test them via proposals, and revise them through reflection.\",\"tags\":[\"BTC\",\"BTC-USDT\",\"demo\"]}";
+
+/// One-time deterministic migration for existing DBs: rewrite the legacy
+/// H_btc_spot_default bootstrap prior (which prescribed a 0.05-0.15 weight
+/// corridor) to the neutral hypothesis. Runs at boot, audited via event;
+/// no runtime/admin mutation surface is added.
+fn migrateBootstrapMemories(
+    gpa: std.mem.Allocator,
+    store: *ab.memory.Store,
+    repo: *ab.storage.MemoriesRepo,
+    events_repo: *ab.storage.EventsRepo,
+    engine: *ab.state.Engine,
+    cfg: *const ab.config.Config,
+) void {
+    const m = store.find("H_btc_spot_default") orelse return;
+    if (std.mem.indexOf(u8, m.content_json, "0.05-0.15") == null) return;
+    var touched: std.ArrayList(ab.memory.Memory) = .empty;
+    defer touched.deinit(gpa);
+    store.applyOp(.{ .update = .{
+        .memory_id = "H_btc_spot_default",
+        .new_status = .unverified,
+        .content_json = neutral_hypothesis_json,
+    } }, nowMs(), &touched) catch |err| {
+        std.debug.print("[boot] bootstrap memory migration failed: {t}\n", .{err});
+        return;
+    };
+    for (touched.items) |mem| persistMemory(repo, mem);
+    logEventPayload(events_repo, engine, "MEMORY_BOOTSTRAP", "memory", "INFO", cfg, "{\"migrated\":\"H_btc_spot_default\",\"reason\":\"strip_sizing_prior\"}");
+    std.debug.print("[boot] migrated H_btc_spot_default to neutral hypothesis\n", .{});
 }
 
 fn recordProposalEpisode(
@@ -3864,20 +3898,6 @@ fn applyShadowReflection(
         std.debug.print("[reflect] create failed: {t}\n", .{err});
         return;
     };
-
-    // Touch strategy hypothesis with tiny evidence if present.
-    if (store.find("H_btc_spot_default") != null) {
-        const delta = if (std.mem.eql(u8, action, "HOLD"))
-            (ab.decimal.Decimal.parse("0.01") catch ab.decimal.Decimal.zero)
-        else
-            (ab.decimal.Decimal.parse("-0.01") catch ab.decimal.Decimal.zero);
-        store.applyOp(.{ .update = .{
-            .memory_id = "H_btc_spot_default",
-            .confidence_delta = delta,
-            .evidence_increment = 1,
-            .new_status = .active,
-        } }, now, &touched) catch {};
-    }
 
     for (touched.items) |m| persistMemory(repo, m);
 
