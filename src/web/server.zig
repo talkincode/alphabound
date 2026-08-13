@@ -472,9 +472,9 @@ fn handleAuth(buf: []u8, req_in: RequestInfo, path: []const u8, ctx: Context) Re
             if (n2 > cd_buf.len) return .{ .status = .bad_request, .body = "{\"error\":\"too_large\"}" };
             std.base64.standard.Decoder.decode(cd_buf[0..n2], client_data_b64) catch
                 return .{ .status = .bad_request, .body = "{\"error\":\"b64\"}" };
-            return finishPasskeyLogin(buf, ctx, req, wa.origin, now, bank, cred.pub_sec1, cd_buf[0..n2], auth_data_b64, sig_b64, challenge_b64);
+            return finishPasskeyLogin(buf, ctx, req, wa.origin, wa.rp_id, now, bank, cred.pub_sec1, cd_buf[0..n2], auth_data_b64, sig_b64, challenge_b64);
         };
-        return finishPasskeyLogin(buf, ctx, req, wa.origin, now, bank, cred.pub_sec1, cd_buf[0..cd_n], auth_data_b64, sig_b64, challenge_b64);
+        return finishPasskeyLogin(buf, ctx, req, wa.origin, wa.rp_id, now, bank, cred.pub_sec1, cd_buf[0..cd_n], auth_data_b64, sig_b64, challenge_b64);
     }
 
     return .{ .status = .not_found, .body = "{\"error\":\"not found\"}" };
@@ -499,6 +499,7 @@ fn finishPasskeyLogin(
     ctx: Context,
     req: RequestInfo,
     expected_origin: []const u8,
+    expected_rp_id: []const u8,
     now: i64,
     bank: *auth.ChallengeBank,
     pub_sec1: [65]u8,
@@ -522,6 +523,7 @@ fn finishPasskeyLogin(
         sig,
         challenge_b64,
         expected_origin,
+        expected_rp_id,
         bank,
         now,
     );

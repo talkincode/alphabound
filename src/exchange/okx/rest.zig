@@ -953,3 +953,24 @@ test "malformed bodies fail closed" {
         \\{"code":"0","data":[{"bidPx":"1","askPx":"2","ts":"notanum","last":"1"}]}
     ));
 }
+
+pub const BalanceProbe = union(enum) {
+    ok: Balance,
+    err: []const u8,
+};
+
+/// Read-only signed GET /api/v5/account/balance. Never places orders.
+pub fn probeBalance(client: *Client, gpa: std.mem.Allocator, now_ms: i64) BalanceProbe {
+    const body = client.getPrivate("/api/v5/account/balance", now_ms) catch {
+        return .{ .err = "http_failed" };
+    };
+    defer gpa.free(body);
+    const bal = parseBalance(gpa, body) catch |err| {
+        const token = classifyErrorBody(body);
+        // One-line body snippet for ops (no secrets expected in OKX error JSON).
+        const snip_n = @min(body.len, 240);
+        std.debug.print("[okx] balance_err token={s} err={s} len={d} body={s}\n", .{ token, @errorName(err), body.len, body[0..snip_n] });
+        return .{ .err = token };
+    };
+    return .{ .ok = bal };
+}
