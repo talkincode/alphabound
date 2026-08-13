@@ -1,6 +1,6 @@
 # Phase 5 — 数据工具扩展：审计结论与开工计划
 
-> 状态：L1 开工（2026-08-12）  
+> 状态：L1 达标；扩展域第一切片已上线（2026-08-13：`onchain.btc` + `macro.sentiment`，零密钥源）  
 > 对齐：`docs/ROADMAP.md` Phase 5、`docs/NEXT.md`、生产 `tool_calls` 实证
 
 ---
@@ -78,6 +78,20 @@ AGENT_PROPOSAL_OK 近 80 条 thesis 含 funding/oi/deriv ≈ 4（~5%）
 ```
 
 目标（L1 部署后滚动 7 日）：derivatives 调用 ≈ ticker；citation_rate ≥ 30%（REBALANCE 子集）。
+
+### L1 复评（2026-08-13）
+
+```
+tool_calls 当日: ticker=candles=derivatives 同频（每 run 全采）
+citation_rate: overall 1.00 / REBALANCE 子集 1.00（目标 0.30）
+```
+
+**升级信号命中 → 扩展域第一切片上线（同日）：**
+
+- `onchain.btc`（mempool.space 费率 + 难度调整）与 `macro.sentiment`（alternative.me Fear & Greed）— 均为零密钥公共源
+- 注入隔离：只提取白名单数字字段并重渲染；供应商自由文本标签不透传（class 由数值在固定词表上重推导）
+- `market.indicators` 本地计算器（LLM 一轮自主请求协议）同期上线
+- `news.*` / `wallet.*` 仍延后（供应商与密钥决策未做）；4 周价值闭环用扩展后的 `tool-value-report` 度量新域引用率
 
 ---
 
