@@ -18,6 +18,7 @@ const Decimal = dec.Decimal;
 
 pub const MAX_EVENTS = 16;
 pub const MAX_MEMORIES = 12;
+pub const MAX_SELF_ITEMS = 8;
 
 pub const Input = struct {
     snapshot: state_mod.PortfolioState,
@@ -28,6 +29,12 @@ pub const Input = struct {
     registry: *const tools_mod.Registry,
     /// Pre-rendered tool observation JSON objects (untrusted data inside).
     tool_observations: []const []const u8 = &.{},
+    /// Self-review: own recent proposals (compact JSON lines, oldest first).
+    recent_proposals: []const []const u8 = &.{},
+    /// Self-review: own recent executions/fills (compact JSON lines, oldest first).
+    recent_fills: []const []const u8 = &.{},
+    /// Self-review: labelled equity marks at fixed horizons (JSON lines).
+    equity_marks: []const []const u8 = &.{},
     /// Immutable risk boundary echoed verbatim into the context.
     max_drawdown: Decimal,
     instrument: []const u8,
@@ -40,8 +47,9 @@ pub const ContextError = error{
 };
 
 /// Render the full agent context as a deterministic JSON document into `buf`.
-/// The document has five fixed top-level sections mirroring the design:
-/// current_state / recent_events / memories / tools / risk_rules.
+/// The document has seven fixed top-level sections mirroring the design:
+/// current_state / recent_events / memories / tools / tool_observations /
+/// self_review / risk_rules.
 pub fn render(buf: []u8, input: Input) ContextError![]const u8 {
     if (input.recent_events.len > MAX_EVENTS) return error.TooManyEvents;
 
@@ -92,6 +100,28 @@ fn writeContext(w: *std.Io.Writer, input: Input) !void {
         try w.writeAll(obs); // already JSON objects; data field is untrusted
     }
     try w.writeAll("],");
+
+    // Self-review: first-party audit data — the agent's own recent proposals,
+    // what actually executed, and the equity path. Facts only, no verdicts.
+    try w.writeAll("\"self_review\":{\"proposals\":[");
+    const prop_n = @min(input.recent_proposals.len, MAX_SELF_ITEMS);
+    for (input.recent_proposals[0..prop_n], 0..) |p, i| {
+        if (i > 0) try w.writeByte(',');
+        try w.writeAll(p);
+    }
+    try w.writeAll("],\"fills\":[");
+    const fill_n = @min(input.recent_fills.len, MAX_SELF_ITEMS);
+    for (input.recent_fills[0..fill_n], 0..) |f, i| {
+        if (i > 0) try w.writeByte(',');
+        try w.writeAll(f);
+    }
+    try w.writeAll("],\"equity_marks\":[");
+    const eq_n = @min(input.equity_marks.len, MAX_SELF_ITEMS);
+    for (input.equity_marks[0..eq_n], 0..) |m, i| {
+        if (i > 0) try w.writeByte(',');
+        try w.writeAll(m);
+    }
+    try w.writeAll("]},");
 
     // Immutable boundary: stated, not negotiable, never sourced from agent input.
     try w.writeAll("\"risk_rules\":{");
@@ -145,6 +175,9 @@ fn testInput(reg: *const tools_mod.Registry, mems: []const mem_store.Scored) Inp
         .recent_events = &.{ "{\"type\":\"RISK_MODE_CHANGED\"}", "{\"type\":\"ORDER_FILLED\"}" },
         .memories = mems,
         .registry = reg,
+        .recent_proposals = &.{"{\"decision_id\":\"dec_1\",\"action\":\"HOLD\",\"target\":\"0\",\"confidence\":\"0.8\",\"executed\":false,\"exec\":\"hold\"}"},
+        .recent_fills = &.{"{\"ts\":\"2026-01-01T00:00:00Z\",\"side\":\"buy\",\"qty\":\"0.0001\",\"price\":\"64000\",\"fee\":\"0.01\",\"decision_id\":\"dec_0\"}"},
+        .equity_marks = &.{"{\"ago\":\"24h\",\"ts\":\"2026-01-01T00:00:00Z\",\"equity\":\"100.5\"}"},
         .max_drawdown = d("0.10"),
         .instrument = "BTC-USDT",
         .now_ms = 1_700_000_000_500,
@@ -191,7 +224,14 @@ test "render is deterministic and structurally complete" {
     try testing.expect(obj.get("memories") != null);
     try testing.expect(obj.get("tools") != null);
     try testing.expect(obj.get("tool_observations") != null);
+    try testing.expect(obj.get("self_review") != null);
     try testing.expect(obj.get("risk_rules") != null);
+
+    const sr = obj.get("self_review").?.object;
+    try testing.expectEqual(@as(usize, 1), sr.get("proposals").?.array.items.len);
+    try testing.expectEqual(@as(usize, 1), sr.get("fills").?.array.items.len);
+    try testing.expectEqual(@as(usize, 1), sr.get("equity_marks").?.array.items.len);
+    try testing.expectEqualStrings("24h", sr.get("equity_marks").?.array.items[0].object.get("ago").?.string);
 
     const cs = obj.get("current_state").?.object;
     try testing.expectEqual(@as(i64, 184392), cs.get("snapshot_version").?.integer);
@@ -235,6 +275,17 @@ test "render enforces budgets: memory cap and event cap" {
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, rendered, .{});
     defer parsed.deinit();
     try testing.expectEqual(@as(usize, MAX_MEMORIES), parsed.value.object.get("memories").?.array.items.len);
+
+    // self_review lists cap at MAX_SELF_ITEMS
+    var many_props: [MAX_SELF_ITEMS + 4][]const u8 = undefined;
+    for (&many_props) |*p| p.* = "{}";
+    input.recent_proposals = &many_props;
+    const rendered2 = try render(&buf, input);
+    var parsed2 = try std.json.parseFromSlice(std.json.Value, testing.allocator, rendered2, .{});
+    defer parsed2.deinit();
+    const sr = parsed2.value.object.get("self_review").?.object;
+    try testing.expectEqual(@as(usize, MAX_SELF_ITEMS), sr.get("proposals").?.array.items.len);
+    input.recent_proposals = &.{};
 
     // too many events refused outright (caller must pre-filter)
     var evs: [MAX_EVENTS + 1][]const u8 = undefined;
