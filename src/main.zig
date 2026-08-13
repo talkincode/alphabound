@@ -3130,7 +3130,7 @@ fn seedBootstrapMemories(
         .kind = .strategy,
         .status = .unverified,
         .confidence = ab.decimal.Decimal.parse("0.40") catch ab.decimal.Decimal.zero,
-        .content_json = "{\"hypothesis\":\"Cash-only + NORMAL + fresh data may take a small BTC weight (0.05-0.15); HOLD when evidence conflicts or risk mode degrades.\",\"tags\":[\"BTC\",\"BTC-USDT\",\"demo\"]}",
+        .content_json = "{\"hypothesis\":\"No validated sizing strategy yet. Form hypotheses from market evidence, test them via proposals, and revise them through reflection.\",\"tags\":[\"BTC\",\"BTC-USDT\",\"demo\"]}",
     } }, now, &touched) catch {};
     for (touched.items) |m| persistMemory(repo, m);
     logEventPayload(events_repo, engine, "MEMORY_BOOTSTRAP", "memory", "INFO", cfg, "{\"seeded\":true}");
