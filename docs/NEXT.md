@@ -2,9 +2,9 @@
 
 > 与 [ROADMAP.md](ROADMAP.md)、[GATE2_CHECKLIST.md](GATE2_CHECKLIST.md)、[GATE3_CHECKLIST.md](GATE3_CHECKLIST.md) 对齐。
 
-**当前焦点（2026-08-12）**: 小额实盘已是主路径；**`mode=live` + `OKX_REAL_MONEY_OK=1` 已解锁**。  
+**当前焦点（2026-08-13）**: 小额实盘已是主路径；**`mode=live` + `OKX_REAL_MONEY_OK=1` 已解锁**。  
 `mode=demo` 仅保留给 OKX 模拟盘（`OKX_SIMULATED=1`）；`demo+REAL_MONEY` 仍兼容但 boot 告警，请迁 live。  
-**已合并**: PR #1–#3 + 实盘解锁链 + live 模式正式化。  
+**已合并**: PR #1–#8 链（实盘解锁、ops/auth、equity buffer、favicon 等）+ live 模式正式化。  
 
 ---
 
@@ -20,13 +20,14 @@
 
 ## 现在做什么（按序）
 
-### P0 — 迁 live + 稳盘（本周）
+### P0 — 稳盘（滚动）
 
 1. ✅ 生产 `mode = "live"` + `OKX_REAL_MONEY_OK=1`（2026-08-12）  
 2. ✅ 运维脚本带 Dashboard token：`check-remote` / `soak-report` / `gate2-report`  
-3. **滚动 soak**：继续 `HOST=<host> ./scripts/soak-report.sh 24`（24h PASS；向 7 日窗口滚）  
-4. **控制面演练**：`cancel-all` → `flatten` → 拒增仓 → `target-weight=0.05` 恢复（flatten 已验；cancel-all 有挂单时再验）  
-5. ✅ 对账：live balance applied；新单 `exchange_order_id` 非空（历史 5 笔 FILLED 空 id 为修前数据）  
+3. ✅ Dashboard 鉴权 + 只读 Analytics MCP（PR #6 链）  
+4. **滚动 soak**：继续 `HOST=<host> ./scripts/soak-report.sh 24`（24h PASS；向 7 日窗口滚）  
+5. **控制面演练**：`cancel-all` → `flatten` → 拒增仓 → `target-weight=0.05` 恢复（flatten 已验；cancel-all 有挂单时再验）  
+6. ✅ 对账：live balance applied；新单 `exchange_order_id` 非空（历史 FILLED 空 id 为修前数据）  
 
 ### P1 — Gate3 收口
 

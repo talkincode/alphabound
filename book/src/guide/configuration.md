@@ -138,10 +138,18 @@ static_dir = "/opt/alphabound/ui/current"   # 预留；当前 Dashboard 已嵌�
 OKX_API_KEY=...
 OKX_API_SECRET=...
 OKX_API_PASSPHRASE=...
-# OKX_SIMULATED=1          # 仅演示盘密钥
+# mode=demo  → OKX_SIMULATED=1
+# mode=live  → OKX_REAL_MONEY_OK=1（小额子账号；禁止 SIMULATED）
 LLM_API_KEY=
 LLM_API_URL=https://api.openai.com/v1
 LLM_MODEL=gpt-4o-mini
+
+# Dashboard / MCP（可选；空 = 本机开放 API）
+# ALPHABOUND_API_TOKEN=          # openssl rand -hex 32
+# ALPHABOUND_TRUST_PROXY=1       # 仅受信任 TLS 反代后
+# ALPHABOUND_TRUSTED_PROXY_HOPS=1
+# ALPHABOUND_WEBAUTHN_RP_ID=localhost
+# ALPHABOUND_WEBAUTHN_ORIGIN=http://127.0.0.1:18180
 ```
 
 macOS 本地：
@@ -160,7 +168,13 @@ set -a && source ./secrets.env && set +a
 | `invalid_sign` / `invalid_key` / `invalid_passphrase` | 密钥或签名问题 |
 | `http_failed` | 网络/TLS |
 
-日志与事件经 `observability/redaction.zig` 脱敏；**不要**把 `secrets.env` 贴进 issue 或聊天。
+| Dashboard 环境变量 | 含义 |
+|---|---|
+| `ALPHABOUND_API_TOKEN` | 非空则保护 `/api/v1/*` 数据路由 |
+| `ALPHABOUND_TRUST_PROXY` | 仅反代后信任 `X-Forwarded-For`（右起 hops） |
+| `ALPHABOUND_WEBAUTHN_*` | Passkey rpId/origin；须与浏览器打开的 URL 一致 |
+
+日志与事件经 `observability/redaction.zig` 脱敏；**不要**把 `secrets.env` 贴进 issue 或聊天。鉴权细节见 [鉴权与 MCP](auth-mcp.md)。
 
 ---
 
@@ -168,7 +182,7 @@ set -a && source ./secrets.env && set +a
 
 - `--self-check`：解析 TOML、打开 DB、migration、bind；若有 `OKX_*` 则做私有只读探测。
 - 每次启动计算 `config_hash`（SHA-256），写入事件信封。
-- `mode=live` 需要 `OKX_*` + `OKX_REAL_MONEY_OK=1`（且禁止 `OKX_SIMULATED`）；`mode=demo` 无密钥或无 venue 授权则失败。
+- `mode=live` 需要 `OKX_*` + `OKX_REAL_MONEY_OK=1`（且禁止 `OKX_SIMULATED`）；`mode=demo` 需要密钥 + `OKX_SIMULATED=1`。
 
 ## 热加载边界
 

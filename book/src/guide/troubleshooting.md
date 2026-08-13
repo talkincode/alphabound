@@ -147,3 +147,27 @@ CI 应保持绿：`zig build` + `zig build test` + `--self-check` + `mdbook buil
 - 需要尝试 private WS 时：`export ALPHABOUND_PRIVATE_WS=1` 后启动。
 - 若日志出现 `login_read_failed` 且 detail 含 close `881a0fa4…`（OKX 4004 / No data received）：
   TLS upgrade(101) 已成功，但 login 帧在 `std.http.Client` 原始连接路径上仍不稳定；协议编解码单测仍有效，长连修复前请继续依赖 REST。
+
+## Dashboard 鉴权
+
+### `401 unauthorized` on `/api/v1/*`
+
+- 已设置 `ALPHABOUND_API_TOKEN` 时，脚本需带：
+
+```bash
+curl -sS -H "Authorization: Bearer $ALPHABOUND_API_TOKEN" http://127.0.0.1:18180/api/v1/state
+```
+
+- 浏览器：打开 Dashboard 登录门，用同一 token；或先 `POST /api/v1/auth/login`。
+- 运维脚本：确保远端 `secrets.env` 与本机 `check-remote`/`soak-report` 能读到 token。
+
+### Passkey 不可用 / `passkey` API 禁用
+
+- 浏览器要求 **secure context**：`https://…` 或 `http://127.0.0.1` / `http://localhost`。
+- 内网 `http://10.x.x.x` 仅 Token 登录可用；需要 Passkey 时 SSH 转到本机 loopback。
+- 核对 `ALPHABOUND_WEBAUTHN_RP_ID` / `ORIGIN` 与地址栏一致（或依赖 Host 自动解析）。
+
+### `429 rate_limited`
+
+- FailGuard：错误 token/登录失败过多会按 IP 锁定一段时间。
+- 等 `Retry-After`，或重启进程清内存计数（生产仍应修凭证而非依赖重启）。
