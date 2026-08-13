@@ -3142,10 +3142,10 @@ fn seedBootstrapMemories(
 /// Neutral hypothesis text shared by seed and migration: no sizing recipe.
 const neutral_hypothesis_json = "{\"hypothesis\":\"No validated sizing strategy yet. Form hypotheses from market evidence, test them via proposals, and revise them through reflection.\",\"tags\":[\"BTC\",\"BTC-USDT\",\"demo\"]}";
 
-/// One-time deterministic migration for existing DBs: rewrite the legacy
-/// H_btc_spot_default bootstrap prior (which prescribed a 0.05-0.15 weight
-/// corridor) to the neutral hypothesis. Runs at boot, audited via event;
-/// no runtime/admin mutation surface is added.
+/// One-time deterministic migration for existing DBs: rewrite legacy
+/// H_btc_spot_default bootstrap priors (v1 "prefer cash / default HOLD",
+/// v2 "0.05-0.15 weight corridor") to the neutral hypothesis. Runs at
+/// boot, audited via event; no runtime/admin mutation surface is added.
 fn migrateBootstrapMemories(
     gpa: std.mem.Allocator,
     store: *ab.memory.Store,
@@ -3155,7 +3155,9 @@ fn migrateBootstrapMemories(
     cfg: *const ab.config.Config,
 ) void {
     const m = store.find("H_btc_spot_default") orelse return;
-    if (std.mem.indexOf(u8, m.content_json, "0.05-0.15") == null) return;
+    const legacy = std.mem.indexOf(u8, m.content_json, "0.05-0.15") != null or
+        std.mem.indexOf(u8, m.content_json, "prefer cash over forced BTC exposure") != null;
+    if (!legacy) return;
     var touched: std.ArrayList(ab.memory.Memory) = .empty;
     defer touched.deinit(gpa);
     store.applyOp(.{ .update = .{
