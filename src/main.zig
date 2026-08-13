@@ -1388,14 +1388,14 @@ fn registerDefaultTools(reg: *ab.tools.Registry) !void {
         .domain = .market,
         .source = "okx",
         .max_age_ms = 120_000,
-        .schema_note = "1H OHLCV array (newest first)",
+        .schema_note = "multi-timeframe OHLCV frames: 1D/4H/1H (newest first)",
     });
     try reg.register(.{
         .name = "market.derivatives",
         .domain = .market,
         .source = "okx",
         .max_age_ms = 60_000,
-        .schema_note = "SWAP funding/OI + long_short + taker + basis_bps",
+        .schema_note = "SWAP funding (+history) / OI + long_short (now/4h/24h) + taker + basis_bps",
     });
 }
 
@@ -1752,7 +1752,7 @@ fn collectMarketTools(
     registry: *const ab.tools.Registry,
     run_id: []const u8,
     tools_repo: *ab.storage.ToolCallsRepo,
-    obs_bufs: *[3][2048]u8,
+    obs_bufs: *[3][8192]u8,
     obs_out: *[3][]const u8,
 ) usize {
     var n: usize = 0;
@@ -1789,36 +1789,56 @@ fn collectMarketTools(
         } else |_| {}
     }
 
-    // market.candles — fetch 24h, expose newest 8 bars in context (size budget)
+    // market.candles — multi-timeframe frames: 1D×14, 4H×12, 1H×8 (size budget)
     if (registry.find("market.candles")) |spec| {
         if (n >= obs_out.len) return n;
-        var path_buf: [160]u8 = undefined;
-        const path = std.fmt.bufPrint(
-            &path_buf,
-            "/api/v5/market/candles?instId={s}&bar=1H&limit=24",
-            .{cfg.instrument},
-        ) catch return n;
-        var data_buf: [1536]u8 = undefined;
+        const frame_specs = [_]struct { bar: []const u8, limit: usize }{
+            .{ .bar = "1D", .limit = 14 },
+            .{ .bar = "4H", .limit = 12 },
+            .{ .bar = "1H", .limit = 8 },
+        };
+        var frame_candles: [3][14]ab.okx_rest.Candle = undefined;
+        var frames: [3]ab.market_tools.CandleFrame = undefined;
+        var frames_n: usize = 0;
+        var as_of: i64 = 0;
+        var data_buf: [6144]u8 = undefined;
         var result: ab.tools.ToolResult = undefined;
         const t_start = nowMs();
-        if (okx.getPublic(path)) |body| {
-            defer gpa.free(body);
-            var candles: [24]ab.okx_rest.Candle = undefined;
-            if (ab.okx_rest.parseCandles(gpa, body, &candles)) |count| {
-                const latency: u32 = @intCast(@max(@as(i64, 0), nowMs() - t_start));
-                const as_of: i64 = if (count > 0) candles[0].ts_ms else nowMs();
-                const show_n = @min(count, @as(usize, 8));
-                if (ab.market_tools.formatCandlesData(&data_buf, cfg.instrument, candles[0..show_n])) |data| {
-                    result = ab.market_tools.okResult("okx", as_of, latency, data);
+        var fetch_err = false;
+        for (frame_specs, 0..) |fs, fi| {
+            var path_buf: [160]u8 = undefined;
+            const path = std.fmt.bufPrint(
+                &path_buf,
+                "/api/v5/market/candles?instId={s}&bar={s}&limit={d}",
+                .{ cfg.instrument, fs.bar, fs.limit },
+            ) catch continue;
+            if (okx.getPublic(path)) |body| {
+                defer gpa.free(body);
+                if (ab.okx_rest.parseCandles(gpa, body, frame_candles[fi][0..fs.limit])) |count| {
+                    if (count > 0) {
+                        frames[frames_n] = .{ .bar = fs.bar, .candles = frame_candles[fi][0..count] };
+                        frames_n += 1;
+                        // Newest bar across frames drives observation freshness.
+                        if (frame_candles[fi][0].ts_ms > as_of) as_of = frame_candles[fi][0].ts_ms;
+                    }
                 } else |_| {
-                    result = ab.market_tools.errResult("okx", nowMs(), latency, "buffer");
+                    fetch_err = true;
                 }
             } else |_| {
-                const latency: u32 = @intCast(@max(@as(i64, 0), nowMs() - t_start));
-                result = ab.market_tools.errResult("okx", nowMs(), latency, "parse");
+                fetch_err = true;
             }
-        } else |_| {
+        }
+        const latency: u32 = @intCast(@max(@as(i64, 0), nowMs() - t_start));
+        if (frames_n > 0) {
+            if (ab.market_tools.formatCandleFramesData(&data_buf, cfg.instrument, frames[0..frames_n])) |data| {
+                result = ab.market_tools.okResult("okx", as_of, latency, data);
+            } else |_| {
+                result = ab.market_tools.errResult("okx", nowMs(), latency, "buffer");
+            }
+        } else if (fetch_err) {
             result = ab.market_tools.unavailableResult("okx", nowMs());
+        } else {
+            result = ab.market_tools.errResult("okx", nowMs(), latency, "parse");
         }
         const rec = ab.tools.auditRecord(spec, result, nowMs());
         journalToolCall(tools_repo, run_id, rec);
@@ -1844,7 +1864,7 @@ fn collectMarketTools(
             break :blk cfg.instrument;
         };
         var path_buf: [160]u8 = undefined;
-        var data_buf: [1024]u8 = undefined;
+        var data_buf: [2048]u8 = undefined;
         var result: ab.tools.ToolResult = undefined;
         const t_start = nowMs();
         const fr_path = std.fmt.bufPrint(&path_buf, "/api/v5/public/funding-rate?instId={s}", .{swap_inst}) catch return n;
@@ -1865,11 +1885,25 @@ fn collectMarketTools(
                 if (std.fmt.bufPrint(&ls_path_buf, "/api/v5/rubik/stat/contracts/long-short-account-ratio?ccy={s}&period=1H", .{base_ccy})) |ls_path| {
                     if (okx.getPublic(ls_path)) |ls_body| {
                         defer gpa.free(ls_body);
-                        if (ab.okx_rest.parseLongShortRatio(gpa, ls_body)) |ls| {
-                            extras.long_short_ratio = ls.ratio;
+                        var ls_rows: [25]ab.okx_rest.LongShortRatio = undefined;
+                        if (ab.okx_rest.parseLongShortRatioSeries(gpa, ls_body, &ls_rows)) |ls_n| {
+                            // Rows are newest-first hourly samples.
+                            if (ls_n > 0) extras.long_short_ratio = ls_rows[0].ratio;
+                            if (ls_n > 4) extras.long_short_ratio_4h_ago = ls_rows[4].ratio;
+                            if (ls_n > 24) extras.long_short_ratio_24h_ago = ls_rows[24].ratio;
                         } else |_| {}
                     } else |_| {}
                 } else |_| {}
+                var fh_rows: [6]ab.okx_rest.FundingHist = undefined;
+                var fh_n: usize = 0;
+                var fh_path_buf: [160]u8 = undefined;
+                if (std.fmt.bufPrint(&fh_path_buf, "/api/v5/public/funding-rate-history?instId={s}&limit=6", .{swap_inst})) |fh_path| {
+                    if (okx.getPublic(fh_path)) |fh_body| {
+                        defer gpa.free(fh_body);
+                        fh_n = ab.okx_rest.parseFundingHistory(gpa, fh_body, &fh_rows) catch 0;
+                    } else |_| {}
+                } else |_| {}
+                extras.funding_history = fh_rows[0..fh_n];
                 var tv_path_buf: [180]u8 = undefined;
                 if (std.fmt.bufPrint(&tv_path_buf, "/api/v5/rubik/stat/taker-volume?ccy={s}&instType=CONTRACTS&period=1H", .{base_ccy})) |tv_path| {
                     if (okx.getPublic(tv_path)) |tv_body| {
@@ -2247,7 +2281,7 @@ fn runAgentDecision(
         return;
     };
 
-    var obs_bufs: [3][2048]u8 = undefined;
+    var obs_bufs: [3][8192]u8 = undefined;
     var obs_ptrs: [3][]const u8 = .{ "", "", "" };
     const obs_n = collectMarketTools(gpa, okx, cfg, registry, run_id, tools_repo, &obs_bufs, &obs_ptrs);
     const observations = obs_ptrs[0..obs_n];

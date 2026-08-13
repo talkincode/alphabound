@@ -198,6 +198,34 @@ pub fn parseFundingRate(gpa: std.mem.Allocator, body: []const u8) Error!FundingR
     };
 }
 
+/// One realized funding entry from /api/v5/public/funding-rate-history.
+pub const FundingHist = struct {
+    funding_rate: Decimal,
+    funding_time_ms: i64,
+};
+
+/// Parse funding history envelope into `out` (newest-first as OKX); returns count.
+pub fn parseFundingHistory(gpa: std.mem.Allocator, body: []const u8, out: []FundingHist) Error!usize {
+    var parsed = std.json.parseFromSlice(std.json.Value, gpa, body, .{}) catch return Error.MalformedResponse;
+    defer parsed.deinit();
+    const data = try unwrapEnvelope(parsed.value);
+    var n: usize = 0;
+    for (data.items) |item| {
+        if (n >= out.len) break;
+        const obj = switch (item) {
+            .object => |o| o,
+            else => return Error.MalformedResponse,
+        };
+        const ft_s = try getString(obj, "fundingTime");
+        out[n] = .{
+            .funding_rate = try getDecimalLossy(obj, "fundingRate"),
+            .funding_time_ms = std.fmt.parseInt(i64, ft_s, 10) catch return Error.MalformedResponse,
+        };
+        n += 1;
+    }
+    return n;
+}
+
 /// Open interest snapshot from /api/v5/public/open-interest.
 pub const OpenInterest = struct {
     oi_contracts: Decimal,
@@ -262,6 +290,28 @@ pub fn parseLongShortRatio(gpa: std.mem.Allocator, body: []const u8) Error!LongS
         .ts_ms = try parseJsonTsMs(row.items[0]),
         .ratio = try parseJsonNumberish(row.items[1]),
     };
+}
+
+/// Parse the full rubik long/short series into `out` (newest-first); returns count.
+pub fn parseLongShortRatioSeries(gpa: std.mem.Allocator, body: []const u8, out: []LongShortRatio) Error!usize {
+    var parsed = std.json.parseFromSlice(std.json.Value, gpa, body, .{}) catch return Error.MalformedResponse;
+    defer parsed.deinit();
+    const data = try unwrapEnvelope(parsed.value);
+    var n: usize = 0;
+    for (data.items) |item| {
+        if (n >= out.len) break;
+        const row = switch (item) {
+            .array => |a| a,
+            else => return Error.MalformedResponse,
+        };
+        if (row.items.len < 2) return Error.MalformedResponse;
+        out[n] = .{
+            .ts_ms = try parseJsonTsMs(row.items[0]),
+            .ratio = try parseJsonNumberish(row.items[1]),
+        };
+        n += 1;
+    }
+    return n;
 }
 
 /// Taker buy/sell notional from rubik
@@ -692,6 +742,30 @@ test "parse long-short ratio rubik rows" {
     const ls = try parseLongShortRatio(testing.allocator, body);
     try testing.expect(ls.ratio.eql(Decimal.parse("1.71") catch unreachable));
     try testing.expectEqual(@as(i64, 1786536000000), ls.ts_ms);
+}
+
+test "parse long-short ratio series keeps newest-first order" {
+    const body =
+        \\{"code":"0","data":[["1786536000000","1.71"],["1786532400000","1.68"],["1786528800000","1.62"]]}
+    ;
+    var out: [8]LongShortRatio = undefined;
+    const n = try parseLongShortRatioSeries(testing.allocator, body, &out);
+    try testing.expectEqual(@as(usize, 3), n);
+    try testing.expect(out[0].ratio.eql(Decimal.parse("1.71") catch unreachable));
+    try testing.expect(out[2].ratio.eql(Decimal.parse("1.62") catch unreachable));
+    try testing.expectEqual(@as(i64, 1786528800000), out[2].ts_ms);
+}
+
+test "parse funding history rows" {
+    const body =
+        \\{"code":"0","data":[{"instId":"BTC-USDT-SWAP","fundingRate":"0.0001","realizedRate":"0.0001","fundingTime":"1786521600000"},{"instId":"BTC-USDT-SWAP","fundingRate":"-0.00005","realizedRate":"-0.00005","fundingTime":"1786492800000"}]}
+    ;
+    var out: [4]FundingHist = undefined;
+    const n = try parseFundingHistory(testing.allocator, body, &out);
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expect(out[0].funding_rate.eql(Decimal.parse("0.0001") catch unreachable));
+    try testing.expect(out[1].funding_rate.eql(Decimal.parse("-0.00005") catch unreachable));
+    try testing.expectEqual(@as(i64, 1786492800000), out[1].funding_time_ms);
 }
 
 test "parse taker volume rubik rows" {
