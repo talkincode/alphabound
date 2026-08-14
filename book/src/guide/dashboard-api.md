@@ -39,10 +39,18 @@ curl -sS -H "Authorization: Bearer YOUR_TOKEN" http://127.0.0.1:18180/api/v1/sta
 | 形态 | 单文件 HTML + favicon 集，**编译期嵌入**二进制（`dashboard/`） |
 | 入口 | `GET /` 与 `GET /index.html` |
 | 依赖 | 零 Node 运行时；浏览器直接 `fetch` API |
-| 刷新 | 前端约 2s 轮询 state / shadow / agent-runs / equity / candles / memories / events / system / orders / decisions |
-| 内容 | Overview + Shadow vs BH + **Lightweight Charts**（分时/多周期 K 线 + 成交量 + 净值/HWM）+ 提案/记忆/事件/订单 + System |
+| 刷新 | 前端约 2s 轮询 state / shadow / agent-runs / equity / candles / memories / events / system / orders / decisions / review-chats |
+| 内容 | Overview + Shadow vs BH + **Lightweight Charts**（分时/多周期 K 线 + 成交量 + 净值/HWM）+ **复盘**（K 线决策标记 + 指标 + AI 复盘对话）+ 提案/记忆/事件/订单 + System |
 
 概览图表使用 [Lightweight Charts](https://www.tradingview.com/lightweight-charts/)（CDN）。周期按钮：**分时**（1m 收盘面积图）、1分/5分/15分/1时/4时/1日。离线无 CDN 时其余 UI 仍可用。
+
+### 复盘标签页
+
+K 线图（1m–1D 周期，MA/EMA/BOLL 主图指标，VOL/RSI/MACD 副图）上把每次 Agent 提案画成标记：`●` 持有、`▲/▼` 调仓（按目标权重方向）、`▪` 失败或准入拒绝。点击标记（或用决策下拉）后，下方三个子页联动：
+
+- **决策**：该提案的完整摘要（thesis、invalid_if、准入结论、关联订单/成交、原始 payload）。
+- **事件流**：该时点 ±30 分钟的事件账本窗口（行情、余额、准入、执行、备份等），由核心循环按需从 SQLite 提取。
+- **AI 复盘**：与复盘助手就该时点对话。助手可发起**一轮有界工具请求**（≤6 个）：决策时点指标（SMA/EMA/RSI/ATR/VOL/BOLL/RANGE，`at:anchor` 在锚点截断计算）、K 线窗口、提案历史、净值轨迹、记忆检索——全部只读，接触不到交易路径。**克制边界**：助手只做归因分析，不给交易建议、无执行能力，人不能借它直接或间接改变决策；对话全部落库（`review_chats` 表）。点「沉淀为记忆」可将对话压缩成一条 **confidence 0.3 的 reflection 记忆**（`HR_<decision_id>`，每个决策一条、就地更新），作为人类观点进入主 Agent 上下文的唯一通道，由 Agent 自行取舍。
 
 ### 本地打开
 
@@ -94,6 +102,9 @@ open http://127.0.0.1:18180/
 | `GET /api/v1/system` | 进程/agent/paused/disk/latency 等 |
 | `GET /api/v1/decisions` | 提案/反思审计事件（含 thesis） |
 | `GET /api/v1/orders` | `{"orders":[...],"fills":[...]}` 投影 |
+| `GET /api/v1/review/chats` | 复盘对话最近轮次（newest first，客户端按 `id` 升序重排） |
+| `GET /api/v1/review/context` | 最近一次请求的复盘事件窗口 `{decision_id, from, to, events}` |
+| `GET /api/v1/audit` | 定时审计报告（newest first，含完整 findings 与 stats） |
 
 ### `GET /api/v1/shadow`
 
@@ -146,6 +157,32 @@ open http://127.0.0.1:18180/
 ### `GET /api/v1/orders`
 
 订单 8 状态投影 + 近期 fills；Dashboard「订单」标签与决策详情按 `decision_id` 关联。
+
+### 复盘 API（`/api/v1/review/*`）
+
+复盘请求走**邮箱模式**：web 线程只入队（立即返回 `202 {"ok":true,"queued":true}`），核心循环每 tick 出队一件、查库/调 LLM，把结果发布为预渲染 JSON——与「web 线程不碰 SQLite」的单写者架构一致。该通道只读交易状态，写入面仅限 `review_chats`、记忆与审计事件，**接触不到提案与下单路径**。
+
+| 方法 | 路径 | Body | 说明 |
+|---|---|---|---|
+| POST | `/api/v1/review/context` | `{"decision_id","anchor_ts"}` | 提取该时点 ±30min 事件窗口 → `GET /api/v1/review/context` |
+| POST | `/api/v1/review/chat` | `{"decision_id","anchor_ts","message"}` | 复盘提问（≤1500B）；回复落库后出现在 `GET /api/v1/review/chats` |
+| POST | `/api/v1/review/summarize` | `{"decision_id"}` | 将对话压缩为一条低置信度 reflection 记忆（`HR_<decision_id>`） |
+
+限制：队列深度 4（满载 429）；同决策同类请求去重（409）；每决策对话上限 40 轮；每次提问至多一轮工具请求（≤6 个，均为只读）；LLM 未配置时提问仍会保存并得到降级答复。审计事件：`REVIEW_CHAT_OK/FAILED`（含 `tools` 计数）、`REVIEW_SUMMARY_OK`。
+
+### 定时审计（`/api/v1/audit` 与告警铃铛）
+
+核心循环内置**确定性规则审计器**（`src/observability/auditor.zig`，判定路径无 LLM），默认每 4 小时（`[audit] interval_ms`，0 关闭，下限 10 分钟）对五个面自检：
+
+| 检查面 | 内容 |
+|---|---|
+| llm | run 成功率、连续失败、僵尸检测（超 3× 决策周期无提案） |
+| tools | 工具调用缺失、延迟、MARKET_STALE 频次 |
+| data | 净值恒等式重算、HWM 单调、drawdown 自洽、样本新鲜度、SQLite quick_check |
+| flow | 触发→提案→准入→反思事件链完整性、备份、严重事件（FAULT 等） |
+| self | 审计自身按时、风险模式非 NORMAL 可见 |
+
+结果：完整报告落库 `audit_reports`（`GET /api/v1/audit` 可回放）；事件流写 `AUDIT_OK/WARN/ALERT`；`/api/v1/system` 的 `audit` 块驱动 Dashboard **右上角告警铃铛**（黄=警告、红=告警，点开看发现明细与历史）。启动即跑一次，之后按间隔。
 
 ### 规划中
 

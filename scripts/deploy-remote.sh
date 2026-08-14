@@ -15,7 +15,7 @@ zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe
 rm -rf "$STAGE"
 mkdir -p "$STAGE"/{opt/alphabound/current,etc/alphabound/prompts,systemd}
 cp zig-out/bin/alphabound "$STAGE/opt/alphabound/current/"
-cp prompts/system.md prompts/reflection.md "$STAGE/etc/alphabound/prompts/"
+cp prompts/system.md prompts/reflection.md prompts/review.md "$STAGE/etc/alphabound/prompts/"
 cp deploy/alphabound.service "$STAGE/systemd/"
 if [[ -f deploy/production.example.toml ]]; then
   cp deploy/production.example.toml "$STAGE/etc/alphabound/alphabound.toml"

@@ -68,6 +68,8 @@ pub const Config = struct {
     prompt_dir: []const u8 = "prompts",
     /// When false, never call LLM even if keys are present.
     agent_enabled: bool = true,
+    // [audit] — scheduled deterministic self-audit (0 disables).
+    audit_interval_ms: u32 = 14_400_000, // 4h default
     /// When true, after a valid proposal run a second LLM reflection call
     /// (structured memory_ops). Fail-closed → deterministic fallback.
     agent_llm_reflection: bool = true,
@@ -142,7 +144,7 @@ pub fn parse(gpa: std.mem.Allocator, text: []const u8) ConfigError!Config {
         if (line[0] == '[') {
             if (line[line.len - 1] != ']') return error.SyntaxError;
             section = line[1 .. line.len - 1];
-            const known = [_][]const u8{ "app", "exchange", "risk", "agent", "storage", "web" };
+            const known = [_][]const u8{ "app", "exchange", "risk", "agent", "storage", "web", "audit" };
             var ok = false;
             for (known) |k| {
                 if (std.mem.eql(u8, section, k)) ok = true;
@@ -275,6 +277,12 @@ fn applyKey(a: std.mem.Allocator, cfg: *Config, section: []const u8, key: []cons
             if (!validWebBind(cfg.web_bind)) return error.InvalidValue;
         } else if (std.mem.eql(u8, key, "static_dir")) {
             cfg.static_dir = try parseString(a, val);
+        } else return error.UnknownKey;
+    } else if (std.mem.eql(u8, section, "audit")) {
+        if (std.mem.eql(u8, key, "interval_ms")) {
+            cfg.audit_interval_ms = parseInt(u32, val) catch return error.InvalidValue;
+            // Floor guards alert fatigue; 0 disables entirely.
+            if (cfg.audit_interval_ms != 0 and cfg.audit_interval_ms < 600_000) return error.InvalidValue;
         } else return error.UnknownKey;
     } else {
         return error.UnknownSection;

@@ -19,11 +19,15 @@ pub const DbError = error{
 
 const migration_0001: [:0]const u8 = @embedFile("migration_0001");
 const migration_0002: [:0]const u8 = @embedFile("migration_0002");
+const migration_0003: [:0]const u8 = @embedFile("migration_0003");
+const migration_0004: [:0]const u8 = @embedFile("migration_0004");
 
 /// Ordered list of migrations; user_version tracks the applied count.
 const migrations = [_][:0]const u8{
     migration_0001,
     migration_0002,
+    migration_0003,
+    migration_0004,
 };
 
 /// Expected user_version for a fully migrated database (restore drills).
@@ -271,6 +275,112 @@ pub const EventsRepo = struct {
         defer stmt.finalize();
         try stmt.bindInt(1, limit);
         return writeEventRows(&stmt, out);
+    }
+
+    /// Events inside [ts_from, ts_to] (RFC3339 strings compare lexicographically),
+    /// newest first. Backs the 复盘「事件流」window around a decision.
+    pub fn listWindowJson(
+        self: *EventsRepo,
+        db: *Db,
+        out: []u8,
+        ts_from: []const u8,
+        ts_to: []const u8,
+        limit: i64,
+    ) DbError![]const u8 {
+        _ = self;
+        var stmt = try db.prepare(
+            \\SELECT event_id, ts, type, source, severity, state_version, payload_json
+            \\FROM events
+            \\WHERE ts >= ?1 AND ts <= ?2
+            \\ORDER BY ts DESC
+            \\LIMIT ?3
+        );
+        defer stmt.finalize();
+        try stmt.bindText(1, ts_from);
+        try stmt.bindText(2, ts_to);
+        try stmt.bindInt(3, limit);
+        return writeEventRows(&stmt, out);
+    }
+
+    /// payload_json of the newest event with this type + decision_id in payload,
+    /// copied into `out`. Null when absent. Feeds the review chat prompt.
+    pub fn proposalPayloadByDecision(
+        self: *EventsRepo,
+        db: *Db,
+        out: []u8,
+        decision_id: []const u8,
+    ) DbError!?[]const u8 {
+        _ = self;
+        var stmt = try db.prepare(
+            \\SELECT payload_json FROM events
+            \\WHERE type = 'AGENT_PROPOSAL_OK'
+            \\  AND json_extract(payload_json, '$.decision_id') = ?1
+            \\ORDER BY ts DESC LIMIT 1
+        );
+        defer stmt.finalize();
+        try stmt.bindText(1, decision_id);
+        if (!try stmt.step()) return null;
+        const p = stmt.columnText(0);
+        const n = @min(p.len, out.len);
+        @memcpy(out[0..n], p[0..n]);
+        return out[0..n];
+    }
+
+    /// Compact proposal lines inside [ts_from, ts_to] (oldest first) for the
+    /// review tool round: ts/action/weight/conf/admission verdict only.
+    pub fn writeProposalsWindowCompact(
+        self: *EventsRepo,
+        db: *Db,
+        w: *std.Io.Writer,
+        ts_from: []const u8,
+        ts_to: []const u8,
+        limit: i64,
+    ) DbError!void {
+        _ = self;
+        var stmt = try db.prepare(
+            \\SELECT ts,
+            \\  COALESCE(json_extract(payload_json,'$.decision_id'),''),
+            \\  COALESCE(json_extract(payload_json,'$.action'),''),
+            \\  COALESCE(json_extract(payload_json,'$.target_btc_weight'),''),
+            \\  COALESCE(json_extract(payload_json,'$.confidence'),''),
+            \\  COALESCE(json_extract(payload_json,'$.admission.verdict'),''),
+            \\  COALESCE(json_extract(payload_json,'$.executed'),0)
+            \\FROM (
+            \\  SELECT ts, payload_json FROM events
+            \\  WHERE type = 'AGENT_PROPOSAL_OK' AND ts >= ?1 AND ts <= ?2
+            \\  ORDER BY ts DESC LIMIT ?3
+            \\) ORDER BY ts ASC
+        );
+        defer stmt.finalize();
+        try stmt.bindText(1, ts_from);
+        try stmt.bindText(2, ts_to);
+        try stmt.bindInt(3, limit);
+        w.writeAll("\"rows\":[") catch return DbError.StepFailed;
+        var i: usize = 0;
+        while (try stmt.step()) : (i += 1) {
+            const mark = w.end;
+            const wrote = blk: {
+                if (i > 0) w.writeByte(',') catch break :blk false;
+                w.print(
+                    "{{\"ts\":\"{s}\",\"decision_id\":\"{s}\",\"action\":\"{s}\",\"w\":\"{s}\",\"conf\":\"{s}\",\"verdict\":\"{s}\",\"executed\":{d}}}",
+                    .{
+                        stmt.columnText(0),
+                        stmt.columnText(1),
+                        stmt.columnText(2),
+                        stmt.columnText(3),
+                        stmt.columnText(4),
+                        stmt.columnText(5),
+                        stmt.columnInt(6),
+                    },
+                ) catch break :blk false;
+                break :blk true;
+            };
+            if (!wrote) {
+                w.end = mark;
+                break;
+            }
+        }
+        w.writeAll("]") catch return DbError.StepFailed;
     }
 
     /// Serialize stepped event rows as a JSON array, keeping as many newest
@@ -752,6 +862,48 @@ pub const EquityRepo = struct {
         }
         return DbError.NotFound;
     }
+
+    /// Hourly-bucketed equity trail inside [ts_from, ts_to] (oldest first)
+    /// for the review tool round: last sample of each hour.
+    pub fn writeTrailCompact(
+        self: *EquityRepo,
+        db: *Db,
+        w: *std.Io.Writer,
+        ts_from: []const u8,
+        ts_to: []const u8,
+        limit: i64,
+    ) DbError!void {
+        _ = self;
+        var stmt = try db.prepare(
+            \\SELECT ts, equity, drawdown FROM equity_samples
+            \\WHERE ts >= ?1 AND ts <= ?2
+            \\GROUP BY substr(ts, 1, 13)
+            \\HAVING ts = MAX(ts)
+            \\ORDER BY ts ASC LIMIT ?3
+        );
+        defer stmt.finalize();
+        try stmt.bindText(1, ts_from);
+        try stmt.bindText(2, ts_to);
+        try stmt.bindInt(3, limit);
+        w.writeAll("\"rows\":[") catch return DbError.StepFailed;
+        var i: usize = 0;
+        while (try stmt.step()) : (i += 1) {
+            const mark = w.end;
+            const wrote = blk: {
+                if (i > 0) w.writeByte(',') catch break :blk false;
+                w.print(
+                    "{{\"ts\":\"{s}\",\"equity\":\"{s}\",\"dd\":\"{s}\"}}",
+                    .{ stmt.columnText(0), stmt.columnText(1), stmt.columnText(2) },
+                ) catch break :blk false;
+                break :blk true;
+            };
+            if (!wrote) {
+                w.end = mark;
+                break;
+            }
+        }
+        w.writeAll("]") catch return DbError.StepFailed;
+    }
 };
 
 pub const AgentRunRow = struct {
@@ -959,29 +1111,40 @@ pub const MemoriesRepo = struct {
         );
         defer stmt.finalize();
         try stmt.bindInt(1, limit);
-        var w: std.Io.Writer = .fixed(out);
+        if (out.len < 2) return DbError.StepFailed;
+        var w: std.Io.Writer = .fixed(out[0 .. out.len - 1]); // reserve "]"
         w.writeAll("[") catch return DbError.StepFailed;
         var i: usize = 0;
         while (try stmt.step()) : (i += 1) {
-            if (i > 0) w.writeAll(",") catch return DbError.StepFailed;
-            // confidence is REAL in SQLite; print as decimal string without scientific notation.
-            const conf = stmt.columnFloat(4);
-            w.print(
-                "{{\"memory_id\":\"{s}\",\"version\":{d},\"kind\":\"{s}\",\"status\":\"{s}\",\"confidence\":\"{d:.6}\",\"evidence_count\":{d},\"content\":{s},\"created_ts\":\"{s}\"}}",
-                .{
-                    stmt.columnText(0),
-                    stmt.columnInt(1),
-                    stmt.columnText(2),
-                    stmt.columnText(3),
-                    conf,
-                    stmt.columnInt(5),
-                    stmt.columnText(6),
-                    stmt.columnText(7),
-                },
-            ) catch return DbError.StepFailed;
+            const mark = w.end;
+            const wrote = blk: {
+                if (i > 0) w.writeAll(",") catch break :blk false;
+                // confidence is REAL in SQLite; print as decimal string without scientific notation.
+                const conf = stmt.columnFloat(4);
+                w.print(
+                    "{{\"memory_id\":\"{s}\",\"version\":{d},\"kind\":\"{s}\",\"status\":\"{s}\",\"confidence\":\"{d:.6}\",\"evidence_count\":{d},\"content\":{s},\"created_ts\":\"{s}\"}}",
+                    .{
+                        stmt.columnText(0),
+                        stmt.columnInt(1),
+                        stmt.columnText(2),
+                        stmt.columnText(3),
+                        conf,
+                        stmt.columnInt(5),
+                        stmt.columnText(6),
+                        stmt.columnText(7),
+                    },
+                ) catch break :blk false;
+                break :blk true;
+            };
+            // Keep as many newest rows as fit; drop the overflowing row and
+            // older ones instead of blanking the whole memories API.
+            if (!wrote) {
+                w.end = mark;
+                break;
+            }
         }
-        w.writeAll("]") catch return DbError.StepFailed;
-        return w.buffered();
+        out[w.end] = ']';
+        return out[0 .. w.end + 1];
     }
 
     /// Callback for each latest-version row (boot rebuild of in-memory store).
@@ -1016,6 +1179,222 @@ pub const MemoriesRepo = struct {
         }
     }
 };
+
+pub const ReviewChatRow = struct {
+    decision_id: []const u8,
+    anchor_ts: []const u8 = "",
+    role: []const u8, // 'user' | 'assistant' | 'summary'
+    content: []const u8,
+    model: []const u8 = "",
+    created_ts: []const u8,
+};
+
+/// 复盘对话 transcripts. Analysis-only side channel: rows never feed the
+/// trading loop; an explicit summarize step may distill them into a memory.
+pub const ReviewChatsRepo = struct {
+    insert: Stmt,
+
+    pub fn init(db: *Db) DbError!ReviewChatsRepo {
+        return .{ .insert = try db.prepare(
+            \\INSERT INTO review_chats (decision_id, anchor_ts, role, content, model, created_ts)
+            \\VALUES (?1,?2,?3,?4,?5,?6)
+        ) };
+    }
+
+    pub fn deinit(self: *ReviewChatsRepo) void {
+        self.insert.finalize();
+    }
+
+    pub fn append(self: *ReviewChatsRepo, row: ReviewChatRow) DbError!void {
+        self.insert.reset();
+        try self.insert.bindText(1, row.decision_id);
+        try self.insert.bindText(2, row.anchor_ts);
+        try self.insert.bindText(3, row.role);
+        try self.insert.bindText(4, row.content);
+        try self.insert.bindText(5, row.model);
+        try self.insert.bindText(6, row.created_ts);
+        _ = try self.insert.stepCritical();
+    }
+
+    pub fn countForDecision(self: *ReviewChatsRepo, db: *Db, decision_id: []const u8) DbError!i64 {
+        _ = self;
+        var stmt = try db.prepare("SELECT COUNT(*) FROM review_chats WHERE decision_id = ?1");
+        defer stmt.finalize();
+        try stmt.bindText(1, decision_id);
+        if (!try stmt.step()) return 0;
+        return stmt.columnInt(0);
+    }
+
+    /// Newest turns as a JSON array (newest first; client re-sorts by id).
+    /// Content is raw text → JSON-escaped here. Rows that overflow `out`
+    /// are dropped (with all older rows) instead of failing the listing.
+    pub fn listRecentJson(self: *ReviewChatsRepo, db: *Db, out: []u8, limit: i64) DbError![]const u8 {
+        _ = self;
+        var stmt = try db.prepare(
+            \\SELECT id, decision_id, anchor_ts, role, content, model, created_ts
+            \\FROM review_chats ORDER BY id DESC LIMIT ?1
+        );
+        defer stmt.finalize();
+        try stmt.bindInt(1, limit);
+        if (out.len < 2) return DbError.StepFailed;
+        var w: std.Io.Writer = .fixed(out[0 .. out.len - 1]); // reserve "]"
+        w.writeAll("[") catch return DbError.StepFailed;
+        var i: usize = 0;
+        while (try stmt.step()) : (i += 1) {
+            const mark = w.end;
+            const wrote = blk: {
+                if (i > 0) w.writeAll(",") catch break :blk false;
+                w.print(
+                    "{{\"id\":{d},\"decision_id\":\"{s}\",\"anchor_ts\":\"{s}\",\"role\":\"{s}\",\"content\":\"",
+                    .{ stmt.columnInt(0), stmt.columnText(1), stmt.columnText(2), stmt.columnText(3) },
+                ) catch break :blk false;
+                writeJsonEscaped(&w, stmt.columnText(4)) catch break :blk false;
+                w.print(
+                    "\",\"model\":\"{s}\",\"created_ts\":\"{s}\"}}",
+                    .{ stmt.columnText(5), stmt.columnText(6) },
+                ) catch break :blk false;
+                break :blk true;
+            };
+            if (!wrote) {
+                w.end = mark;
+                break;
+            }
+        }
+        out[w.end] = ']';
+        return out[0 .. w.end + 1];
+    }
+
+    /// Plain-text transcript tail (oldest→newest of the last `max_turns`),
+    /// "role: content" lines. Feeds the review LLM prompt.
+    pub fn transcriptTail(
+        self: *ReviewChatsRepo,
+        db: *Db,
+        out: []u8,
+        decision_id: []const u8,
+        max_turns: i64,
+    ) DbError![]const u8 {
+        _ = self;
+        var stmt = try db.prepare(
+            \\SELECT role, content FROM (
+            \\  SELECT id, role, content FROM review_chats
+            \\  WHERE decision_id = ?1 AND role != 'summary'
+            \\  ORDER BY id DESC LIMIT ?2
+            \\) ORDER BY id ASC
+        );
+        defer stmt.finalize();
+        try stmt.bindText(1, decision_id);
+        try stmt.bindInt(2, max_turns);
+        var w: std.Io.Writer = .fixed(out);
+        while (try stmt.step()) {
+            const mark = w.end;
+            const wrote = blk: {
+                w.print("{s}: {s}\n", .{ stmt.columnText(0), stmt.columnText(1) }) catch break :blk false;
+                break :blk true;
+            };
+            if (!wrote) {
+                w.end = mark;
+                break;
+            }
+        }
+        return w.buffered();
+    }
+};
+
+pub const AuditReportRow = struct {
+    audit_id: []const u8,
+    ts: []const u8,
+    status: []const u8, // 'ok' | 'warn' | 'alert'
+    findings: i64,
+    report_json: []const u8,
+};
+
+/// Scheduled audit reports (定时审计): full findings JSON kept for replay.
+pub const AuditReportsRepo = struct {
+    insert: Stmt,
+
+    pub fn init(db: *Db) DbError!AuditReportsRepo {
+        return .{ .insert = try db.prepare(
+            \\INSERT INTO audit_reports (audit_id, ts, status, findings, report_json)
+            \\VALUES (?1,?2,?3,?4,?5)
+        ) };
+    }
+
+    pub fn deinit(self: *AuditReportsRepo) void {
+        self.insert.finalize();
+    }
+
+    pub fn append(self: *AuditReportsRepo, row: AuditReportRow) DbError!void {
+        self.insert.reset();
+        try self.insert.bindText(1, row.audit_id);
+        try self.insert.bindText(2, row.ts);
+        try self.insert.bindText(3, row.status);
+        try self.insert.bindInt(4, row.findings);
+        try self.insert.bindText(5, row.report_json);
+        _ = try self.insert.stepCritical();
+    }
+
+    /// ms timestamp of the newest report (parsed from RFC3339 ts), or null.
+    pub fn latestTs(self: *AuditReportsRepo, db: *Db, out: []u8) DbError!?[]const u8 {
+        _ = self;
+        var stmt = try db.prepare("SELECT ts FROM audit_reports ORDER BY id DESC LIMIT 1");
+        defer stmt.finalize();
+        if (!try stmt.step()) return null;
+        const t = stmt.columnText(0);
+        const n = @min(t.len, out.len);
+        @memcpy(out[0..n], t[0..n]);
+        return out[0..n];
+    }
+
+    /// Newest reports as a JSON array (newest first); report_json embedded raw.
+    /// Overflowing rows are dropped (with older ones) instead of failing.
+    pub fn listRecentJson(self: *AuditReportsRepo, db: *Db, out: []u8, limit: i64) DbError![]const u8 {
+        _ = self;
+        var stmt = try db.prepare(
+            \\SELECT audit_id, ts, status, findings, report_json
+            \\FROM audit_reports ORDER BY id DESC LIMIT ?1
+        );
+        defer stmt.finalize();
+        try stmt.bindInt(1, limit);
+        if (out.len < 2) return DbError.StepFailed;
+        var w: std.Io.Writer = .fixed(out[0 .. out.len - 1]);
+        w.writeAll("[") catch return DbError.StepFailed;
+        var i: usize = 0;
+        while (try stmt.step()) : (i += 1) {
+            const mark = w.end;
+            const wrote = blk: {
+                if (i > 0) w.writeAll(",") catch break :blk false;
+                w.print("{s}", .{stmt.columnText(4)}) catch break :blk false;
+                break :blk true;
+            };
+            if (!wrote) {
+                w.end = mark;
+                break;
+            }
+        }
+        out[w.end] = ']';
+        return out[0 .. w.end + 1];
+    }
+};
+
+/// Escape raw text into a JSON string value (no surrounding quotes).
+fn writeJsonEscaped(w: *std.Io.Writer, s: []const u8) error{WriteFailed}!void {
+    for (s) |ch| {
+        switch (ch) {
+            '"' => try w.writeAll("\\\""),
+            '\\' => try w.writeAll("\\\\"),
+            '\n' => try w.writeAll("\\n"),
+            '\r' => try w.writeAll("\\r"),
+            '\t' => try w.writeAll("\\t"),
+            else => {
+                if (ch < 0x20) {
+                    try w.print("\\u{x:0>4}", .{ch});
+                } else {
+                    try w.writeByte(ch);
+                }
+            },
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 
@@ -1563,4 +1942,86 @@ test "self-review queries: proposals, fills join, equity marks" {
     // Cutoff before any sample → NotFound.
     var mark_buf2: [128]u8 = undefined;
     try testing.expectError(DbError.NotFound, equity.equityMarkJson(&db, "7d", "2026-08-13T07:00:00.000Z", &mark_buf2));
+}
+
+test "review chats append, list, transcript and count" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const path = try tmpDbPath(&tmp, &buf);
+    var db = try Db.open(path);
+    defer db.close();
+
+    var repo = try ReviewChatsRepo.init(&db);
+    defer repo.deinit();
+
+    try repo.append(.{
+        .decision_id = "dec_1",
+        .anchor_ts = "2026-08-14T03:26:41.212Z",
+        .role = "user",
+        .content = "当时为什么 HOLD？\n有\"引号\"",
+        .created_ts = "2026-08-14T04:00:00.000Z",
+    });
+    try repo.append(.{
+        .decision_id = "dec_1",
+        .anchor_ts = "2026-08-14T03:26:41.212Z",
+        .role = "assistant",
+        .content = "基于负基差与卖压占优。",
+        .model = "test-model",
+        .created_ts = "2026-08-14T04:00:10.000Z",
+    });
+    try repo.append(.{
+        .decision_id = "dec_2",
+        .role = "user",
+        .content = "另一个决策",
+        .created_ts = "2026-08-14T05:00:00.000Z",
+    });
+
+    try testing.expectEqual(@as(i64, 2), try repo.countForDecision(&db, "dec_1"));
+    try testing.expectEqual(@as(i64, 0), try repo.countForDecision(&db, "dec_x"));
+
+    var out: [4096]u8 = undefined;
+    const j = try repo.listRecentJson(&db, &out, 10);
+    // Newest first; quotes and newlines escaped.
+    try testing.expect(std.mem.indexOf(u8, j, "\"decision_id\":\"dec_2\"") != null);
+    try testing.expect(std.mem.indexOf(u8, j, "\\\"引号\\\"") != null);
+    try testing.expect(std.mem.indexOf(u8, j, "\\n") != null);
+    try testing.expect(std.mem.indexOf(u8, j, "\"model\":\"test-model\"") != null);
+    // Valid JSON array
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, j, .{});
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 3), parsed.value.array.items.len);
+
+    var tr_buf: [1024]u8 = undefined;
+    const tr = try repo.transcriptTail(&db, &tr_buf, "dec_1", 8);
+    // Oldest first, role-prefixed lines.
+    try testing.expect(std.mem.startsWith(u8, tr, "user: "));
+    try testing.expect(std.mem.indexOf(u8, tr, "assistant: 基于负基差") != null);
+}
+
+test "events window query filters by ts range" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const path = try tmpDbPath(&tmp, &buf);
+    var db = try Db.open(path);
+    defer db.close();
+
+    var repo = try EventsRepo.init(&db);
+    defer repo.deinit();
+    try repo.append(.{ .event_id = "e1", .ts = "2026-08-14T02:00:00.000Z", .type = "MARKET_TICK", .source = "t", .severity = "INFO" });
+    try repo.append(.{ .event_id = "e2", .ts = "2026-08-14T03:00:00.000Z", .type = "AGENT_PROPOSAL_OK", .source = "agent", .severity = "INFO", .payload_json = "{\"decision_id\":\"dec_9\",\"action\":\"HOLD\"}" });
+    try repo.append(.{ .event_id = "e3", .ts = "2026-08-14T04:00:00.000Z", .type = "MARKET_TICK", .source = "t", .severity = "INFO" });
+
+    var out: [2048]u8 = undefined;
+    const j = try repo.listWindowJson(&db, &out, "2026-08-14T02:30:00.000Z", "2026-08-14T03:30:00.000Z", 10);
+    try testing.expect(std.mem.indexOf(u8, j, "\"event_id\":\"e2\"") != null);
+    try testing.expect(std.mem.indexOf(u8, j, "\"event_id\":\"e1\"") == null);
+    try testing.expect(std.mem.indexOf(u8, j, "\"event_id\":\"e3\"") == null);
+
+    var pl_buf: [512]u8 = undefined;
+    const pl = try repo.proposalPayloadByDecision(&db, &pl_buf, "dec_9");
+    try testing.expect(pl != null);
+    try testing.expect(std.mem.indexOf(u8, pl.?, "\"action\":\"HOLD\"") != null);
+    try testing.expect((try repo.proposalPayloadByDecision(&db, &pl_buf, "dec_none")) == null);
 }

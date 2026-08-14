@@ -7,6 +7,7 @@ const state_mod = @import("../core/state.zig");
 const sm = @import("../risk/state_machine.zig");
 const clock = @import("../core/clock.zig");
 const auth = @import("auth.zig");
+const review = @import("review.zig");
 
 const favicon_svg: []const u8 = @embedFile("favicon_svg");
 const favicon_ico: []const u8 = @embedFile("favicon_ico");
@@ -61,6 +62,14 @@ pub const Context = struct {
     decisions_json: []const u8 = "[]",
     /// Orders projection + recent fills: `{"orders":[...],"fills":[...]}`.
     orders_json: []const u8 = "{\"orders\":[],\"fills\":[]}",
+    /// 复盘 chat transcripts (recent turns, newest first).
+    review_json: []const u8 = "[]",
+    /// Last rendered 复盘 context window (decision-anchored events).
+    review_ctx_json: []const u8 = "{}",
+    /// Review request mailbox; null = review feature unavailable.
+    review_inbox: ?*review.Inbox = null,
+    /// Recent scheduled-audit reports (newest first).
+    audit_json: []const u8 = "[]",
     /// Dashboard HTML served at "/". Embedded at comptime; empty = 404.
     index_html: []const u8 = "",
     auth_cfg: auth.Config = .{},
@@ -231,6 +240,11 @@ pub fn handleReq(buf: []u8, req: RequestInfo, ctx: Context) Response {
         if (checkProtectedAuth(ctx, req)) |denied| return denied;
     }
 
+    // --- review (复盘) POST mailbox: analysis-only, never touches trading ---
+    if (method == .POST and std.mem.startsWith(u8, path, "/api/v1/review/")) {
+        return handleReviewPost(req, path, ctx);
+    }
+
     if (method != .GET) {
         return .{ .status = .method_not_allowed, .body = "{\"error\":\"method not allowed\"}" };
     }
@@ -247,7 +261,51 @@ pub fn handleReq(buf: []u8, req: RequestInfo, ctx: Context) Response {
     if (std.mem.eql(u8, path, "/api/v1/system")) return copyBody(buf, ctx.system_json);
     if (std.mem.eql(u8, path, "/api/v1/decisions")) return copyBody(buf, ctx.decisions_json);
     if (std.mem.eql(u8, path, "/api/v1/orders")) return copyBody(buf, ctx.orders_json);
+    if (std.mem.eql(u8, path, "/api/v1/review/chats")) return copyBody(buf, ctx.review_json);
+    if (std.mem.eql(u8, path, "/api/v1/review/context")) return copyBody(buf, ctx.review_ctx_json);
+    if (std.mem.eql(u8, path, "/api/v1/audit")) return copyBody(buf, ctx.audit_json);
     return .{ .status = .not_found, .body = "{\"error\":\"not found\"}" };
+}
+
+/// Enqueue a review request (chat / context / summarize). The core loop
+/// processes it and publishes results via the pre-rendered review blobs.
+fn handleReviewPost(req: RequestInfo, path: []const u8, ctx: Context) Response {
+    const inbox = ctx.review_inbox orelse {
+        return .{ .status = .service_unavailable, .body = "{\"error\":\"review_unavailable\"}" };
+    };
+    const kind: review.Kind = if (std.mem.eql(u8, path, "/api/v1/review/chat"))
+        .chat
+    else if (std.mem.eql(u8, path, "/api/v1/review/context"))
+        .context
+    else if (std.mem.eql(u8, path, "/api/v1/review/summarize"))
+        .summarize
+    else {
+        return .{ .status = .not_found, .body = "{\"error\":\"not found\"}" };
+    };
+
+    var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, req.body, .{}) catch {
+        return .{ .status = .bad_request, .body = "{\"error\":\"bad_json\"}" };
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return .{ .status = .bad_request, .body = "{\"error\":\"bad_json\"}" };
+    const obj = parsed.value.object;
+    const decision_id = jsonGetString(obj, "decision_id") orelse "";
+    const anchor_ts = jsonGetString(obj, "anchor_ts") orelse "";
+    const message = std.mem.trim(u8, jsonGetString(obj, "message") orelse "", " \t\r\n");
+
+    inbox.enqueue(kind, decision_id, anchor_ts, message) catch |err| switch (err) {
+        review.EnqueueError.BadInput => return .{ .status = .bad_request, .body = "{\"error\":\"bad_input\"}" },
+        review.EnqueueError.Full => return .{
+            .status = .too_many_requests,
+            .body = "{\"error\":\"busy\",\"hint\":\"review_queue_full\"}",
+            .retry_after_sec = 5,
+        },
+        review.EnqueueError.DuplicatePending => return .{
+            .status = .conflict,
+            .body = "{\"error\":\"pending\",\"hint\":\"request_already_queued\"}",
+        },
+    };
+    return .{ .status = .accepted, .body = "{\"ok\":true,\"queued\":true}" };
 }
 
 fn jsonGetString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
@@ -974,6 +1032,9 @@ test "agent-runs equity shadow endpoints serve context blobs" {
     ctx.system_json = "{\"ready\":true}";
     ctx.decisions_json = "[{\"type\":\"AGENT_PROPOSAL_OK\"}]";
     ctx.orders_json = "{\"orders\":[{\"status\":\"FILLED\"}],\"fills\":[]}";
+    ctx.review_json = "[{\"role\":\"user\"}]";
+    ctx.review_ctx_json = "{\"decision_id\":\"dec_1\"}";
+    ctx.audit_json = "[{\"audit_id\":\"aud_1\",\"status\":\"ok\"}]";
     try testing.expectEqualStrings("[{\"run_id\":\"r1\"}]", handle(&buf, .GET, "/api/v1/agent-runs", ctx).body);
     try testing.expectEqualStrings("[{\"equity\":\"100\"}]", handle(&buf, .GET, "/api/v1/equity", ctx).body);
     try testing.expectEqualStrings("{\"alpha\":\"0\"}", handle(&buf, .GET, "/api/v1/shadow", ctx).body);
@@ -982,6 +1043,120 @@ test "agent-runs equity shadow endpoints serve context blobs" {
     try testing.expectEqualStrings("{\"ready\":true}", handle(&buf, .GET, "/api/v1/system", ctx).body);
     try testing.expectEqualStrings("[{\"type\":\"AGENT_PROPOSAL_OK\"}]", handle(&buf, .GET, "/api/v1/decisions", ctx).body);
     try testing.expectEqualStrings("{\"orders\":[{\"status\":\"FILLED\"}],\"fills\":[]}", handle(&buf, .GET, "/api/v1/orders", ctx).body);
+    try testing.expectEqualStrings("[{\"role\":\"user\"}]", handle(&buf, .GET, "/api/v1/review/chats", ctx).body);
+    try testing.expectEqualStrings("{\"decision_id\":\"dec_1\"}", handle(&buf, .GET, "/api/v1/review/context", ctx).body);
+    try testing.expectEqualStrings("[{\"audit_id\":\"aud_1\",\"status\":\"ok\"}]", handle(&buf, .GET, "/api/v1/audit", ctx).body);
+}
+
+test "review POST enqueues into inbox; validation and limits enforced" {
+    var buf: [1024]u8 = undefined;
+    var inbox: review.Inbox = .{};
+    var ctx = testCtx();
+    ctx.review_inbox = &inbox;
+
+    // Missing inbox → 503
+    {
+        const no_ctx = testCtx();
+        const r = handleReq(&buf, .{
+            .method = .POST,
+            .target = "/api/v1/review/chat",
+            .body = "{\"decision_id\":\"dec_1\",\"message\":\"why\"}",
+        }, no_ctx);
+        try testing.expectEqual(std.http.Status.service_unavailable, r.status);
+    }
+
+    // Happy path chat
+    {
+        const r = handleReq(&buf, .{
+            .method = .POST,
+            .target = "/api/v1/review/chat",
+            .body = "{\"decision_id\":\"dec_1\",\"anchor_ts\":\"2026-08-14T03:00:00.000Z\",\"message\":\"为什么 HOLD？\"}",
+        }, ctx);
+        try testing.expectEqual(std.http.Status.accepted, r.status);
+        try testing.expectEqual(@as(usize, 1), inbox.pending());
+    }
+    // Duplicate chat for same decision → 409
+    {
+        const r = handleReq(&buf, .{
+            .method = .POST,
+            .target = "/api/v1/review/chat",
+            .body = "{\"decision_id\":\"dec_1\",\"message\":\"again\"}",
+        }, ctx);
+        try testing.expectEqual(std.http.Status.conflict, r.status);
+    }
+    // Context + summarize routes accepted
+    {
+        const r = handleReq(&buf, .{
+            .method = .POST,
+            .target = "/api/v1/review/context",
+            .body = "{\"decision_id\":\"dec_1\",\"anchor_ts\":\"2026-08-14T03:00:00.000Z\"}",
+        }, ctx);
+        try testing.expectEqual(std.http.Status.accepted, r.status);
+        const s = handleReq(&buf, .{
+            .method = .POST,
+            .target = "/api/v1/review/summarize",
+            .body = "{\"decision_id\":\"dec_1\"}",
+        }, ctx);
+        try testing.expectEqual(std.http.Status.accepted, s.status);
+    }
+    // Bad JSON / empty message / empty decision → 400
+    {
+        try testing.expectEqual(std.http.Status.bad_request, handleReq(&buf, .{
+            .method = .POST,
+            .target = "/api/v1/review/chat",
+            .body = "not json",
+        }, ctx).status);
+        try testing.expectEqual(std.http.Status.bad_request, handleReq(&buf, .{
+            .method = .POST,
+            .target = "/api/v1/review/chat",
+            .body = "{\"decision_id\":\"dec_2\",\"message\":\"   \"}",
+        }, ctx).status);
+        try testing.expectEqual(std.http.Status.bad_request, handleReq(&buf, .{
+            .method = .POST,
+            .target = "/api/v1/review/chat",
+            .body = "{\"message\":\"hi\"}",
+        }, ctx).status);
+    }
+    // Unknown review subpath → 404; drain leaves queue reusable
+    {
+        try testing.expectEqual(std.http.Status.not_found, handleReq(&buf, .{
+            .method = .POST,
+            .target = "/api/v1/review/execute",
+            .body = "{\"decision_id\":\"dec_1\"}",
+        }, ctx).status);
+        while (inbox.drain()) |_| {}
+        try testing.expectEqual(@as(usize, 0), inbox.pending());
+    }
+}
+
+test "review endpoints require auth when token configured" {
+    var buf: [1024]u8 = undefined;
+    var inbox: review.Inbox = .{};
+    var ctx = testCtx();
+    ctx.review_inbox = &inbox;
+    ctx.auth_cfg = .{ .api_token = "secret-token" };
+    ctx.auth_cfg.session_secret = auth.deriveSessionSecret(ctx.auth_cfg.api_token);
+
+    try testing.expectEqual(std.http.Status.unauthorized, handleReq(&buf, .{
+        .method = .POST,
+        .target = "/api/v1/review/chat",
+        .body = "{\"decision_id\":\"dec_1\",\"message\":\"hi\"}",
+    }, ctx).status);
+    try testing.expectEqual(@as(usize, 0), inbox.pending());
+    try testing.expectEqual(std.http.Status.unauthorized, handleReq(&buf, .{
+        .method = .GET,
+        .target = "/api/v1/review/chats",
+    }, ctx).status);
+
+    // With token → accepted
+    const r = handleReq(&buf, .{
+        .method = .POST,
+        .target = "/api/v1/review/chat",
+        .authorization = "Bearer secret-token",
+        .body = "{\"decision_id\":\"dec_1\",\"message\":\"hi\"}",
+    }, ctx);
+    try testing.expectEqual(std.http.Status.accepted, r.status);
+    try testing.expectEqual(@as(usize, 1), inbox.pending());
 }
 
 test "brand icons are public and embedded" {

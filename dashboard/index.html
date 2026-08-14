@@ -199,6 +199,105 @@
     border: 1px solid var(--border); border-radius: 6px; padding: 4px 10px;
     font: inherit; font-size: 12px; cursor: pointer;
   }
+
+  /* ===== 复盘 (review) tab ===== */
+  .chart-host.lg { height: 400px; }
+  .rv-nav { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 12px 0; }
+  .rv-nav select {
+    background: var(--panel); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 6px 10px; font: inherit; font-size: 12px; max-width: 420px;
+  }
+  .rv-nav button {
+    appearance: none; background: var(--panel); color: var(--dim);
+    border: 1px solid var(--border); border-radius: 999px;
+    padding: 6px 12px; font: inherit; font-size: 12px; cursor: pointer;
+  }
+  .rv-nav button:hover { color: var(--text); }
+  .rv-head {
+    display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px 14px; margin-bottom: 12px; font-size: 12px; color: var(--dim);
+  }
+  .rv-head b { color: var(--text); }
+  .rv-subtabs { display: flex; gap: 6px; margin: 0 0 12px; }
+  .rv-subtabs button {
+    appearance: none; background: var(--panel); color: var(--dim);
+    border: 1px solid var(--border); border-radius: 999px;
+    padding: 6px 16px; font: inherit; font-size: 13px; cursor: pointer;
+  }
+  .rv-subtabs button.active { color: var(--line); border-color: var(--line); }
+  .rv-pane { display: none; }
+  .rv-pane.active { display: block; }
+  .rv-pane .dec-summary {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+    padding: 14px; font-size: 12px; line-height: 1.55;
+  }
+  /* chat */
+  #rv_chat_log {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+    padding: 14px; min-height: 160px; max-height: 420px; overflow-y: auto;
+    display: flex; flex-direction: column; gap: 10px; margin-bottom: 10px;
+  }
+  .rv-msg { max-width: 86%; padding: 8px 12px; border-radius: 10px; font-size: 13px;
+    line-height: 1.55; white-space: pre-wrap; word-break: break-word; }
+  .rv-msg.user { align-self: flex-end; background: rgba(88,166,255,.12); border: 1px solid rgba(88,166,255,.35); }
+  .rv-msg.assistant { align-self: flex-start; background: #0f141b; border: 1px solid var(--border); }
+  .rv-msg.summary { align-self: center; background: rgba(63,185,80,.08); border: 1px dashed rgba(63,185,80,.45); color: var(--dim); font-size: 12px; }
+  .rv-msg .meta { display: block; color: var(--dim); font-size: 10px; margin-top: 4px; }
+  .rv-msg.pending { align-self: flex-start; color: var(--dim); border: 1px dashed var(--border); background: transparent; }
+  .rv-chat-input { display: flex; gap: 8px; align-items: flex-end; }
+  .rv-chat-input textarea {
+    flex: 1; background: var(--panel); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px;
+    font: inherit; font-size: 13px; resize: vertical; min-height: 44px; max-height: 160px;
+  }
+  .rv-chat-input button {
+    appearance: none; border-radius: 8px; padding: 10px 16px; font: inherit; font-size: 13px;
+    cursor: pointer; border: 1px solid var(--border); white-space: nowrap;
+  }
+  #rv_chat_send { background: #238636; color: #fff; border-color: #2ea043; }
+  #rv_chat_send:disabled, #rv_chat_summarize:disabled { opacity: .45; cursor: not-allowed; }
+  #rv_chat_summarize { background: var(--tab); color: var(--text); }
+  .rv-count { color: var(--dim); font-size: 11px; align-self: center; }
+
+  /* ===== 审计告警铃铛 ===== */
+  #alert_bell {
+    display: inline-flex; align-items: center; gap: 2px;
+    position: relative; cursor: pointer; color: var(--dim);
+    vertical-align: 2px; margin-left: 6px; padding: 2px;
+  }
+  #alert_bell:hover { color: var(--text); }
+  #alert_bell.warn { color: var(--warn); }
+  #alert_bell.alert { color: var(--bad); }
+  #alert_bell b {
+    display: none; min-width: 14px; height: 14px; border-radius: 999px;
+    font-size: 10px; line-height: 14px; text-align: center; font-weight: 700;
+    color: #fff; padding: 0 3px; position: relative; top: -6px; left: -4px;
+  }
+  #alert_bell.warn b { display: inline-block; background: var(--warn); color: #1c1500; }
+  #alert_bell.alert b { display: inline-block; background: var(--bad); }
+  #alert_panel {
+    display: none; position: fixed; top: 64px; right: max(16px, calc((100vw - 1180px)/2));
+    width: min(460px, calc(100vw - 32px)); z-index: 900;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    box-shadow: 0 12px 32px rgba(0,0,0,.5); padding: 12px 14px; font-size: 12px;
+  }
+  #alert_panel.show { display: block; }
+  #alert_panel .ap-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+  #alert_panel .ap-head span { font-weight: 600; }
+  #alert_panel .ap-head button {
+    appearance: none; background: transparent; border: none; color: var(--dim);
+    font-size: 16px; cursor: pointer; padding: 0 4px;
+  }
+  #alert_panel .ap-body { max-height: 220px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px; }
+  .ap-finding { border: 1px solid var(--border); border-left-width: 3px; border-radius: 6px; padding: 6px 8px; }
+  .ap-finding.warn { border-left-color: var(--warn); }
+  .ap-finding.alert { border-left-color: var(--bad); }
+  .ap-finding .k { color: var(--dim); font-size: 10px; font-family: ui-monospace, Menlo, monospace; }
+  #alert_panel .ap-sub { color: var(--dim); font-size: 11px; margin: 8px 0 4px; }
+  #alert_panel table { font-size: 11px; }
+  #alert_panel td { padding: 4px 6px; }
+  #alert_panel .ap-note { color: var(--dim); font-size: 10px; margin-top: 8px; line-height: 1.5; }
 </style>
 </head>
 <body>
@@ -218,7 +317,20 @@
   </div>
 </div>
 
-  <h1>AlphaBound <span id="staleness" class="sub"></span></h1>
+  <h1>AlphaBound
+    <span id="alert_bell" title="定时审计告警" role="button" aria-label="审计告警">
+      <svg viewBox="0 0 16 16" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M8 16a2 2 0 0 0 1.985-1.75c.017-.137-.097-.25-.235-.25h-3.5c-.138 0-.252.113-.235.25A2 2 0 0 0 8 16ZM3 5a5 5 0 0 1 10 0v2.947c0 .05.015.098.042.139l1.703 2.555A1.519 1.519 0 0 1 13.482 13H2.518a1.516 1.516 0 0 1-1.263-2.36l1.703-2.554A.255.255 0 0 0 3 7.947Z"/></svg>
+      <b id="alert_badge"></b>
+    </span>
+    <span id="staleness" class="sub"></span>
+  </h1>
+  <div id="alert_panel" aria-live="polite">
+    <div class="ap-head"><span id="ap_title">审计状态</span><button type="button" id="ap_close" aria-label="关闭">×</button></div>
+    <div class="ap-body" id="ap_findings"><span class="muted">尚无审计报告</span></div>
+    <div class="ap-sub">最近审计</div>
+    <table><tbody id="ap_history"><tr><td class="muted">加载中…</td></tr></tbody></table>
+    <p class="ap-note">确定性规则审计：LLM 提案/工具/数据不变量/流程链每 <span id="ap_interval">—</span> 自检一次；详情落库 audit_reports，事件流可见 AUDIT_*。</p>
+  </div>
   <div id="auth_bar">
     <span id="auth_bar_text">已登录</span>
     <button type="button" id="auth_register_passkey">注册 Passkey</button>
@@ -228,6 +340,7 @@
 
   <div class="tabs" role="tablist">
     <button class="tab active" data-tab="overview" type="button">概览</button>
+    <button class="tab" data-tab="review" type="button">复盘</button>
     <button class="tab" data-tab="decisions" type="button">决策历史</button>
     <button class="tab" data-tab="orders" type="button">订单</button>
     <button class="tab" data-tab="status" type="button">状态</button>
@@ -361,6 +474,74 @@
       </thead>
       <tbody id="eq_body"><tr><td colspan="6" class="muted">加载中…</td></tr></tbody>
     </table>
+  </div>
+
+  <!-- ========== 复盘 ========== -->
+  <div class="panel" id="panel-review">
+    <div class="chart-wrap">
+      <div class="chart-meta" id="rv_meta"><span>BTC-USDT</span><span class="muted">加载中…</span></div>
+      <div class="filters bar-filters" id="rv_bar_filters" role="group" aria-label="复盘K线周期">
+        <button type="button" data-bar="1m">1分</button>
+        <button type="button" data-bar="5m">5分</button>
+        <button type="button" data-bar="15m" class="active">15分</button>
+        <button type="button" data-bar="1H">1时</button>
+        <button type="button" data-bar="4H">4时</button>
+        <button type="button" data-bar="1D">1日</button>
+      </div>
+      <div class="filters" id="rv_ind_filters" role="group" aria-label="指标">
+        <span class="range-label">主图</span>
+        <button type="button" data-ind="ma5">MA5</button>
+        <button type="button" data-ind="ma20">MA20</button>
+        <button type="button" data-ind="ema20">EMA20</button>
+        <button type="button" data-ind="boll">BOLL</button>
+        <span class="range-label">副图</span>
+        <button type="button" data-sub="vol">VOL</button>
+        <button type="button" data-sub="rsi">RSI</button>
+        <button type="button" data-sub="macd">MACD</button>
+      </div>
+      <div class="chart-host lg" id="chart_review" role="img" aria-label="BTC-USDT 复盘 K 线与决策标记"></div>
+      <div class="tv-attr">标记：▲/▼ 调仓提案（绿加仓/红减仓）· ● 持有 · ▪ 失败/拒绝 — 点击标记回看该时点。Charts by <a href="https://www.tradingview.com" target="_blank" rel="noopener noreferrer">TradingView</a></div>
+    </div>
+
+    <div class="rv-nav">
+      <button type="button" id="rv_prev">◀ 上一决策</button>
+      <select id="rv_select" aria-label="选择决策"><option value="">选择提案决策…</option></select>
+      <button type="button" id="rv_next">下一决策 ▶</button>
+      <span class="rv-count" id="rv_count"></span>
+    </div>
+
+    <div class="rv-head" id="rv_head"><span class="muted">点击图中标记或在上方选择一个提案决策。</span></div>
+
+    <div class="rv-subtabs" id="rv_subtabs" role="tablist">
+      <button type="button" data-rvtab="decision" class="active">决策</button>
+      <button type="button" data-rvtab="events">事件流</button>
+      <button type="button" data-rvtab="chat">AI 复盘</button>
+    </div>
+
+    <div class="rv-pane active" id="rv_pane_decision">
+      <div class="dec-summary" id="rv_decision_body">未选择决策。</div>
+    </div>
+
+    <div class="rv-pane" id="rv_pane_events">
+      <p class="hint" id="rv_events_hint">选中决策前后 ±30 分钟的系统事件（行情、余额、准入、执行、备份等）。</p>
+      <table>
+        <thead>
+          <tr><th>时间</th><th>类型</th><th>来源</th><th>级别</th><th>摘要</th></tr>
+        </thead>
+        <tbody id="rv_events_body"><tr><td colspan="5" class="muted">未选择决策</td></tr></tbody>
+      </table>
+    </div>
+
+    <div class="rv-pane" id="rv_pane_chat">
+      <p class="hint">复盘对话仅用于研究与归因：助手可自主查询历史 K 线、决策时点指标（RSI/BOLL 等）、提案历史与净值轨迹，但不给交易建议，也改变不了任何决策；对话全程保存。
+        如需让结论参与后续推理，请点「沉淀为记忆」——它会被压缩成一条<b>低置信度参考记忆</b>，供主 Agent 自行取舍。</p>
+      <div id="rv_chat_log"><div class="rv-msg assistant">选择一个决策标记后开始复盘。</div></div>
+      <div class="rv-chat-input">
+        <textarea id="rv_chat_input" maxlength="1200" placeholder="针对该时点提问，如：当时的失效条件后来触发了吗？"></textarea>
+        <button type="button" id="rv_chat_send">发送</button>
+        <button type="button" id="rv_chat_summarize" title="将本决策的复盘对话压缩为一条低置信度参考记忆">沉淀为记忆</button>
+      </div>
+    </div>
   </div>
 
   <!-- ========== 决策历史 ========== -->
@@ -528,6 +709,22 @@ let ordHours = parseInt(localStorage.getItem("ab_ord_hours") || "0", 10);
 let cachedDecisions = [];
 let cachedRuns = [];
 let cachedOrdersBundle = { orders: [], fills: [] };
+
+// --- 复盘 (review) state ---
+let cachedReviewChats = [];
+let cachedAudit = [];
+let cachedAuditMeta = null;
+let rvBar = localStorage.getItem("ab_rv_bar") || "15m";
+let rvInd = { ma5: true, ma20: true, ema20: false, boll: false };
+try { const s = JSON.parse(localStorage.getItem("ab_rv_ind") || "null"); if (s && typeof s === "object") rvInd = Object.assign(rvInd, s); } catch (_) {}
+let rvSub = localStorage.getItem("ab_rv_sub") || "vol";
+let rvSelectedKey = null;      // decision key = payload.decision_id || event_id
+let rvActivePane = "decision";
+let rvChatPendingSince = 0;    // >0 → waiting for assistant/summary turn
+let rvChatLastTurnId = 0;      // newest turn id seen for selected decision at send time
+let rvCtxCache = {};           // decision key -> {events:[...]} once fetched
+let rvCtxWaiting = null;       // decision key currently being fetched
+let rvLastMarkerSig = "";
 
 // --- Lightweight Charts state (lazy-init, incremental setData) ---
 let candleChart = null, candleSeries = null, volumeSeries = null, timeSeries = null;
@@ -1182,6 +1379,592 @@ function onOverviewChartsVisible() {
   }
 }
 
+/* ===================== 复盘 (review) tab ===================== */
+
+let reviewChart = null, rvCandleSeries = null, rvVolSeries = null;
+let rvMa5 = null, rvMa20 = null, rvEma20 = null, rvBollUp = null, rvBollMid = null, rvBollLow = null;
+let rvRsi = null, rvMacdHist = null, rvMacdLine = null, rvMacdSignal = null;
+let rvLastSig = "";
+const RV_BAR_SEC = { "1m": 60, "5m": 300, "15m": 900, "1H": 3600, "4H": 14400, "1D": 86400 };
+
+// --- indicator math (close-based) ---
+function indSma(vals, n) {
+  const out = new Array(vals.length).fill(null);
+  let sum = 0;
+  for (let i = 0; i < vals.length; i++) {
+    sum += vals[i];
+    if (i >= n) sum -= vals[i - n];
+    if (i >= n - 1) out[i] = sum / n;
+  }
+  return out;
+}
+function indEma(vals, n) {
+  const out = new Array(vals.length).fill(null);
+  if (!vals.length) return out;
+  const k = 2 / (n + 1);
+  let prev = vals[0];
+  out[0] = prev;
+  for (let i = 1; i < vals.length; i++) {
+    prev = vals[i] * k + prev * (1 - k);
+    out[i] = prev;
+  }
+  // hide warm-up noise
+  for (let i = 0; i < Math.min(n - 1, out.length); i++) out[i] = null;
+  return out;
+}
+function indBoll(vals, n, mult) {
+  const mid = indSma(vals, n);
+  const up = new Array(vals.length).fill(null);
+  const low = new Array(vals.length).fill(null);
+  for (let i = n - 1; i < vals.length; i++) {
+    let s = 0;
+    for (let j = i - n + 1; j <= i; j++) s += Math.pow(vals[j] - mid[i], 2);
+    const sd = Math.sqrt(s / n);
+    up[i] = mid[i] + mult * sd;
+    low[i] = mid[i] - mult * sd;
+  }
+  return { mid, up, low };
+}
+function indRsi(vals, n) {
+  const out = new Array(vals.length).fill(null);
+  let gain = 0, loss = 0;
+  for (let i = 1; i < vals.length; i++) {
+    const d = vals[i] - vals[i - 1];
+    const g = d > 0 ? d : 0;
+    const l = d < 0 ? -d : 0;
+    if (i <= n) {
+      gain += g; loss += l;
+      if (i === n) {
+        gain /= n; loss /= n;
+        out[i] = loss === 0 ? 100 : 100 - 100 / (1 + gain / loss);
+      }
+    } else {
+      gain = (gain * (n - 1) + g) / n;
+      loss = (loss * (n - 1) + l) / n;
+      out[i] = loss === 0 ? 100 : 100 - 100 / (1 + gain / loss);
+    }
+  }
+  return out;
+}
+function indMacd(vals) {
+  const fast = indEma(vals, 12), slow = indEma(vals, 26);
+  const macd = vals.map((_, i) => (fast[i] != null && slow[i] != null) ? fast[i] - slow[i] : null);
+  const valid = macd.map(v => v == null ? 0 : v);
+  const sig = indEma(valid, 9);
+  const hist = macd.map((v, i) => (v != null && sig[i] != null) ? v - sig[i] : null);
+  return { macd, signal: sig.map((v, i) => macd[i] == null ? null : v), hist };
+}
+function toLineData(times, vals) {
+  const out = [];
+  for (let i = 0; i < times.length; i++) {
+    if (vals[i] != null && isFinite(vals[i])) out.push({ time: times[i], value: vals[i] });
+  }
+  return out;
+}
+
+function ensureReviewChart() {
+  if (reviewChart || !lwAvailable()) return !!reviewChart;
+  const el = $("chart_review");
+  if (!el) return false;
+  reviewChart = LightweightCharts.createChart(el, chartBaseOptions(400));
+  rvCandleSeries = reviewChart.addCandlestickSeries({
+    upColor: "#3fb950", downColor: "#f85149",
+    borderUpColor: "#3fb950", borderDownColor: "#f85149",
+    wickUpColor: "#3fb950", wickDownColor: "#f85149",
+  });
+  const overlay = (color, width) => reviewChart.addLineSeries({
+    color, lineWidth: width || 1,
+    priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
+  });
+  rvMa5 = overlay("#d29922");
+  rvMa20 = overlay("#58a6ff");
+  rvEma20 = overlay("#a371f7");
+  rvBollUp = overlay("rgba(139,148,158,0.8)");
+  rvBollMid = overlay("rgba(139,148,158,0.5)");
+  rvBollLow = overlay("rgba(139,148,158,0.8)");
+  // sub pane (bottom 20% via shared price scale)
+  rvVolSeries = reviewChart.addHistogramSeries({ priceFormat: { type: "volume" }, priceScaleId: "rvsub" });
+  rvRsi = reviewChart.addLineSeries({ color: "#d29922", lineWidth: 1, priceScaleId: "rvsub", priceLineVisible: false, lastValueVisible: false });
+  rvMacdHist = reviewChart.addHistogramSeries({ priceScaleId: "rvsub" });
+  rvMacdLine = reviewChart.addLineSeries({ color: "#58a6ff", lineWidth: 1, priceScaleId: "rvsub", priceLineVisible: false, lastValueVisible: false });
+  rvMacdSignal = reviewChart.addLineSeries({ color: "#f0883e", lineWidth: 1, priceScaleId: "rvsub", priceLineVisible: false, lastValueVisible: false });
+  reviewChart.priceScale("rvsub").applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
+  reviewChart.priceScale("right").applyOptions({ scaleMargins: { top: 0.06, bottom: 0.24 } });
+  reviewChart.applyOptions({ width: el.clientWidth || el.offsetWidth || 800 });
+  bindChartResize(reviewChart, el);
+  reviewChart.subscribeClick(onReviewChartClick);
+  return true;
+}
+
+/** Marker-worthy decisions: proposals + hard failures, oldest first. */
+function reviewDecisionList() {
+  const all = Array.isArray(cachedDecisions) ? cachedDecisions : [];
+  const list = all.filter(e => {
+    const t = e.type || "";
+    return t === "AGENT_PROPOSAL_OK" || t.indexOf("LLM_FAILED") >= 0 || t.indexOf("INVALID") >= 0;
+  });
+  list.sort((a, b) => Date.parse(a.ts || 0) - Date.parse(b.ts || 0));
+  return list;
+}
+
+function reviewKeyOf(e) {
+  const p = e.payload || {};
+  return p.decision_id || e.event_id || "";
+}
+
+function reviewFindByKey(key) {
+  if (!key) return null;
+  return reviewDecisionList().find(e => reviewKeyOf(e) === key) || null;
+}
+
+function updateReviewChart() {
+  const meta = $("rv_meta");
+  const payload = cachedCandlesPayload;
+  const inst = (payload && payload.instrument) || "BTC-USDT";
+  if (!lwAvailable()) {
+    if (meta) meta.innerHTML = "<span>" + inst + "</span><span class=\"warn\">图表库未加载（需出网 CDN）</span>";
+    return;
+  }
+  if (!ensureReviewChart()) return;
+  const bundle = resolveBarBundle(payload, rvBar);
+  const list = bundle.candles || [];
+  const barLabel = BAR_LABEL[rvBar] || rvBar;
+  if (!list.length) {
+    if (meta) meta.innerHTML = "<span>" + inst + " · " + barLabel + "</span><span class=\"muted\">暂无行情数据</span>";
+    return;
+  }
+
+  const rows = [], vols = [];
+  for (const c of list) {
+    const t = toUnixSec(c.ts_ms);
+    const o = parseFloat(c.o), h = parseFloat(c.h), l = parseFloat(c.l), cl = parseFloat(c.c);
+    const v = parseFloat(c.vol);
+    if (t == null || [o, h, l, cl].some(x => isNaN(x))) continue;
+    rows.push({ time: t, open: o, high: h, low: l, close: cl });
+    vols.push({ time: t, value: isNaN(v) ? 0 : v, color: cl >= o ? "rgba(63,185,80,0.45)" : "rgba(248,81,73,0.45)" });
+  }
+  rows.sort((a, b) => a.time - b.time);
+  vols.sort((a, b) => a.time - b.time);
+  const dedup = [], dedupV = [];
+  for (let i = 0; i < rows.length; i++) {
+    if (dedup.length && dedup[dedup.length - 1].time === rows[i].time) {
+      dedup[dedup.length - 1] = rows[i];
+      dedupV[dedupV.length - 1] = vols[i];
+    } else { dedup.push(rows[i]); dedupV.push(vols[i]); }
+  }
+  if (!dedup.length) return;
+
+  const times = dedup.map(r => r.time);
+  const closes = dedup.map(r => r.close);
+  const barSec = RV_BAR_SEC[rvBar] || 900;
+  const timeSet = new Set(times);
+
+  // markers from decisions (snap to bar bucket; keep only on-chart ones)
+  const decs = reviewDecisionList();
+  const markers = [];
+  let onChart = 0;
+  let prevTarget = null;
+  for (const e of decs) {
+    const p = e.payload || {};
+    const key = reviewKeyOf(e);
+    const tsSec = toUnixSec(e.ts);
+    const target = p.target_btc_weight != null ? parseFloat(p.target_btc_weight) : null;
+    let snap = null;
+    if (tsSec != null) {
+      const bucket = Math.floor(tsSec / barSec) * barSec;
+      if (timeSet.has(bucket)) snap = bucket;
+    }
+    const isSel = key === rvSelectedKey;
+    if (snap != null) {
+      onChart++;
+      let m;
+      const failed = (e.type || "") !== "AGENT_PROPOSAL_OK";
+      const rejected = p.admission && p.admission.verdict && p.admission.verdict !== "APPROVE";
+      const act = String(p.action || "").toUpperCase();
+      if (failed) {
+        m = { position: "aboveBar", shape: "square", color: "#f85149", text: "✕" };
+      } else if (rejected) {
+        m = { position: "aboveBar", shape: "square", color: "#d29922", text: "拒" };
+      } else if (act === "REBALANCE") {
+        const up = prevTarget == null || (target != null && target >= prevTarget);
+        m = up
+          ? { position: "belowBar", shape: "arrowUp", color: "#3fb950", text: target != null ? "R" + target : "R" }
+          : { position: "aboveBar", shape: "arrowDown", color: "#f85149", text: target != null ? "R" + target : "R" };
+      } else {
+        m = { position: "aboveBar", shape: "circle", color: isSel ? "#58a6ff" : "#8b949e", text: "" };
+      }
+      m.time = snap;
+      m.id = key;
+      m.size = isSel ? 2 : 1;
+      if (isSel) m.color = "#58a6ff";
+      markers.push(m);
+    }
+    if ((e.type || "") === "AGENT_PROPOSAL_OK" && target != null && !isNaN(target)) prevTarget = target;
+  }
+  markers.sort((a, b) => a.time - b.time);
+
+  const sig = rvBar + "|" + rvSub + "|" + JSON.stringify(Object.entries(rvInd)) + "|" +
+    (dedup.length ? dedup[dedup.length - 1].time + ":" + dedup[dedup.length - 1].close : "") + "|" +
+    dedup.length + "|" + markers.map(m => m.id + m.size).join(",");
+  if (sig !== rvLastSig) {
+    rvLastSig = sig;
+    rvCandleSeries.setData(dedup);
+    rvMa5.setData(rvInd.ma5 ? toLineData(times, indSma(closes, 5)) : []);
+    rvMa20.setData(rvInd.ma20 ? toLineData(times, indSma(closes, 20)) : []);
+    rvEma20.setData(rvInd.ema20 ? toLineData(times, indEma(closes, 20)) : []);
+    if (rvInd.boll) {
+      const b = indBoll(closes, 20, 2);
+      rvBollUp.setData(toLineData(times, b.up));
+      rvBollMid.setData(toLineData(times, b.mid));
+      rvBollLow.setData(toLineData(times, b.low));
+    } else {
+      rvBollUp.setData([]); rvBollMid.setData([]); rvBollLow.setData([]);
+    }
+    rvVolSeries.setData(rvSub === "vol" ? dedupV : []);
+    rvRsi.setData(rvSub === "rsi" ? toLineData(times, indRsi(closes, 14)) : []);
+    if (rvSub === "macd") {
+      const m = indMacd(closes);
+      rvMacdHist.setData(times.map((t, i) => m.hist[i] == null ? null : {
+        time: t, value: m.hist[i],
+        color: m.hist[i] >= 0 ? "rgba(63,185,80,0.5)" : "rgba(248,81,73,0.5)",
+      }).filter(Boolean));
+      rvMacdLine.setData(toLineData(times, m.macd));
+      rvMacdSignal.setData(toLineData(times, m.signal));
+    } else {
+      rvMacdHist.setData([]); rvMacdLine.setData([]); rvMacdSignal.setData([]);
+    }
+    rvCandleSeries.setMarkers(markers);
+    reviewChart.timeScale().fitContent();
+  }
+
+  if (meta) {
+    const last = dedup[dedup.length - 1].close;
+    let note = "提案标记 " + onChart + "/" + decs.length;
+    if (rvSelectedKey && !markers.some(m => m.id === rvSelectedKey)) {
+      note += " · <span class=\"warn\">所选决策超出当前周期范围，试试更大周期</span>";
+    }
+    meta.innerHTML = "<span><b>" + inst + "</b> · " + barLabel + " · 最新 <b>" + last + "</b></span><span>" + note + "</span>";
+  }
+}
+
+function onReviewChartClick(param) {
+  let key = param && param.hoveredObjectId;
+  if (!key && param && param.time != null) {
+    // fall back: nearest decision within one bar of the click
+    const barSec = RV_BAR_SEC[rvBar] || 900;
+    let best = null, bestD = Infinity;
+    for (const e of reviewDecisionList()) {
+      const t = toUnixSec(e.ts);
+      if (t == null) continue;
+      const d = Math.abs(t - param.time);
+      if (d < bestD) { bestD = d; best = e; }
+    }
+    if (best && bestD <= barSec) key = reviewKeyOf(best);
+  }
+  if (key) selectReviewDecision(String(key));
+}
+
+function selectReviewDecision(key) {
+  if (!key || key === rvSelectedKey) return;
+  rvSelectedKey = key;
+  rvChatPendingSince = 0;
+  rvLastSig = ""; // marker highlight redraw
+  renderReviewSelection();
+  updateReviewChart();
+  if (rvActivePane === "events") ensureReviewContext();
+}
+
+function renderReviewSelection() {
+  const e = reviewFindByKey(rvSelectedKey);
+  const head = $("rv_head");
+  const sel = $("rv_select");
+  if (sel && sel.value !== (rvSelectedKey || "")) sel.value = rvSelectedKey || "";
+  if (!e) {
+    if (head) head.innerHTML = '<span class="muted">点击图中标记或在上方选择一个提案决策。</span>';
+    $("rv_decision_body").textContent = "未选择决策。";
+    $("rv_events_body").innerHTML = '<tr><td colspan="5" class="muted">未选择决策</td></tr>';
+    renderReviewChatLog();
+    return;
+  }
+  const p = e.payload || {};
+  const runById = {};
+  (cachedRuns || []).forEach(r => { if (r.run_id) runById[r.run_id] = r; });
+  const run = runById[p.run_id] || {};
+  const adm = p.admission || {};
+  if (head) {
+    head.innerHTML =
+      "<span><b>" + (e.ts || "") + "</b></span>" +
+      "<span>" + typePill(e.type) + "</span>" +
+      (p.action ? "<span>" + actionPill(p.action) + "</span>" : "") +
+      (p.target_btc_weight != null ? "<span>目标权重 <b>" + esc(p.target_btc_weight) + "</b></span>" : "") +
+      (p.confidence != null ? "<span>置信度 <b>" + esc(p.confidence) + "</b></span>" : "") +
+      (adm.verdict ? "<span>准入 <b>" + esc(adm.verdict) + "</b></span>" : "") +
+      (run.model ? "<span class=\"muted\">" + esc(short(run.model, 24)) + "</span>" : "") +
+      "<span class=\"muted\" title=\"" + esc(p.decision_id || e.event_id || "") + "\">" + esc(short(p.decision_id || e.event_id || "", 22)) + "</span>";
+  }
+  $("rv_decision_body").textContent = buildSummary(e, run);
+  renderReviewEvents();
+  renderReviewChatLog();
+}
+
+/* --- 事件流 pane: mailbox round-trip through the core loop --- */
+async function ensureReviewContext() {
+  const e = reviewFindByKey(rvSelectedKey);
+  if (!e) return;
+  const key = rvSelectedKey;
+  if (rvCtxCache[key]) { renderReviewEvents(); return; }
+  if (rvCtxWaiting === key) return;
+  rvCtxWaiting = key;
+  renderReviewEvents();
+  try {
+    await jpost("/api/v1/review/context", { decision_id: key, anchor_ts: e.ts || "" });
+    for (let i = 0; i < 12; i++) {
+      await new Promise(r => setTimeout(r, 1000));
+      if (rvSelectedKey !== key) return;
+      const ctx = await jget("/api/v1/review/context");
+      if (ctx && ctx.decision_id === key && Array.isArray(ctx.events)) {
+        rvCtxCache[key] = ctx;
+        break;
+      }
+    }
+  } catch (err) {
+    console.error("review context", err);
+  }
+  if (rvCtxWaiting === key) rvCtxWaiting = null;
+  renderReviewEvents();
+}
+
+function renderReviewEvents() {
+  const body = $("rv_events_body");
+  if (!body) return;
+  if (!rvSelectedKey) {
+    body.innerHTML = '<tr><td colspan="5" class="muted">未选择决策</td></tr>';
+    return;
+  }
+  const ctx = rvCtxCache[rvSelectedKey];
+  if (!ctx) {
+    body.innerHTML = '<tr><td colspan="5" class="muted">' +
+      (rvCtxWaiting === rvSelectedKey ? "正在从事件账本提取该时点窗口…" : "打开此页时自动加载该时点事件窗口。") +
+      "</td></tr>";
+    return;
+  }
+  const evs = ctx.events || [];
+  if (!evs.length) {
+    body.innerHTML = '<tr><td colspan="5" class="muted">该时间窗口内无事件（可能已超出保留期）。</td></tr>';
+    return;
+  }
+  body.innerHTML = evs.map(ev => {
+    let snippet = "";
+    try { snippet = JSON.stringify(ev.payload); } catch (_) { snippet = String(ev.payload || ""); }
+    return "<tr>" +
+      "<td>" + esc(ev.ts || "") + "</td>" +
+      "<td>" + esc(ev.type || "") + "</td>" +
+      "<td>" + esc(ev.source || "") + "</td>" +
+      "<td>" + esc(ev.severity || "") + "</td>" +
+      "<td title=\"" + esc(snippet) + "\">" + esc(short(snippet, 72)) + "</td>" +
+      "</tr>";
+  }).join("");
+}
+
+/* --- AI 复盘 pane: restrained analysis chat, persisted server-side --- */
+function reviewTurnsForSelected() {
+  if (!rvSelectedKey) return [];
+  const all = Array.isArray(cachedReviewChats) ? cachedReviewChats : [];
+  return all.filter(t => t.decision_id === rvSelectedKey).sort((a, b) => (a.id || 0) - (b.id || 0));
+}
+
+function renderReviewChatLog() {
+  const log = $("rv_chat_log");
+  if (!log) return;
+  const nearBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 60;
+  if (!rvSelectedKey) {
+    log.innerHTML = '<div class="rv-msg assistant">选择一个决策标记后开始复盘。</div>';
+    setReviewChatEnabled(false);
+    return;
+  }
+  setReviewChatEnabled(!rvChatPendingSince);
+  const turns = reviewTurnsForSelected();
+  // pending resolved once a non-user turn newer than our send appears
+  if (rvChatPendingSince && turns.some(t => (t.id || 0) > rvChatLastTurnId && t.role !== "user")) {
+    rvChatPendingSince = 0;
+    setReviewChatEnabled(true);
+  }
+  if (rvChatPendingSince && Date.now() - rvChatPendingSince > 90000) {
+    rvChatPendingSince = 0; // stop blocking UI after 90s
+    setReviewChatEnabled(true);
+  }
+  let html = "";
+  if (!turns.length) {
+    html += '<div class="rv-msg assistant">尚无对话。就该时点的行情、推理或结果提问即可开始；对话会保存并可随时回看。</div>';
+  }
+  for (const t of turns) {
+    const role = t.role === "user" ? "user" : (t.role === "summary" ? "summary" : "assistant");
+    const meta = (t.created_ts || "") + (t.model ? " · " + t.model : "");
+    const prefix = role === "summary" ? "🧠 已沉淀为参考记忆：\n" : "";
+    html += '<div class="rv-msg ' + role + '">' + esc(prefix + (t.content || "")) +
+      '<span class="meta">' + esc(meta) + "</span></div>";
+  }
+  if (rvChatPendingSince) {
+    html += '<div class="rv-msg pending">复盘助手处理中…（由核心循环串行执行，可能需要几十秒）</div>';
+  }
+  const sig = html.length + "|" + turns.length + "|" + (rvChatPendingSince ? 1 : 0) + "|" + rvSelectedKey;
+  if (log.getAttribute("data-sig") !== sig) {
+    log.setAttribute("data-sig", sig);
+    log.innerHTML = html;
+    if (nearBottom) log.scrollTop = log.scrollHeight;
+  }
+}
+
+function setReviewChatEnabled(on) {
+  const send = $("rv_chat_send");
+  const sum = $("rv_chat_summarize");
+  const input = $("rv_chat_input");
+  if (send) send.disabled = !on || !rvSelectedKey;
+  if (input) input.disabled = !rvSelectedKey;
+  if (sum) {
+    const turns = reviewTurnsForSelected();
+    const talked = turns.filter(t => t.role !== "summary").length >= 2;
+    sum.disabled = !on || !rvSelectedKey || !talked;
+  }
+}
+
+async function sendReviewChat() {
+  const input = $("rv_chat_input");
+  const e = reviewFindByKey(rvSelectedKey);
+  if (!input || !e || rvChatPendingSince) return;
+  const msg = (input.value || "").trim();
+  if (!msg) return;
+  if (msg.length > 1200) { alert("问题请控制在 1200 字符以内"); return; }
+  const turns = reviewTurnsForSelected();
+  rvChatLastTurnId = turns.length ? (turns[turns.length - 1].id || 0) : 0;
+  try {
+    await jpost("/api/v1/review/chat", { decision_id: rvSelectedKey, anchor_ts: e.ts || "", message: msg });
+    input.value = "";
+    rvChatPendingSince = Date.now();
+    renderReviewChatLog();
+  } catch (err) {
+    alert("发送失败：" + err.message);
+  }
+}
+
+async function summarizeReviewChat() {
+  const e = reviewFindByKey(rvSelectedKey);
+  if (!e || rvChatPendingSince) return;
+  if (!confirm("将本决策的复盘对话压缩为一条低置信度参考记忆（进入主 Agent 上下文，由其自行取舍）？")) return;
+  const turns = reviewTurnsForSelected();
+  rvChatLastTurnId = turns.length ? (turns[turns.length - 1].id || 0) : 0;
+  try {
+    await jpost("/api/v1/review/summarize", { decision_id: rvSelectedKey, anchor_ts: e.ts || "" });
+    rvChatPendingSince = Date.now();
+    renderReviewChatLog();
+  } catch (err) {
+    alert("沉淀失败：" + err.message);
+  }
+}
+
+function renderReviewSelect() {
+  const sel = $("rv_select");
+  if (!sel) return;
+  const decs = reviewDecisionList().slice().reverse(); // newest first in dropdown
+  const sig = decs.map(reviewKeyOf).join(",");
+  if (sel.getAttribute("data-sig") !== sig) {
+    sel.setAttribute("data-sig", sig);
+    sel.innerHTML = '<option value="">选择提案决策…</option>' + decs.map(e => {
+      const p = e.payload || {};
+      const t = (e.ts || "").replace("T", " ").slice(5, 16);
+      const act = p.action || (e.type && e.type.indexOf("FAILED") >= 0 ? "失败" : e.type);
+      const label = t + " · " + act +
+        (p.target_btc_weight != null ? " → " + p.target_btc_weight : "") +
+        (p.confidence != null ? " · conf " + p.confidence : "");
+      return '<option value="' + esc(reviewKeyOf(e)) + '">' + esc(label) + "</option>";
+    }).join("");
+  }
+  if (sel.value !== (rvSelectedKey || "")) sel.value = rvSelectedKey || "";
+  const c = $("rv_count");
+  if (c) c.textContent = decs.length ? ("共 " + decs.length + " 个决策点") : "暂无提案决策";
+}
+
+function stepReviewDecision(delta) {
+  const decs = reviewDecisionList();
+  if (!decs.length) return;
+  let idx = decs.findIndex(e => reviewKeyOf(e) === rvSelectedKey);
+  if (idx < 0) idx = delta > 0 ? -1 : decs.length;
+  idx = Math.min(decs.length - 1, Math.max(0, idx + delta));
+  selectReviewDecision(reviewKeyOf(decs[idx]));
+}
+
+function showReviewPane(name) {
+  rvActivePane = name || "decision";
+  document.querySelectorAll("#rv_subtabs button").forEach(b =>
+    b.classList.toggle("active", b.getAttribute("data-rvtab") === rvActivePane));
+  document.querySelectorAll(".rv-pane").forEach(p =>
+    p.classList.toggle("active", p.id === "rv_pane_" + rvActivePane));
+  if (rvActivePane === "events") ensureReviewContext();
+  if (rvActivePane === "chat") renderReviewChatLog();
+}
+
+function onReviewTabVisible() {
+  if (reviewChart) {
+    const el = $("chart_review");
+    if (el && el.clientWidth) reviewChart.applyOptions({ width: el.clientWidth });
+  }
+  updateReviewChart();
+  renderReviewSelect();
+  renderReviewSelection();
+}
+
+/* wire review controls */
+document.querySelectorAll("#rv_bar_filters button[data-bar]").forEach(btn => {
+  btn.classList.toggle("active", btn.getAttribute("data-bar") === rvBar);
+  btn.addEventListener("click", () => {
+    rvBar = btn.getAttribute("data-bar") || "15m";
+    try { localStorage.setItem("ab_rv_bar", rvBar); } catch (_) {}
+    document.querySelectorAll("#rv_bar_filters button").forEach(b => b.classList.toggle("active", b === btn));
+    rvLastSig = "";
+    updateReviewChart();
+  });
+});
+document.querySelectorAll("#rv_ind_filters button[data-ind]").forEach(btn => {
+  const k = btn.getAttribute("data-ind");
+  btn.classList.toggle("active", !!rvInd[k]);
+  btn.addEventListener("click", () => {
+    rvInd[k] = !rvInd[k];
+    try { localStorage.setItem("ab_rv_ind", JSON.stringify(rvInd)); } catch (_) {}
+    btn.classList.toggle("active", !!rvInd[k]);
+    rvLastSig = "";
+    updateReviewChart();
+  });
+});
+document.querySelectorAll("#rv_ind_filters button[data-sub]").forEach(btn => {
+  btn.classList.toggle("active", btn.getAttribute("data-sub") === rvSub);
+  btn.addEventListener("click", () => {
+    rvSub = btn.getAttribute("data-sub") || "vol";
+    try { localStorage.setItem("ab_rv_sub", rvSub); } catch (_) {}
+    document.querySelectorAll("#rv_ind_filters button[data-sub]").forEach(b =>
+      b.classList.toggle("active", b.getAttribute("data-sub") === rvSub));
+    rvLastSig = "";
+    updateReviewChart();
+  });
+});
+document.querySelectorAll("#rv_subtabs button").forEach(btn => {
+  btn.addEventListener("click", () => showReviewPane(btn.getAttribute("data-rvtab")));
+});
+{
+  const sel = $("rv_select");
+  if (sel) sel.addEventListener("change", () => { if (sel.value) selectReviewDecision(sel.value); });
+  const prev = $("rv_prev"), next = $("rv_next");
+  if (prev) prev.addEventListener("click", () => stepReviewDecision(-1));
+  if (next) next.addEventListener("click", () => stepReviewDecision(1));
+  const send = $("rv_chat_send");
+  if (send) send.addEventListener("click", sendReviewChat);
+  const sum = $("rv_chat_summarize");
+  if (sum) sum.addEventListener("click", summarizeReviewChat);
+  const input = $("rv_chat_input");
+  if (input) input.addEventListener("keydown", ev => {
+    if (ev.key === "Enter" && !ev.shiftKey) { ev.preventDefault(); sendReviewChat(); }
+  });
+}
+
 function actionPill(action) {
   if (!action) return "—";
   const a = String(action).toUpperCase();
@@ -1210,6 +1993,136 @@ function fillsForOrders(orderList) {
   (orderList || []).forEach(o => { if (o.client_order_id) ids[o.client_order_id] = true; });
   const all = (cachedOrdersBundle && cachedOrdersBundle.fills) || [];
   return all.filter(f => ids[f.order_id]);
+}
+
+function esc(s) {
+  return String(s == null ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function buildSummary(e, run) {
+  const p = e.payload || {};
+  const lines = [];
+  const typeZh = DEC_TYPE_ZH[e.type] || e.type || "未知";
+  lines.push("【" + typeZh + "】 " + (e.ts || ""));
+  if (p.decision_id) lines.push("决策 ID：" + p.decision_id);
+  if (p.run_id) lines.push("运行 ID：" + p.run_id);
+  if (p.action) {
+    const act = String(p.action).toUpperCase();
+    lines.push("动作：" + (act === "HOLD" ? "持有 (HOLD)" : act === "REBALANCE" ? "调仓 (REBALANCE)" : p.action));
+  }
+  if (p.target_btc_weight != null && p.target_btc_weight !== "")
+    lines.push("目标 BTC 权重：" + p.target_btc_weight);
+  if (p.confidence != null && p.confidence !== "")
+    lines.push("置信度：" + p.confidence);
+  if (Array.isArray(p.thesis) && p.thesis.length) {
+    lines.push("推理 thesis：");
+    p.thesis.slice(0, 8).forEach((t, i) => lines.push("  " + (i + 1) + ". " + t));
+  }
+  if (Array.isArray(p.invalid_if) && p.invalid_if.length) {
+    lines.push("失效条件 invalid_if：");
+    p.invalid_if.slice(0, 8).forEach((t, i) => lines.push("  " + (i + 1) + ". " + t));
+  }
+  if (p.review_after) lines.push("复盘周期 review_after：" + p.review_after);
+  if (p.snapshot_version != null)
+    lines.push("绑定快照版本：" + p.snapshot_version);
+  else if (e.state_version != null)
+    lines.push("状态版本：" + e.state_version);
+  if (p.episode_id) lines.push("反思 episode：" + p.episode_id);
+  if (p.ops_applied != null) lines.push("记忆操作数：" + p.ops_applied);
+  if (p.source) lines.push("来源：" + (p.source === "llm" ? "LLM 反思" : p.source === "deterministic_shadow" ? "确定性回退反思" : p.source));
+  if (p.tools != null) lines.push("工具观察数：" + p.tools);
+  if (p.usage) {
+    const u = p.usage;
+    lines.push("Token：prompt=" + (u.prompt_tokens||0) + " completion=" + (u.completion_tokens||0) + " total=" + (u.total_tokens||0));
+  }
+  if (p.executed === false) lines.push("执行：否（仅审计，未发订单）");
+  if (p.exec) lines.push("执行结果：" + p.exec);
+  if (p.admission) {
+    const a = p.admission;
+    lines.push("准入：" + (a.verdict || "—") + (a.reason ? " · " + a.reason : "") +
+      (a.admitted_weight != null ? " · admitted=" + a.admitted_weight : ""));
+  }
+  if (p.error) lines.push("错误：" + p.error);
+  if (p.reason) lines.push("原因：" + p.reason);
+  if (p.degraded) lines.push("降级策略：" + p.degraded);
+  // Trade detail: join orders/fills by decision_id (Gate3 AC-GO7 slice).
+  const linked = ordersForDecision(p.decision_id);
+  if (linked.length) {
+    lines.push("关联订单（" + linked.length + "）：");
+    linked.slice(0, 8).forEach(o => {
+      lines.push("  · " + (o.status || "?") + " " + (o.side || "") + " qty=" + (o.qty || "") +
+        " px=" + (o.price || "") + " clOrdId=" + (o.client_order_id || "") +
+        (o.exchange_order_id ? " ex=" + o.exchange_order_id : ""));
+    });
+    const fl = fillsForOrders(linked);
+    if (fl.length) {
+      lines.push("关联成交（" + fl.length + "）：");
+      fl.slice(0, 8).forEach(f => {
+        lines.push("  · fill " + (f.qty || "") + " @ " + (f.price || "") +
+          " fee=" + (f.fee || "0") + " order=" + short(f.order_id, 16));
+      });
+    }
+  } else if (p.decision_id && p.executed) {
+    lines.push("关联订单：暂无（可能尚未投影或未实际执行）");
+  }
+  if (run.model) lines.push("模型：" + run.model);
+  if (run.status) lines.push("运行状态：" + zhStatus(run.status));
+  if (run.started_ts) lines.push("开始：" + run.started_ts);
+  if (run.finished_ts) lines.push("结束：" + run.finished_ts);
+  if (run.input_digest) lines.push("输入摘要：" + run.input_digest);
+  if (run.output_digest) lines.push("输出摘要：" + run.output_digest);
+  if (p.output_digest && !run.output_digest) lines.push("输出摘要：" + p.output_digest);
+
+  // Prefer model thesis; fall back to structured template.
+  let blurb = "";
+  if (e.type === "AGENT_PROPOSAL_OK") {
+    const act = String(p.action || "").toUpperCase();
+    const thesis0 = (Array.isArray(p.thesis) && p.thesis.length) ? String(p.thesis[0]) : "";
+    if (thesis0) {
+      blurb = "摘要：" + thesis0 +
+        (act === "REBALANCE"
+          ? " → 调仓目标权重 " + (p.target_btc_weight != null ? p.target_btc_weight : "—")
+          : " → HOLD") +
+        "（conf=" + (p.confidence != null ? p.confidence : "—") +
+        (p.exec ? " exec=" + p.exec : "") + "）";
+    } else if (act === "HOLD") {
+      blurb = "摘要：Agent 建议继续持有现金/当前仓位，目标 BTC 权重 " +
+        (p.target_btc_weight != null ? p.target_btc_weight : "0") +
+        "，置信度 " + (p.confidence != null ? p.confidence : "—") +
+        (p.executed ? "。已执行。" : "。本轮未发订单。") +
+        "（历史记录无 thesis 字段）";
+    } else if (act === "REBALANCE") {
+      blurb = "摘要：Agent 建议调仓至 BTC 权重 " +
+        (p.target_btc_weight != null ? p.target_btc_weight : "—") +
+        "，置信度 " + (p.confidence != null ? p.confidence : "—") +
+        (p.executed ? "。已进入执行。" : "。未执行（见准入/执行结果）。") +
+        "（历史记录无 thesis 字段）";
+    } else {
+      blurb = "摘要：提案已通过 Schema 校验并落库审计。";
+    }
+  } else if (e.type === "AGENT_REFLECTION_OK") {
+    blurb = "摘要：决策后反思完成" +
+      (p.source === "llm" ? "（LLM）" : p.source ? "（" + p.source + "）" : "") +
+      "，应用记忆操作 " + (p.ops_applied != null ? p.ops_applied : "—") + " 条。";
+  } else if (e.type && e.type.indexOf("LLM_FAILED") >= 0) {
+    blurb = "摘要：模型调用失败，本轮安全降级为 HOLD / 确定性反思回退。错误：" +
+      (p.error || p.reason || "未知");
+  } else if (e.type && e.type.indexOf("INVALID") >= 0) {
+    blurb = "摘要：输出未通过校验，提案作废。原因：" + (p.reason || p.error || "schema/json");
+  } else {
+    blurb = "摘要：" + (DEC_TYPE_ZH[e.type] || e.type || "Agent 事件");
+  }
+  lines.unshift(blurb);
+  lines.push("");
+  lines.push("—— 原始 payload ——");
+  try {
+    lines.push(JSON.stringify(p, null, 2));
+  } catch (_) {
+    lines.push(String(p));
+  }
+  return lines.join("\n");
 }
 
 function renderDecisions(decisions, runs) {
@@ -1252,136 +2165,6 @@ function renderDecisions(decisions, runs) {
   if (list.length === 0) {
     body.innerHTML = '<tr><td colspan="9" class="muted">暂无决策记录</td></tr>';
     return;
-  }
-
-  function esc(s) {
-    return String(s == null ? "" : s)
-      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;");
-  }
-
-  function buildSummary(e, run) {
-    const p = e.payload || {};
-    const lines = [];
-    const typeZh = DEC_TYPE_ZH[e.type] || e.type || "未知";
-    lines.push("【" + typeZh + "】 " + (e.ts || ""));
-    if (p.decision_id) lines.push("决策 ID：" + p.decision_id);
-    if (p.run_id) lines.push("运行 ID：" + p.run_id);
-    if (p.action) {
-      const act = String(p.action).toUpperCase();
-      lines.push("动作：" + (act === "HOLD" ? "持有 (HOLD)" : act === "REBALANCE" ? "调仓 (REBALANCE)" : p.action));
-    }
-    if (p.target_btc_weight != null && p.target_btc_weight !== "")
-      lines.push("目标 BTC 权重：" + p.target_btc_weight);
-    if (p.confidence != null && p.confidence !== "")
-      lines.push("置信度：" + p.confidence);
-    if (Array.isArray(p.thesis) && p.thesis.length) {
-      lines.push("推理 thesis：");
-      p.thesis.slice(0, 8).forEach((t, i) => lines.push("  " + (i + 1) + ". " + t));
-    }
-    if (Array.isArray(p.invalid_if) && p.invalid_if.length) {
-      lines.push("失效条件 invalid_if：");
-      p.invalid_if.slice(0, 8).forEach((t, i) => lines.push("  " + (i + 1) + ". " + t));
-    }
-    if (p.review_after) lines.push("复盘周期 review_after：" + p.review_after);
-    if (p.snapshot_version != null)
-      lines.push("绑定快照版本：" + p.snapshot_version);
-    else if (e.state_version != null)
-      lines.push("状态版本：" + e.state_version);
-    if (p.episode_id) lines.push("反思 episode：" + p.episode_id);
-    if (p.ops_applied != null) lines.push("记忆操作数：" + p.ops_applied);
-    if (p.source) lines.push("来源：" + (p.source === "llm" ? "LLM 反思" : p.source === "deterministic_shadow" ? "确定性回退反思" : p.source));
-    if (p.tools != null) lines.push("工具观察数：" + p.tools);
-    if (p.usage) {
-      const u = p.usage;
-      lines.push("Token：prompt=" + (u.prompt_tokens||0) + " completion=" + (u.completion_tokens||0) + " total=" + (u.total_tokens||0));
-    }
-    if (p.executed === false) lines.push("执行：否（仅审计，未发订单）");
-    if (p.exec) lines.push("执行结果：" + p.exec);
-    if (p.admission) {
-      const a = p.admission;
-      lines.push("准入：" + (a.verdict || "—") + (a.reason ? " · " + a.reason : "") +
-        (a.admitted_weight != null ? " · admitted=" + a.admitted_weight : ""));
-    }
-    if (p.error) lines.push("错误：" + p.error);
-    if (p.reason) lines.push("原因：" + p.reason);
-    if (p.degraded) lines.push("降级策略：" + p.degraded);
-    // Trade detail: join orders/fills by decision_id (Gate3 AC-GO7 slice).
-    const linked = ordersForDecision(p.decision_id);
-    if (linked.length) {
-      lines.push("关联订单（" + linked.length + "）：");
-      linked.slice(0, 8).forEach(o => {
-        lines.push("  · " + (o.status || "?") + " " + (o.side || "") + " qty=" + (o.qty || "") +
-          " px=" + (o.price || "") + " clOrdId=" + (o.client_order_id || "") +
-          (o.exchange_order_id ? " ex=" + o.exchange_order_id : ""));
-      });
-      const fl = fillsForOrders(linked);
-      if (fl.length) {
-        lines.push("关联成交（" + fl.length + "）：");
-        fl.slice(0, 8).forEach(f => {
-          lines.push("  · fill " + (f.qty || "") + " @ " + (f.price || "") +
-            " fee=" + (f.fee || "0") + " order=" + short(f.order_id, 16));
-        });
-      }
-    } else if (p.decision_id && p.executed) {
-      lines.push("关联订单：暂无（可能尚未投影或未实际执行）");
-    }
-    if (run.model) lines.push("模型：" + run.model);
-    if (run.status) lines.push("运行状态：" + zhStatus(run.status));
-    if (run.started_ts) lines.push("开始：" + run.started_ts);
-    if (run.finished_ts) lines.push("结束：" + run.finished_ts);
-    if (run.input_digest) lines.push("输入摘要：" + run.input_digest);
-    if (run.output_digest) lines.push("输出摘要：" + run.output_digest);
-    if (p.output_digest && !run.output_digest) lines.push("输出摘要：" + p.output_digest);
-
-    // Prefer model thesis; fall back to structured template.
-    let blurb = "";
-    if (e.type === "AGENT_PROPOSAL_OK") {
-      const act = String(p.action || "").toUpperCase();
-      const thesis0 = (Array.isArray(p.thesis) && p.thesis.length) ? String(p.thesis[0]) : "";
-      if (thesis0) {
-        blurb = "摘要：" + thesis0 +
-          (act === "REBALANCE"
-            ? " → 调仓目标权重 " + (p.target_btc_weight != null ? p.target_btc_weight : "—")
-            : " → HOLD") +
-          "（conf=" + (p.confidence != null ? p.confidence : "—") +
-          (p.exec ? " exec=" + p.exec : "") + "）";
-      } else if (act === "HOLD") {
-        blurb = "摘要：Agent 建议继续持有现金/当前仓位，目标 BTC 权重 " +
-          (p.target_btc_weight != null ? p.target_btc_weight : "0") +
-          "，置信度 " + (p.confidence != null ? p.confidence : "—") +
-          (p.executed ? "。已执行。" : "。本轮未发订单。") +
-          "（历史记录无 thesis 字段）";
-      } else if (act === "REBALANCE") {
-        blurb = "摘要：Agent 建议调仓至 BTC 权重 " +
-          (p.target_btc_weight != null ? p.target_btc_weight : "—") +
-          "，置信度 " + (p.confidence != null ? p.confidence : "—") +
-          (p.executed ? "。已进入执行。" : "。未执行（见准入/执行结果）。") +
-          "（历史记录无 thesis 字段）";
-      } else {
-        blurb = "摘要：提案已通过 Schema 校验并落库审计。";
-      }
-    } else if (e.type === "AGENT_REFLECTION_OK") {
-      blurb = "摘要：决策后反思完成" +
-        (p.source === "llm" ? "（LLM）" : p.source ? "（" + p.source + "）" : "") +
-        "，应用记忆操作 " + (p.ops_applied != null ? p.ops_applied : "—") + " 条。";
-    } else if (e.type && e.type.indexOf("LLM_FAILED") >= 0) {
-      blurb = "摘要：模型调用失败，本轮安全降级为 HOLD / 确定性反思回退。错误：" +
-        (p.error || p.reason || "未知");
-    } else if (e.type && e.type.indexOf("INVALID") >= 0) {
-      blurb = "摘要：输出未通过校验，提案作废。原因：" + (p.reason || p.error || "schema/json");
-    } else {
-      blurb = "摘要：" + (DEC_TYPE_ZH[e.type] || e.type || "Agent 事件");
-    }
-    lines.unshift(blurb);
-    lines.push("");
-    lines.push("—— 原始 payload ——");
-    try {
-      lines.push(JSON.stringify(p, null, 2));
-    } catch (_) {
-      lines.push(String(p));
-    }
-    return lines.join("\n");
   }
 
   const shown = decLimit > 0 ? list.slice(0, decLimit) : list.slice(0, 200);
@@ -1485,6 +2268,9 @@ function showTab(name) {
   if (activeTab === "overview") {
     // Charts sized 0 while hidden — reflow on show.
     setTimeout(onOverviewChartsVisible, 0);
+  }
+  if (activeTab === "review") {
+    setTimeout(onReviewTabVisible, 0);
   }
 }
 document.querySelectorAll(".tab").forEach(btn => {
@@ -1614,6 +2400,85 @@ function renderStatus(system, state) {
   $("st_hint").textContent = hint;
 }
 
+/* ===== 审计告警铃铛 ===== */
+const AUDIT_STATUS_ZH = { ok: "正常", warn: "警告", alert: "告警", unknown: "未知" };
+
+function renderAuditBell(system) {
+  const bell = $("alert_bell");
+  if (!bell) return;
+  const au = (system && system.audit) || null;
+  cachedAuditMeta = au;
+  const status = (au && au.status) || "unknown";
+  bell.className = status === "alert" ? "alert" : (status === "warn" ? "warn" : "");
+  const badge = $("alert_badge");
+  if (badge) badge.textContent = au && au.findings ? String(au.findings) : "";
+  bell.title = "定时审计：" + (AUDIT_STATUS_ZH[status] || status) +
+    (au && au.ts_ms ? " · " + ageText(au.ts_ms) : "");
+  if ($("alert_panel").classList.contains("show")) renderAuditPanel();
+}
+
+function renderAuditPanel() {
+  const au = cachedAuditMeta;
+  const title = $("ap_title");
+  const body = $("ap_findings");
+  if (title) {
+    const st = (au && au.status) || "unknown";
+    title.textContent = "审计状态：" + (AUDIT_STATUS_ZH[st] || st) +
+      (au && au.ts_ms ? "（" + ageText(au.ts_ms) + "）" : "");
+    title.className = st === "alert" ? "err" : (st === "warn" ? "warn" : "ok");
+  }
+  if ($("ap_interval") && au && au.interval_ms) {
+    const h = au.interval_ms / 3600000;
+    $("ap_interval").textContent = h >= 1 ? (Math.round(h * 10) / 10 + " 小时") : (Math.round(au.interval_ms / 60000) + " 分钟");
+  }
+  if (body) {
+    const alerts = (au && Array.isArray(au.alerts)) ? au.alerts : [];
+    if (!alerts.length) {
+      body.innerHTML = '<span class="ok">✓ 最近一次审计全部通过（LLM / 工具 / 数据不变量 / 流程链）</span>';
+    } else {
+      body.innerHTML = alerts.map(f =>
+        '<div class="ap-finding ' + esc(f.severity || "warn") + '">' +
+        '<span class="k">' + esc(f.check || "") + " · " + esc(f.severity || "") + "</span><br>" +
+        esc(f.detail || "") + "</div>"
+      ).join("");
+    }
+  }
+  const hist = $("ap_history");
+  if (hist) {
+    const reports = Array.isArray(cachedAudit) ? cachedAudit : [];
+    if (!reports.length) {
+      hist.innerHTML = '<tr><td class="muted">尚无历史报告</td></tr>';
+    } else {
+      hist.innerHTML = reports.slice(0, 8).map(r => {
+        const cls = r.status === "alert" ? "err" : (r.status === "warn" ? "warn" : "ok");
+        const n = (r.findings || []).length;
+        return "<tr><td>" + esc((r.ts || "").replace("T", " ").slice(5, 19)) + "</td>" +
+          '<td class="' + cls + '">' + esc(AUDIT_STATUS_ZH[r.status] || r.status || "") + "</td>" +
+          "<td>" + (n ? n + " 项发现" : "全部通过") + "</td></tr>";
+      }).join("");
+    }
+  }
+}
+
+{
+  const bell = $("alert_bell");
+  const panel = $("alert_panel");
+  if (bell && panel) {
+    bell.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      panel.classList.toggle("show");
+      if (panel.classList.contains("show")) renderAuditPanel();
+    });
+    const close = $("ap_close");
+    if (close) close.addEventListener("click", () => panel.classList.remove("show"));
+    document.addEventListener("click", (ev) => {
+      if (panel.classList.contains("show") && !panel.contains(ev.target) && ev.target !== bell) {
+        panel.classList.remove("show");
+      }
+    });
+  }
+}
+
 function renderOrders(bundle) {
   const allOrders = (bundle && Array.isArray(bundle.orders)) ? bundle.orders : [];
   const allFills = (bundle && Array.isArray(bundle.fills)) ? bundle.fills : [];
@@ -1679,7 +2544,7 @@ function renderOrders(bundle) {
 
 async function poll() {
   try {
-    const [s, shadow, runs, equity, candles, memories, events, system, decisions, ordersBundle] = await Promise.all([
+    const [s, shadow, runs, equity, candles, memories, events, system, decisions, ordersBundle, reviewChats, auditReports] = await Promise.all([
       jget("/api/v1/state"),
       jget("/api/v1/shadow"),
       jget("/api/v1/agent-runs"),
@@ -1690,6 +2555,8 @@ async function poll() {
       jget("/api/v1/system"),
       jget("/api/v1/decisions"),
       jget("/api/v1/orders"),
+      jget("/api/v1/review/chats"),
+      jget("/api/v1/audit"),
     ]);
     lastOk = Date.now();
 
@@ -1753,9 +2620,19 @@ async function poll() {
     if (activeTab === "overview") onOverviewChartsVisible();
     cachedDecisions = decisions;
     cachedRuns = runs;
+    cachedReviewChats = Array.isArray(reviewChats) ? reviewChats : [];
+    cachedAudit = Array.isArray(auditReports) ? auditReports : [];
+    try { renderAuditBell(system); } catch (err) { console.error("audit bell", err); }
     cachedOrdersBundle = ordersBundle && typeof ordersBundle === "object"
       ? ordersBundle
       : { orders: [], fills: [] };
+    if (activeTab === "review") {
+      try {
+        updateReviewChart();
+        renderReviewSelect();
+        renderReviewSelection();
+      } catch (err) { console.error("review render", err); }
+    }
     renderOverviewSummary(decisions, runs);
     renderDecisions(decisions, runs);
     try { renderOrders(cachedOrdersBundle); } catch (err) { console.error("renderOrders", err); }

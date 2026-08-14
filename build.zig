@@ -39,6 +39,12 @@ pub fn build(b: *std.Build) void {
     mod.addAnonymousImport("migration_0002", .{
         .root_source_file = b.path("migrations/0002_webauthn.sql"),
     });
+    mod.addAnonymousImport("migration_0003", .{
+        .root_source_file = b.path("migrations/0003_review.sql"),
+    });
+    mod.addAnonymousImport("migration_0004", .{
+        .root_source_file = b.path("migrations/0004_audit.sql"),
+    });
     mod.addAnonymousImport("favicon_svg", .{
         .root_source_file = b.path("dashboard/favicon.svg"),
     });
@@ -79,6 +85,9 @@ pub fn build(b: *std.Build) void {
     });
     exe.root_module.addAnonymousImport("agent_reflection_prompt", .{
         .root_source_file = b.path("prompts/reflection.md"),
+    });
+    exe.root_module.addAnonymousImport("agent_review_prompt", .{
+        .root_source_file = b.path("prompts/review.md"),
     });
     b.installArtifact(exe);
 

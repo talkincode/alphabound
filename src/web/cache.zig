@@ -14,6 +14,7 @@ const memory = @import("../memory/store.zig");
 const latency = @import("../observability/latency.zig");
 const openai = @import("../agent/openai.zig");
 const clock = @import("../core/clock.zig");
+const review = @import("review.zig");
 
 fn nowMs() i64 {
     return clock.SystemClock.clock().wallMs();
@@ -42,15 +43,26 @@ pub const WebState = struct {
     /// Multi-timeframe candles JSON (分时/1m…1D); sized for ~1k bars total.
     candles_buf: [131072]u8 = undefined,
     candles_len: usize = 2,
-    memories_buf: [8192]u8 = undefined,
+    memories_buf: [24576]u8 = undefined,
     memories_len: usize = 2,
-    system_buf: [4096]u8 = undefined,
+    system_buf: [8192]u8 = undefined,
     system_len: usize = 2,
     decisions_buf: [49152]u8 = undefined,
     decisions_len: usize = 2,
     /// Bundle: {"orders":[...],"fills":[...]}.
     orders_buf: [24576]u8 = undefined,
     orders_len: usize = 2,
+    /// 复盘 chat transcripts (recent turns, newest first).
+    review_buf: [49152]u8 = undefined,
+    review_len: usize = 2,
+    /// Last requested 复盘 context window: {"decision_id":..,"events":[..]}.
+    review_ctx_buf: [24576]u8 = undefined,
+    review_ctx_len: usize = 2,
+    /// Review request mailbox (web thread enqueues, core loop drains).
+    review_inbox: ?*review.Inbox = null,
+    /// Recent scheduled-audit reports (newest first).
+    audit_buf: [24576]u8 = undefined,
+    audit_len: usize = 2,
     /// Dashboard / MCP auth (optional; empty token = open).
     auth_cfg: web_auth.Config = .{},
     cred_store: ?*web_auth.CredStore = null,
@@ -79,6 +91,12 @@ pub const WebState = struct {
         const empty_orders = "{\"orders\":[],\"fills\":[]}";
         @memcpy(self.orders_buf[0..empty_orders.len], empty_orders);
         self.orders_len = empty_orders.len;
+        @memcpy(self.review_buf[0..2], "[]");
+        self.review_len = 2;
+        @memcpy(self.review_ctx_buf[0..2], "{}");
+        self.review_ctx_len = 2;
+        @memcpy(self.audit_buf[0..2], "[]");
+        self.audit_len = 2;
     }
 
     pub fn contextFn(userdata: ?*anyopaque) web.Context {
@@ -91,10 +109,13 @@ pub const WebState = struct {
             var events: [12288]u8 = undefined;
             var shadow: [512]u8 = undefined;
             var candles: [131072]u8 = undefined;
-            var memories: [8192]u8 = undefined;
-            var system: [4096]u8 = undefined;
+            var memories: [24576]u8 = undefined;
+            var system: [8192]u8 = undefined;
             var decisions: [49152]u8 = undefined;
             var orders: [24576]u8 = undefined;
+            var review_chats: [49152]u8 = undefined;
+            var review_ctx: [24576]u8 = undefined;
+            var audit: [24576]u8 = undefined;
             var config_hash: [71]u8 = undefined;
             var agent_len: usize = 2;
             var equity_len: usize = 2;
@@ -105,6 +126,9 @@ pub const WebState = struct {
             var system_len: usize = 2;
             var decisions_len: usize = 2;
             var orders_len: usize = 2;
+            var review_len: usize = 2;
+            var review_ctx_len: usize = 2;
+            var audit_len: usize = 2;
         };
         const self: *WebState = @ptrCast(@alignCast(userdata.?));
         while (true) {
@@ -124,7 +148,10 @@ pub const WebState = struct {
             const yl = self.system_len;
             const dl = self.decisions_len;
             const ol = self.orders_len;
-            if (al > Tls.agent.len or el > Tls.equity.len or vl > Tls.events.len or sl > Tls.shadow.len or cl > Tls.candles.len or ml > Tls.memories.len or yl > Tls.system.len or dl > Tls.decisions.len or ol > Tls.orders.len) {
+            const rl = self.review_len;
+            const rcl = self.review_ctx_len;
+            const aul = self.audit_len;
+            if (al > Tls.agent.len or el > Tls.equity.len or vl > Tls.events.len or sl > Tls.shadow.len or cl > Tls.candles.len or ml > Tls.memories.len or yl > Tls.system.len or dl > Tls.decisions.len or ol > Tls.orders.len or rl > Tls.review_chats.len or rcl > Tls.review_ctx.len or aul > Tls.audit.len) {
                 std.atomic.spinLoopHint();
                 continue;
             }
@@ -137,6 +164,9 @@ pub const WebState = struct {
             @memcpy(Tls.system[0..yl], self.system_buf[0..yl]);
             @memcpy(Tls.decisions[0..dl], self.decisions_buf[0..dl]);
             @memcpy(Tls.orders[0..ol], self.orders_buf[0..ol]);
+            @memcpy(Tls.review_chats[0..rl], self.review_buf[0..rl]);
+            @memcpy(Tls.review_ctx[0..rcl], self.review_ctx_buf[0..rcl]);
+            @memcpy(Tls.audit[0..aul], self.audit_buf[0..aul]);
             @memcpy(Tls.config_hash[0..], self.config_hash[0..]);
             Tls.agent_len = al;
             Tls.equity_len = el;
@@ -147,6 +177,9 @@ pub const WebState = struct {
             Tls.system_len = yl;
             Tls.decisions_len = dl;
             Tls.orders_len = ol;
+            Tls.review_len = rl;
+            Tls.review_ctx_len = rcl;
+            Tls.audit_len = aul;
             const s2 = self.seq.load(.acquire);
             if (s1 == s2) {
                 return .{
@@ -163,6 +196,10 @@ pub const WebState = struct {
                     .system_json = Tls.system[0..Tls.system_len],
                     .decisions_json = Tls.decisions[0..Tls.decisions_len],
                     .orders_json = Tls.orders[0..Tls.orders_len],
+                    .review_json = Tls.review_chats[0..Tls.review_len],
+                    .review_ctx_json = Tls.review_ctx[0..Tls.review_ctx_len],
+                    .review_inbox = self.review_inbox,
+                    .audit_json = Tls.audit[0..Tls.audit_len],
                     .index_html = self.index_html,
                     .auth_cfg = self.auth_cfg,
                     .cred_store = self.cred_store,
@@ -182,7 +219,7 @@ pub const WebState = struct {
         _ = self.seq.fetchAdd(1, .release); // even: stable
     }
 
-    pub fn setJson(self: *WebState, comptime which: enum { agent, equity, events, shadow, candles, memories, system, decisions, orders }, src: []const u8) void {
+    pub fn setJson(self: *WebState, comptime which: enum { agent, equity, events, shadow, candles, memories, system, decisions, orders, review, review_ctx, audit }, src: []const u8) void {
         _ = self.seq.fetchAdd(1, .acq_rel);
         switch (which) {
             .agent => {
@@ -230,6 +267,21 @@ pub const WebState = struct {
                 @memcpy(self.orders_buf[0..n], src[0..n]);
                 self.orders_len = n;
             },
+            .review => {
+                const n = @min(src.len, self.review_buf.len);
+                @memcpy(self.review_buf[0..n], src[0..n]);
+                self.review_len = n;
+            },
+            .review_ctx => {
+                const n = @min(src.len, self.review_ctx_buf.len);
+                @memcpy(self.review_ctx_buf[0..n], src[0..n]);
+                self.review_ctx_len = n;
+            },
+            .audit => {
+                const n = @min(src.len, self.audit_buf.len);
+                @memcpy(self.audit_buf[0..n], src[0..n]);
+                self.audit_len = n;
+            },
         }
         _ = self.seq.fetchAdd(1, .release);
     }
@@ -265,6 +317,12 @@ pub const RuntimeStatus = struct {
     last_decision: []const u8 = "",
     last_decision_buf: [96]u8 = undefined,
     last_decision_ms: i64 = 0,
+    // Scheduled audit surface (定时审计): status + findings for the alert bell.
+    audit_status: []const u8 = "unknown",
+    audit_ms: i64 = 0,
+    audit_findings: u32 = 0,
+    audit_alerts: []const u8 = "[]",
+    audit_alerts_buf: [3072]u8 = undefined,
     // Owned scratch for mutable strings
     bid_buf: [48]u8 = undefined,
     bid_len: usize = 0,
@@ -327,6 +385,20 @@ pub const RuntimeStatus = struct {
         self.last_decision = self.last_decision_buf[0..n];
         self.last_decision_ms = nowMs();
     }
+
+    /// Publish the latest audit outcome. `status` must be a static string
+    /// ("ok"/"warn"/"alert"); `alerts_json` is a findings JSON array.
+    pub fn setAudit(self: *RuntimeStatus, status: []const u8, alerts_json: []const u8, findings: u32) void {
+        self.audit_status = status;
+        self.audit_findings = findings;
+        self.audit_ms = nowMs();
+        if (alerts_json.len <= self.audit_alerts_buf.len) {
+            @memcpy(self.audit_alerts_buf[0..alerts_json.len], alerts_json);
+            self.audit_alerts = self.audit_alerts_buf[0..alerts_json.len];
+        } else {
+            self.audit_alerts = "[]"; // oversized detail lives in audit_reports
+        }
+    }
     pub fn setEgress(self: *RuntimeStatus, ip: []const u8) void {
         const n = @min(ip.len, self.egress_buf.len);
         @memcpy(self.egress_buf[0..n], ip[0..n]);
@@ -358,7 +430,7 @@ pub fn refreshWebCaches(
     var tmp_equity: [49152]u8 = undefined;
     var tmp_events: [12288]u8 = undefined;
     var tmp_shadow: [768]u8 = undefined;
-    var tmp_mem: [8192]u8 = undefined;
+    var tmp_mem: [24576]u8 = undefined;
     if (runs.listRecentJson(db, &tmp_agent, 50)) |j| {
         ws.setJson(.agent, j);
     } else |_| {}
@@ -403,6 +475,22 @@ pub fn refreshWebCaches(
         return;
     };
     ws.setJson(.orders, bw.buffered());
+}
+
+/// Re-render 复盘 chat transcripts blob from SQLite (core loop only).
+pub fn refreshReviewCache(ws: *WebState, db: *storage.Db, repo: *storage.ReviewChatsRepo) void {
+    var tmp: [49152]u8 = undefined;
+    if (repo.listRecentJson(db, &tmp, 150)) |j| {
+        ws.setJson(.review, j);
+    } else |_| {}
+}
+
+/// Re-render recent scheduled-audit reports blob (core loop only).
+pub fn refreshAuditCache(ws: *WebState, db: *storage.Db, repo: *storage.AuditReportsRepo) void {
+    var tmp: [24576]u8 = undefined;
+    if (repo.listRecentJson(db, &tmp, 16)) |j| {
+        ws.setJson(.audit, j);
+    } else |_| {}
 }
 
 const CandleBarSpec = struct { okx_bar: []const u8, limit: u16 };
@@ -527,7 +615,7 @@ pub fn refreshSystemCache(
         .demo => "demo",
         .live => "live",
     };
-    var tmp: [4096]u8 = undefined;
+    var tmp: [8192]u8 = undefined;
     var w: std.Io.Writer = .fixed(&tmp);
     w.print(
         "{{\"software_version\":\"{s}\",\"config_hash\":\"{s}\",\"mode\":\"{s}\",\"instrument\":\"{s}\",\"ready\":true,\"paused\":{},\"started_ms\":{d},\"uptime_ms\":{d},\"web_bind\":\"{s}\",\"private_keys\":{},\"private_ws_opt_in\":{},\"agent_enabled\":{},\"memories\":{d},",
@@ -553,6 +641,10 @@ pub fn refreshSystemCache(
     w.print(
         "\"execution\":{{\"enabled\":{},\"real_money\":{}}},",
         .{ exec.allowed, exec.real_money },
+    ) catch return;
+    w.print(
+        "\"audit\":{{\"status\":\"{s}\",\"ts_ms\":{d},\"findings\":{d},\"interval_ms\":{d},\"alerts\":{s}}},",
+        .{ st.audit_status, st.audit_ms, st.audit_findings, cfg.audit_interval_ms, st.audit_alerts },
     ) catch return;
     w.print(
         "\"schedule\":{{\"base_ms\":{d},\"quiet_ms\":{d},\"min_ms\":{d},\"active_hours_utc\":\"{s}\",\"price_move\":\"{f}\",\"drawdown_step\":\"{f}\",\"reflect_on_hold\":{}}},",
