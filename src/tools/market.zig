@@ -69,6 +69,40 @@ pub fn formatCandleFramesData(
     return w.buffered();
 }
 
+/// Compact newest-first rows for the agent: more bars, fewer tokens.
+/// `structure_json` is a precomputed HTF object or null.
+pub fn formatCandleFramesCompact(
+    buf: []u8,
+    instrument: []const u8,
+    frames: []const CandleFrame,
+    structure_json: ?[]const u8,
+) error{BufferTooSmall}![]const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    w.print(
+        "{{\"instrument\":\"{s}\",\"newest\":\"first\",\"layout\":[\"ts_ms\",\"o\",\"h\",\"l\",\"c\",\"vol\"],\"frames\":[",
+        .{instrument},
+    ) catch return error.BufferTooSmall;
+    for (frames, 0..) |f, fi| {
+        if (fi > 0) w.writeByte(',') catch return error.BufferTooSmall;
+        w.print("{{\"bar\":\"{s}\",\"n\":{d},\"rows\":[", .{ f.bar, f.candles.len }) catch return error.BufferTooSmall;
+        for (f.candles, 0..) |c, i| {
+            if (i > 0) w.writeByte(',') catch return error.BufferTooSmall;
+            w.print(
+                "[{d},\"{f}\",\"{f}\",\"{f}\",\"{f}\",\"{f}\"]",
+                .{ c.ts_ms, c.open, c.high, c.low, c.close, c.vol },
+            ) catch return error.BufferTooSmall;
+        }
+        w.writeAll("]}") catch return error.BufferTooSmall;
+    }
+    w.writeByte(']') catch return error.BufferTooSmall;
+    if (structure_json) |st| {
+        w.writeAll(",\"structure\":") catch return error.BufferTooSmall;
+        w.writeAll(st) catch return error.BufferTooSmall;
+    }
+    w.writeByte('}') catch return error.BufferTooSmall;
+    return w.buffered();
+}
+
 /// Optional positioning extras (all best-effort; null/empty when fetch failed).
 pub const PositioningExtras = struct {
     long_short_ratio: ?Decimal = null,
@@ -260,6 +294,24 @@ test "formatCandleFramesData renders multiple timeframes" {
     var buf2: [128]u8 = undefined;
     const empty = try formatCandleFramesData(&buf2, "BTC-USDT", &.{});
     try testing.expect(std.mem.indexOf(u8, empty, "\"frames\":[]") != null);
+}
+
+test "formatCandleFramesCompact is array-encoded and can embed structure" {
+    var buf: [512]u8 = undefined;
+    const daily = [_]rest.Candle{.{
+        .ts_ms = 86_400_000,
+        .open = d("100"),
+        .high = d("110"),
+        .low = d("95"),
+        .close = d("105"),
+        .vol = d("1000"),
+    }};
+    const frames = [_]CandleFrame{.{ .bar = "1D", .candles = &daily }};
+    const s = try formatCandleFramesCompact(&buf, "BTC-USDT", &frames, "{\"1D\":{\"broke_prior_high\":true}}");
+    try testing.expect(std.mem.indexOf(u8, s, "\"layout\"") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "[86400000,\"100\"") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "\"structure\":{\"1D\"") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "\"n\":1") != null);
 }
 
 test "formatDerivativesData with and without open interest" {

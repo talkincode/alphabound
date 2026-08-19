@@ -42,7 +42,7 @@ pub const Kind = enum {
 };
 
 /// Whitelisted timeframes (must match OKX bar strings used elsewhere).
-pub const bars = [_][]const u8{ "1m", "5m", "15m", "1H", "4H", "1D" };
+pub const bars = [_][]const u8{ "1m", "5m", "15m", "30m", "1H", "4H", "1D" };
 
 pub fn barValid(bar: []const u8) bool {
     for (bars) |b| {
@@ -56,9 +56,78 @@ fn barsPerYear(bar: []const u8) f64 {
     if (std.mem.eql(u8, bar, "1m")) return 525_600.0;
     if (std.mem.eql(u8, bar, "5m")) return 105_120.0;
     if (std.mem.eql(u8, bar, "15m")) return 35_040.0;
+    if (std.mem.eql(u8, bar, "30m")) return 17_520.0;
     if (std.mem.eql(u8, bar, "1H")) return 8_760.0;
     if (std.mem.eql(u8, bar, "4H")) return 2_190.0;
     return 365.0; // 1D
+}
+
+/// Compact HTF structure from venue candles (newest-first, as OKX returns).
+/// Facts only: SMA/range/RSI plus whether the forming bar broke the prior
+/// completed-window high. Never prescribes a trade.
+pub fn formatHtfStructure(
+    buf: []u8,
+    daily_newest_first: []const Candle,
+    h4_newest_first: []const Candle,
+) error{BufferTooSmall}![]const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    w.writeAll("{\"1D\":") catch return error.BufferTooSmall;
+    writeBarStructure(&w, daily_newest_first, 20, 14) catch return error.BufferTooSmall;
+    w.writeAll(",\"4H\":") catch return error.BufferTooSmall;
+    writeBarStructure(&w, h4_newest_first, 20, 14) catch return error.BufferTooSmall;
+    w.writeByte('}') catch return error.BufferTooSmall;
+    return w.buffered();
+}
+
+fn writeBarStructure(w: *std.Io.Writer, newest_first: []const Candle, range_period: usize, rsi_period: usize) !void {
+    if (newest_first.len < 2) {
+        try w.writeAll("null");
+        return;
+    }
+    var oldest: [64]Candle = undefined;
+    const n = @min(newest_first.len, oldest.len);
+    for (0..n) |i| oldest[i] = newest_first[n - 1 - i];
+    const cs = oldest[0..n];
+    const last = newest_first[0];
+    const close = last.close.toF64Lossy();
+
+    try w.print("{{\"n\":{d},\"close\":{d:.1}", .{ n, close });
+
+    if (n >= range_period) {
+        const window = cs[n - range_period ..];
+        var sma: f64 = 0;
+        var hi: f64 = -std.math.inf(f64);
+        var lo: f64 = std.math.inf(f64);
+        for (window) |c| {
+            sma += c.close.toF64Lossy();
+            hi = @max(hi, c.high.toF64Lossy());
+            lo = @min(lo, c.low.toF64Lossy());
+        }
+        sma /= @as(f64, @floatFromInt(range_period));
+        const width = hi - lo;
+        const pos = if (width > 0) (close - lo) / width else 0.5;
+        try w.print(
+            ",\"sma{d}\":{d:.1},\"range{d}_high\":{d:.1},\"range{d}_low\":{d:.1},\"range{d}_pos\":{d:.2}",
+            .{ range_period, sma, range_period, hi, range_period, lo, range_period, pos },
+        );
+    }
+
+    if (n >= 2) {
+        const completed = cs[0 .. n - 1];
+        const take = @min(completed.len, range_period);
+        const prior = completed[completed.len - take ..];
+        var prior_hi: f64 = -std.math.inf(f64);
+        for (prior) |c| prior_hi = @max(prior_hi, c.high.toF64Lossy());
+        const broke = last.high.toF64Lossy() > prior_hi or close > prior_hi;
+        try w.print(",\"prior_completed_high\":{d:.1},\"broke_prior_high\":{}", .{ prior_hi, broke });
+    }
+
+    if (n >= rsi_period * 3) {
+        var closes_buf: [64]f64 = undefined;
+        for (cs, 0..) |c, i| closes_buf[i] = c.close.toF64Lossy();
+        try w.print(",\"rsi{d}\":{d:.1}", .{ rsi_period, rsi(closes_buf[0..n], rsi_period) });
+    }
+    try w.writeByte('}');
 }
 
 pub const Request = struct {
@@ -435,4 +504,28 @@ test "parseRequests: valid batch, defaults, and rejections" {
         \\{"tool_requests":[{"name":"rsi","bar":"1H"},{"name":"rsi","bar":"4H"},{"name":"rsi","bar":"1D"},{"name":"atr","bar":"1H"},{"name":"atr","bar":"4H"},{"name":"atr","bar":"1D"},{"name":"sma","bar":"1H"}]}
     ;
     try testing.expectError(error.TooManyRequests, parseRequests(gpa, many, &backing, &reqs));
+    try testing.expect(barValid("30m"));
+}
+
+test "formatHtfStructure flags a daily breakout vs prior completed high" {
+    var daily: [24]Candle = undefined;
+    for (0..23) |i| {
+        const px = 64000.0 + @as(f64, @floatFromInt(i)) * 10.0;
+        daily[23 - i] = mkCandle(px, px + 50, px - 50, px); // newest-first
+    }
+    // Forming bar breaks the prior 20-completed high (~64220+50).
+    daily[0] = mkCandle(65000, 70000, 64800, 68680);
+
+    var h4: [24]Candle = undefined;
+    for (0..24) |i| {
+        const px = 65000.0;
+        h4[i] = mkCandle(px, px + 20, px - 20, px);
+    }
+
+    var buf: [768]u8 = undefined;
+    const s = try formatHtfStructure(&buf, &daily, &h4);
+    try testing.expect(std.mem.indexOf(u8, s, "\"broke_prior_high\":true") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "\"1D\":{") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "\"4H\":{") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "\"sma20\":") != null);
 }

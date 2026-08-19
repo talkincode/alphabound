@@ -1119,7 +1119,7 @@ fn registerDefaultTools(reg: *ab.tools.Registry) !void {
         .domain = .market,
         .source = "okx",
         .max_age_ms = 120_000,
-        .schema_note = "multi-timeframe OHLCV frames: 1D/4H/1H (newest first)",
+        .schema_note = "compact OHLCV frames newest-first (layout ts/o/h/l/c/vol): 1D×45 4H×42 1H×48 30m×48 15m×48 + structure{1D,4H} sma/range/prior_high/broke",
     });
     try reg.register(.{
         .name = "market.derivatives",
@@ -1133,7 +1133,7 @@ fn registerDefaultTools(reg: *ab.tools.Registry) !void {
         .domain = .market,
         .source = "local-calc",
         .max_age_ms = 120_000,
-        .schema_note = "on-demand calculator: instead of a proposal, reply {\"tool_requests\":[{\"name\":\"sma|ema|rsi|atr|vol|bollinger|range\",\"bar\":\"1m|5m|15m|1H|4H|1D\",\"period\":N}]} (max 6, one round); results arrive as an observation and you then produce the final proposal",
+        .schema_note = "on-demand calculator: instead of a proposal, reply {\"tool_requests\":[{\"name\":\"sma|ema|rsi|atr|vol|bollinger|range\",\"bar\":\"1m|5m|15m|30m|1H|4H|1D\",\"period\":N}]} (max 6, one round); 1D/4H structure is already in market.candles",
     });
     try reg.register(.{
         .name = "onchain.btc",
@@ -1354,7 +1354,7 @@ fn collectMarketTools(
     registry: *const ab.tools.Registry,
     run_id: []const u8,
     tools_repo: *ab.storage.ToolCallsRepo,
-    obs_bufs: *[5][8192]u8,
+    obs_bufs: *[5][20480]u8,
     obs_out: *[5][]const u8,
 ) usize {
     var n: usize = 0;
@@ -1391,22 +1391,26 @@ fn collectMarketTools(
         } else |_| {}
     }
 
-    // market.candles — multi-timeframe frames: 1D×14, 4H×12, 1H×8 (size budget)
+    // market.candles — wave-capable frames + computed 1D/4H structure.
     if (registry.find("market.candles")) |spec| {
         if (n >= obs_out.len) return n;
         const frame_specs = [_]struct { bar: []const u8, limit: usize }{
-            .{ .bar = "1D", .limit = 14 },
-            .{ .bar = "4H", .limit = 12 },
-            .{ .bar = "1H", .limit = 8 },
+            .{ .bar = "1D", .limit = 45 },
+            .{ .bar = "4H", .limit = 42 },
+            .{ .bar = "1H", .limit = 48 },
+            .{ .bar = "30m", .limit = 48 },
+            .{ .bar = "15m", .limit = 48 },
         };
-        var frame_candles: [3][14]ab.okx_rest.Candle = undefined;
-        var frames: [3]ab.market_tools.CandleFrame = undefined;
+        var frame_candles: [5][48]ab.okx_rest.Candle = undefined;
+        var frames: [5]ab.market_tools.CandleFrame = undefined;
         var frames_n: usize = 0;
         var as_of: i64 = 0;
-        var data_buf: [6144]u8 = undefined;
+        var data_buf: [24576]u8 = undefined;
         var result: ab.tools.ToolResult = undefined;
         const t_start = nowMs();
         var fetch_err = false;
+        var daily_n: usize = 0;
+        var h4_n: usize = 0;
         for (frame_specs, 0..) |fs, fi| {
             var path_buf: [160]u8 = undefined;
             const path = std.fmt.bufPrint(
@@ -1420,6 +1424,8 @@ fn collectMarketTools(
                     if (count > 0) {
                         frames[frames_n] = .{ .bar = fs.bar, .candles = frame_candles[fi][0..count] };
                         frames_n += 1;
+                        if (std.mem.eql(u8, fs.bar, "1D")) daily_n = count;
+                        if (std.mem.eql(u8, fs.bar, "4H")) h4_n = count;
                         // Newest bar across frames drives observation freshness.
                         if (frame_candles[fi][0].ts_ms > as_of) as_of = frame_candles[fi][0].ts_ms;
                     }
@@ -1430,9 +1436,18 @@ fn collectMarketTools(
                 fetch_err = true;
             }
         }
+        var struct_buf: [768]u8 = undefined;
+        const structure = if (daily_n > 0)
+            ab.indicators.formatHtfStructure(
+                &struct_buf,
+                frame_candles[0][0..daily_n],
+                if (h4_n > 0) frame_candles[1][0..h4_n] else &.{},
+            ) catch null
+        else
+            null;
         const latency: u32 = @intCast(@max(@as(i64, 0), nowMs() - t_start));
         if (frames_n > 0) {
-            if (ab.market_tools.formatCandleFramesData(&data_buf, cfg.instrument, frames[0..frames_n])) |data| {
+            if (ab.market_tools.formatCandleFramesCompact(&data_buf, cfg.instrument, frames[0..frames_n], structure)) |data| {
                 result = ab.market_tools.okResult("okx", as_of, latency, data);
             } else |_| {
                 result = ab.market_tools.errResult("okx", nowMs(), latency, "buffer");
@@ -2094,7 +2109,7 @@ fn runAgentDecision(
         return;
     };
 
-    var obs_bufs: [5][8192]u8 = undefined;
+    var obs_bufs: [5][20480]u8 = undefined;
     var obs_ptrs: [5][]const u8 = .{ "", "", "", "", "" };
     const obs_n = collectMarketTools(gpa, okx, cfg, registry, run_id, tools_repo, &obs_bufs, &obs_ptrs);
     const observations = obs_ptrs[0..obs_n];
@@ -2167,7 +2182,7 @@ fn runAgentDecision(
         review_facts.alpha_return = bh_cmp.alpha_return;
     }
 
-    var ctx_buf: [32 * 1024]u8 = undefined;
+    var ctx_buf: [48 * 1024]u8 = undefined;
     const ctx_json = ab.context.render(&ctx_buf, .{
         .snapshot = snap,
         .recent_events = recent_events,
@@ -2200,7 +2215,7 @@ fn runAgentDecision(
         \\Respond with ONE JSON Decision Proposal only. Context:
         \\
     ;
-    var user_buf: [36 * 1024]u8 = undefined;
+    var user_buf: [56 * 1024]u8 = undefined;
     const user_msg = std.fmt.bufPrint(&user_buf, "{s}{s}", .{ user_msg_prefix, ctx_json }) catch {
         completeRun(runs, run_id, "error_buffer", "", input_digest, nowMs());
         return;
@@ -2277,7 +2292,7 @@ fn runAgentDecision(
         all_obs[obs_n] = ind_line;
         tools_used = obs_n + 1;
 
-        var ctx_buf2: [40 * 1024]u8 = undefined;
+        var ctx_buf2: [56 * 1024]u8 = undefined;
         const ctx_json2 = ab.context.render(&ctx_buf2, .{
             .snapshot = snap,
             .recent_events = recent_events,
@@ -2297,7 +2312,7 @@ fn runAgentDecision(
         };
         ab.context.digest(ctx_json2, &digest_hex);
 
-        var user_buf2: [44 * 1024]u8 = undefined;
+        var user_buf2: [64 * 1024]u8 = undefined;
         const user_msg2 = std.fmt.bufPrint(&user_buf2, "{s}{s}", .{ user_msg_prefix, ctx_json2 }) catch break :tool_round;
 
         const chat2 = client.chat(default_system_prompt, user_msg2) catch |err| {
@@ -3200,7 +3215,7 @@ fn runReviewChat(
             // tell the model why and let it answer from existing context.
             else => {
                 std.debug.print("[review] tool_requests invalid ({t})\n", .{err});
-                obs = "{\"results\":[],\"error\":\"invalid_tool_requests: name must be ONE of sma/ema/rsi/atr/vol/bollinger/range/candles/decisions/equity/memories, bar one of 1m/5m/15m/1H/4H/1D, at most 6 items\"}";
+                obs = "{\"results\":[],\"error\":\"invalid_tool_requests: name must be ONE of sma/ema/rsi/atr/vol/bollinger/range/candles/decisions/equity/memories, bar one of 1m/5m/15m/30m/1H/4H/1D, at most 6 items\"}";
             },
         }
 
