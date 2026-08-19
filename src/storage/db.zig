@@ -21,6 +21,7 @@ const migration_0001: [:0]const u8 = @embedFile("migration_0001");
 const migration_0002: [:0]const u8 = @embedFile("migration_0002");
 const migration_0003: [:0]const u8 = @embedFile("migration_0003");
 const migration_0004: [:0]const u8 = @embedFile("migration_0004");
+const migration_0005: [:0]const u8 = @embedFile("migration_0005");
 
 /// Ordered list of migrations; user_version tracks the applied count.
 const migrations = [_][:0]const u8{
@@ -28,6 +29,7 @@ const migrations = [_][:0]const u8{
     migration_0002,
     migration_0003,
     migration_0004,
+    migration_0005,
 };
 
 /// Expected user_version for a fully migrated database (restore drills).
@@ -1381,6 +1383,48 @@ pub const AuditReportsRepo = struct {
     }
 };
 
+/// Small runtime key/value store for persisted baselines (e.g. the shadow
+/// buy-and-hold benchmark). Single writer like every other repo.
+pub const KvRepo = struct {
+    put_stmt: Stmt,
+    get_stmt: Stmt,
+
+    pub fn init(db: *Db) DbError!KvRepo {
+        return .{
+            .put_stmt = try db.prepare(
+                \\INSERT INTO runtime_kv (key, value, updated_ts) VALUES (?1,?2,?3)
+                \\ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_ts=excluded.updated_ts
+            ),
+            .get_stmt = try db.prepare("SELECT value FROM runtime_kv WHERE key = ?1"),
+        };
+    }
+
+    pub fn deinit(self: *KvRepo) void {
+        self.put_stmt.finalize();
+        self.get_stmt.finalize();
+    }
+
+    pub fn put(self: *KvRepo, key: []const u8, value: []const u8, ts: []const u8) DbError!void {
+        self.put_stmt.reset();
+        try self.put_stmt.bindText(1, key);
+        try self.put_stmt.bindText(2, value);
+        try self.put_stmt.bindText(3, ts);
+        _ = try self.put_stmt.stepCritical();
+    }
+
+    /// Copy the value for `key` into `out`; null when missing or too large.
+    pub fn get(self: *KvRepo, key: []const u8, out: []u8) ?[]const u8 {
+        self.get_stmt.reset();
+        self.get_stmt.bindText(1, key) catch return null;
+        const has = self.get_stmt.step() catch return null;
+        if (!has) return null;
+        const v = self.get_stmt.columnText(0);
+        if (v.len > out.len) return null;
+        @memcpy(out[0..v.len], v);
+        return out[0..v.len];
+    }
+};
+
 /// Escape raw text into a JSON string value (no surrounding quotes).
 fn writeJsonEscaped(w: *std.Io.Writer, s: []const u8) error{WriteFailed}!void {
     for (s) |ch| {
@@ -2029,4 +2073,33 @@ test "events window query filters by ts range" {
     try testing.expect(pl != null);
     try testing.expect(std.mem.indexOf(u8, pl.?, "\"action\":\"HOLD\"") != null);
     try testing.expect((try repo.proposalPayloadByDecision(&db, &pl_buf, "dec_none")) == null);
+}
+
+test "runtime_kv put/get round-trip and overwrite" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const path = try tmpDbPath(&tmp, &buf);
+
+    var db = try Db.open(path);
+    defer db.close();
+    var kv = try KvRepo.init(&db);
+    defer kv.deinit();
+
+    var out: [128]u8 = undefined;
+    try testing.expect(kv.get("shadow_bh", &out) == null);
+
+    try kv.put("shadow_bh", "v1|403.2|68624.9|0.00586|0.001", "2026-08-19T16:00:00.000Z");
+    const v = kv.get("shadow_bh", &out).?;
+    try testing.expectEqualStrings("v1|403.2|68624.9|0.00586|0.001", v);
+
+    // Overwrite wins; unrelated key stays missing.
+    try kv.put("shadow_bh", "v1|500|70000|0.007|0.001", "2026-08-19T17:00:00.000Z");
+    const v2 = kv.get("shadow_bh", &out).?;
+    try testing.expectEqualStrings("v1|500|70000|0.007|0.001", v2);
+    try testing.expect(kv.get("other", &out) == null);
+
+    // Value larger than out buffer fails closed.
+    var tiny: [4]u8 = undefined;
+    try testing.expect(kv.get("shadow_bh", &tiny) == null);
 }

@@ -647,7 +647,7 @@ pub fn refreshSystemCache(
         .{ st.audit_status, st.audit_ms, st.audit_findings, cfg.audit_interval_ms, st.audit_alerts },
     ) catch return;
     w.print(
-        "\"schedule\":{{\"base_ms\":{d},\"quiet_ms\":{d},\"min_ms\":{d},\"active_hours_utc\":\"{s}\",\"price_move\":\"{f}\",\"drawdown_step\":\"{f}\",\"reflect_on_hold\":{},\"review_backoff_max_ms\":{d}}},",
+        "\"schedule\":{{\"base_ms\":{d},\"quiet_ms\":{d},\"min_ms\":{d},\"active_hours_utc\":\"{s}\",\"price_move\":\"{f}\",\"drawdown_step\":\"{f}\",\"reflect_on_hold\":{},\"review_backoff_max_ms\":{d},\"noop_backoff_max_ms\":{d}}},",
         .{
             cfg.decision_interval_ms,
             cfg.decision_interval_quiet_ms,
@@ -657,6 +657,7 @@ pub fn refreshSystemCache(
             cfg.event_drawdown_step,
             cfg.agent_llm_reflection_on_hold,
             cfg.review_backoff_max_ms,
+            cfg.event_noop_backoff_max_ms,
         },
     ) catch return;
     w.print(

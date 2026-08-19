@@ -131,6 +131,40 @@ fn withReturns(c: Comparison) Comparison {
     return out;
 }
 
+/// Serialize an initialized baseline for the runtime_kv store so alpha
+/// survives daemon restarts. Compact pipe format, no allocator:
+/// "v1|capital|entry_bid|bh_btc|fee_rate".
+pub fn formatSnapshot(buf: []u8, s: Snapshot) error{BufferTooSmall}![]const u8 {
+    if (!s.initialized) return error.BufferTooSmall;
+    return std.fmt.bufPrint(
+        buf,
+        "v1|{f}|{f}|{f}|{f}",
+        .{ s.initial_capital, s.entry_bid, s.bh_btc, s.fee_rate },
+    ) catch return error.BufferTooSmall;
+}
+
+/// Parse a persisted baseline; null on any malformed/implausible field
+/// (fail-closed → caller re-inits from live equity as before).
+pub fn parseSnapshot(text: []const u8) ?Snapshot {
+    var it = std.mem.splitScalar(u8, text, '|');
+    const ver = it.next() orelse return null;
+    if (!std.mem.eql(u8, ver, "v1")) return null;
+    const cap = Decimal.parse(it.next() orelse return null) catch return null;
+    const entry = Decimal.parse(it.next() orelse return null) catch return null;
+    const btc = Decimal.parse(it.next() orelse return null) catch return null;
+    const fee = Decimal.parse(it.next() orelse return null) catch return null;
+    if (it.next() != null) return null;
+    if (!cap.gt(Decimal.zero) or !entry.gt(Decimal.zero) or !btc.gt(Decimal.zero)) return null;
+    if (fee.isNegative() or fee.gte(Decimal.one)) return null;
+    return .{
+        .initial_capital = cap,
+        .entry_bid = entry,
+        .bh_btc = btc,
+        .fee_rate = fee,
+        .initialized = true,
+    };
+}
+
 pub fn formatJson(buf: []u8, c: Comparison) error{BufferTooSmall}![]const u8 {
     return std.fmt.bufPrint(
         buf,
@@ -208,4 +242,39 @@ test "rebase restores comparable alpha" {
     // Same start → alpha near 0 (fees only on BH)
     try testing.expect(c.alpha.abs().lt(d("2")));
     try testing.expect(c.alpha_return.abs().lt(d("0.01")));
+}
+
+test "snapshot persistence round-trip" {
+    const s = init(d("403.21530502"), d("68624.9"), d("0.001"));
+    try testing.expect(s.initialized);
+    var buf: [256]u8 = undefined;
+    const text = try formatSnapshot(&buf, s);
+    const back = parseSnapshot(text) orelse return error.TestUnexpectedResult;
+    try testing.expect(back.initialized);
+    try testing.expect(back.initial_capital.eql(s.initial_capital));
+    try testing.expect(back.entry_bid.eql(s.entry_bid));
+    try testing.expect(back.bh_btc.eql(s.bh_btc));
+    try testing.expect(back.fee_rate.eql(s.fee_rate));
+
+    // Restored snapshot evaluates identically.
+    const a = evaluate(s, d("70000"), d("405"));
+    const b = evaluate(back, d("70000"), d("405"));
+    try testing.expect(a.alpha.eql(b.alpha));
+    try testing.expect(a.bh_equity.eql(b.bh_equity));
+}
+
+test "parseSnapshot fails closed on malformed input" {
+    try testing.expect(parseSnapshot("") == null);
+    try testing.expect(parseSnapshot("v2|1|2|3|4") == null);
+    try testing.expect(parseSnapshot("v1|1|2|3") == null); // missing field
+    try testing.expect(parseSnapshot("v1|1|2|3|4|5") == null); // extra field
+    try testing.expect(parseSnapshot("v1|abc|2|3|0.001") == null);
+    try testing.expect(parseSnapshot("v1|0|2|3|0.001") == null); // zero capital
+    try testing.expect(parseSnapshot("v1|100|0|3|0.001") == null); // zero entry
+    try testing.expect(parseSnapshot("v1|100|50000|0|0.001") == null); // zero btc
+    try testing.expect(parseSnapshot("v1|100|50000|0.002|1") == null); // fee >= 1
+    try testing.expect(parseSnapshot("v1|100|50000|0.002|-0.1") == null);
+    // Uninitialized snapshot refuses to serialize.
+    var buf: [256]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, formatSnapshot(&buf, .{}));
 }

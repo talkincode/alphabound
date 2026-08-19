@@ -32,6 +32,7 @@ decision_min_interval_ms = 30000    # 任意两次决策的硬性冷却下限
 active_hours_utc = ""               # UTC 活跃时段如 "13-21";空 = 全天 base
 event_price_move = 0.005            # 距上次决策价格偏离 ≥0.5% 提前触发
 event_drawdown_step = 0.01          # 回撤加深 ≥1% 提前触发
+event_noop_backoff_max_ms = 3600000 # 连续空转决策后对 price_move 触发指数退避,上限 1 小时 (0 = 关闭)
 llm_reflection_on_hold = false      # HOLD 提案用确定性反思,省一次 LLM 调用
 prompt_dir = "/etc/alphabound/prompts"
 

@@ -534,13 +534,16 @@ fn queryAndResolveOrder(
     if (q.filled_qty.gt(Decimal.zero)) {
         var fid_buf: [40]u8 = undefined;
         const fill_id = std.fmt.bufPrint(&fid_buf, "{s}f0", .{cl_id}) catch "fill0";
+        var fee_buf: [48]u8 = undefined;
+        const fee_s = decFmt(&fee_buf, q.fee);
+        const fee_ccy = if (q.feeCcy().len > 0) q.feeCcy() else "USDT";
         fills_repo.append(.{
             .fill_id = fill_id,
             .order_id = cl_id,
             .price = avg_s,
             .qty = fill_s,
-            .fee = "0",
-            .fee_ccy = "USDT",
+            .fee = fee_s,
+            .fee_ccy = fee_ccy,
             .ts = ts,
         }) catch {};
     }

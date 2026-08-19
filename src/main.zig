@@ -23,6 +23,21 @@ fn nowMs() i64 {
     return ab.clock.SystemClock.clock().wallMs();
 }
 
+/// runtime_kv key for the persisted shadow buy-and-hold baseline.
+const shadow_bh_kv_key = "shadow_bh_baseline";
+
+/// Best-effort persist of the BH baseline (alpha survives restarts).
+/// Failures only log — the in-memory baseline keeps working either way.
+fn persistShadowBaseline(kv: *ab.storage.KvRepo, snap: ab.shadow_bench.Snapshot) void {
+    var val_buf: [256]u8 = undefined;
+    const val = ab.shadow_bench.formatSnapshot(&val_buf, snap) catch return;
+    var ts_buf: [40]u8 = undefined;
+    const ts = ab.clock.formatRfc3339Ms(nowMs(), &ts_buf) catch "";
+    kv.put(shadow_bh_kv_key, val, ts) catch {
+        std.debug.print("[shadow-bh] persist failed (kv write)\n", .{});
+    };
+}
+
 var shutdown_requested = std.atomic.Value(bool).init(false);
 
 fn onSignal(_: std.posix.SIG) callconv(.c) void {
@@ -379,6 +394,8 @@ pub fn main(init: std.process.Init) !u8 {
     defer review_repo.deinit();
     var audit_repo = try ab.storage.AuditReportsRepo.init(&db);
     defer audit_repo.deinit();
+    var kv_repo = try ab.storage.KvRepo.init(&db);
+    defer kv_repo.deinit();
 
     // In-process memory index rebuilt from SQLite latest versions.
     var mem_store = ab.memory.Store.init(gpa);
@@ -647,7 +664,21 @@ pub fn main(init: std.process.Init) !u8 {
     writeControlState(io, control_state_path, admin_paused, .none, true);
 
     // Shadow buy-and-hold baseline (initialized on first live bid).
+    // Restored from runtime_kv when present so alpha survives restarts;
+    // fail-closed parse → re-init from live equity as before.
     var bh = ab.shadow_bench.Snapshot{};
+    {
+        var kv_buf: [256]u8 = undefined;
+        if (kv_repo.get(shadow_bh_kv_key, &kv_buf)) |persisted| {
+            if (ab.shadow_bench.parseSnapshot(persisted)) |restored| {
+                bh = restored;
+                std.debug.print(
+                    "[shadow-bh] restored baseline capital={f} entry_bid={f} bh_btc={f}\n",
+                    .{ bh.initial_capital, bh.entry_bid, bh.bh_btc },
+                );
+            }
+        }
+    }
     var last_bh_cmp = ab.shadow_bench.Comparison{
         .shadow_equity = cfg.initial_capital,
         .bh_equity = cfg.initial_capital,
@@ -697,6 +728,7 @@ pub fn main(init: std.process.Init) !u8 {
         .price_move = cfg.event_price_move,
         .drawdown_step = cfg.event_drawdown_step,
         .review_backoff_max_ms = @as(i64, cfg.review_backoff_max_ms),
+        .noop_backoff_cap_ms = @as(i64, cfg.event_noop_backoff_max_ms),
     });
     var ticker_path_buf: [128]u8 = undefined;
     const ticker_path = std.fmt.bufPrint(&ticker_path_buf, "/api/v5/market/ticker?instId={s}", .{cfg.instrument}) catch return 1;
@@ -863,6 +895,7 @@ pub fn main(init: std.process.Init) !u8 {
                                 .{ bh.initial_capital, bh.entry_bid, bh.bh_btc, bh.fee_rate },
                             );
                             logEvent(&events_repo, &engine, "SHADOW_BH_INIT", "core", "INFO", &cfg);
+                            persistShadowBaseline(&kv_repo, bh);
                         }
                     } else if (ab.shadow_bench.needsRebase(bh.initial_capital, live_eq)) {
                         const prev_cap = bh.initial_capital;
@@ -883,6 +916,7 @@ pub fn main(init: std.process.Init) !u8 {
                                 .{ as, bs },
                             ) catch "{\"reason\":\"capital_jump\"}";
                             logEventPayload(&events_repo, &engine, "SHADOW_BH_REBASE", "core", "INFO", &cfg, rp);
+                            persistShadowBaseline(&kv_repo, bh);
                         }
                     }
                 } else if (!bh.initialized and !ticker.bid.isZero()) {
@@ -890,6 +924,7 @@ pub fn main(init: std.process.Init) !u8 {
                     bh = ab.shadow_bench.init(cfg.initial_capital, ticker.bid, cfg.taker_fee_rate);
                     if (bh.initialized) {
                         logEvent(&events_repo, &engine, "SHADOW_BH_INIT", "core", "INFO", &cfg);
+                        persistShadowBaseline(&kv_repo, bh);
                     }
                 }
                 last_bh_cmp = ab.shadow_bench.evaluate(bh, ticker.bid, snap.conservative_equity);
@@ -2417,6 +2452,14 @@ fn runAgentDecision(
             prop.order_policy,
         );
     }
+    // Feed the outcome back to the scheduler: consecutive no-ops (HOLD or
+    // plan-held rebalance) escalate the price_move cooldown so trending
+    // markets stop re-asking the LLM for the same no-op every few minutes.
+    // Execution errors and shadow-mode approvals count as real intent → reset.
+    const noop_outcome = prop.action == .hold or
+        std.mem.eql(u8, exec_note, "plan_hold") or
+        std.mem.eql(u8, exec_note, "skipped_reject");
+    sched.noteOutcome(!noop_outcome);
     std.debug.print(
         "[agent] proposal ok id={s} action={s} target_btc={f} conf={f} mem={d} admit={s} exec={s}\n",
         .{ prop.decision_id, action_txt, prop.target_btc_weight, prop.confidence, scored.items.len, admission.verdict_txt, exec_note },

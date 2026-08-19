@@ -492,6 +492,11 @@ pub const OrderQuery = struct {
     exchange_order_id_len: usize = 0,
     filled_qty: Decimal,
     avg_price: Decimal,
+    /// Fee charged by the venue, normalized to a non-negative "fee paid"
+    /// (OKX reports charges as negative numbers). Zero when absent.
+    fee: Decimal = Decimal.zero,
+    fee_ccy_buf: [12]u8 = undefined,
+    fee_ccy_len: usize = 0,
 
     pub fn status(self: *const OrderQuery) []const u8 {
         return self.status_buf[0..self.status_len];
@@ -499,6 +504,10 @@ pub const OrderQuery = struct {
 
     pub fn exchangeOrderId(self: *const OrderQuery) []const u8 {
         return self.exchange_order_id_buf[0..self.exchange_order_id_len];
+    }
+
+    pub fn feeCcy(self: *const OrderQuery) []const u8 {
+        return self.fee_ccy_buf[0..self.fee_ccy_len];
     }
 };
 
@@ -522,6 +531,20 @@ pub fn parseOrderQuery(gpa: std.mem.Allocator, body: []const u8) Error!OrderQuer
         if (ord_id.len > 0 and ord_id.len <= q.exchange_order_id_buf.len) {
             @memcpy(q.exchange_order_id_buf[0..ord_id.len], ord_id);
             q.exchange_order_id_len = ord_id.len;
+        }
+    } else |_| {}
+    // Fee fields are best-effort: absent/malformed → zero (never fail the query).
+    if (getString(obj, "fee")) |fee_s| {
+        if (fee_s.len > 0) {
+            if (Decimal.parseLossy(fee_s)) |f| {
+                q.fee = f.abs();
+            } else |_| {}
+        }
+    } else |_| {}
+    if (getString(obj, "feeCcy")) |ccy| {
+        if (ccy.len > 0 and ccy.len <= q.fee_ccy_buf.len) {
+            @memcpy(q.fee_ccy_buf[0..ccy.len], ccy);
+            q.fee_ccy_len = ccy.len;
         }
     } else |_| {}
     return q;
@@ -882,13 +905,16 @@ test "parse order ack" {
 
 test "parse order query filled" {
     const body =
-        \\{"code":"0","msg":"","data":[{"ordId":"312269865356374099","state":"filled","accFillSz":"0.0001","avgPx":"100000.1"}]}
+        \\{"code":"0","msg":"","data":[{"ordId":"312269865356374099","state":"filled","accFillSz":"0.0001","avgPx":"100000.1","fee":"-0.0000001","feeCcy":"BTC"}]}
     ;
     const q = try parseOrderQuery(testing.allocator, body);
     try testing.expectEqualStrings("filled", q.status());
     try testing.expectEqualStrings("312269865356374099", q.exchangeOrderId());
     try testing.expect(q.filled_qty.eql(d("0.0001")));
     try testing.expect(q.avg_price.eql(d("100000.1")));
+    // Fee normalized to positive "fee paid" with its currency.
+    try testing.expect(q.fee.eql(d("0.0000001")));
+    try testing.expectEqualStrings("BTC", q.feeCcy());
 }
 
 /// Extract up to `out.len` client order ids from orders-pending response.
@@ -937,13 +963,18 @@ test "parse order query with empty avgPx" {
     const q = try parseOrderQuery(testing.allocator, body);
     try testing.expectEqualStrings("live", q.status());
     try testing.expect(q.filled_qty.isZero());
+    // No fee fields → zero fee, empty ccy (fee is best-effort).
+    try testing.expect(q.fee.isZero());
+    try testing.expectEqualStrings("", q.feeCcy());
 
     const body2 =
-        \\{"code":"0","msg":"","data":[{"state":"partially_filled","accFillSz":"0.0004","avgPx":"99120.5"}]}
+        \\{"code":"0","msg":"","data":[{"state":"partially_filled","accFillSz":"0.0004","avgPx":"99120.5","fee":"-0.12","feeCcy":"USDT"}]}
     ;
     const q2 = try parseOrderQuery(testing.allocator, body2);
     try testing.expectEqualStrings("partially_filled", q2.status());
     try testing.expect(q2.filled_qty.eql(d("0.0004")));
+    try testing.expect(q2.fee.eql(d("0.12")));
+    try testing.expectEqualStrings("USDT", q2.feeCcy());
 }
 
 test "malformed bodies fail closed" {

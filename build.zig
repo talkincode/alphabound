@@ -45,6 +45,9 @@ pub fn build(b: *std.Build) void {
     mod.addAnonymousImport("migration_0004", .{
         .root_source_file = b.path("migrations/0004_audit.sql"),
     });
+    mod.addAnonymousImport("migration_0005", .{
+        .root_source_file = b.path("migrations/0005_runtime_kv.sql"),
+    });
     mod.addAnonymousImport("favicon_svg", .{
         .root_source_file = b.path("dashboard/favicon.svg"),
     });

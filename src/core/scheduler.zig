@@ -141,6 +141,13 @@ pub const Params = struct {
     /// Event triggers (price_move / drawdown_step / risk_mode_change) always
     /// cut through a backoff, so risk reaction speed is unchanged.
     review_backoff_max_ms: i64 = 0,
+    /// Cap for the escalating price_move cooldown after consecutive no-op
+    /// decisions (HOLD / plan-held rebalances). Each consecutive no-op doubles
+    /// the price_move floor starting from min_interval_ms, capped here.
+    /// 0 disables escalation. Only price_move is dampened — drawdown_step and
+    /// risk_mode_change keep the base cooldown, and the risk kernel is
+    /// independent of this advisory loop entirely.
+    noop_backoff_cap_ms: i64 = 0,
 
     pub fn effectiveInterval(self: Params, hour: u8) i64 {
         if (self.active_hours.contains(hour)) return self.base_interval_ms;
@@ -158,6 +165,10 @@ pub const Scheduler = struct {
     /// Regular cadence is suppressed until this instant (HOLD review_after
     /// backoff). Event triggers ignore it; cleared on every fire.
     hold_until_ms: i64 = 0,
+    /// Consecutive decisions that produced no order (HOLD or plan-held
+    /// rebalance). Drives the escalating price_move cooldown; reset by
+    /// `noteOutcome(true)` when a decision actually trades.
+    consecutive_noops: u32 = 0,
 
     pub fn init(params: Params) Scheduler {
         return .{ .params = params };
@@ -193,7 +204,7 @@ pub const Scheduler = struct {
         {
             const diff = bid.sub(self.last_bid) catch Decimal.zero;
             const rel = diff.abs().div(self.last_bid, .down) catch Decimal.zero;
-            if (rel.gte(p.price_move))
+            if (rel.gte(p.price_move) and elapsed >= self.priceMoveFloorMs())
                 return .{ .fire = true, .reason = .price_move };
         }
 
@@ -235,6 +246,28 @@ pub const Scheduler = struct {
         const clamped = @min(@max(review_after_ms, floor_ms), cap);
         self.hold_until_ms = now_ms + clamped;
         return clamped;
+    }
+
+    /// Record whether the fired decision actually produced an order.
+    /// Consecutive no-ops (HOLD, plan-held rebalance) escalate the
+    /// price_move cooldown; any real order resets it.
+    pub fn noteOutcome(self: *Scheduler, produced_order: bool) void {
+        if (produced_order) {
+            self.consecutive_noops = 0;
+        } else {
+            self.consecutive_noops +|= 1;
+        }
+    }
+
+    /// Effective cooldown floor for the price_move trigger: doubles per
+    /// consecutive no-op from min_interval_ms, saturating at the cap.
+    fn priceMoveFloorMs(self: *const Scheduler) i64 {
+        const p = self.params;
+        if (p.noop_backoff_cap_ms <= 0 or self.consecutive_noops == 0)
+            return p.min_interval_ms;
+        const shift: u6 = @intCast(@min(self.consecutive_noops, 20));
+        const scaled = p.min_interval_ms *| (@as(i64, 1) <<| shift);
+        return @min(scaled, @max(p.noop_backoff_cap_ms, p.min_interval_ms));
     }
 };
 
@@ -416,4 +449,78 @@ test "hold backoff clamps below to interval and disabled cap is a no-op" {
     var off = Scheduler.init(.{ .base_interval_ms = 900_000 });
     try testing.expectEqual(@as(i64, 0), off.deferAfterHold(0, 3_600_000));
     try testing.expectEqual(@as(i64, 0), off.hold_until_ms);
+}
+
+test "no-op escalation dampens price_move only; order resets" {
+    var s = Scheduler.init(.{
+        .base_interval_ms = 900_000,
+        .min_interval_ms = 180_000,
+        .price_move = d("0.005"),
+        .noop_backoff_cap_ms = 3_600_000,
+    });
+    s.commit(0, d("100"), Decimal.zero, .normal);
+
+    // Baseline: 1% move fires at the 180s floor.
+    var v = s.evaluate(180_000, d("101"), Decimal.zero, .normal);
+    try testing.expect(v.fire);
+    try testing.expectEqual(TriggerReason.price_move, v.reason);
+    s.commit(180_000, d("101"), Decimal.zero, .normal);
+
+    // One no-op → price_move floor doubles to 360s.
+    s.noteOutcome(false);
+    try testing.expect(!s.evaluate(180_000 + 180_000, d("102.1"), Decimal.zero, .normal).fire);
+    v = s.evaluate(180_000 + 360_000, d("102.1"), Decimal.zero, .normal);
+    try testing.expect(v.fire);
+    try testing.expectEqual(TriggerReason.price_move, v.reason);
+    s.commit(540_000, d("102.1"), Decimal.zero, .normal);
+
+    // Three more no-ops (4 total) → floor 16×=2880s; still blocked at 720s...
+    s.noteOutcome(false);
+    s.noteOutcome(false);
+    s.noteOutcome(false);
+    try testing.expect(!s.evaluate(540_000 + 720_000, d("104"), Decimal.zero, .normal).fire);
+    // ...but a risk-mode change still cuts through at the base 180s floor.
+    const vr = s.evaluate(540_000 + 180_000, d("104"), Decimal.zero, .exit_only);
+    try testing.expect(vr.fire);
+    try testing.expectEqual(TriggerReason.risk_mode_change, vr.reason);
+    // Regular cadence also unaffected (fires at base interval).
+    const vc = s.evaluate(540_000 + 900_000, d("102.2"), Decimal.zero, .normal);
+    try testing.expect(vc.fire);
+    try testing.expectEqual(TriggerReason.interval_active, vc.reason);
+
+    // A real order resets escalation back to the base floor.
+    s.noteOutcome(true);
+    const v2 = s.evaluate(540_000 + 180_000, d("104"), Decimal.zero, .normal);
+    try testing.expect(v2.fire);
+    try testing.expectEqual(TriggerReason.price_move, v2.reason);
+}
+
+test "no-op escalation saturates at cap and disabled cap keeps legacy behavior" {
+    var s = Scheduler.init(.{
+        .base_interval_ms = 7_200_000,
+        .min_interval_ms = 180_000,
+        .price_move = d("0.005"),
+        .noop_backoff_cap_ms = 3_600_000,
+    });
+    s.commit(0, d("100"), Decimal.zero, .normal);
+    var i: u32 = 0;
+    while (i < 40) : (i += 1) s.noteOutcome(false); // way past any shift width
+    // Blocked below the 1h cap, fires at the cap.
+    try testing.expect(!s.evaluate(3_599_999, d("110"), Decimal.zero, .normal).fire);
+    const v = s.evaluate(3_600_000, d("110"), Decimal.zero, .normal);
+    try testing.expect(v.fire);
+    try testing.expectEqual(TriggerReason.price_move, v.reason);
+
+    // cap=0 → legacy: no-ops never dampen price_move.
+    var legacy = Scheduler.init(.{
+        .base_interval_ms = 900_000,
+        .min_interval_ms = 180_000,
+        .price_move = d("0.005"),
+    });
+    legacy.commit(0, d("100"), Decimal.zero, .normal);
+    legacy.noteOutcome(false);
+    legacy.noteOutcome(false);
+    const lv = legacy.evaluate(180_000, d("101"), Decimal.zero, .normal);
+    try testing.expect(lv.fire);
+    try testing.expectEqual(TriggerReason.price_move, lv.reason);
 }

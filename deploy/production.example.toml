@@ -36,6 +36,7 @@ active_hours_utc = "13-21"           # EU/US overlap; empty = always base
 event_price_move = 0.005             # fire early on ≥0.5% move since last call
 event_drawdown_step = 0.01           # fire early when drawdown deepens ≥1%
 review_backoff_max_ms = 14400000     # honor HOLD review_after as backoff, capped at 4h (0 = legacy fixed cadence)
+event_noop_backoff_max_ms = 3600000  # dampen price_move trigger after consecutive no-op decisions, capped at 1h (0 = off)
 prompt_dir = "/etc/alphabound/prompts"
 enabled = true
 llm_reflection = true

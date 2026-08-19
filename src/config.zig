@@ -73,6 +73,13 @@ pub const Config = struct {
     /// backoff (ms); 0 disables (legacy fixed cadence). Event triggers
     /// (price_move / drawdown_step / risk_mode_change) always cut through.
     review_backoff_max_ms: u32 = 0,
+    /// Cap (ms) for the escalating price_move cooldown after consecutive
+    /// no-op decisions (HOLD / plan-held rebalance): each no-op doubles the
+    /// price_move floor from decision_min_interval_ms up to this cap.
+    /// Only dampens the advisory LLM loop's price_move trigger —
+    /// drawdown_step / risk_mode_change and the risk kernel are unaffected.
+    /// 0 disables. Default 1h.
+    event_noop_backoff_max_ms: u32 = 3_600_000,
     prompt_dir: []const u8 = "prompts",
     /// When false, never call LLM even if keys are present.
     agent_enabled: bool = true,
@@ -267,6 +274,8 @@ fn applyKey(a: std.mem.Allocator, cfg: *Config, section: []const u8, key: []cons
                 cfg.event_drawdown_step.gte(Decimal.fromInt(1))) return error.InvalidValue;
         } else if (std.mem.eql(u8, key, "review_backoff_max_ms")) {
             cfg.review_backoff_max_ms = parseInt(u32, val) catch return error.InvalidValue;
+        } else if (std.mem.eql(u8, key, "event_noop_backoff_max_ms")) {
+            cfg.event_noop_backoff_max_ms = parseInt(u32, val) catch return error.InvalidValue;
         } else if (std.mem.eql(u8, key, "prompt_dir")) {
             cfg.prompt_dir = try parseString(a, val);
         } else if (std.mem.eql(u8, key, "enabled")) {
