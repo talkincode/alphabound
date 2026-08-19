@@ -520,6 +520,13 @@ pub fn main(init: std.process.Init) !u8 {
             }
         }
     }
+    // Config floor on per-trade notional: dust rebalances whose fee round-trip
+    // exceeds any plausible edge should plan to HOLD (§4.1 keeps venue limits
+    // authoritative; this only ever raises the bar, never lowers it).
+    if (cfg.min_trade_notional.gt(trade_instrument.min_notional)) {
+        trade_instrument.min_notional = cfg.min_trade_notional;
+        std.debug.print("[boot] min trade notional raised to {f} USDT (config)\n", .{cfg.min_trade_notional});
+    }
 
     std.debug.print("[connect] probing {s}\n", .{cfg.rest_url});
     if (okx.getPublic("/api/v5/public/time")) |body| {
@@ -689,6 +696,7 @@ pub fn main(init: std.process.Init) !u8 {
         .active_hours = ab.scheduler.parseHours(cfg.active_hours_utc) catch .{},
         .price_move = cfg.event_price_move,
         .drawdown_step = cfg.event_drawdown_step,
+        .review_backoff_max_ms = @as(i64, cfg.review_backoff_max_ms),
     });
     var ticker_path_buf: [128]u8 = undefined;
     const ticker_path = std.fmt.bufPrint(&ticker_path_buf, "/api/v5/market/ticker?instId={s}", .{cfg.instrument}) catch return 1;
@@ -985,7 +993,7 @@ pub fn main(init: std.process.Init) !u8 {
                         .{ reason_txt, ab.scheduler.hourUtc(tnow), agent_sched.params.effectiveInterval(ab.scheduler.hourUtc(tnow)) },
                     ) catch "{\"reason\":\"unknown\"}";
                     logEventPayload(&events_repo, &engine, "AGENT_TRIGGER", "agent", "INFO", &cfg, trig_payload);
-                    runAgentDecision(gpa, client, &okx, &cfg, &engine, &tool_reg, &agent_runs, &tool_calls, &events_repo, &orders_repo, &fills_repo, &equity_repo, &db, &mem_store, &memories_repo, env, &runtime_status, trade_instrument);
+                    runAgentDecision(gpa, client, &okx, &cfg, &engine, &tool_reg, &agent_runs, &tool_calls, &events_repo, &orders_repo, &fills_repo, &equity_repo, &db, &mem_store, &memories_repo, env, &runtime_status, trade_instrument, &agent_sched, last_bh_cmp);
                     refreshWebCaches(&web_state, &db, &agent_runs, &equity_repo, &events_repo, &memories_repo, &orders_repo, &fills_repo, last_bh_cmp);
                     refreshSystemCache(&web_state, &db, &cfg, &mem_store, boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), llm_client != null, admin_paused, &runtime_status, &risk_latency);
                 }
@@ -2020,6 +2028,15 @@ fn compactProposalLines(
     return n;
 }
 
+/// Pull `"ts":"..."` from a compact JSON line already on the context path.
+fn compactJsonTsMs(line: []const u8) ?i64 {
+    const key = "\"ts\":\"";
+    const start = std.mem.indexOf(u8, line, key) orelse return null;
+    const from = start + key.len;
+    const end = std.mem.indexOfScalarPos(u8, line, from, '"') orelse return null;
+    return ab.clock.parseRfc3339Ms(line[from..end]) catch null;
+}
+
 /// Field accessor: string value from a parsed JSON object, else null.
 fn jsonStr(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     const v = obj.get(key) orelse return null;
@@ -2048,6 +2065,8 @@ fn runAgentDecision(
     env: *const std.process.Environ.Map,
     st: *RuntimeStatus,
     instrument: ab.planner.Instrument,
+    sched: *ab.scheduler.Scheduler,
+    bh_cmp: ab.shadow_bench.Comparison,
 ) void {
     const snap = engine.snapshot();
     const decision_start_version = snap.version;
@@ -2131,6 +2150,23 @@ fn runAgentDecision(
     }
     const equity_marks = eq_ptrs[0..eq_n];
 
+    var review_facts = ab.context.ReviewFacts{};
+    if (mem_store.find("E_hold_streak")) |hm| {
+        review_facts.hold_streak = hm.evidence_count;
+    }
+    if (fill_n > 0) {
+        if (compactJsonTsMs(recent_fills[0])) |fts| {
+            const age = nowMs() - fts;
+            if (age >= 0) review_facts.ms_since_last_fill = age;
+        }
+    }
+    if (bh_cmp.entry_bid.gt(ab.decimal.Decimal.zero)) {
+        review_facts.has_benchmark = true;
+        review_facts.shadow_return = bh_cmp.shadow_return;
+        review_facts.bh_return = bh_cmp.bh_return;
+        review_facts.alpha_return = bh_cmp.alpha_return;
+    }
+
     var ctx_buf: [32 * 1024]u8 = undefined;
     const ctx_json = ab.context.render(&ctx_buf, .{
         .snapshot = snap,
@@ -2141,6 +2177,7 @@ fn runAgentDecision(
         .recent_proposals = recent_proposals,
         .recent_fills = recent_fills,
         .equity_marks = equity_marks,
+        .facts = review_facts,
         .max_drawdown = cfg.max_drawdown,
         .instrument = cfg.instrument,
         .now_ms = nowMs(),
@@ -2250,6 +2287,7 @@ fn runAgentDecision(
             .recent_proposals = recent_proposals,
             .recent_fills = recent_fills,
             .equity_marks = equity_marks,
+            .facts = review_facts,
             .max_drawdown = cfg.max_drawdown,
             .instrument = cfg.instrument,
             .now_ms = nowMs(),
@@ -2338,6 +2376,16 @@ fn runAgentDecision(
     if (prop.action == .hold) {
         exec_note = "hold";
         logEventPayload(events_repo, engine, "EXEC_HOLD", "execution", "INFO", cfg, "{\"reason\":\"action_hold\"}");
+        // Honor the model's own review_after as a regular-cadence backoff
+        // (clamped; event triggers still cut through). Quiet markets stop
+        // burning LLM calls re-stating the same HOLD.
+        if (prop.review_after) |ra| {
+            if (ab.scheduler.parseIsoDurationMs(ra)) |ra_ms| {
+                const applied = sched.deferAfterHold(admit_now, ra_ms);
+                if (applied > 0)
+                    std.debug.print("[agent] hold backoff review_after={s} applied_ms={d}\n", .{ ra, applied });
+            }
+        }
     } else if (ab.okx_trade.executionAllowed(cfg.mode.isTrading(), exec_venue_authorized)) {
         exec_note = tryDemoExecute(
             gpa,
@@ -2602,7 +2650,12 @@ fn recordProposalEpisode(
     conf: ab.decimal.Decimal,
 ) void {
     var id_buf: [80]u8 = undefined;
-    const mid = std.fmt.bufPrint(&id_buf, "E_{s}", .{run_id}) catch return;
+    // HOLD cycles roll up into ONE evolving episode (evidence_count = streak
+    // length) instead of one record per run: at 15-min cadence per-run HOLD
+    // episodes are pure template noise that floods the store and reduces
+    // retrieval to recency. Rebalances keep their own per-run episode.
+    const is_hold = std.mem.eql(u8, action, "HOLD");
+    const mid = if (is_hold) "E_hold_streak" else std.fmt.bufPrint(&id_buf, "E_{s}", .{run_id}) catch return;
     var t_buf: [48]u8 = undefined;
     var c_buf: [48]u8 = undefined;
     const t_s = decFmt(&t_buf, target);
@@ -2615,13 +2668,22 @@ fn recordProposalEpisode(
     ) catch return;
     var touched: std.ArrayList(ab.memory.Memory) = .empty;
     defer touched.deinit(gpa);
-    store.applyOp(.{ .create = .{
-        .memory_id = mid,
-        .kind = .episodic,
-        .status = .active,
-        .confidence = conf,
-        .content_json = content,
-    } }, nowMs(), &touched) catch return;
+    if (is_hold and store.find(mid) != null) {
+        store.applyOp(.{ .update = .{
+            .memory_id = mid,
+            .evidence_increment = 1,
+            .new_status = .active,
+            .content_json = content,
+        } }, nowMs(), &touched) catch return;
+    } else {
+        store.applyOp(.{ .create = .{
+            .memory_id = mid,
+            .kind = .episodic,
+            .status = .active,
+            .confidence = conf,
+            .content_json = content,
+        } }, nowMs(), &touched) catch return;
+    }
     for (touched.items) |m| persistMemory(repo, m);
 
     // Refresh working "last decision" pointer (update if exists else create).
@@ -3627,7 +3689,10 @@ fn applyShadowReflection(
     const now = nowMs();
 
     var id_buf: [80]u8 = undefined;
-    const rid = std.fmt.bufPrint(&id_buf, "R_{s}", .{run_id}) catch return;
+    // HOLD shadow reflections roll up into ONE evolving record (see
+    // recordProposalEpisode) — per-run copies are identical template text.
+    const is_hold = std.mem.eql(u8, action, "HOLD");
+    const rid = if (is_hold) "R_hold_streak" else std.fmt.bufPrint(&id_buf, "R_{s}", .{run_id}) catch return;
     var t_buf: [48]u8 = undefined;
     var c_buf: [48]u8 = undefined;
     const t_s = decFmt(&t_buf, target);
@@ -3639,16 +3704,28 @@ fn applyShadowReflection(
         .{ run_id, action, t_s, decision_id, c_s },
     ) catch return;
 
-    store.applyOp(.{ .create = .{
-        .memory_id = rid,
-        .kind = .reflection,
-        .status = .active,
-        .confidence = conf,
-        .content_json = content,
-    } }, now, &touched) catch |err| {
-        std.debug.print("[reflect] create failed: {t}\n", .{err});
-        return;
-    };
+    if (is_hold and store.find(rid) != null) {
+        store.applyOp(.{ .update = .{
+            .memory_id = rid,
+            .evidence_increment = 1,
+            .new_status = .active,
+            .content_json = content,
+        } }, now, &touched) catch |err| {
+            std.debug.print("[reflect] update failed: {t}\n", .{err});
+            return;
+        };
+    } else {
+        store.applyOp(.{ .create = .{
+            .memory_id = rid,
+            .kind = .reflection,
+            .status = .active,
+            .confidence = conf,
+            .content_json = content,
+        } }, now, &touched) catch |err| {
+            std.debug.print("[reflect] create failed: {t}\n", .{err});
+            return;
+        };
+    }
 
     for (touched.items) |m| persistMemory(repo, m);
 

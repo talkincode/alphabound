@@ -160,7 +160,7 @@ pub const Store = struct {
         switch (op) {
             .create => |c| {
                 if (self.find(c.memory_id) != null) return error.DuplicateId;
-                if (self.items.items.len >= MAX_MEMORIES) return error.StoreFull;
+                if (self.items.items.len >= MAX_MEMORIES) try self.evictForCreate();
                 const m = try self.own(.{
                     .memory_id = c.memory_id,
                     .version = 1,
@@ -205,6 +205,45 @@ pub const Store = struct {
                 try out.append(self.gpa, into.*);
             },
         }
+    }
+
+    /// Deterministic eviction when the index is at MAX_MEMORIES: drop the
+    /// least valuable record from the in-process index only — the SQLite
+    /// `memories` log keeps full append-only history for audit. Order:
+    /// oldest terminal (invalidated/merged) first, then oldest reflection,
+    /// then oldest episodic. Working and strategy memories are never
+    /// evicted; with none of the above present this fails closed.
+    fn evictForCreate(self: *Store) StoreError!void {
+        const Pass = struct { terminal: bool, kind: Kind };
+        const passes = [_]Pass{
+            .{ .terminal = true, .kind = .working }, // kind unused for terminal pass
+            .{ .terminal = false, .kind = .reflection },
+            .{ .terminal = false, .kind = .episodic },
+        };
+        for (passes) |p| {
+            var best: ?usize = null;
+            for (self.items.items, 0..) |m, i| {
+                const terminal = m.status == .invalidated or m.status == .merged;
+                if (p.terminal) {
+                    if (!terminal) continue;
+                } else {
+                    if (terminal or m.kind != p.kind) continue;
+                }
+                if (best) |b| {
+                    const cur = self.items.items[b];
+                    if (m.created_ms < cur.created_ms or
+                        (m.created_ms == cur.created_ms and std.mem.lessThan(u8, m.memory_id, cur.memory_id)))
+                        best = i;
+                } else {
+                    best = i;
+                }
+            }
+            if (best) |b| {
+                _ = self.items.orderedRemove(b);
+                return;
+            }
+        }
+        return error.StoreFull;
     }
 
     fn own(self: *Store, m: Memory) StoreError!Memory {
@@ -449,4 +488,75 @@ test "retrieval ranks by tags, recency, evidence; hides invalidated" {
     defer res3.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 1), res3.items.len);
     try testing.expectEqualStrings("old-tagged", res3.items[0].memory.memory_id);
+}
+
+test "create at capacity evicts deterministically: terminal, then oldest reflection/episodic; strategy protected" {
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var touched: std.ArrayList(Memory) = .empty;
+    defer touched.deinit(testing.allocator);
+
+    // Fill to MAX_MEMORIES: 1 strategy + 1 merged + 1 episodic + reflections.
+    try store.load(.{
+        .memory_id = "S_keep",
+        .version = 1,
+        .kind = .strategy,
+        .status = .active,
+        .confidence = d("0.9"),
+        .evidence_count = 5,
+        .content_json = "{}",
+        .created_ms = 1,
+    });
+    try store.load(.{
+        .memory_id = "M_dead",
+        .version = 2,
+        .kind = .reflection,
+        .status = .merged,
+        .confidence = d("0.1"),
+        .evidence_count = 0,
+        .content_json = "{}",
+        .created_ms = 2,
+    });
+    try store.load(.{
+        .memory_id = "E_old",
+        .version = 1,
+        .kind = .episodic,
+        .status = .active,
+        .confidence = d("0.5"),
+        .evidence_count = 1,
+        .content_json = "{}",
+        .created_ms = 3,
+    });
+    var i: usize = 0;
+    var id_buf: [32]u8 = undefined;
+    while (store.count() < MAX_MEMORIES) : (i += 1) {
+        const id = try std.fmt.bufPrint(&id_buf, "R_{d:0>6}", .{i});
+        try store.load(.{
+            .memory_id = id,
+            .version = 1,
+            .kind = .reflection,
+            .status = .active,
+            .confidence = d("0.3"),
+            .evidence_count = 0,
+            .content_json = "{}",
+            .created_ms = 100 + @as(i64, @intCast(i)),
+        });
+    }
+    try testing.expectEqual(@as(usize, MAX_MEMORIES), store.count());
+
+    // 1st create at capacity: terminal M_dead evicted first.
+    try store.applyOp(.{ .create = .{ .memory_id = "R_new_1", .kind = .reflection, .content_json = "{}" } }, 9000, &touched);
+    try testing.expectEqual(@as(usize, MAX_MEMORIES), store.count());
+    try testing.expect(store.find("M_dead") == null);
+    try testing.expect(store.find("R_new_1") != null);
+
+    // 2nd: no terminal left -> oldest reflection R_000000 goes.
+    try store.applyOp(.{ .create = .{ .memory_id = "R_new_2", .kind = .reflection, .content_json = "{}" } }, 9001, &touched);
+    try testing.expect(store.find("R_000000") == null);
+    try testing.expect(store.find("E_old") != null);
+    try testing.expect(store.find("S_keep") != null);
+
+    // Strategy is never evicted and duplicate create still rejected at capacity.
+    try testing.expectError(error.DuplicateId, store.applyOp(.{ .create = .{ .memory_id = "R_new_2", .kind = .reflection } }, 9002, &touched));
+    try testing.expect(store.find("S_keep") != null);
 }

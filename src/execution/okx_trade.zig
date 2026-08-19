@@ -107,6 +107,17 @@ pub fn wantsResidualPlan(resolve_note: []const u8) bool {
 /// Hard cap on market legs per decision (anti-runaway replan).
 pub const max_replan_legs: u16 = 3;
 
+/// After a confirmed fill the venue book MUST have moved in the trade
+/// direction. An unchanged (or wrong-direction) balance means the feed is
+/// lagging — replanning on it re-sends the same delta (the 08-12 triple-buy
+/// class of bug, generalized beyond the zero-book case).
+pub fn bookMoved(side: orders.Side, pre_btc: Decimal, post_btc: Decimal) bool {
+    return switch (side) {
+        .buy => post_btc.gt(pre_btc),
+        .sell => post_btc.lt(pre_btc),
+    };
+}
+
 /// Whether another leg is still allowed (`leg_index` is 0-based, already placed).
 pub fn canPlaceAnotherLeg(leg_index: u16) bool {
     return leg_index + 1 < max_replan_legs;
@@ -186,6 +197,14 @@ test "residual plan policy and leg cap" {
     try testing.expect(canPlaceAnotherLeg(1));
     try testing.expect(!canPlaceAnotherLeg(2));
     try testing.expectEqual(@as(u16, 3), max_replan_legs);
+
+    // Book-moved idempotency guard: fills must move the balance directionally.
+    try testing.expect(bookMoved(.buy, d("0.001"), d("0.0015")));
+    try testing.expect(!bookMoved(.buy, d("0.001"), d("0.001"))); // stale book
+    try testing.expect(!bookMoved(.buy, Decimal.zero, Decimal.zero)); // zero-book case
+    try testing.expect(bookMoved(.sell, d("0.002"), d("0.001")));
+    try testing.expect(!bookMoved(.sell, d("0.002"), d("0.002")));
+    try testing.expect(!bookMoved(.sell, d("0.002"), d("0.003")));
 
     try testing.expect(!executionAllowed(false, false));
 }

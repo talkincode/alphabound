@@ -1148,6 +1148,10 @@ pub const MemoriesRepo = struct {
     }
 
     /// Callback for each latest-version row (boot rebuild of in-memory store).
+    /// Terminal rows (invalidated/merged) are skipped — retrieval never
+    /// surfaces them and they would only consume index slots; full history
+    /// stays in the table. Newest first so the freshest memories survive if
+    /// the row count ever exceeds the in-process index capacity.
     pub fn forEachLatest(
         self: *MemoriesRepo,
         db: *Db,
@@ -1162,7 +1166,8 @@ pub const MemoriesRepo = struct {
             \\WHERE version = (
             \\  SELECT MAX(version) FROM memories m2 WHERE m2.memory_id = m.memory_id
             \\)
-            \\ORDER BY created_ts ASC
+            \\  AND status NOT IN ('invalidated','merged')
+            \\ORDER BY created_ts DESC
         );
         defer stmt.finalize();
         while (try stmt.step()) {

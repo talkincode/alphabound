@@ -20,6 +20,7 @@ allow_runtime_override = false
 taker_fee_rate = 0.001
 slippage_rate = 0.0005
 initial_capital = 100.0
+min_trade_notional = 10              # USDT floor per trade; dust rebalances plan to HOLD (0 = venue min only)
 
 [agent]
 provider = "openai"
@@ -34,6 +35,7 @@ decision_min_interval_ms = 180000    # 3 min hard floor between any two calls
 active_hours_utc = "13-21"           # EU/US overlap; empty = always base
 event_price_move = 0.005             # fire early on ≥0.5% move since last call
 event_drawdown_step = 0.01           # fire early when drawdown deepens ≥1%
+review_backoff_max_ms = 14400000     # honor HOLD review_after as backoff, capped at 4h (0 = legacy fixed cadence)
 prompt_dir = "/etc/alphabound/prompts"
 enabled = true
 llm_reflection = true

@@ -100,6 +100,7 @@ pub fn tryDemoExecute(
             std.debug.print("[exec] replan leg={d} side={s} qty={s}\n", .{ seq, po.side.jsonName(), q_s });
         }
 
+        const pre_btc = snap.btc_total;
         const leg = placeDemoLeg(
             gpa,
             okx,
@@ -131,12 +132,14 @@ pub fn tryDemoExecute(
                 return if (std.mem.eql(u8, leg, "filled")) "filled_refresh_failed" else "partial_refresh_failed";
             }
             snap = engine.snapshot();
-            // If venue still reports a zero book after a confirmed fill, the
-            // balance feed is lagging/wrong — stop rather than buy again.
-            if (std.mem.eql(u8, leg, "filled") and snap.btc_total.isZero() and po.side == .buy) {
+            // If the venue book did not move in the trade direction after a
+            // confirmed fill, the balance feed is lagging/wrong — stop rather
+            // than replan the same delta again (idempotency guard; covers the
+            // zero-book case and the stale-nonzero case alike).
+            if (!okx_trade.bookMoved(po.side, pre_btc, snap.btc_total)) {
                 applyLocalFill(engine, po.side, po.qty, mark);
-                logEventPayload(events_repo, engine, "EXEC_BOOK_LAG", "execution", "WARN", cfg, "{\"action\":\"stop_replan_zero_btc\"}");
-                return "filled_book_lag";
+                logEventPayload(events_repo, engine, "EXEC_BOOK_LAG", "execution", "WARN", cfg, "{\"action\":\"stop_replan_stale_book\"}");
+                return if (std.mem.eql(u8, leg, "filled")) "filled_book_lag" else "partial_book_lag";
             }
             if (std.mem.eql(u8, leg, "filled")) {
                 // If residual is dust, done; else continue for another leg.

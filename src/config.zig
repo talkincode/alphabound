@@ -44,6 +44,10 @@ pub const Config = struct {
     taker_fee_rate: Decimal = Decimal.parse("0.001") catch unreachable,
     slippage_rate: Decimal = Decimal.parse("0.0005") catch unreachable,
     initial_capital: Decimal = Decimal.parse("100") catch unreachable,
+    /// Floor on per-trade notional (USDT). Raises the instrument's own
+    /// min_notional so dust rebalances (fees > edge) plan to HOLD; 0 keeps
+    /// the venue minimum only.
+    min_trade_notional: Decimal = Decimal.zero,
     // [agent]
     agent_provider: []const u8 = "openai",
     agent_model: []const u8 = "gpt-4o-mini",
@@ -65,6 +69,10 @@ pub const Config = struct {
     event_price_move: Decimal = Decimal.parse("0.005") catch unreachable,
     /// Early decision when drawdown deepens by ≥ this fraction; 0 off.
     event_drawdown_step: Decimal = Decimal.parse("0.01") catch unreachable,
+    /// Cap for honoring a HOLD proposal's `review_after` as a regular-cadence
+    /// backoff (ms); 0 disables (legacy fixed cadence). Event triggers
+    /// (price_move / drawdown_step / risk_mode_change) always cut through.
+    review_backoff_max_ms: u32 = 0,
     prompt_dir: []const u8 = "prompts",
     /// When false, never call LLM even if keys are present.
     agent_enabled: bool = true,
@@ -227,6 +235,9 @@ fn applyKey(a: std.mem.Allocator, cfg: *Config, section: []const u8, key: []cons
         } else if (std.mem.eql(u8, key, "initial_capital")) {
             cfg.initial_capital = Decimal.parse(val) catch return error.InvalidValue;
             if (!cfg.initial_capital.gt(Decimal.zero)) return error.InvalidValue;
+        } else if (std.mem.eql(u8, key, "min_trade_notional")) {
+            cfg.min_trade_notional = Decimal.parse(val) catch return error.InvalidValue;
+            if (cfg.min_trade_notional.isNegative()) return error.InvalidValue;
         } else return error.UnknownKey;
     } else if (std.mem.eql(u8, section, "agent")) {
         if (std.mem.eql(u8, key, "provider")) {
@@ -254,6 +265,8 @@ fn applyKey(a: std.mem.Allocator, cfg: *Config, section: []const u8, key: []cons
             cfg.event_drawdown_step = Decimal.parse(val) catch return error.InvalidValue;
             if (cfg.event_drawdown_step.isNegative() or
                 cfg.event_drawdown_step.gte(Decimal.fromInt(1))) return error.InvalidValue;
+        } else if (std.mem.eql(u8, key, "review_backoff_max_ms")) {
+            cfg.review_backoff_max_ms = parseInt(u32, val) catch return error.InvalidValue;
         } else if (std.mem.eql(u8, key, "prompt_dir")) {
             cfg.prompt_dir = try parseString(a, val);
         } else if (std.mem.eql(u8, key, "enabled")) {
@@ -373,6 +386,20 @@ test "unknown keys and unsafe values rejected" {
     try testing.expectError(error.InvalidValue, parse(testing.allocator,
         \\[web]
         \\bind = "1.2.3.4:8080"
+    ));
+}
+
+test "min_trade_notional parses with validation" {
+    var cfg = try parse(testing.allocator,
+        \\[risk]
+        \\min_trade_notional = 25
+    );
+    defer cfg.deinit();
+    try testing.expect(cfg.min_trade_notional.eql(Decimal.fromInt(25)));
+
+    try testing.expectError(error.InvalidValue, parse(testing.allocator,
+        \\[risk]
+        \\min_trade_notional = -1
     ));
 }
 

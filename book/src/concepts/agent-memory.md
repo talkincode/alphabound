@@ -21,7 +21,7 @@
 
 每轮送给模型的是**稳定能力边界**，不是聊天流水账。固定五段 JSON：
 
-1. `current_state` — 净值、仓位、HWM、回撤、模式、是否已对账
+1. `current_state` — 净值、仓位、`btc_weight`、HWM、回撤、模式、是否已对账
 2. `recent_events` — 有界最近事件
 3. `memories` — 检索命中的长期记忆
 4. `tools` — 注册表中的可用工具与时效/成本元数据

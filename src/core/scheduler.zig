@@ -84,6 +84,46 @@ pub fn hourUtc(now_ms: i64) u8 {
     return @intCast(h);
 }
 
+/// Parse a bounded ISO-8601 duration ("PT4H", "PT30M", "P1D", "PT1H30M")
+/// into milliseconds. Returns null for anything malformed, negative,
+/// fractional, or beyond 30 days — model output is untrusted input.
+pub fn parseIsoDurationMs(s: []const u8) ?i64 {
+    const max_ms: i64 = 30 * 86_400_000;
+    if (s.len < 3 or (s[0] != 'P' and s[0] != 'p')) return null;
+    var total: i64 = 0;
+    var in_time = false;
+    var i: usize = 1;
+    var any = false;
+    while (i < s.len) {
+        const c = s[i];
+        if (c == 'T' or c == 't') {
+            if (in_time) return null;
+            in_time = true;
+            i += 1;
+            continue;
+        }
+        const start = i;
+        while (i < s.len and s[i] >= '0' and s[i] <= '9') i += 1;
+        if (i == start or i >= s.len) return null;
+        const n = std.fmt.parseInt(i64, s[start..i], 10) catch return null;
+        const unit = s[i];
+        i += 1;
+        const ms: i64 = switch (unit) {
+            'D', 'd' => if (in_time) return null else 86_400_000,
+            'H', 'h' => if (!in_time) return null else 3_600_000,
+            'M', 'm' => if (!in_time) return null else 60_000,
+            'S', 's' => if (!in_time) return null else 1_000,
+            else => return null,
+        };
+        if (n > @divTrunc(max_ms, ms)) return null;
+        total += n * ms;
+        if (total > max_ms) return null;
+        any = true;
+    }
+    if (!any) return null;
+    return total;
+}
+
 pub const Params = struct {
     /// Cadence inside the active session; 0 disables scheduled decisions.
     base_interval_ms: i64 = 600_000,
@@ -96,6 +136,11 @@ pub const Params = struct {
     price_move: Decimal = Decimal.zero,
     /// Early trigger when drawdown − last_drawdown ≥ this fraction; 0 disables.
     drawdown_step: Decimal = Decimal.zero,
+    /// Upper bound for honoring a HOLD proposal's `review_after` as a regular-
+    /// cadence backoff; 0 disables the backoff entirely (legacy behavior).
+    /// Event triggers (price_move / drawdown_step / risk_mode_change) always
+    /// cut through a backoff, so risk reaction speed is unchanged.
+    review_backoff_max_ms: i64 = 0,
 
     pub fn effectiveInterval(self: Params, hour: u8) i64 {
         if (self.active_hours.contains(hour)) return self.base_interval_ms;
@@ -110,6 +155,9 @@ pub const Scheduler = struct {
     last_bid: Decimal = Decimal.zero,
     last_drawdown: Decimal = Decimal.zero,
     last_risk_mode: sm.RiskMode = .exit_only,
+    /// Regular cadence is suppressed until this instant (HOLD review_after
+    /// backoff). Event triggers ignore it; cleared on every fire.
+    hold_until_ms: i64 = 0,
 
     pub fn init(params: Params) Scheduler {
         return .{ .params = params };
@@ -149,8 +197,9 @@ pub const Scheduler = struct {
                 return .{ .fire = true, .reason = .price_move };
         }
 
-        // Session-aware regular cadence.
+        // Session-aware regular cadence, deferrable by a HOLD review_after backoff.
         const hour = hourUtc(now_ms);
+        if (now_ms < self.hold_until_ms) return .{};
         const interval = p.effectiveInterval(hour);
         if (interval > 0 and elapsed >= interval) {
             const reason: TriggerReason = if (p.active_hours.contains(hour)) .interval_active else .interval_quiet;
@@ -172,6 +221,20 @@ pub const Scheduler = struct {
         self.last_bid = bid;
         self.last_drawdown = drawdown;
         self.last_risk_mode = risk_mode;
+        self.hold_until_ms = 0;
+    }
+
+    /// Honor a HOLD proposal's `review_after` by deferring the next regular-
+    /// cadence fire. Clamped into [current effective interval,
+    /// review_backoff_max_ms]; returns the applied backoff in ms, or 0 when
+    /// the feature is disabled. Event triggers still cut through.
+    pub fn deferAfterHold(self: *Scheduler, now_ms: i64, review_after_ms: i64) i64 {
+        const cap = self.params.review_backoff_max_ms;
+        if (cap <= 0 or review_after_ms <= 0) return 0;
+        const floor_ms = self.params.effectiveInterval(hourUtc(now_ms));
+        const clamped = @min(@max(review_after_ms, floor_ms), cap);
+        self.hold_until_ms = now_ms + clamped;
+        return clamped;
     }
 };
 
@@ -287,4 +350,70 @@ test "quiet interval 0 falls back to base" {
     };
     try testing.expectEqual(@as(i64, 600_000), params.effectiveInterval(2));
     try testing.expectEqual(@as(i64, 600_000), params.effectiveInterval(15));
+}
+
+test "parseIsoDurationMs accepts bounded durations, rejects junk" {
+    try testing.expectEqual(@as(?i64, 4 * 3_600_000), parseIsoDurationMs("PT4H"));
+    try testing.expectEqual(@as(?i64, 30 * 60_000), parseIsoDurationMs("PT30M"));
+    try testing.expectEqual(@as(?i64, 86_400_000), parseIsoDurationMs("P1D"));
+    try testing.expectEqual(@as(?i64, 5_400_000), parseIsoDurationMs("PT1H30M"));
+    try testing.expectEqual(@as(?i64, 90_061_000), parseIsoDurationMs("P1DT1H1M1S"));
+    try testing.expectEqual(@as(?i64, null), parseIsoDurationMs(""));
+    try testing.expectEqual(@as(?i64, null), parseIsoDurationMs("PT"));
+    try testing.expectEqual(@as(?i64, null), parseIsoDurationMs("4H"));
+    try testing.expectEqual(@as(?i64, null), parseIsoDurationMs("PT4X"));
+    try testing.expectEqual(@as(?i64, null), parseIsoDurationMs("P4H")); // H needs T
+    try testing.expectEqual(@as(?i64, null), parseIsoDurationMs("PT1.5H"));
+    try testing.expectEqual(@as(?i64, null), parseIsoDurationMs("P99D")); // > 30d
+    try testing.expectEqual(@as(?i64, null), parseIsoDurationMs("PT999999999999H"));
+}
+
+test "hold backoff defers regular cadence but not event triggers" {
+    var s = Scheduler.init(.{
+        .base_interval_ms = 900_000,
+        .min_interval_ms = 180_000,
+        .price_move = d("0.005"),
+        .review_backoff_max_ms = 4 * 3_600_000,
+    });
+    s.commit(0, d("64000"), Decimal.zero, .normal);
+
+    // HOLD with PT4H → backoff applied at the cap.
+    const applied = s.deferAfterHold(0, parseIsoDurationMs("PT4H").?);
+    try testing.expectEqual(@as(i64, 4 * 3_600_000), applied);
+
+    // Regular cadence suppressed at base interval and well beyond.
+    try testing.expect(!s.evaluate(900_000, d("64000"), Decimal.zero, .normal).fire);
+    try testing.expect(!s.evaluate(3 * 3_600_000, d("64000"), Decimal.zero, .normal).fire);
+
+    // Price event still cuts through during the backoff.
+    const v = s.evaluate(900_000, d("63616"), Decimal.zero, .normal);
+    try testing.expect(v.fire);
+    try testing.expectEqual(TriggerReason.price_move, v.reason);
+
+    // Risk mode change also cuts through.
+    try testing.expect(s.evaluate(900_000, d("64000"), Decimal.zero, .exit_only).fire);
+
+    // After the backoff expires, regular cadence resumes.
+    const v2 = s.evaluate(4 * 3_600_000 + 1, d("64000"), Decimal.zero, .normal);
+    try testing.expect(v2.fire);
+    try testing.expectEqual(TriggerReason.interval_active, v2.reason);
+
+    // commit clears the backoff.
+    _ = s.deferAfterHold(0, 3_600_000);
+    s.commit(10, d("64000"), Decimal.zero, .normal);
+    try testing.expectEqual(@as(i64, 0), s.hold_until_ms);
+}
+
+test "hold backoff clamps below to interval and disabled cap is a no-op" {
+    var s = Scheduler.init(.{
+        .base_interval_ms = 900_000,
+        .min_interval_ms = 0,
+        .review_backoff_max_ms = 4 * 3_600_000,
+    });
+    // PT1M below the base interval → clamped up to base.
+    try testing.expectEqual(@as(i64, 900_000), s.deferAfterHold(0, 60_000));
+
+    var off = Scheduler.init(.{ .base_interval_ms = 900_000 });
+    try testing.expectEqual(@as(i64, 0), off.deferAfterHold(0, 3_600_000));
+    try testing.expectEqual(@as(i64, 0), off.hold_until_ms);
 }

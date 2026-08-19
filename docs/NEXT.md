@@ -35,6 +35,12 @@
 2. 7 日滚动 soak 窗口继续积累（AC-GO8）  
 3. ✅ Dashboard/API：orders `exchange_order_id` 抽查（新单 8/8）  
 
+### P1.5 — Agent 决策质量（实盘证据，2026-08-19）
+
+1. Context 给出权威 `btc_weight`，以及 HOLD 连胜次数 / 距上次成交 / vs 买持有 `alpha_return` 事实（不给建议）
+2. Prompt：HOLD = 维持当前权重；thesis 有方向就必须 REBALANCE；连胜不是正确性证据
+3. **不做**：放松风险内核、强制加仓、抬高仓位上限
+
 ### P2 — Phase 5 L1 观察
 
 1. 部署后 7 日：derivatives≈ticker；REBALANCE citation≥30%（`tool-value-report.sh`）  
