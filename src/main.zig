@@ -423,6 +423,11 @@ pub fn main(init: std.process.Init) !u8 {
         }
     }
 
+    var maintenance_path_buf: [640]u8 = undefined;
+    const maintenance_path = env.get("ALPHABOUND_MAINTENANCE_MARKER") orelse
+        (ab.maintenance.pathFromDb(cfg.db_path, &maintenance_path_buf) catch "");
+    consumeMaintenanceMarker(io, maintenance_path, &events_repo, &engine, &cfg);
+
     var web_state = WebState{};
     web_state.initEmpty();
     web_state.software_version = version_string;
@@ -4490,6 +4495,53 @@ fn execLabel(mode: ab.config.Mode) []const u8 {
 
 const logEvent = ab.journal.logEvent;
 const logEventPayload = ab.journal.logEventPayload;
+const logEventPayloadChecked = ab.journal.logEventPayloadChecked;
+
+fn consumeMaintenanceMarker(
+    io: std.Io,
+    marker_path: []const u8,
+    events_repo: *ab.storage.EventsRepo,
+    engine: *ab.state.Engine,
+    cfg: *const ab.config.Config,
+) void {
+    if (marker_path.len == 0) return;
+
+    var raw_buf: [512]u8 = undefined;
+    const raw = std.Io.Dir.cwd().readFile(io, marker_path, &raw_buf) catch |err| {
+        if (err != error.FileNotFound)
+            std.debug.print("[maintenance] marker read failed: {t}\n", .{err});
+        return;
+    };
+    const marker = ab.maintenance.parse(raw) catch |err| {
+        std.debug.print("[maintenance] marker invalid: {t}\n", .{err});
+        return;
+    };
+
+    var payload_buf: [256]u8 = undefined;
+    var payload_writer: std.Io.Writer = .fixed(&payload_buf);
+    ab.maintenance.writeEventPayload(&payload_writer, marker) catch {
+        std.debug.print("[maintenance] marker payload did not fit\n", .{});
+        return;
+    };
+    if (!logEventPayloadChecked(
+        events_repo,
+        engine,
+        "SYSTEM_MAINTENANCE",
+        "deploy",
+        "INFO",
+        cfg,
+        payload_writer.buffered(),
+    )) {
+        std.debug.print("[maintenance] event append failed; retaining marker for retry\n", .{});
+        return;
+    }
+
+    std.Io.Dir.cwd().deleteFile(io, marker_path) catch |err| {
+        std.debug.print("[maintenance] event recorded but marker cleanup failed: {t}\n", .{err});
+        return;
+    };
+    std.debug.print("[maintenance] deployment restart recorded\n", .{});
+}
 
 fn writeEquitySample(
     repo: *ab.storage.EquityRepo,

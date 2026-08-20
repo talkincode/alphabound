@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="theme-color" content="#0d1117">
+<meta name="theme-color" content="#03080c">
 <meta name="color-scheme" content="dark">
 <title>AlphaBound — 概览</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
@@ -382,6 +382,565 @@
   #alert_panel .ap-sub { color: var(--dim); font-size: 11px; margin: 8px 0 4px; }
   #alert_panel table { font-size: 11px; }
   #alert_panel td { padding: 4px 6px; }
+
+  :root {
+    --bg: #03080c;
+    --panel: #07141d;
+    --panel-deep: #040d14;
+    --border: #1c4b5d;
+    --border-soft: rgba(62, 186, 227, .22);
+    --text: #d9edf4;
+    --dim: #819aa8;
+    --ok: #4ff5a2;
+    --warn: #ffca5c;
+    --bad: #ff6b7b;
+    --halt: #ad8cff;
+    --line: #35d8ff;
+    --tab: #0b1b26;
+    --signal: #64ffcf;
+  }
+  html { background: var(--bg); }
+  body {
+    min-height: 100vh;
+    max-width: 1440px;
+    padding: 22px clamp(16px, 3vw, 44px) 44px;
+    position: relative;
+    isolation: isolate;
+    overflow-x: hidden;
+    background:
+      radial-gradient(ellipse 72% 38% at 50% -10%, rgba(16, 110, 145, .2), transparent 70%),
+      radial-gradient(ellipse 28% 24% at 94% 12%, rgba(29, 104, 126, .12), transparent 75%),
+      var(--bg);
+    font: 13px/1.55 "IBM Plex Mono", "JetBrains Mono", "SFMono-Regular", "PingFang SC", ui-monospace, monospace;
+  }
+  body::before,
+  body::after {
+    content: "";
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+  }
+  body::before {
+    z-index: 0;
+    opacity: .58;
+    background-image:
+      linear-gradient(rgba(54, 183, 226, .035) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(54, 183, 226, .035) 1px, transparent 1px);
+    background-size: 28px 28px;
+    mask-image: linear-gradient(to bottom, rgba(0, 0, 0, .95), transparent 78%);
+  }
+  body::after {
+    z-index: 0;
+    opacity: .18;
+    background: repeating-linear-gradient(0deg, transparent 0 3px, rgba(120, 218, 255, .04) 3px 4px);
+    mix-blend-mode: screen;
+  }
+  body > * { position: relative; z-index: 1; }
+  ::selection { color: #021015; background: var(--signal); }
+  button, input, select, textarea { transition: border-color .16s ease, color .16s ease, background .16s ease, box-shadow .16s ease, transform .16s ease; }
+  button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible {
+    outline: 2px solid rgba(53, 216, 255, .85);
+    outline-offset: 2px;
+  }
+
+  .command-header {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 22px;
+    min-height: 144px;
+    margin: 0 0 12px;
+    padding: 22px 24px 18px;
+    position: relative;
+    overflow: hidden;
+    border: 1px solid rgba(60, 194, 238, .48);
+    background:
+      linear-gradient(115deg, rgba(13, 50, 66, .88), rgba(4, 14, 22, .96) 46%, rgba(8, 29, 39, .88)),
+      var(--panel-deep);
+    box-shadow:
+      inset 0 0 0 1px rgba(105, 224, 255, .07),
+      0 18px 44px rgba(0, 0, 0, .28),
+      0 0 28px rgba(35, 196, 255, .08);
+  }
+  .command-header::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    opacity: .52;
+    pointer-events: none;
+    background:
+      linear-gradient(90deg, rgba(53, 216, 255, .75) 0 72px, transparent 72px calc(100% - 134px), rgba(100, 255, 207, .68) calc(100% - 134px)) top 12px left 12px / calc(100% - 24px) 1px no-repeat,
+      linear-gradient(90deg, rgba(53, 216, 255, .58) 0 30px, transparent 30px calc(100% - 76px), rgba(53, 216, 255, .58) calc(100% - 76px)) bottom 12px left 12px / calc(100% - 24px) 1px no-repeat,
+      linear-gradient(90deg, transparent, rgba(87, 219, 255, .12), transparent) 0 0 / 280px 100% no-repeat;
+    animation: header-sweep 8s linear infinite;
+  }
+  .command-header::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    opacity: .5;
+    background-image:
+      linear-gradient(90deg, rgba(103, 231, 255, .13) 1px, transparent 1px),
+      linear-gradient(rgba(103, 231, 255, .09) 1px, transparent 1px);
+    background-size: 12px 12px;
+    mask-image: linear-gradient(90deg, transparent 8%, black 34%, transparent 72%);
+  }
+  .brand-shell, .header-utilities { position: relative; z-index: 1; }
+  .brand-shell { display: flex; align-items: flex-start; gap: 15px; }
+  .brand-sigil {
+    width: 52px;
+    height: 52px;
+    flex: 0 0 52px;
+    display: grid;
+    place-items: center;
+    position: relative;
+    clip-path: polygon(18% 0, 82% 0, 100% 18%, 100% 82%, 82% 100%, 18% 100%, 0 82%, 0 18%);
+    background: linear-gradient(145deg, rgba(69, 226, 255, .2), rgba(18, 59, 79, .88));
+    box-shadow: inset 0 0 0 1px rgba(85, 226, 255, .75), 0 0 20px rgba(53, 216, 255, .24);
+  }
+  .brand-sigil::before {
+    content: "";
+    position: absolute;
+    inset: 6px;
+    border: 1px solid rgba(100, 255, 207, .3);
+    clip-path: inherit;
+  }
+  .brand-sigil svg { width: 35px; height: 35px; position: relative; z-index: 1; filter: drop-shadow(0 0 5px rgba(88, 231, 255, .76)); }
+  .brand-sigil path { fill: none; stroke: var(--line); stroke-width: 2.4; stroke-linejoin: round; }
+  .brand-sigil path:last-child { stroke: var(--signal); }
+  .brand-kicker {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    color: #a6c4d0;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: .16em;
+    text-transform: uppercase;
+  }
+  .brand-kicker::before {
+    content: "";
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--signal);
+    box-shadow: 0 0 0 3px rgba(100, 255, 207, .11), 0 0 12px var(--signal);
+    animation: signal-breathe 2.4s ease-in-out infinite;
+  }
+  h1 {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    margin: 3px 0 3px;
+    color: #ebf9ff;
+    font-family: "DIN Condensed", "Arial Narrow", "IBM Plex Mono", "PingFang SC", sans-serif;
+    font-size: clamp(25px, 3vw, 34px);
+    font-weight: 700;
+    letter-spacing: -.045em;
+    line-height: 1;
+    text-shadow: 0 0 20px rgba(78, 213, 255, .22);
+  }
+  h1::after {
+    content: "CORE";
+    margin-left: 7px;
+    padding: 3px 5px;
+    border: 1px solid rgba(100, 255, 207, .35);
+    color: var(--signal);
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: .11em;
+  }
+  .system-strap {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    margin: 9px 0 0;
+    color: var(--dim);
+    font-size: 11px;
+  }
+  .system-strap strong { color: #a8c6d2; font-weight: 500; }
+  .system-strap .strap-key { color: var(--line); font-size: 10px; font-weight: 700; letter-spacing: .11em; }
+  .system-strap .strap-divider { color: rgba(100, 255, 207, .62); }
+  #run_mode_banner { color: var(--signal); font-weight: 700; text-shadow: 0 0 12px rgba(100, 255, 207, .26); }
+  #alert_bell {
+    width: 25px;
+    height: 25px;
+    display: inline-grid;
+    place-items: center;
+    margin: 0 0 0 5px;
+    padding: 0;
+    border: 1px solid rgba(96, 207, 244, .26);
+    border-radius: 2px;
+    color: #9dc0cd;
+    background: rgba(4, 18, 27, .52);
+  }
+  #alert_bell:hover { color: var(--line); border-color: rgba(53, 216, 255, .66); box-shadow: 0 0 14px rgba(53, 216, 255, .16); }
+  .header-utilities {
+    min-width: min(430px, 44vw);
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 16px;
+  }
+  .connection-readout {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 7px;
+    min-height: 22px;
+    color: #9ab8c4;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+  }
+  .connection-readout::before {
+    content: "";
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--signal);
+    box-shadow: 0 0 9px var(--signal);
+  }
+  #staleness {
+    float: none;
+    color: var(--dim);
+    font-size: 10px;
+    letter-spacing: 0;
+    text-transform: none;
+  }
+  #auth_bar {
+    display: none;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 7px;
+    width: 100%;
+    margin: 0;
+    color: var(--dim);
+  }
+  #auth_bar.show { display: flex; }
+  #auth_bar_text {
+    max-width: 36ch;
+    overflow: hidden;
+    padding: 6px 8px;
+    border-left: 1px solid rgba(84, 211, 247, .34);
+    color: #9ec0cd;
+    font-size: 10px;
+    line-height: 1.25;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  #auth_bar button {
+    min-height: 32px;
+    appearance: none;
+    border: 1px solid rgba(70, 191, 231, .62);
+    border-radius: 2px;
+    padding: 6px 12px;
+    background: linear-gradient(135deg, rgba(23, 97, 125, .54), rgba(5, 26, 38, .86));
+    color: #c9f3ff;
+    font: 700 11px/1 "IBM Plex Mono", ui-monospace, monospace;
+    letter-spacing: .04em;
+    cursor: pointer;
+    box-shadow: inset 0 0 0 1px rgba(111, 224, 255, .08);
+  }
+  #auth_bar button:hover:not(:disabled) {
+    border-color: var(--line);
+    color: #fff;
+    box-shadow: 0 0 17px rgba(53, 216, 255, .2), inset 0 0 16px rgba(53, 216, 255, .11);
+    transform: translateY(-1px);
+  }
+  #auth_bar #auth_register_passkey { color: var(--signal); border-color: rgba(100, 255, 207, .54); }
+  #auth_bar #auth_logout_btn { color: #ffb4bd; border-color: rgba(255, 107, 123, .48); background: linear-gradient(135deg, rgba(112, 30, 43, .38), rgba(30, 11, 18, .82)); }
+
+  h2 {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    margin: 24px 0 10px;
+    color: #9dd9ed;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: .12em;
+  }
+  h2::before {
+    content: "";
+    width: 4px;
+    height: 13px;
+    background: var(--line);
+    box-shadow: 0 0 11px rgba(53, 216, 255, .9);
+  }
+  h2::after {
+    content: "";
+    height: 1px;
+    flex: 1;
+    max-width: 108px;
+    background: linear-gradient(90deg, rgba(53, 216, 255, .48), transparent);
+  }
+  .sub, .hint { color: var(--dim); }
+  .tabs {
+    display: flex;
+    gap: 4px;
+    margin: 0 0 18px;
+    padding: 5px 7px 5px 11px;
+    overflow-x: auto;
+    border: 1px solid var(--border-soft);
+    border-radius: 2px;
+    background: linear-gradient(90deg, rgba(9, 32, 44, .92), rgba(5, 15, 22, .94));
+    scrollbar-width: none;
+  }
+  .tabs::-webkit-scrollbar { display: none; }
+  .tabs::before {
+    content: "NAV//";
+    align-self: center;
+    margin-right: 5px;
+    color: rgba(100, 255, 207, .68);
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: .1em;
+  }
+  .tab {
+    flex: 0 0 auto;
+    min-height: 34px;
+    border: 1px solid transparent;
+    border-radius: 1px;
+    padding: 8px 15px;
+    color: #7894a1;
+    font: 700 11px/1 "IBM Plex Mono", "PingFang SC", ui-monospace, monospace;
+    letter-spacing: .04em;
+  }
+  .tab:hover { color: #d7f5ff; background: rgba(43, 154, 194, .12); }
+  .tab.active {
+    top: 0;
+    border-color: rgba(53, 216, 255, .65);
+    background: linear-gradient(135deg, rgba(22, 112, 145, .52), rgba(5, 29, 42, .92));
+    color: #e4fbff;
+    box-shadow: inset 0 -2px 0 var(--signal), 0 0 18px rgba(53, 216, 255, .1);
+  }
+
+  .book-grid, .bench-grid { gap: 10px; }
+  .card, .chart-wrap, .token-strip, .ov-ledger, .rv-head, .stat {
+    border-color: var(--border-soft);
+    border-radius: 2px;
+    background:
+      linear-gradient(135deg, rgba(16, 60, 77, .3), transparent 34%),
+      linear-gradient(160deg, rgba(8, 28, 39, .98), rgba(4, 15, 22, .98));
+    box-shadow: inset 0 0 0 1px rgba(112, 224, 255, .035), 0 10px 22px rgba(0, 0, 0, .12);
+  }
+  .card {
+    min-height: 104px;
+    position: relative;
+    overflow: hidden;
+    padding: 13px 15px;
+  }
+  .card::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    right: 0;
+    width: 46px;
+    height: 1px;
+    background: var(--line);
+    box-shadow: 0 0 10px rgba(53, 216, 255, .74);
+  }
+  .card::after {
+    content: "";
+    position: absolute;
+    right: 10px;
+    bottom: 10px;
+    width: 18px;
+    height: 18px;
+    border-right: 1px solid rgba(100, 255, 207, .22);
+    border-bottom: 1px solid rgba(100, 255, 207, .22);
+  }
+  .card .label, .stat .k {
+    color: #789aa8;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: .08em;
+  }
+  .card .value {
+    color: #e9f9ff;
+    font-size: 23px;
+    font-weight: 600;
+    text-shadow: 0 0 18px rgba(107, 228, 255, .08);
+  }
+  .card .value.sm { font-size: 18px; }
+  .card .subv {
+    border-top-color: rgba(72, 178, 212, .14);
+    color: #7995a2;
+  }
+  .card .subv b { color: #cce8f1; }
+  .ddbar { height: 5px; border-radius: 0; background: #0b2632; }
+  .ddbar > div { background: linear-gradient(90deg, var(--signal), var(--line)); box-shadow: 0 0 10px rgba(100, 255, 207, .4); }
+
+  .token-strip {
+    min-height: 46px;
+    align-items: center;
+    padding: 11px 15px;
+    color: #85a9b6;
+    font-size: 11px;
+  }
+  .token-strip::before {
+    content: "PROCESS//";
+    color: var(--signal);
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: .09em;
+  }
+  .token-strip b { color: #e0f7ff; }
+  .chart-wrap {
+    position: relative;
+    overflow: hidden;
+    padding: 13px 14px 11px;
+  }
+  .chart-wrap::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 42%;
+    height: 1px;
+    background: linear-gradient(90deg, var(--line), transparent);
+  }
+  .chart-wrap > * { position: relative; z-index: 1; }
+  .chart-meta { color: #84a8b6; font-size: 11px; }
+  .chart-meta b, .chart-meta span:first-child { color: #cdeaf4; }
+  .tv-attr { color: #607d8b; font-size: 10px; }
+  .tv-attr a, .ov-open-history { color: var(--line); }
+  .tv-attr a:hover, .ov-open-history:hover { color: var(--signal); }
+  .hint { color: #7894a1; font-size: 11px; }
+  .stats { gap: 10px; }
+  .stat { min-width: 132px; padding: 10px 13px; }
+  .stat .v { color: #ddf5fc; font-size: 18px; }
+
+  table {
+    border-color: var(--border-soft);
+    border-radius: 2px;
+    background: rgba(4, 16, 24, .86);
+  }
+  th, td { border-bottom-color: rgba(65, 169, 204, .14); }
+  th {
+    background: linear-gradient(90deg, rgba(19, 61, 78, .74), rgba(8, 28, 39, .74));
+    color: #82afbf;
+    font-size: 10px;
+    letter-spacing: .06em;
+  }
+  tr:hover td { background: rgba(44, 166, 203, .08); }
+  .filters button, .rv-nav button, .rv-subtabs button, .ov-subtabs button {
+    border-color: rgba(68, 169, 205, .28);
+    border-radius: 1px;
+    background: rgba(7, 28, 39, .78);
+    color: #7899a7;
+    font: 700 11px/1 "IBM Plex Mono", "PingFang SC", ui-monospace, monospace;
+  }
+  .filters button:hover, .rv-nav button:hover, .rv-subtabs button:hover, .ov-subtabs button:hover {
+    border-color: rgba(53, 216, 255, .62);
+    color: #d8f8ff;
+    background: rgba(21, 92, 120, .26);
+  }
+  .filters button.active, .rv-subtabs button.active, .ov-subtabs button.active {
+    border-color: rgba(53, 216, 255, .76);
+    background: rgba(21, 104, 139, .23);
+    color: var(--line);
+    box-shadow: inset 0 -1px 0 var(--signal);
+  }
+  .rv-nav select, .rv-chat-input textarea, #auth_gate input[type=password], #auth_gate input[type=text] {
+    border-color: rgba(69, 172, 208, .4);
+    border-radius: 2px;
+    background: #041018;
+    color: #d9f1f9;
+  }
+  .ov-ledger { padding: 15px; }
+  .ov-ledger h2 { margin: 0 0 4px; }
+  .ov-subtabs button.active { box-shadow: inset 0 -1px 0 var(--signal); }
+  .rv-head, .rv-pane .dec-summary, #rv_chat_log, .pr-card {
+    border-color: var(--border-soft);
+    border-radius: 2px;
+    background: linear-gradient(135deg, rgba(11, 45, 59, .5), rgba(4, 16, 24, .9));
+  }
+  .rv-msg.assistant { border-color: rgba(68, 162, 196, .3); border-radius: 2px; background: #071821; }
+  .rv-msg.user { border-color: rgba(53, 216, 255, .48); border-radius: 2px; background: rgba(13, 79, 106, .28); }
+  .pill { border-radius: 1px; }
+
+  #auth_gate {
+    background: rgba(1, 6, 10, .88);
+    backdrop-filter: blur(8px);
+  }
+  #auth_gate .box {
+    position: relative;
+    overflow: hidden;
+    border-color: rgba(53, 216, 255, .6);
+    border-radius: 2px;
+    background: linear-gradient(145deg, rgba(10, 51, 67, .98), rgba(3, 13, 20, .99));
+    box-shadow: 0 0 0 1px rgba(100, 255, 207, .12), 0 24px 70px rgba(0, 0, 0, .6), 0 0 42px rgba(53, 216, 255, .14);
+  }
+  #auth_gate .box::before {
+    content: "AUTHENTICATION GATE";
+    display: block;
+    margin: -22px -20px 18px;
+    padding: 8px 20px;
+    border-bottom: 1px solid rgba(60, 186, 227, .26);
+    color: var(--signal);
+    font: 700 10px/1 "IBM Plex Mono", ui-monospace, monospace;
+    letter-spacing: .12em;
+  }
+  #auth_gate h2 { color: #e1f7ff; }
+  #auth_gate button.primary, #rv_chat_send {
+    border-color: rgba(100, 255, 207, .72);
+    border-radius: 2px;
+    background: linear-gradient(135deg, #146f67, #0b3a43);
+    box-shadow: 0 0 16px rgba(100, 255, 207, .13);
+  }
+  #auth_gate button.secondary {
+    border-color: rgba(53, 216, 255, .48);
+    border-radius: 2px;
+    background: rgba(8, 42, 56, .82);
+  }
+  #alert_panel {
+    right: max(18px, calc((100vw - 1440px) / 2 + 20px));
+    border-color: rgba(53, 216, 255, .52);
+    border-radius: 2px;
+    background: linear-gradient(145deg, rgba(10, 46, 61, .98), rgba(3, 13, 20, .99));
+    box-shadow: 0 18px 42px rgba(0, 0, 0, .56), 0 0 30px rgba(53, 216, 255, .1);
+  }
+  .footer {
+    margin-top: 28px;
+    padding-top: 12px;
+    border-top: 1px solid rgba(56, 164, 202, .22);
+    color: #66818e;
+  }
+
+  @keyframes header-sweep {
+    from { background-position: top 12px left 12px, bottom 12px left 12px, -280px 0; }
+    to { background-position: top 12px left 12px, bottom 12px left 12px, calc(100% + 280px) 0; }
+  }
+  @keyframes signal-breathe {
+    0%, 100% { opacity: .65; box-shadow: 0 0 0 3px rgba(100, 255, 207, .08), 0 0 7px var(--signal); }
+    50% { opacity: 1; box-shadow: 0 0 0 4px rgba(100, 255, 207, .15), 0 0 16px var(--signal); }
+  }
+  @media (max-width: 780px) {
+    .command-header { grid-template-columns: 1fr; gap: 14px; padding: 18px 16px 15px; }
+    .header-utilities { min-width: 0; align-items: flex-end; }
+    .connection-readout { justify-content: flex-end; }
+    #auth_bar { justify-content: flex-end; flex-wrap: wrap; }
+    #auth_bar_text { max-width: min(100%, 42ch); }
+  }
+  @media (max-width: 560px) {
+    body { padding: 12px 12px 32px; }
+    .brand-sigil { width: 44px; height: 44px; flex-basis: 44px; }
+    .brand-sigil svg { width: 30px; height: 30px; }
+    h1 { font-size: 27px; }
+    .tabs { margin-bottom: 14px; }
+    .tabs::before { display: none; }
+    .tab { padding: 8px 12px; }
+    .card { min-height: 94px; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; scroll-behavior: auto !important; }
+  }
   #alert_panel .ap-note { color: var(--dim); font-size: 10px; margin-top: 8px; line-height: 1.5; }
 </style>
 </head>
@@ -402,13 +961,39 @@
   </div>
 </div>
 
-  <h1>AlphaBound
-    <span id="alert_bell" title="定时审计告警" role="button" aria-label="审计告警">
-      <svg viewBox="0 0 16 16" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M8 16a2 2 0 0 0 1.985-1.75c.017-.137-.097-.25-.235-.25h-3.5c-.138 0-.252.113-.235.25A2 2 0 0 0 8 16ZM3 5a5 5 0 0 1 10 0v2.947c0 .05.015.098.042.139l1.703 2.555A1.519 1.519 0 0 1 13.482 13H2.518a1.516 1.516 0 0 1-1.263-2.36l1.703-2.554A.255.255 0 0 0 3 7.947Z"/></svg>
-      <b id="alert_badge"></b>
-    </span>
-    <span id="staleness" class="sub"></span>
-  </h1>
+  <header class="command-header">
+    <div class="brand-shell">
+      <div class="brand-sigil" aria-hidden="true">
+        <svg viewBox="0 0 48 48">
+          <path d="M24 5 7 39h10l7-14 7 14h10L24 5Z"/>
+          <path d="m18 39 6-12 6 12"/>
+        </svg>
+      </div>
+      <div>
+        <div class="brand-kicker">Bounded autonomy / command deck</div>
+        <h1>AlphaBound
+          <span id="alert_bell" title="定时审计告警" role="button" aria-label="审计告警">
+            <svg viewBox="0 0 16 16" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M8 16a2 2 0 0 0 1.985-1.75c.017-.137-.097-.25-.235-.25h-3.5c-.138 0-.252.113-.235.25A2 2 0 0 0 8 16ZM3 5a5 5 0 0 1 10 0v2.947c0 .05.015.098.042.139l1.703 2.555A1.519 1.519 0 0 1 13.482 13H2.518a1.516 1.516 0 0 1-1.263-2.36l1.703-2.554A.255.255 0 0 0 3 7.947Z"/></svg>
+            <b id="alert_badge"></b>
+          </span>
+        </h1>
+        <div class="system-strap">
+          <span class="strap-key">AGENT//</span>
+          <strong>有界自主交易</strong>
+          <span class="strap-divider">///</span>
+          <span id="run_mode_banner">连接中…</span>
+        </div>
+      </div>
+    </div>
+    <div class="header-utilities">
+      <div class="connection-readout">control link <span id="staleness" class="system-staleness"></span></div>
+      <div id="auth_bar" aria-label="账户会话操作">
+        <span id="auth_bar_text">已登录</span>
+        <button type="button" id="auth_register_passkey" aria-label="注册 Passkey">Passkey</button>
+        <button type="button" id="auth_logout_btn">退出</button>
+      </div>
+    </div>
+  </header>
   <div id="alert_panel" aria-live="polite">
     <div class="ap-head"><span id="ap_title">审计状态</span><button type="button" id="ap_close" aria-label="关闭">×</button></div>
     <div class="ap-body" id="ap_findings"><span class="muted">尚无审计报告</span></div>
@@ -416,12 +1001,6 @@
     <table><tbody id="ap_history"><tr><td class="muted">加载中…</td></tr></tbody></table>
     <p class="ap-note">确定性规则审计：LLM 提案/工具/数据不变量/流程链每 <span id="ap_interval">—</span> 自检一次；详情落库 audit_reports，事件流可见 AUDIT_*。</p>
   </div>
-  <div id="auth_bar">
-    <span id="auth_bar_text">已登录</span>
-    <button type="button" id="auth_register_passkey">注册 Passkey</button>
-    <button type="button" id="auth_logout_btn">退出</button>
-  </div>
-  <div class="sub">有界自主交易 Agent — <span id="run_mode_banner">连接中…</span></div>
 
   <div class="tabs" role="tablist">
     <button class="tab active" data-tab="overview" type="button">概览</button>
@@ -909,10 +1488,10 @@ let cachedCandlesPayload = null;
 /** @type {string} UI bar key: time | 1m | 5m | 15m | 1H | 4H | 1D */
 let selectedBar = localStorage.getItem("ab_candle_bar") || "1H";
 const BAR_LABEL = { time: "分时", "1m": "1分", "5m": "5分", "15m": "15分", "1H": "1时", "4H": "4时", "1D": "1日" };
-const CHART_BG = "#161b22";
-const CHART_TEXT = "#8b949e";
-const CHART_GRID = "#30363d";
-const CHART_BORDER = "#30363d";
+const CHART_BG = "#07141d";
+const CHART_TEXT = "#8aa5b4";
+const CHART_GRID = "#103544";
+const CHART_BORDER = "#1c4b5d";
 try {
   const savedTab = localStorage.getItem("ab_tab");
   if (savedTab) activeTab = savedTab;
@@ -1288,18 +1867,18 @@ function ensureCandleChart() {
   if (!el) return false;
   candleChart = LightweightCharts.createChart(el, chartBaseOptions(280));
   candleSeries = candleChart.addCandlestickSeries({
-    upColor: "#3fb950",
-    downColor: "#f85149",
-    borderUpColor: "#3fb950",
-    borderDownColor: "#f85149",
-    wickUpColor: "#3fb950",
-    wickDownColor: "#f85149",
+    upColor: "#4ff5a2",
+    downColor: "#ff6b7b",
+    borderUpColor: "#4ff5a2",
+    borderDownColor: "#ff6b7b",
+    wickUpColor: "#4ff5a2",
+    wickDownColor: "#ff6b7b",
   });
   // 分时：收盘价面积图（与 K 线互斥显示）
   timeSeries = candleChart.addAreaSeries({
-    lineColor: "#58a6ff",
-    topColor: "rgba(88,166,255,0.35)",
-    bottomColor: "rgba(88,166,255,0.02)",
+    lineColor: "#35d8ff",
+    topColor: "rgba(53,216,255,0.35)",
+    bottomColor: "rgba(53,216,255,0.02)",
     lineWidth: 2,
     crosshairMarkerVisible: true,
   });
@@ -1362,14 +1941,14 @@ function ensureEquityChart() {
   if (!el) return false;
   equityChart = LightweightCharts.createChart(el, chartBaseOptions(200));
   equitySeries = equityChart.addAreaSeries({
-    lineColor: "#58a6ff",
-    topColor: "rgba(88,166,255,0.28)",
-    bottomColor: "rgba(88,166,255,0.02)",
+    lineColor: "#35d8ff",
+    topColor: "rgba(53,216,255,0.28)",
+    bottomColor: "rgba(53,216,255,0.02)",
     lineWidth: 2,
     title: "净值",
   });
   hwmSeries = equityChart.addLineSeries({
-    color: "#d29922",
+    color: "#ffca5c",
     lineWidth: 1,
     lineStyle: LightweightCharts.LineStyle.Dashed,
     title: "HWM",

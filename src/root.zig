@@ -14,6 +14,7 @@ pub const proposal = @import("agent/proposal.zig");
 pub const events = @import("core/events.zig");
 pub const redaction = @import("observability/redaction.zig");
 pub const journal = @import("observability/journal.zig");
+pub const maintenance = @import("observability/maintenance.zig");
 pub const auditor = @import("observability/auditor.zig");
 pub const config = @import("config.zig");
 pub const state = @import("core/state.zig");

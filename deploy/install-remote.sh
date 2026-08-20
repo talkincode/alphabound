@@ -12,6 +12,7 @@ BASE=/opt/alphabound
 RELEASES="$BASE/releases"
 CURRENT="$BASE/current"
 DATA_DIR=/var/lib/alphabound
+MAINTENANCE_MARKER="$DATA_DIR/deployment.maintenance"
 KEEP_RELEASES="${KEEP_RELEASES:-5}"
 
 echo "[install] alphabound on $(hostname)"
@@ -21,6 +22,7 @@ mkdir -p "$RELEASES" "$BASE/ui/current" /etc/alphabound/prompts "$DATA_DIR"
 
 DEPLOY_SHA="unknown"
 [[ -f "$ROOT/DEPLOY_SHA" ]] && DEPLOY_SHA="$(cat "$ROOT/DEPLOY_SHA")"
+[[ "$DEPLOY_SHA" =~ ^[0-9a-fA-F]{7,64}$ ]] || DEPLOY_SHA="unknown"
 TS="$(date -u +%Y%m%d%H%M%S)"
 RELEASE_DIR="$RELEASES/${DEPLOY_SHA}-${TS}"
 
@@ -75,6 +77,22 @@ log_deploy() {
   chown alphabound:alphabound "$DATA_DIR/deploys.log"
 }
 
+write_maintenance_marker() {
+  local tmp started_at
+  tmp="${MAINTENANCE_MARKER}.tmp.$$"
+  started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  umask 077
+  {
+      printf 'version=1\n'
+      printf 'kind=deployment\n'
+      printf 'deployment_id=%s\n' "$DEPLOY_SHA"
+      printf 'started_at=%s\n' "$started_at"
+  } > "$tmp"
+  chown alphabound:alphabound "$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$MAINTENANCE_MARKER"
+}
+
 health_ready() {
   for _ in $(seq 1 15); do
     if curl -sS --max-time 2 http://127.0.0.1:8080/health/ready | grep -q '"ready"'; then
@@ -88,6 +106,7 @@ health_ready() {
 switch_release "$RELEASE_DIR"
 # Rolling-soak accounting: every deploy restart is recorded so the soak
 # report can separate intentional restarts from crashes.
+write_maintenance_marker
 log_deploy "deploy sha=$DEPLOY_SHA release=$(basename "$RELEASE_DIR")"
 systemctl restart alphabound
 

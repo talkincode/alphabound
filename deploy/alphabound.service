@@ -9,6 +9,7 @@ Type=simple
 User=alphabound
 Group=alphabound
 ExecStart=/opt/alphabound/current/alphabound --config /etc/alphabound/alphabound.toml
+Environment=ALPHABOUND_MAINTENANCE_MARKER=/var/lib/alphabound/deployment.maintenance
 EnvironmentFile=/etc/alphabound/secrets.env
 Restart=always
 RestartSec=5

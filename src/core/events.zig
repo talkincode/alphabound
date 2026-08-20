@@ -51,6 +51,7 @@ pub const EventType = enum {
     reflection,
     memory_op,
     config_applied,
+    system_maintenance,
     backup_done,
     fault,
 
@@ -82,6 +83,7 @@ pub const EventType = enum {
             .reflection => "REFLECTION",
             .memory_op => "MEMORY_OP",
             .config_applied => "CONFIG_APPLIED",
+            .system_maintenance => "SYSTEM_MAINTENANCE",
             .backup_done => "BACKUP_DONE",
             .fault => "FAULT",
         };
@@ -101,6 +103,7 @@ pub const EventType = enum {
             .system_mode_change,
             .reconcile_mismatch,
             .config_applied,
+            .system_maintenance,
             .fault,
             => true,
             else => false,
@@ -190,6 +193,7 @@ test "critical classification covers order and risk events" {
     try testing.expect(EventType.order_submitted.isCritical());
     try testing.expect(EventType.risk_decision.isCritical());
     try testing.expect(EventType.config_applied.isCritical());
+    try testing.expect(EventType.system_maintenance.isCritical());
     try testing.expect(!EventType.market_tick.isCritical());
     try testing.expect(!EventType.equity_sample.isCritical());
 }

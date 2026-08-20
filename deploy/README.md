@@ -46,7 +46,12 @@ Deploys are versioned: each install stages
 `/opt/alphabound/releases/<sha>-<ts>/` and atomically flips the
 `/opt/alphabound/current` symlink. If `/health/ready` fails after restart
 the installer automatically rolls back to the previous release. The newest
-5 releases are kept.
+5 releases are kept. Before a controlled restart, the installer writes a
+restricted maintenance marker. Once the daemon can write its journal, it
+records a `SYSTEM_MAINTENANCE` event and removes the marker; a failed journal
+append leaves the marker for the next boot. The decision context treats the
+brief expected health-check gap adjacent to this event as maintenance, not
+trading risk.
 
 Unit hardens: `NoNewPrivileges`, `PrivateTmp`, `ProtectSystem=strict`,
 `ReadWritePaths=/var/lib/alphabound`.
