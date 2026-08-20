@@ -36,6 +36,7 @@ pub const review_tools = @import("tools/review_tools.zig");
 pub const external_tools = @import("tools/external.zig");
 pub const memory = @import("memory/store.zig");
 pub const reflection = @import("agent/reflection.zig");
+pub const periodic_review = @import("agent/periodic_review.zig");
 pub const context = @import("agent/context.zig");
 pub const openai = @import("agent/openai.zig");
 pub const shadow_bench = @import("core/shadow_bench.zig");
@@ -45,6 +46,7 @@ pub const web = @import("web/server.zig");
 pub const web_auth = @import("web/auth.zig");
 pub const web_cache = @import("web/cache.zig");
 pub const web_review = @import("web/review.zig");
+pub const analytics = @import("analytics/ab_factor.zig");
 pub const fault_matrix = @import("fault/matrix.zig");
 pub const security_isolation = @import("security/isolation.zig");
 

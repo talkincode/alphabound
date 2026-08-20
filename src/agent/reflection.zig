@@ -93,7 +93,9 @@ pub fn parse(gpa: std.mem.Allocator, raw: []const u8) ValidationError!Reflection
     };
 }
 
-fn parseOp(a: std.mem.Allocator, v: std.json.Value) ValidationError!mem_store.Op {
+/// Parse one structured memory op. Shared with periodic review (定期复盘) so
+/// both loops mutate memory through exactly the same validated grammar.
+pub fn parseOp(a: std.mem.Allocator, v: std.json.Value) ValidationError!mem_store.Op {
     if (v != .object) return error.WrongType;
     const obj = v.object;
     const op_str = try getString(obj, "op");

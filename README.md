@@ -115,6 +115,7 @@ docker compose up --build
 |---|---|---|
 | 宽信息入口 | 工具只多看世界；返回内容不可信 | `src/tools/` |
 | 慢投资决策 | 可以 HOLD，可以反思，不抢跑 | `src/agent/` · `src/memory/` |
+| 定期复盘 | 小时级小周期 + 周度大周期回看整段窗口，结论只沉淀为低置信度记忆 | `src/agent/periodic_review.zig` |
 | 快风险反应 | 风控不等模型 | `src/risk/` · `src/core/` |
 | 窄交易出口 | 只能提案 → 准入 → 幂等订单 | `src/agent/proposal.zig` → `src/risk/` → `src/execution/` |
 
@@ -184,7 +185,7 @@ alphabound/
 ├── dashboard/           # 零依赖 HTML + favicon（编译期嵌入）
 ├── tools/alphabound-mcp # 只读 Analytics MCP（stdio / HTTP）
 ├── config/              # 示例 TOML（local / 生产 / docker）
-├── prompts/             # 系统 / 反思 Prompt（版本可审计）
+├── prompts/             # 系统 / 反思 / 定期复盘 Prompt（版本可审计）
 ├── migrations/          # SQLite 迁移
 ├── deploy/              # systemd、nginx 示例、发布脚本
 ├── scripts/             # 本地运行、远端部署、soak、演练

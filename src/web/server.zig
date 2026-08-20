@@ -70,6 +70,10 @@ pub const Context = struct {
     review_inbox: ?*review.Inbox = null,
     /// Recent scheduled-audit reports (newest first).
     audit_json: []const u8 = "[]",
+    /// Recent 定期复盘 reports (newest first; 8h 小周期 + 周度大周期).
+    periodic_json: []const u8 = "[]",
+    /// AB 因子复盘 analytics blob (experimental, research-only).
+    analytics_json: []const u8 = "{}",
     /// Dashboard HTML served at "/". Embedded at comptime; empty = 404.
     index_html: []const u8 = "",
     auth_cfg: auth.Config = .{},
@@ -263,6 +267,8 @@ pub fn handleReq(buf: []u8, req: RequestInfo, ctx: Context) Response {
     if (std.mem.eql(u8, path, "/api/v1/orders")) return copyBody(buf, ctx.orders_json);
     if (std.mem.eql(u8, path, "/api/v1/review/chats")) return copyBody(buf, ctx.review_json);
     if (std.mem.eql(u8, path, "/api/v1/review/context")) return copyBody(buf, ctx.review_ctx_json);
+    if (std.mem.eql(u8, path, "/api/v1/review/analytics")) return copyBody(buf, ctx.analytics_json);
+    if (std.mem.eql(u8, path, "/api/v1/review/periodic")) return copyBody(buf, ctx.periodic_json);
     if (std.mem.eql(u8, path, "/api/v1/audit")) return copyBody(buf, ctx.audit_json);
     return .{ .status = .not_found, .body = "{\"error\":\"not found\"}" };
 }
@@ -279,6 +285,8 @@ fn handleReviewPost(req: RequestInfo, path: []const u8, ctx: Context) Response {
         .context
     else if (std.mem.eql(u8, path, "/api/v1/review/summarize"))
         .summarize
+    else if (std.mem.eql(u8, path, "/api/v1/review/periodic"))
+        .periodic
     else {
         return .{ .status = .not_found, .body = "{\"error\":\"not found\"}" };
     };
@@ -289,7 +297,10 @@ fn handleReviewPost(req: RequestInfo, path: []const u8, ctx: Context) Response {
     defer parsed.deinit();
     if (parsed.value != .object) return .{ .status = .bad_request, .body = "{\"error\":\"bad_json\"}" };
     const obj = parsed.value.object;
-    const decision_id = jsonGetString(obj, "decision_id") orelse "";
+    const decision_id = if (kind == .periodic)
+        (jsonGetString(obj, "cycle") orelse "")
+    else
+        (jsonGetString(obj, "decision_id") orelse "");
     const anchor_ts = jsonGetString(obj, "anchor_ts") orelse "";
     const message = std.mem.trim(u8, jsonGetString(obj, "message") orelse "", " \t\r\n");
 
@@ -1035,6 +1046,8 @@ test "agent-runs equity shadow endpoints serve context blobs" {
     ctx.review_json = "[{\"role\":\"user\"}]";
     ctx.review_ctx_json = "{\"decision_id\":\"dec_1\"}";
     ctx.audit_json = "[{\"audit_id\":\"aud_1\",\"status\":\"ok\"}]";
+    ctx.periodic_json = "[{\"review_id\":\"pr_1\",\"cycle\":\"short\"}]";
+    ctx.analytics_json = "{\"factor_version\":\"v1\",\"points\":[]}";
     try testing.expectEqualStrings("[{\"run_id\":\"r1\"}]", handle(&buf, .GET, "/api/v1/agent-runs", ctx).body);
     try testing.expectEqualStrings("[{\"equity\":\"100\"}]", handle(&buf, .GET, "/api/v1/equity", ctx).body);
     try testing.expectEqualStrings("{\"alpha\":\"0\"}", handle(&buf, .GET, "/api/v1/shadow", ctx).body);
@@ -1046,6 +1059,8 @@ test "agent-runs equity shadow endpoints serve context blobs" {
     try testing.expectEqualStrings("[{\"role\":\"user\"}]", handle(&buf, .GET, "/api/v1/review/chats", ctx).body);
     try testing.expectEqualStrings("{\"decision_id\":\"dec_1\"}", handle(&buf, .GET, "/api/v1/review/context", ctx).body);
     try testing.expectEqualStrings("[{\"audit_id\":\"aud_1\",\"status\":\"ok\"}]", handle(&buf, .GET, "/api/v1/audit", ctx).body);
+    try testing.expectEqualStrings("{\"factor_version\":\"v1\",\"points\":[]}", handle(&buf, .GET, "/api/v1/review/analytics", ctx).body);
+    try testing.expectEqualStrings("[{\"review_id\":\"pr_1\",\"cycle\":\"short\"}]", handle(&buf, .GET, "/api/v1/review/periodic", ctx).body);
 }
 
 test "review POST enqueues into inbox; validation and limits enforced" {
@@ -1115,6 +1130,26 @@ test "review POST enqueues into inbox; validation and limits enforced" {
             .method = .POST,
             .target = "/api/v1/review/chat",
             .body = "{\"message\":\"hi\"}",
+        }, ctx).status);
+    }
+    // Periodic 复盘 trigger: cycle travels in the body, unknown cycle → 400.
+    {
+        while (inbox.drain()) |_| {}
+        const r = handleReq(&buf, .{
+            .method = .POST,
+            .target = "/api/v1/review/periodic",
+            .body = "{\"cycle\":\"short\"}",
+        }, ctx);
+        try testing.expectEqual(std.http.Status.accepted, r.status);
+        try testing.expectEqual(std.http.Status.conflict, handleReq(&buf, .{
+            .method = .POST,
+            .target = "/api/v1/review/periodic",
+            .body = "{\"cycle\":\"short\"}",
+        }, ctx).status);
+        try testing.expectEqual(std.http.Status.bad_request, handleReq(&buf, .{
+            .method = .POST,
+            .target = "/api/v1/review/periodic",
+            .body = "{\"cycle\":\"decade\"}",
         }, ctx).status);
     }
     // Unknown review subpath → 404; drain leaves queue reusable

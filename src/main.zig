@@ -18,6 +18,7 @@ const dashboard_html: []const u8 = @embedFile("dashboard_index_html");
 const default_system_prompt: []const u8 = @embedFile("agent_system_prompt");
 const default_reflection_prompt: []const u8 = @embedFile("agent_reflection_prompt");
 const default_review_prompt: []const u8 = @embedFile("agent_review_prompt");
+const default_periodic_review_prompt: []const u8 = @embedFile("agent_periodic_review_prompt");
 
 fn nowMs() i64 {
     return ab.clock.SystemClock.clock().wallMs();
@@ -394,6 +395,8 @@ pub fn main(init: std.process.Init) !u8 {
     defer review_repo.deinit();
     var audit_repo = try ab.storage.AuditReportsRepo.init(&db);
     defer audit_repo.deinit();
+    var periodic_repo = try ab.storage.PeriodicReviewsRepo.init(&db);
+    defer periodic_repo.deinit();
     var kv_repo = try ab.storage.KvRepo.init(&db);
     defer kv_repo.deinit();
 
@@ -707,6 +710,7 @@ pub fn main(init: std.process.Init) !u8 {
     refreshWebCaches(&web_state, &db, &agent_runs, &equity_repo, &events_repo, &memories_repo, &orders_repo, &fills_repo, last_bh_cmp);
     ab.web_cache.refreshReviewCache(&web_state, &db, &review_repo);
     ab.web_cache.refreshAuditCache(&web_state, &db, &audit_repo);
+    ab.web_cache.refreshAnalyticsCache(&web_state, &db, &equity_repo);
     refreshCandlesCache(gpa, &web_state, &okx, &cfg);
     refreshEgressIp(&okx, &runtime_status);
     refreshDiskStatus(&cfg, &engine, &events_repo, &runtime_status);
@@ -742,11 +746,27 @@ pub fn main(init: std.process.Init) !u8 {
     const egress_refresh_ms: i64 = 3_600_000;
     // FD7: probe DB volume free space often enough to catch fill-ups.
     const disk_refresh_ms: i64 = 60_000;
+    // AB 因子复盘 analytics: recompute over the 48h 1m trail once a minute.
+    const analytics_refresh_ms: i64 = 60_000;
     var last_egress_ms: i64 = 0;
     var last_disk_ms: i64 = 0;
+    var last_analytics_ms: i64 = 0;
     var last_private_ws_ms: i64 = now_boot;
     var last_backup_ms: i64 = 0;
     var last_audit_ms: i64 = 0;
+    // 定期复盘 cadence. Seeded from boot so a fresh DB does not review an empty
+    // window, then overridden by the newest stored report per cycle.
+    var review_sched = ab.periodic_review.Schedule.initAt(
+        now_boot,
+        @intCast(cfg.review_short_interval_ms),
+        @intCast(cfg.review_long_interval_ms),
+    );
+    restorePeriodicSchedule(&periodic_repo, &db, &review_sched);
+    runtime_status.setReviewNext(
+        review_sched.msUntil(.short, now_boot),
+        review_sched.msUntil(.long, now_boot),
+    );
+    ab.web_cache.refreshPeriodicReviewCache(&web_state, &db, &periodic_repo);
     // Cooldown between auto flatten market sells while risk_mode=FLATTENING.
     var last_flatten_exec_ms: i64 = 0;
 
@@ -957,7 +977,7 @@ pub fn main(init: std.process.Init) !u8 {
                 const minute = @divFloor(snap.as_of_ms, 60_000);
                 if (minute != last_sample_min) {
                     last_sample_min = minute;
-                    writeEquitySample(&equity_repo, snap);
+                    writeEquitySample(&equity_repo, snap, last_bh_cmp);
                 }
             } else |_| {
                 _ = engine.apply(.{ .clock_tick = .{ .ts_ms = nowMs() } }) catch {};
@@ -1053,6 +1073,8 @@ pub fn main(init: std.process.Init) !u8 {
                 &cfg,
                 &web_state,
                 &runtime_status,
+                &periodic_repo,
+                &review_sched,
             );
         }
 
@@ -1073,6 +1095,10 @@ pub fn main(init: std.process.Init) !u8 {
                 last_disk_ms = tnow;
                 refreshDiskStatus(&cfg, &engine, &events_repo, &runtime_status);
             }
+            if (last_analytics_ms == 0 or tnow - last_analytics_ms >= analytics_refresh_ms) {
+                last_analytics_ms = tnow;
+                ab.web_cache.refreshAnalyticsCache(&web_state, &db, &equity_repo);
+            }
             if (last_backup_ms == 0 or tnow - last_backup_ms >= backup_interval_ms) {
                 last_backup_ms = tnow;
                 runSqliteBackup(io, &db, &cfg, &engine, &events_repo);
@@ -1088,6 +1114,36 @@ pub fn main(init: std.process.Init) !u8 {
                     refreshSystemCache(&web_state, &db, &cfg, &mem_store, boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), llm_client != null, admin_paused, &runtime_status, &risk_latency);
                 }
             }
+            // 定期复盘 (default: 8h short / weekly long; 0 = off). Paused with the
+            // agent and skipped while flattening so the exit path stays fast.
+            if (!admin_paused and engine.snapshot().risk_mode != .flattening) {
+                if (review_sched.due(tnow)) |cycle| {
+                    const window_ms: i64 = tnow - review_sched.windowStartMs(cycle, tnow);
+                    review_sched.commit(cycle, tnow);
+                    runPeriodicReview(
+                        gpa,
+                        if (llm_client) |*c| @as(?*ab.openai.Client, c) else null,
+                        &db,
+                        &periodic_repo,
+                        &events_repo,
+                        &memories_repo,
+                        &mem_store,
+                        &engine,
+                        &cfg,
+                        &web_state,
+                        &runtime_status,
+                        cycle,
+                        "schedule",
+                        window_ms,
+                        tnow,
+                    );
+                    runtime_status.setReviewNext(
+                        review_sched.msUntil(.short, tnow),
+                        review_sched.msUntil(.long, tnow),
+                    );
+                    refreshSystemCache(&web_state, &db, &cfg, &mem_store, boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), llm_client != null, admin_paused, &runtime_status, &risk_latency);
+                }
+            }
         }
 
         tick_count += 1;
@@ -1096,7 +1152,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     // ---- Graceful shutdown (§7.4) -------------------------------------------
     std.debug.print("[shutdown] draining after {d} ticks\n", .{tick_count});
-    writeEquitySample(&equity_repo, engine.snapshot());
+    writeEquitySample(&equity_repo, engine.snapshot(), last_bh_cmp);
     refreshWebCaches(&web_state, &db, &agent_runs, &equity_repo, &events_repo, &memories_repo, &orders_repo, &fills_repo, last_bh_cmp);
     logEvent(&events_repo, &engine, "SHUTDOWN_CLEAN", "core", "CRITICAL", &cfg);
     return 0;
@@ -3073,6 +3129,8 @@ fn processReviewInbox(
     cfg: *const ab.config.Config,
     web_state: *WebState,
     st: *RuntimeStatus,
+    periodic_repo: *ab.storage.PeriodicReviewsRepo,
+    review_sched: *ab.periodic_review.Schedule,
 ) void {
     const inbox = web_state.review_inbox orelse return;
     // One request per tick keeps the loop responsive between LLM calls.
@@ -3081,6 +3139,32 @@ fn processReviewInbox(
         .context => renderReviewContext(db, events_repo, web_state, &req),
         .chat => runReviewChat(gpa, client, okx, db, review_repo, events_repo, equity_repo, mem_store, engine, cfg, web_state, st, &req),
         .summarize => runReviewSummarize(gpa, client, db, review_repo, events_repo, memories_repo, mem_store, engine, cfg, web_state, st, &req),
+        // Manual 定期复盘: same code path as the scheduled one, and it also
+        // commits the cursor so an on-demand run pushes the next auto run out.
+        .periodic => {
+            const cycle = ab.periodic_review.Cycle.fromString(req.decisionId()) orelse .short;
+            const now = nowMs();
+            const window_ms: i64 = now - review_sched.windowStartMs(cycle, now);
+            review_sched.commit(cycle, now);
+            runPeriodicReview(
+                gpa,
+                client,
+                db,
+                periodic_repo,
+                events_repo,
+                memories_repo,
+                mem_store,
+                engine,
+                cfg,
+                web_state,
+                st,
+                cycle,
+                "manual",
+                window_ms,
+                now,
+            );
+            st.setReviewNext(review_sched.msUntil(.short, now), review_sched.msUntil(.long, now));
+        },
     }
 }
 
@@ -3436,6 +3520,588 @@ fn executeReviewTools(
     }
     w.writeAll("]}") catch return null;
     return w.buffered();
+}
+
+// ---- 定期复盘 (scheduled periodic review) -----------------------------------
+// Fixed-cadence review over a *window* instead of a single episode: 小周期
+// (default 8h) asks "did this shift's decisions match their own theses", 大周期
+// (default weekly) asks "does the strategy still hold across shifts".
+//
+// Scheduling and document validation are pure (src/agent/periodic_review.zig);
+// this side collects the window facts from SQLite, spends at most one LLM call,
+// applies the validated memory ops, and persists the report.
+//
+// Analysis-only, exactly like the human 复盘 channel: no engine, no orders, no
+// risk state. Its only channel into future decisions is the low-confidence
+// memory it distills, which the agent may retrieve and weigh on its own.
+
+const periodic_review_timeout_ms: u32 = 90_000;
+/// Reports are journaled even when the model is unavailable, so the 复盘记录
+/// page still shows the deterministic facts for every closed window.
+const periodic_review_degraded_note = "本窗口未生成模型复盘（未配置 LLM 或调用/解析失败），仅记录确定性事实。";
+
+fn periodicCountRange(
+    db: *ab.storage.Db,
+    comptime sql: [:0]const u8,
+    ts_from: []const u8,
+    ts_to: []const u8,
+) i64 {
+    var stmt = db.prepare(sql) catch return 0;
+    defer stmt.finalize();
+    stmt.bindText(1, ts_from) catch return 0;
+    stmt.bindText(2, ts_to) catch return 0;
+    if (stmt.step() catch return 0) return stmt.columnInt(0);
+    return 0;
+}
+
+/// Equity marks at one edge of the window. `has_bh` is false for samples
+/// written before migration 0006 — we then simply omit the benchmark instead
+/// of backfilling a guess.
+const PeriodicEdge = struct {
+    equity: ab.decimal.Decimal = ab.decimal.Decimal.zero,
+    bh_equity: ab.decimal.Decimal = ab.decimal.Decimal.zero,
+    has_bh: bool = false,
+    found: bool = false,
+};
+
+fn periodicEdge(
+    db: *ab.storage.Db,
+    ts_from: []const u8,
+    ts_to: []const u8,
+    comptime newest: bool,
+) PeriodicEdge {
+    const sql: [:0]const u8 = if (newest)
+        \\SELECT equity, bh_equity FROM equity_samples
+        \\WHERE ts >= ?1 AND ts <= ?2 ORDER BY ts DESC LIMIT 1
+    else
+        \\SELECT equity, bh_equity FROM equity_samples
+        \\WHERE ts >= ?1 AND ts <= ?2 ORDER BY ts ASC LIMIT 1
+    ;
+    var stmt = db.prepare(sql) catch return .{};
+    defer stmt.finalize();
+    stmt.bindText(1, ts_from) catch return .{};
+    stmt.bindText(2, ts_to) catch return .{};
+    if (!(stmt.step() catch return .{})) return .{};
+    var out: PeriodicEdge = .{ .found = true };
+    out.equity = ab.decimal.Decimal.parse(stmt.columnText(0)) catch ab.decimal.Decimal.zero;
+    const bh_text = stmt.columnText(1);
+    if (bh_text.len > 0) {
+        if (ab.decimal.Decimal.parse(bh_text)) |v| {
+            if (v.gt(ab.decimal.Decimal.zero)) {
+                out.bh_equity = v;
+                out.has_bh = true;
+            }
+        } else |_| {}
+    }
+    return out;
+}
+
+/// Largest `drawdown` recorded inside the window (stored as decimal text).
+fn periodicMaxDrawdown(db: *ab.storage.Db, ts_from: []const u8, ts_to: []const u8) ab.decimal.Decimal {
+    var stmt = db.prepare(
+        \\SELECT drawdown FROM equity_samples
+        \\WHERE ts >= ?1 AND ts <= ?2
+        \\ORDER BY CAST(drawdown AS REAL) DESC LIMIT 1
+    ) catch return ab.decimal.Decimal.zero;
+    defer stmt.finalize();
+    stmt.bindText(1, ts_from) catch return ab.decimal.Decimal.zero;
+    stmt.bindText(2, ts_to) catch return ab.decimal.Decimal.zero;
+    if (!(stmt.step() catch return ab.decimal.Decimal.zero)) return ab.decimal.Decimal.zero;
+    return ab.decimal.Decimal.parse(stmt.columnText(0)) catch ab.decimal.Decimal.zero;
+}
+
+/// Relative change (end/start − 1); zero when the start mark is unusable.
+fn periodicReturn(start: ab.decimal.Decimal, end: ab.decimal.Decimal) ab.decimal.Decimal {
+    if (!start.gt(ab.decimal.Decimal.zero)) return ab.decimal.Decimal.zero;
+    const ratio = end.div(start, .down) catch return ab.decimal.Decimal.zero;
+    return ratio.sub(ab.decimal.Decimal.one) catch ab.decimal.Decimal.zero;
+}
+
+/// Collect the deterministic window facts. Every number comes from the ledger;
+/// the model gets no chance to invent them.
+fn collectPeriodicFacts(
+    db: *ab.storage.Db,
+    periodic_repo: *ab.storage.PeriodicReviewsRepo,
+    mem_store: *ab.memory.Store,
+    engine: *ab.state.Engine,
+    cfg: *const ab.config.Config,
+    cycle: ab.periodic_review.Cycle,
+    ts_from: []const u8,
+    ts_to: []const u8,
+    window_ms: i64,
+) ab.periodic_review.Facts {
+    const snap = engine.snapshot();
+    var f: ab.periodic_review.Facts = .{
+        .cycle = cycle,
+        .window_from = ts_from,
+        .window_to = ts_to,
+        .window_hours = @divTrunc(window_ms, 3_600_000),
+        .mode = @tagName(cfg.mode),
+        .instrument = cfg.instrument,
+    };
+
+    f.proposals = periodicCountRange(db,
+        \\SELECT COUNT(*) FROM events
+        \\WHERE type = 'AGENT_PROPOSAL_OK' AND ts >= ?1 AND ts <= ?2
+    , ts_from, ts_to);
+    f.holds = periodicCountRange(db,
+        \\SELECT COUNT(*) FROM events
+        \\WHERE type = 'AGENT_PROPOSAL_OK' AND ts >= ?1 AND ts <= ?2
+        \\  AND json_extract(payload_json,'$.action') = 'HOLD'
+    , ts_from, ts_to);
+    f.rebalances = periodicCountRange(db,
+        \\SELECT COUNT(*) FROM events
+        \\WHERE type = 'AGENT_PROPOSAL_OK' AND ts >= ?1 AND ts <= ?2
+        \\  AND json_extract(payload_json,'$.action') = 'REBALANCE'
+    , ts_from, ts_to);
+    f.runs_invalid = periodicCountRange(db,
+        \\SELECT COUNT(*) FROM agent_runs
+        \\WHERE started_ts >= ?1 AND started_ts <= ?2 AND status LIKE 'invalid%'
+    , ts_from, ts_to);
+    f.runs_error = periodicCountRange(db,
+        \\SELECT COUNT(*) FROM agent_runs
+        \\WHERE started_ts >= ?1 AND started_ts <= ?2 AND status LIKE 'error%'
+    , ts_from, ts_to);
+
+    f.admitted = periodicCountRange(db,
+        \\SELECT COUNT(*) FROM events
+        \\WHERE type = 'AGENT_PROPOSAL_OK' AND ts >= ?1 AND ts <= ?2
+        \\  AND json_extract(payload_json,'$.admission.verdict') = 'approved'
+    , ts_from, ts_to);
+    f.reduced = periodicCountRange(db,
+        \\SELECT COUNT(*) FROM events
+        \\WHERE type = 'AGENT_PROPOSAL_OK' AND ts >= ?1 AND ts <= ?2
+        \\  AND json_extract(payload_json,'$.admission.verdict') = 'reduced'
+    , ts_from, ts_to);
+    f.rejected = periodicCountRange(db,
+        \\SELECT COUNT(*) FROM events
+        \\WHERE type = 'AGENT_PROPOSAL_OK' AND ts >= ?1 AND ts <= ?2
+        \\  AND json_extract(payload_json,'$.admission.verdict') = 'rejected'
+    , ts_from, ts_to);
+    f.executed = periodicCountRange(db,
+        \\SELECT COUNT(*) FROM events
+        \\WHERE type = 'AGENT_PROPOSAL_OK' AND ts >= ?1 AND ts <= ?2
+        \\  AND COALESCE(json_extract(payload_json,'$.executed'),0) = 1
+    , ts_from, ts_to);
+    f.fills = periodicCountRange(db,
+        "SELECT COUNT(*) FROM fills WHERE ts >= ?1 AND ts <= ?2",
+        ts_from,
+        ts_to,
+    );
+
+    const first = periodicEdge(db, ts_from, ts_to, false);
+    const last = periodicEdge(db, ts_from, ts_to, true);
+    f.equity_start = first.equity;
+    f.equity_end = if (last.found) last.equity else snap.conservative_equity;
+    f.window_return = periodicReturn(f.equity_start, f.equity_end);
+    f.max_drawdown = periodicMaxDrawdown(db, ts_from, ts_to);
+    f.hwm = snap.high_watermark;
+    f.btc_weight = ab.context.btcWeight(snap);
+    f.risk_mode = switch (snap.risk_mode) {
+        .normal => "NORMAL",
+        .exit_only => "EXIT_ONLY",
+        .flattening => "FLATTENING",
+        .halted => "HALTED",
+    };
+    // Window-local benchmark: both edges must carry a bh mark, otherwise we
+    // report no benchmark rather than a half-window comparison.
+    if (first.has_bh and last.has_bh and first.found and last.found) {
+        f.has_benchmark = true;
+        f.bh_return = periodicReturn(first.bh_equity, last.bh_equity);
+        f.alpha_return = f.window_return.sub(f.bh_return) catch ab.decimal.Decimal.zero;
+    }
+
+    f.audit_alerts = periodicCountRange(db,
+        "SELECT COUNT(*) FROM audit_reports WHERE ts >= ?1 AND ts <= ?2 AND status = 'alert'",
+        ts_from,
+        ts_to,
+    );
+    f.audit_warns = periodicCountRange(db,
+        "SELECT COUNT(*) FROM audit_reports WHERE ts >= ?1 AND ts <= ?2 AND status = 'warn'",
+        ts_from,
+        ts_to,
+    );
+    f.faults = periodicCountRange(db,
+        \\SELECT COUNT(*) FROM events
+        \\WHERE ts >= ?1 AND ts <= ?2 AND (severity = 'CRITICAL' OR type LIKE '%_FAILED')
+    , ts_from, ts_to);
+    f.memories_active = @intCast(mem_store.count());
+    f.prior_short_reviews = periodic_repo.countInWindow(db, "short", ts_from, ts_to) catch 0;
+    return f;
+}
+
+/// Run one periodic review cycle end to end. Always writes a report row (even
+/// degraded) so the schedule is auditable; only a fully valid model document
+/// may mutate memory.
+fn runPeriodicReview(
+    gpa: std.mem.Allocator,
+    client_opt: ?*ab.openai.Client,
+    db: *ab.storage.Db,
+    periodic_repo: *ab.storage.PeriodicReviewsRepo,
+    events_repo: *ab.storage.EventsRepo,
+    memories_repo: *ab.storage.MemoriesRepo,
+    mem_store: *ab.memory.Store,
+    engine: *ab.state.Engine,
+    cfg: *const ab.config.Config,
+    web_state: *WebState,
+    st: *RuntimeStatus,
+    cycle: ab.periodic_review.Cycle,
+    trigger: []const u8,
+    window_ms: i64,
+    now_ms: i64,
+) void {
+    defer ab.web_cache.refreshPeriodicReviewCache(web_state, db, periodic_repo);
+
+    var from_buf: [32]u8 = undefined;
+    var to_buf: [32]u8 = undefined;
+    const ts_from = ab.clock.formatRfc3339Ms(now_ms - window_ms, &from_buf) catch return;
+    const ts_to = ab.clock.formatRfc3339Ms(now_ms, &to_buf) catch return;
+
+    const facts = collectPeriodicFacts(db, periodic_repo, mem_store, engine, cfg, cycle, ts_from, ts_to, window_ms);
+    var facts_buf: [3072]u8 = undefined;
+    var fw: std.Io.Writer = .fixed(&facts_buf);
+    facts.writeJson(&fw) catch {
+        std.debug.print("[periodic] facts render failed cycle={s}\n", .{cycle.text()});
+        return;
+    };
+    const facts_json = fw.buffered();
+
+    var review_id_buf: [96]u8 = undefined;
+    const review_id = std.fmt.bufPrint(&review_id_buf, "pr_{s}_{d}", .{ cycle.text(), now_ms }) catch return;
+
+    std.debug.print("[periodic] {s} review window={s}..{s} proposals={d} trigger={s}\n", .{
+        cycle.text(), ts_from, ts_to, facts.proposals, trigger,
+    });
+
+    // --- model pass (optional; degraded path keeps the facts) ---------------
+    var status: []const u8 = "degraded";
+    var summary: []const u8 = periodic_review_degraded_note;
+    var model_name: []const u8 = "";
+    var ops_applied: usize = 0;
+    var memory_id: []const u8 = "";
+    var memory_id_buf: [96]u8 = undefined;
+    var doc_opt: ?ab.periodic_review.Document = null;
+    defer if (doc_opt) |*d| d.deinit();
+
+    if (client_opt) |client| {
+        var prior_buf: [3072]u8 = undefined;
+        const prior = if (cycle == .long)
+            periodic_repo.summaryTail(db, &prior_buf, "short", ts_from, 12) catch ""
+        else
+            "";
+
+        var mem_buf: [4096]u8 = undefined;
+        const mem_digest = renderPeriodicMemories(gpa, mem_store, cfg, &mem_buf);
+
+        var user_buf: [16 * 1024]u8 = undefined;
+        const user_msg = std.fmt.bufPrint(
+            &user_buf,
+            \\facts={s}
+            \\current_memories={s}
+            \\window_short_reviews:
+            \\{s}
+            \\请针对 cycle="{s}" 输出一个 JSON 复盘对象（严格遵循 schema，不要任何额外文字）。
+            \\
+        ,
+            .{ facts_json, mem_digest, prior, cycle.text() },
+        ) catch {
+            std.debug.print("[periodic] prompt too large; degraded\n", .{});
+            return persistPeriodicReport(periodic_repo, events_repo, engine, cfg, st, .{
+                .review_id = review_id,
+                .cycle = cycle,
+                .ts = ts_to,
+                .window_from = ts_from,
+                .window_to = ts_to,
+                .status = "degraded",
+                .trigger = trigger,
+                .summary = "复盘上下文过大，本轮仅记录事实。",
+                .memory_id = "",
+                .ops_applied = 0,
+                .model = "",
+                .facts_json = facts_json,
+                .doc = null,
+            });
+        };
+
+        const saved_timeout = client.timeout_ms;
+        client.timeout_ms = @min(periodic_review_timeout_ms, cfg.decision_timeout_ms);
+        defer client.timeout_ms = saved_timeout;
+
+        if (client.chat(default_periodic_review_prompt, user_msg)) |res| {
+            defer gpa.free(res.content);
+            st.addUsage(res.usage);
+            model_name = client.model;
+            if (ab.openai.extractJsonObject(res.content)) |json_slice| {
+                if (ab.periodic_review.parse(gpa, json_slice, cycle)) |doc| {
+                    doc_opt = doc;
+                    st.setLlm("ok", "periodic_review");
+                    status = "ok";
+                    summary = doc.summary;
+                    ops_applied = applyReflectionOps(gpa, mem_store, memories_repo, doc.memory_ops);
+                    memory_id = distillPeriodicMemory(
+                        gpa,
+                        mem_store,
+                        memories_repo,
+                        cfg,
+                        cycle,
+                        doc.summary,
+                        facts,
+                        &memory_id_buf,
+                    ) orelse "";
+                } else |err| {
+                    std.debug.print("[periodic] document rejected ({t}); memory untouched\n", .{err});
+                    st.setLlm("invalid", "periodic_review");
+                }
+            } else {
+                std.debug.print("[periodic] no JSON object in model reply\n", .{});
+                st.setLlm("invalid", "periodic_review");
+            }
+        } else |err| {
+            std.debug.print("[periodic] LLM failed ({t})\n", .{err});
+            st.setLlm("error", "periodic_review");
+        }
+    }
+
+    persistPeriodicReport(periodic_repo, events_repo, engine, cfg, st, .{
+        .review_id = review_id,
+        .cycle = cycle,
+        .ts = ts_to,
+        .window_from = ts_from,
+        .window_to = ts_to,
+        .status = status,
+        .trigger = trigger,
+        .summary = summary,
+        .memory_id = memory_id,
+        .ops_applied = ops_applied,
+        .model = model_name,
+        .facts_json = facts_json,
+        .doc = if (doc_opt) |*d| d else null,
+    });
+}
+
+/// Compact digest of the memories the review may revise (ids + confidence).
+fn renderPeriodicMemories(
+    gpa: std.mem.Allocator,
+    mem_store: *ab.memory.Store,
+    cfg: *const ab.config.Config,
+    out: []u8,
+) []const u8 {
+    var scored = ab.memory.retrieve(mem_store, gpa, .{
+        .tags = &.{ cfg.instrument, "BTC", "periodic_review" },
+        .now_ms = nowMs(),
+        .limit = 12,
+    }, ab.memory.substringTagMatch) catch return "[]";
+    defer scored.deinit(gpa);
+
+    var w: std.Io.Writer = .fixed(out);
+    w.writeByte('[') catch return "[]";
+    for (scored.items, 0..) |s, i| {
+        const mark = w.end;
+        const wrote = blk: {
+            if (i > 0) w.writeByte(',') catch break :blk false;
+            const cj = s.memory.content_json;
+            var esc_buf: [512]u8 = undefined;
+            const snip = jsonEscapeInto(&esc_buf, if (cj.len > 300) cj[0..300] else cj);
+            w.print("{{\"id\":\"{s}\",\"kind\":\"{s}\",\"status\":\"{s}\",\"conf\":\"{f}\",\"evidence\":{d},\"content\":\"{s}\"}}", .{
+                s.memory.memory_id,
+                s.memory.kind.text(),
+                s.memory.status.text(),
+                s.memory.confidence,
+                s.memory.evidence_count,
+                snip,
+            }) catch break :blk false;
+            break :blk true;
+        };
+        if (!wrote) {
+            w.end = mark;
+            break;
+        }
+    }
+    w.writeByte(']') catch return "[]";
+    return w.buffered();
+}
+
+/// One rolling memory per cycle (`PR_short` / `PR_long`), refreshed with the
+/// newest window summary. Low confidence on purpose: it is a *reference* the
+/// agent may weigh, never an instruction.
+fn distillPeriodicMemory(
+    gpa: std.mem.Allocator,
+    mem_store: *ab.memory.Store,
+    memories_repo: *ab.storage.MemoriesRepo,
+    cfg: *const ab.config.Config,
+    cycle: ab.periodic_review.Cycle,
+    summary: []const u8,
+    facts: ab.periodic_review.Facts,
+    id_buf: []u8,
+) ?[]const u8 {
+    const rid = std.fmt.bufPrint(id_buf, "PR_{s}", .{cycle.text()}) catch return null;
+
+    var note_buf: [1024]u8 = undefined;
+    const note = sanitizeJsonString(if (summary.len > 640) summary[0..640] else summary, &note_buf);
+    var alpha_buf: [48]u8 = undefined;
+    const alpha_s: []const u8 = if (facts.has_benchmark)
+        (facts.alpha_return.toString(&alpha_buf) catch "0")
+    else
+        "";
+
+    var content_buf: [2048]u8 = undefined;
+    const content = std.fmt.bufPrint(
+        &content_buf,
+        "{{\"cycle\":\"{s}\",\"window\":\"{s}..{s}\",\"note\":\"{s}\",\"proposals\":{d},\"hold\":{d}," ++
+            "\"executed\":{d},\"alpha\":\"{s}\",\"source\":\"periodic_review\"," ++
+            "\"tags\":[\"periodic_review\",\"{s}\",\"reflection\"]}}",
+        .{
+            cycle.text(),   facts.window_from, facts.window_to, note,
+            facts.proposals, facts.holds,      facts.executed,  alpha_s,
+            cfg.instrument,
+        },
+    ) catch return null;
+
+    const low_conf = ab.decimal.Decimal.parse("0.3") catch ab.decimal.Decimal.zero;
+    var touched: std.ArrayList(ab.memory.Memory) = .empty;
+    defer touched.deinit(gpa);
+    const now = nowMs();
+    if (mem_store.find(rid) == null) {
+        mem_store.applyOp(.{ .create = .{
+            .memory_id = rid,
+            .kind = .reflection,
+            .status = .active,
+            .confidence = low_conf,
+            .content_json = content,
+        } }, now, &touched) catch |err| {
+            std.debug.print("[periodic] memory create failed: {t}\n", .{err});
+            return null;
+        };
+    } else {
+        mem_store.applyOp(.{ .update = .{
+            .memory_id = rid,
+            .evidence_increment = 1,
+            .new_status = .active,
+            .content_json = content,
+        } }, now, &touched) catch |err| {
+            std.debug.print("[periodic] memory update failed: {t}\n", .{err});
+            return null;
+        };
+    }
+    for (touched.items) |m| persistMemory(memories_repo, m);
+    return rid;
+}
+
+const PeriodicReportInput = struct {
+    review_id: []const u8,
+    cycle: ab.periodic_review.Cycle,
+    ts: []const u8,
+    window_from: []const u8,
+    window_to: []const u8,
+    status: []const u8,
+    trigger: []const u8,
+    summary: []const u8,
+    memory_id: []const u8,
+    ops_applied: usize,
+    model: []const u8,
+    facts_json: []const u8,
+    doc: ?*const ab.periodic_review.Document,
+};
+
+/// Persist one report row + audit event + status surface.
+fn persistPeriodicReport(
+    periodic_repo: *ab.storage.PeriodicReviewsRepo,
+    events_repo: *ab.storage.EventsRepo,
+    engine: *ab.state.Engine,
+    cfg: *const ab.config.Config,
+    st: *RuntimeStatus,
+    in: PeriodicReportInput,
+) void {
+    var report_buf: [12288]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&report_buf);
+    var id_esc: [128]u8 = undefined;
+    var sum_esc: [1400]u8 = undefined;
+    const summary_trimmed = if (in.summary.len > 1200) in.summary[0..1200] else in.summary;
+    w.print(
+        "{{\"review_id\":\"{s}\",\"cycle\":\"{s}\",\"status\":\"{s}\",\"trigger\":\"{s}\",\"ts\":\"{s}\"," ++
+            "\"summary\":\"{s}\",\"memory_id\":\"{s}\",\"ops_applied\":{d},\"model\":\"{s}\",\"facts\":{s}",
+        .{
+            jsonEscapeInto(&id_esc, in.review_id),
+            in.cycle.text(),
+            in.status,
+            in.trigger,
+            in.ts,
+            sanitizeJsonString(summary_trimmed, &sum_esc),
+            in.memory_id,
+            in.ops_applied,
+            in.model,
+            in.facts_json,
+        },
+    ) catch return;
+    if (in.doc) |doc| {
+        writePeriodicList(&w, ",\"findings\":", doc.findings);
+        writePeriodicList(&w, ",\"lessons\":", doc.lessons);
+        writePeriodicList(&w, ",\"risks\":", doc.risks);
+    }
+    w.writeByte('}') catch return;
+    const report_json = w.buffered();
+
+    periodic_repo.append(.{
+        .review_id = in.review_id,
+        .cycle = in.cycle.text(),
+        .ts = in.ts,
+        .window_from = in.window_from,
+        .window_to = in.window_to,
+        .status = in.status,
+        .trigger = in.trigger,
+        .summary = summary_trimmed,
+        .memory_id = in.memory_id,
+        .ops_applied = @intCast(in.ops_applied),
+        .model = in.model,
+        .report_json = report_json,
+    }) catch |err| {
+        std.debug.print("[periodic] persist failed: {t}\n", .{err});
+    };
+
+    const status_static: []const u8 = if (std.mem.eql(u8, in.status, "ok")) "ok" else "degraded";
+    st.setPeriodicReview(status_static, if (in.cycle == .short) "short" else "long");
+
+    const severity: []const u8 = if (std.mem.eql(u8, in.status, "ok")) "INFO" else "WARN";
+    logEventPayload(events_repo, engine, "PERIODIC_REVIEW", "review", severity, cfg, report_json);
+}
+
+fn writePeriodicList(w: *std.Io.Writer, prefix: []const u8, items: []const []const u8) void {
+    const mark = w.end;
+    const wrote = blk: {
+        w.writeAll(prefix) catch break :blk false;
+        w.writeByte('[') catch break :blk false;
+        for (items, 0..) |item, i| {
+            if (i > 0) w.writeByte(',') catch break :blk false;
+            var esc: [1024]u8 = undefined;
+            w.print("\"{s}\"", .{sanitizeJsonString(if (item.len > 700) item[0..700] else item, &esc)}) catch break :blk false;
+        }
+        w.writeByte(']') catch break :blk false;
+        break :blk true;
+    };
+    if (!wrote) w.end = mark;
+}
+
+/// Restore both cycle cursors from the newest stored report so a restart does
+/// not refire a review that already ran (nor skip one that is overdue).
+fn restorePeriodicSchedule(
+    periodic_repo: *ab.storage.PeriodicReviewsRepo,
+    db: *ab.storage.Db,
+    sched: *ab.periodic_review.Schedule,
+) void {
+    inline for (.{ "short", "long" }) |cycle_name| {
+        var buf: [48]u8 = undefined;
+        if (periodic_repo.latestTsForCycle(db, &buf, cycle_name) catch null) |ts| {
+            if (ab.clock.parseRfc3339Ms(ts)) |ms| {
+                if (comptime std.mem.eql(u8, cycle_name, "short")) {
+                    sched.last_short_ms = ms;
+                } else {
+                    sched.last_long_ms = ms;
+                }
+                std.debug.print("[boot] periodic review {s} cursor restored: {s}\n", .{ cycle_name, ts });
+            } else |_| {}
+        }
+    }
+    sched.last_any_ms = @max(sched.last_short_ms, sched.last_long_ms);
 }
 
 // ---- 定时审计 (scheduled deterministic self-audit) --------------------------
@@ -3825,7 +4491,11 @@ fn execLabel(mode: ab.config.Mode) []const u8 {
 const logEvent = ab.journal.logEvent;
 const logEventPayload = ab.journal.logEventPayload;
 
-fn writeEquitySample(repo: *ab.storage.EquityRepo, snap: ab.state.PortfolioState) void {
+fn writeEquitySample(
+    repo: *ab.storage.EquityRepo,
+    snap: ab.state.PortfolioState,
+    bh: ab.shadow_bench.Comparison,
+) void {
     var ts_buf: [32]u8 = undefined;
     const ts = ab.clock.formatRfc3339Ms(snap.as_of_ms, &ts_buf) catch return;
     var e_buf: [48]u8 = undefined;
@@ -3833,6 +4503,9 @@ fn writeEquitySample(repo: *ab.storage.EquityRepo, snap: ab.state.PortfolioState
     var d_buf: [48]u8 = undefined;
     var c_buf: [48]u8 = undefined;
     var b_buf: [48]u8 = undefined;
+    var p_buf: [48]u8 = undefined;
+    var q_buf: [48]u8 = undefined;
+    var bh_buf: [48]u8 = undefined;
     const btc_value = snap.btc_total.mul(snap.bid_price, .down) catch ab.decimal.Decimal.zero;
     repo.append(.{
         .ts = ts,
@@ -3842,6 +4515,11 @@ fn writeEquitySample(repo: *ab.storage.EquityRepo, snap: ab.state.PortfolioState
         .drawdown = decFmt(&d_buf, snap.drawdown),
         .cash = decFmt(&c_buf, snap.cash_usdt),
         .btc_value = decFmt(&b_buf, btc_value),
+        // 0006 marks: keep price and quantity separable so 复盘 can tell a market
+        // move apart from a rebalance, and replay the BH baseline as a series.
+        .bid_price = decFmt(&p_buf, snap.bid_price),
+        .btc_qty = decFmt(&q_buf, snap.btc_total),
+        .bh_equity = decFmt(&bh_buf, bh.bh_equity),
     }) catch |err| {
         std.debug.print("[journal] equity sample failed: {t}\n", .{err});
     };

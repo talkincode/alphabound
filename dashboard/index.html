@@ -202,6 +202,27 @@
 
   /* ===== 复盘 (review) tab ===== */
   .chart-host.lg { height: 400px; }
+  .ab-ic-table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 12px; }
+  .ab-ic-table th, .ab-ic-table td { padding: 4px 8px; text-align: right; border-bottom: 1px solid var(--border); color: var(--dim); }
+  .ab-ic-table th:first-child, .ab-ic-table td:first-child { text-align: left; }
+  .ab-ic-table td.ok { color: var(--ok); }
+  .ab-ic-table td.err { color: var(--bad); }
+  .ab-ic-table th[data-abs] { color: var(--ab-c, var(--dim)); }
+  #ab_series_filters button[data-abs] {
+    display: inline-flex; align-items: center; gap: 6px;
+  }
+  #ab_series_filters button[data-abs]::before {
+    content: ""; width: 8px; height: 8px; border-radius: 50%;
+    background: var(--ab-c, var(--dim)); flex: 0 0 auto;
+    opacity: .38;
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--ab-c, var(--dim)) 40%, transparent);
+  }
+  #ab_series_filters button[data-abs].active {
+    color: var(--ab-c, var(--line));
+    border-color: var(--ab-c, var(--line));
+    background: color-mix(in srgb, var(--ab-c, var(--line)) 14%, var(--panel));
+  }
+  #ab_series_filters button[data-abs].active::before { opacity: 1; }
   .rv-nav { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 12px 0; }
   .rv-nav select {
     background: var(--panel); color: var(--text); border: 1px solid var(--border);
@@ -238,6 +259,22 @@
     padding: 14px; min-height: 160px; max-height: 420px; overflow-y: auto;
     display: flex; flex-direction: column; gap: 10px; margin-bottom: 10px;
   }
+  .pr-card { border: 1px solid var(--border); border-radius: 8px; background: #0f141b; margin-bottom: 10px; }
+  .pr-card > summary { cursor: pointer; padding: 10px 12px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .pr-card > summary::-webkit-details-marker { display: none; }
+  .pr-cycle { font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); }
+  .pr-cycle.short { color: #58a6ff; border-color: rgba(88,166,255,.45); }
+  .pr-cycle.long { color: #d2a8ff; border-color: rgba(210,168,255,.45); }
+  .pr-sum { flex: 1 1 320px; min-width: 200px; color: var(--fg); font-size: 13px; }
+  .pr-body { padding: 0 12px 12px; font-size: 13px; }
+  .pr-body h4 { margin: 10px 0 4px; font-size: 12px; color: var(--dim); font-weight: 600; }
+  .pr-body ul { margin: 0; padding-left: 18px; }
+  .pr-body li { margin: 3px 0; }
+  .pr-facts { display: flex; flex-wrap: wrap; gap: 6px 14px; color: var(--dim); font-size: 12px; margin-top: 6px; }
+  .pr-facts b { color: var(--fg); font-weight: 600; }
+  .pr-raw { margin-top: 8px; }
+  .pr-raw pre { max-height: 260px; overflow: auto; background: #0b0f14; border: 1px solid var(--border);
+    border-radius: 6px; padding: 8px; font-size: 11px; white-space: pre-wrap; word-break: break-all; }
   .rv-msg { max-width: 86%; padding: 8px 12px; border-radius: 10px; font-size: 13px;
     line-height: 1.55; white-space: pre-wrap; word-break: break-word; }
   .rv-msg.user { align-self: flex-end; background: rgba(88,166,255,.12); border: 1px solid rgba(88,166,255,.35); }
@@ -503,6 +540,25 @@
       <div class="tv-attr">标记：▲/▼ 调仓提案（绿加仓/红减仓）· ● 持有 · ▪ 失败/拒绝 — 点击标记回看该时点。Charts by <a href="https://www.tradingview.com" target="_blank" rel="noopener noreferrer">TradingView</a></div>
     </div>
 
+    <div class="chart-wrap" style="margin-top:12px;">
+      <div class="chart-meta" id="ab_meta"><span><b>AB 因子</b> · 实验性复盘指标</span><span class="muted">加载中…</span></div>
+      <div class="filters" id="ab_series_filters" role="group" aria-label="AB因子成分曲线">
+        <button type="button" data-abs="ab">AB因子</button>
+        <button type="button" data-abs="pos">仓位</button>
+        <button type="button" data-abs="ret">净值收益</button>
+        <button type="button" data-abs="alpha">超额α</button>
+        <button type="button" data-abs="dd">回撤</button>
+        <button type="button" data-abs="vol">波动</button>
+        <button type="button" data-abs="mom">动量</button>
+      </div>
+      <div class="chart-host sm" id="chart_ab" role="img" aria-label="AB 因子与成分指标曲线（z-score）"></div>
+      <div class="tv-attr">成分曲线为全窗口 z-score 标准化 · 最近 48 小时（5 分钟采样）· <b>仅用于复盘观测，不参与任何决策</b> · 空段=样本缺失（迁移前无价格标记）</div>
+      <table class="ab-ic-table" aria-label="信息系数表">
+        <thead><tr><th>IC（因子值 vs 未来净值收益）</th><th data-abs="ab">AB</th><th data-abs="pos">仓位</th><th data-abs="ret">净值收益</th><th data-abs="alpha">超额α</th><th data-abs="dd">回撤</th><th data-abs="vol">波动</th><th data-abs="mom">动量</th></tr></thead>
+        <tbody id="ab_ic_body"><tr><td colspan="8" class="muted">暂无数据</td></tr></tbody>
+      </table>
+    </div>
+
     <div class="rv-nav">
       <button type="button" id="rv_prev">◀ 上一决策</button>
       <select id="rv_select" aria-label="选择决策"><option value="">选择提案决策…</option></select>
@@ -516,6 +572,7 @@
       <button type="button" data-rvtab="decision" class="active">决策</button>
       <button type="button" data-rvtab="events">事件流</button>
       <button type="button" data-rvtab="chat">AI 复盘</button>
+      <button type="button" data-rvtab="periodic">复盘记录</button>
     </div>
 
     <div class="rv-pane active" id="rv_pane_decision">
@@ -541,6 +598,30 @@
         <button type="button" id="rv_chat_send">发送</button>
         <button type="button" id="rv_chat_summarize" title="将本决策的复盘对话压缩为一条低置信度参考记忆">沉淀为记忆</button>
       </div>
+    </div>
+    <div class="rv-pane" id="rv_pane_periodic">
+    <div class="stats">
+      <div class="stat"><div class="k">小周期间隔</div><div class="v" id="pr_short_int">—</div></div>
+      <div class="stat"><div class="k">下次小周期</div><div class="v" id="pr_short_next">—</div></div>
+      <div class="stat"><div class="k">大周期间隔</div><div class="v" id="pr_long_int">—</div></div>
+      <div class="stat"><div class="k">下次大周期</div><div class="v" id="pr_long_next">—</div></div>
+      <div class="stat"><div class="k">最近一次</div><div class="v" id="pr_last">—</div></div>
+      <div class="stat"><div class="k">报告数</div><div class="v" id="pr_count">—</div></div>
+    </div>
+    <p class="hint">定期复盘按固定节奏回看一整段窗口：小周期问“这一班的决策是否兑现了自己的论据”，大周期问“策略在跨班次上是否还成立”。
+      窗口内的所有数字来自账本，模型只做归纳；结论会被压缩成一条<b>低置信度参考记忆</b>（<code>PR_short</code> / <code>PR_long</code>），供主 Agent 自行取舍。
+      <b>该通道只读，不触碰引擎、订单与风控状态，也不产生交易建议。</b></p>
+    <div class="filters" id="pr_actions">
+      <button type="button" id="pr_run_short">立即小周期复盘</button>
+      <button type="button" id="pr_run_long">立即大周期复盘</button>
+      <span class="range-label" id="pr_run_msg"></span>
+    </div>
+    <div class="filters" id="pr_filters" role="group" aria-label="复盘周期筛选">
+      <button type="button" data-prf="all" class="active">全部</button>
+      <button type="button" data-prf="short">小周期</button>
+      <button type="button" data-prf="long">大周期</button>
+    </div>
+    <div id="pr_list"><p class="muted">加载中…</p></div>
     </div>
   </div>
 
@@ -713,6 +794,10 @@ let cachedOrdersBundle = { orders: [], fills: [] };
 // --- 复盘 (review) state ---
 let cachedReviewChats = [];
 let cachedAudit = [];
+let cachedPeriodic = [];
+let cachedSystem = null;
+let prLastSig = "";
+let prFilter = (() => { try { return localStorage.getItem("ab_pr_filter") || "all"; } catch (_) { return "all"; } })();
 let cachedAuditMeta = null;
 let rvBar = localStorage.getItem("ab_rv_bar") || "15m";
 let rvInd = { ma5: true, ma20: true, ema20: false, boll: false };
@@ -1491,8 +1576,10 @@ function ensureReviewChart() {
   reviewChart.priceScale("rvsub").applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
   reviewChart.priceScale("right").applyOptions({ scaleMargins: { top: 0.06, bottom: 0.24 } });
   reviewChart.applyOptions({ width: el.clientWidth || el.offsetWidth || 800 });
+  reviewChart.timeScale().applyOptions({ rightOffset: 2, lockVisibleTimeRangeOnResize: true });
   bindChartResize(reviewChart, el);
   reviewChart.subscribeClick(onReviewChartClick);
+  linkAbReviewTimeScale();
   return true;
 }
 
@@ -1636,6 +1723,8 @@ function updateReviewChart() {
     rvCandleSeries.setMarkers(markers);
     reviewChart.timeScale().fitContent();
   }
+  rvTimes = times;
+  if (abChart && abTimes.length) requestAnimationFrame(syncAbFromReview);
 
   if (meta) {
     const last = dedup[dedup.length - 1].close;
@@ -1671,6 +1760,7 @@ function selectReviewDecision(key) {
   rvLastSig = ""; // marker highlight redraw
   renderReviewSelection();
   updateReviewChart();
+  try { updateAbChart(); } catch (err) { console.error("ab factor", err); }
   if (rvActivePane === "events") ensureReviewContext();
 }
 
@@ -1901,6 +1991,9 @@ function showReviewPane(name) {
     p.classList.toggle("active", p.id === "rv_pane_" + rvActivePane));
   if (rvActivePane === "events") ensureReviewContext();
   if (rvActivePane === "chat") renderReviewChatLog();
+  if (rvActivePane === "periodic") {
+    try { renderPeriodicReviews(cachedSystem); } catch (err) { console.error("periodic render", err); }
+  }
 }
 
 function onReviewTabVisible() {
@@ -1911,9 +2004,251 @@ function onReviewTabVisible() {
   updateReviewChart();
   renderReviewSelect();
   renderReviewSelection();
+  if (abChart) {
+    const el = $("chart_ab");
+    if (el && el.clientWidth) abChart.applyOptions({ width: el.clientWidth });
+  }
+  fetchAbAnalytics(true);
+  try { updateAbChart(); renderAbIcTable(cachedAnalytics); } catch (err) { console.error("ab factor", err); }
 }
 
+/* ===================== AB 因子（实验性，仅复盘观测） ===================== */
+
+let abChart = null, abSeriesMap = {}, abLastSig = "", abLastFetch = 0, cachedAnalytics = null;
+let abSyncing = false, abRangeLinked = false, abIndexSeries = null;
+let abTimes = [], rvTimes = [];
+const AB_SERIES_DEFS = [
+  { key: "ab", color: "#58a6ff", width: 2 },
+  { key: "pos", color: "#3fb950", width: 1 },
+  { key: "ret", color: "#d29922", width: 1 },
+  { key: "alpha", color: "#a371f7", width: 1 },
+  { key: "dd", color: "#f85149", width: 1 },
+  { key: "vol", color: "#39d2c0", width: 1 },
+  { key: "mom", color: "#f0883e", width: 1 },
+];
+function paintAbLegend() {
+  for (const def of AB_SERIES_DEFS) {
+    document.querySelectorAll('[data-abs="' + def.key + '"]').forEach(el => {
+      el.style.setProperty("--ab-c", def.color);
+    });
+  }
+}
+paintAbLegend();
+let abOn = { ab: true, pos: true, ret: false, alpha: false, dd: false, vol: false, mom: false };
+try {
+  const saved = JSON.parse(localStorage.getItem("ab_factor_series") || "null");
+  if (saved && typeof saved === "object") abOn = Object.assign(abOn, saved);
+} catch (_) {}
+
+function fetchAbAnalytics(force) {
+  if (!force && Date.now() - abLastFetch < 15000) return;
+  abLastFetch = Date.now();
+  jget("/api/v1/review/analytics").then(d => {
+    cachedAnalytics = d;
+    if (activeTab === "review") {
+      try { updateAbChart(); renderAbIcTable(d); } catch (err) { console.error("ab factor", err); }
+    }
+  }).catch(() => {});
+}
+
+function ensureAbChart() {
+  if (abChart || !lwAvailable()) return !!abChart;
+  const el = $("chart_ab");
+  if (!el) return false;
+  abChart = LightweightCharts.createChart(el, chartBaseOptions(200));
+  abIndexSeries = abChart.addLineSeries({
+    color: "transparent", visible: false,
+    lastValueVisible: false, priceLineVisible: false,
+    crosshairMarkerVisible: false, priceScaleId: "abidx",
+  });
+  abChart.priceScale("abidx").applyOptions({ visible: false });
+  for (const def of AB_SERIES_DEFS) {
+    abSeriesMap[def.key] = abChart.addLineSeries({
+      color: def.color, lineWidth: def.width,
+      lineStyle: def.key === "ab" ? 0 : 2,
+      priceLineVisible: false, lastValueVisible: true,
+    });
+  }
+  abChart.applyOptions({ width: el.clientWidth || el.offsetWidth || 800 });
+  abChart.timeScale().applyOptions({ rightOffset: 2, lockVisibleTimeRangeOnResize: true });
+  bindChartResize(abChart, el);
+  linkAbReviewTimeScale();
+  return true;
+}
+
+function nearestTime(times, t) {
+  if (!times.length || t == null || !isFinite(t)) return null;
+  if (t <= times[0]) return times[0];
+  if (t >= times[times.length - 1]) return times[times.length - 1];
+  let lo = 0, hi = times.length - 1;
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    if (times[mid] <= t) lo = mid; else hi = mid;
+  }
+  return (t - times[lo] <= times[hi] - t) ? times[lo] : times[hi];
+}
+
+function snapVisibleRange(times, range) {
+  if (!range || !times.length) return null;
+  const from = nearestTime(times, Number(range.from));
+  const to = nearestTime(times, Number(range.to));
+  if (from == null || to == null) return null;
+  if (from === to) {
+    if (times.length < 2) return null;
+    const i = times.indexOf(from);
+    if (i >= 0 && i < times.length - 1) return { from: from, to: times[i + 1] };
+    if (i > 0) return { from: times[i - 1], to: from };
+    return null;
+  }
+  return { from: Math.min(from, to), to: Math.max(from, to) };
+}
+
+function applySnappedRange(chart, times, range) {
+  const snapped = snapVisibleRange(times, range);
+  if (!chart || !snapped) return false;
+  const cur = chart.timeScale().getVisibleRange();
+  if (cur && Math.abs(Number(cur.from) - snapped.from) < 90 && Math.abs(Number(cur.to) - snapped.to) < 90) {
+    return true;
+  }
+  try {
+    chart.timeScale().setVisibleRange(snapped);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function linkAbReviewTimeScale() {
+  if (abRangeLinked || !reviewChart || !abChart) return;
+  abRangeLinked = true;
+  reviewChart.timeScale().subscribeVisibleTimeRangeChange(r => {
+    if (abSyncing || !r) return;
+    abSyncing = true;
+    applySnappedRange(abChart, abTimes, r);
+    abSyncing = false;
+  });
+  abChart.timeScale().subscribeVisibleTimeRangeChange(r => {
+    if (abSyncing || !r) return;
+    abSyncing = true;
+    applySnappedRange(reviewChart, rvTimes, r);
+    abSyncing = false;
+  });
+}
+
+function syncAbFromReview() {
+  if (!reviewChart || !abChart || abSyncing) return;
+  const r = reviewChart.timeScale().getVisibleRange();
+  if (!r) return;
+  abSyncing = true;
+  applySnappedRange(abChart, abTimes, r);
+  abSyncing = false;
+}
+
+/** z-score for display only (server sends raw component values; `ab` arrives pre-normalized). */
+function abDisplayZ(vals) {
+  let sum = 0, n = 0;
+  for (const v of vals) if (v != null && isFinite(v)) { sum += v; n++; }
+  if (n < 8) return vals.map(() => null);
+  const mean = sum / n;
+  let ss = 0;
+  for (const v of vals) if (v != null && isFinite(v)) ss += (v - mean) * (v - mean);
+  const sd = Math.sqrt(ss / n);
+  if (sd < 1e-12) return vals.map(() => null);
+  return vals.map(v => (v != null && isFinite(v)) ? (v - mean) / sd : null);
+}
+
+function updateAbChart() {
+  const meta = $("ab_meta");
+  if (!lwAvailable() || !ensureReviewChart() || !ensureAbChart()) return;
+  const data = cachedAnalytics;
+  const pts = (data && Array.isArray(data.points)) ? data.points : [];
+  if (!pts.length) {
+    if (meta) meta.innerHTML = "<span><b>AB 因子</b> · 实验性复盘指标</span><span class=\"muted\">暂无净值样本（等待 1m equity 轨迹积累）</span>";
+    return;
+  }
+  const sig = JSON.stringify(abOn) + "|" + pts.length + "|" +
+    pts[pts.length - 1].t + ":" + pts[pts.length - 1].ab + "|" + rvSelectedKey;
+  if (sig !== abLastSig) {
+    abLastSig = sig;
+    for (const def of AB_SERIES_DEFS) {
+      const s = abSeriesMap[def.key];
+      if (!abOn[def.key]) { s.setData([]); continue; }
+      let vals;
+      if (def.key === "ab") {
+        vals = pts.map(p => p.ab);
+      } else {
+        vals = abDisplayZ(pts.map(p => p[def.key]));
+      }
+      const rows = [];
+      for (let i = 0; i < pts.length; i++) {
+        if (vals[i] != null && isFinite(vals[i])) rows.push({ time: pts[i].t, value: vals[i] });
+      }
+      s.setData(rows);
+    }
+    // mark the selected decision on the AB line (nearest 5m bucket)
+    const markers = [];
+    const sel = reviewFindByKey(rvSelectedKey);
+    if (sel && abOn.ab) {
+      const tsSec = toUnixSec(sel.ts);
+      if (tsSec != null) {
+        let best = null, bestD = Infinity;
+        for (const p of pts) {
+          const d = Math.abs(p.t - tsSec);
+          if (d < bestD) { bestD = d; best = p; }
+        }
+        if (best && bestD <= 600 && best.ab != null) {
+          markers.push({ time: best.t, position: "inBar", shape: "circle", color: "#58a6ff", text: "决" });
+        }
+      }
+    }
+    abSeriesMap.ab.setMarkers(markers);
+    abTimes = pts.map(p => p.t);
+    if (abIndexSeries) abIndexSeries.setData(abTimes.map(t => ({ time: t, value: 0 })));
+    requestAnimationFrame(syncAbFromReview);
+  }
+  if (meta) {
+    const covH = ((pts[pts.length - 1].t - pts[0].t) / 3600).toFixed(1);
+    meta.innerHTML = "<span><b>AB 因子 " + esc(data.factor_version || "v1") +
+      "</b> · 实验性 · 仅复盘观测</span><span>覆盖 " + covH + " 小时 · 1m 样本 " + (data.n_1m ?? 0) + "</span>";
+  }
+}
+
+function renderAbIcTable(data) {
+  const body = $("ab_ic_body");
+  if (!body) return;
+  const rows = (data && Array.isArray(data.ic)) ? data.ic : [];
+  const anyN = rows.some(r => r.ab && r.ab.n > 0);
+  if (!rows.length || !anyN) {
+    body.innerHTML = '<tr><td colspan="8" class="muted">样本不足（需要更长的 1m 净值轨迹）</td></tr>';
+    return;
+  }
+  const cell = (e) => {
+    if (!e || e.r == null || !isFinite(e.r)) return '<td class="muted" title="样本不足">—</td>';
+    const cls = Math.abs(e.r) >= 0.3 ? (e.r > 0 ? "ok" : "err") : "";
+    return '<td class="' + cls + '" title="n=' + (e.n ?? "?") + '">' + e.r.toFixed(3) + "</td>";
+  };
+  body.innerHTML = rows.map(row => {
+    const h = row.horizon_minutes || 0;
+    const label = h % 60 === 0 ? "未来 " + (h / 60) + " 小时" : "未来 " + h + " 分钟";
+    return "<tr><td>" + label + "</td>" +
+      cell(row.ab) + cell(row.pos) + cell(row.ret) + cell(row.alpha) +
+      cell(row.dd) + cell(row.vol) + cell(row.mom) + "</tr>";
+  }).join("");
+}
+
+
 /* wire review controls */
+document.querySelectorAll("#ab_series_filters button[data-abs]").forEach(btn => {
+  const k = btn.getAttribute("data-abs");
+  btn.classList.toggle("active", !!abOn[k]);
+  btn.addEventListener("click", () => {
+    abOn[k] = !abOn[k];
+    btn.classList.toggle("active", !!abOn[k]);
+    try { localStorage.setItem("ab_factor_series", JSON.stringify(abOn)); } catch (_) {}
+    abLastSig = "";
+    try { updateAbChart(); } catch (err) { console.error("ab factor", err); }
+  });
+});
 document.querySelectorAll("#rv_bar_filters button[data-bar]").forEach(btn => {
   btn.classList.toggle("active", btn.getAttribute("data-bar") === rvBar);
   btn.addEventListener("click", () => {
@@ -2258,6 +2593,170 @@ function renderOverviewSummary(decisions, runs) {
   }).join("");
 }
 
+
+// ---- 复盘记录 (periodic review log) ---------------------------------------
+// Read-only view over the scheduled 定期复盘 reports. The buttons only enqueue a
+// request in the mailbox; the core loop still owns every write.
+const PR_CYCLE_ZH = { short: "小周期", long: "大周期" };
+const PR_STATUS_ZH = { ok: "已生成", degraded: "仅事实", failed: "失败" };
+const PR_TRIGGER_ZH = { schedule: "定时", manual: "手动" };
+
+function fmtDurMs(ms) {
+  const n = Number(ms);
+  if (!Number.isFinite(n) || n <= 0) return "已关闭";
+  if (n >= 86400000) return (Math.round(n / 8640000) / 10) + " 天";
+  if (n >= 3600000) return (Math.round(n / 360000) / 10) + " 小时";
+  return Math.max(1, Math.round(n / 60000)) + " 分钟";
+}
+function fmtEtaMs(ms) {
+  const n = Number(ms);
+  if (!Number.isFinite(n)) return "—";
+  if (n <= 0) return "即将执行";
+  return "约 " + fmtDurMs(n) + "后";
+}
+/** Signed percent — for returns and alpha, where direction is the point. */
+function prPct(v) {
+  const n = parseFloat(v);
+  if (!Number.isFinite(n)) return "—";
+  return (n >= 0 ? "+" : "") + (n * 100).toFixed(2) + "%";
+}
+/** Plain percent — for magnitudes (drawdown, weight) that are never signed. */
+function prPctAbs(v) {
+  const n = parseFloat(v);
+  if (!Number.isFinite(n)) return "—";
+  return (n * 100).toFixed(2) + "%";
+}
+
+function renderPeriodicReviews(system) {
+  const rv = (system && system.review) || {};
+  if ($("pr_short_int")) $("pr_short_int").textContent = fmtDurMs(rv.short_interval_ms);
+  if ($("pr_long_int")) $("pr_long_int").textContent = fmtDurMs(rv.long_interval_ms);
+  if ($("pr_short_next")) $("pr_short_next").textContent = rv.short_interval_ms ? fmtEtaMs(rv.next_short_ms) : "已关闭";
+  if ($("pr_long_next")) $("pr_long_next").textContent = rv.long_interval_ms ? fmtEtaMs(rv.next_long_ms) : "已关闭";
+  if ($("pr_last")) {
+    // Read from the newest report row, not system.review: the report blob is
+    // published the moment a review lands, the system blob up to 5s later.
+    const el = $("pr_last");
+    const newest = cachedPeriodic[0];
+    if (!newest) {
+      el.textContent = rv.status && rv.status !== "idle" ? (PR_STATUS_ZH[rv.status] || rv.status) : "尚未运行";
+      el.className = "v";
+    } else {
+      const at = Date.parse(newest.ts || "");
+      el.textContent = (PR_CYCLE_ZH[newest.cycle] || newest.cycle || "") + " · " +
+        (PR_STATUS_ZH[newest.status] || newest.status || "") +
+        (Number.isFinite(at) ? " · " + ageText(at) : "");
+      el.className = "v " + (newest.status === "ok" ? "ok" : "warn");
+    }
+  }
+  if ($("pr_count")) $("pr_count").textContent = String(cachedPeriodic.length);
+
+  const host = $("pr_list");
+  if (!host) return;
+  const rows = cachedPeriodic.filter(r => prFilter === "all" || r.cycle === prFilter);
+  const sig = prFilter + "|" + rows.map(r => r.review_id + ":" + r.status).join(",");
+  if (sig === prLastSig) return; // 2s polling must not collapse an open card
+  prLastSig = sig;
+  // Keep whatever the reader had expanded across the rebuild.
+  const open = new Set(
+    Array.from(host.querySelectorAll(".pr-card[open]")).map(d => d.getAttribute("data-prid"))
+  );
+  if (!rows.length) {
+    host.innerHTML = '<p class="muted">' +
+      (cachedPeriodic.length ? "该周期暂无报告。" : "尚无定期复盘报告：第一份会在首个窗口结束后生成，也可用上方按钮立即触发。") +
+      "</p>";
+    return;
+  }
+  host.innerHTML = rows.map(prCardHtml).join("");
+  open.forEach(id => {
+    const el = host.querySelector('.pr-card[data-prid="' + (window.CSS && CSS.escape ? CSS.escape(id) : id) + '"]');
+    if (el) el.open = true;
+  });
+}
+
+function prList(title, items) {
+  if (!Array.isArray(items) || !items.length) return "";
+  return "<h4>" + esc(title) + "</h4><ul>" +
+    items.map(x => "<li>" + esc(String(x)) + "</li>").join("") + "</ul>";
+}
+
+function prCardHtml(r) {
+  const rep = (r && r.report) || {};
+  const f = rep.facts || {};
+  const dec = f.decisions || {};
+  const adm = f.admission || {};
+  const exe = f.execution || {};
+  const pf = f.portfolio || {};
+  const bm = f.benchmark;
+  const cycle = r.cycle === "long" ? "long" : "short";
+  const stCls = r.status === "ok" ? "ok" : (r.status === "failed" ? "err" : "warn");
+  const win = (r.window_from || "").replace("T", " ").slice(5, 16) + " → " +
+    (r.window_to || "").replace("T", " ").slice(5, 16);
+
+  const facts =
+    '<div class="pr-facts">' +
+    "<span>提案 <b>" + (dec.proposals ?? 0) + "</b>（HOLD " + (dec.hold ?? 0) + " · 调仓 " + (dec.rebalance ?? 0) + "）</span>" +
+    "<span>准入 <b>" + (adm.approved ?? 0) + "</b> 通过 / " + (adm.reduced ?? 0) + " 缩量 / " + (adm.rejected ?? 0) + " 拒绝</span>" +
+    "<span>执行 <b>" + (exe.executed ?? 0) + "</b> · 成交 " + (exe.fills ?? 0) + "</span>" +
+    "<span>净值 <b>" + prPct(pf.return) + "</b> · 最大回撤 " + prPctAbs(pf.max_drawdown) + "</span>" +
+    "<span>仓位 <b>" + prPctAbs(pf.btc_weight) + "</b> · " + esc(pf.risk_mode || "—") + "</span>" +
+    (bm ? "<span>基准 " + prPct(bm.buy_and_hold_return) + " · 超额 <b>" + prPct(bm.alpha) + "</b></span>"
+        : '<span class="muted">基准：窗口内无标记</span>') +
+    "<span>异常 " + ((f.health && f.health.faults) ?? 0) + " · 审计告警 " + ((f.health && f.health.audit_alerts) ?? 0) + "</span>" +
+    "</div>";
+
+  const memLine = r.memory_id
+    ? '<h4>沉淀</h4><ul><li>参考记忆 <code>' + esc(r.memory_id) + "</code>（低置信度）· 记忆操作 " + (r.ops_applied ?? 0) + " 条</li></ul>"
+    : (r.ops_applied ? '<h4>沉淀</h4><ul><li>记忆操作 ' + r.ops_applied + " 条</li></ul>" : "");
+
+  return '<details class="pr-card" data-prid="' + esc(r.review_id || "") + '">' +
+    "<summary>" +
+    '<span class="pr-cycle ' + cycle + '">' + (PR_CYCLE_ZH[cycle] || cycle) + "</span>" +
+    '<span class="muted">' + esc(win) + "</span>" +
+    '<span class="' + stCls + '">' + esc(PR_STATUS_ZH[r.status] || r.status || "") + "</span>" +
+    '<span class="muted">' + esc(PR_TRIGGER_ZH[r.trigger] || r.trigger || "") + "</span>" +
+    '<span class="pr-sum">' + esc(short(r.summary || "（无摘要）", 120)) + "</span>" +
+    "</summary>" +
+    '<div class="pr-body">' +
+    "<h4>摘要</h4><div>" + esc(r.summary || "—") + "</div>" +
+    facts +
+    prList("发现", rep.findings) +
+    prList("经验", rep.lessons) +
+    prList("风险", rep.risks) +
+    memLine +
+    '<details class="pr-raw"><summary class="muted">原始报告 JSON</summary><pre>' +
+    esc(JSON.stringify(rep, null, 2)) + "</pre></details>" +
+    "</div></details>";
+}
+
+async function runPeriodicReviewNow(cycle) {
+  const msg = $("pr_run_msg");
+  const btns = [$("pr_run_short"), $("pr_run_long")].filter(Boolean);
+  btns.forEach(b => { b.disabled = true; });
+  if (msg) msg.textContent = "已提交，等待核心循环执行…";
+  try {
+    await jpost("/api/v1/review/periodic", { cycle: cycle });
+    if (msg) msg.textContent = (PR_CYCLE_ZH[cycle] || cycle) + "复盘已排队，通常几秒内出结果。";
+  } catch (err) {
+    if (msg) msg.textContent = "提交失败：" + (err && err.message ? err.message : String(err));
+  } finally {
+    setTimeout(() => { btns.forEach(b => { b.disabled = false; }); }, 3000);
+  }
+}
+
+if ($("pr_run_short")) $("pr_run_short").addEventListener("click", () => runPeriodicReviewNow("short"));
+if ($("pr_run_long")) $("pr_run_long").addEventListener("click", () => runPeriodicReviewNow("long"));
+document.querySelectorAll("#pr_filters button").forEach(btn => {
+  btn.classList.toggle("active", btn.getAttribute("data-prf") === prFilter);
+  btn.addEventListener("click", () => {
+    prFilter = btn.getAttribute("data-prf") || "all";
+    try { localStorage.setItem("ab_pr_filter", prFilter); } catch (_) {}
+    document.querySelectorAll("#pr_filters button").forEach(b => b.classList.toggle("active", b === btn));
+    prLastSig = "";
+    renderPeriodicReviews(cachedSystem);
+  });
+});
+
 function showTab(name) {
   activeTab = name || "overview";
   try { localStorage.setItem("ab_tab", activeTab); } catch (_) {}
@@ -2544,7 +3043,7 @@ function renderOrders(bundle) {
 
 async function poll() {
   try {
-    const [s, shadow, runs, equity, candles, memories, events, system, decisions, ordersBundle, reviewChats, auditReports] = await Promise.all([
+    const [s, shadow, runs, equity, candles, memories, events, system, decisions, ordersBundle, reviewChats, auditReports, periodicReviews] = await Promise.all([
       jget("/api/v1/state"),
       jget("/api/v1/shadow"),
       jget("/api/v1/agent-runs"),
@@ -2557,6 +3056,7 @@ async function poll() {
       jget("/api/v1/orders"),
       jget("/api/v1/review/chats"),
       jget("/api/v1/audit"),
+      jget("/api/v1/review/periodic"),
     ]);
     lastOk = Date.now();
 
@@ -2622,7 +3122,10 @@ async function poll() {
     cachedRuns = runs;
     cachedReviewChats = Array.isArray(reviewChats) ? reviewChats : [];
     cachedAudit = Array.isArray(auditReports) ? auditReports : [];
+    cachedPeriodic = Array.isArray(periodicReviews) ? periodicReviews : [];
+    cachedSystem = system;
     try { renderAuditBell(system); } catch (err) { console.error("audit bell", err); }
+    try { renderPeriodicReviews(system); } catch (err) { console.error("periodic review", err); }
     cachedOrdersBundle = ordersBundle && typeof ordersBundle === "object"
       ? ordersBundle
       : { orders: [], fills: [] };
@@ -2632,6 +3135,8 @@ async function poll() {
         renderReviewSelect();
         renderReviewSelection();
       } catch (err) { console.error("review render", err); }
+      fetchAbAnalytics(false);
+      try { updateAbChart(); renderAbIcTable(cachedAnalytics); } catch (err) { console.error("ab factor", err); }
     }
     renderOverviewSummary(decisions, runs);
     renderDecisions(decisions, runs);

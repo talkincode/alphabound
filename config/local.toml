@@ -22,7 +22,7 @@ initial_capital = 100.0
 provider = "openai"
 # 优先用环境变量 LLM_MODEL / LLM_API_URL（见 secrets.env）
 # Azure OpenAI：model 必须是 Deployment 名称
-model = "gpt-4o-mini"
+model = "DeepSeek-V4-Flash-0731"
 base_url = "https://api.openai.com/v1"
 decision_timeout_ms = 180000
 decision_interval_ms = 60000
@@ -31,6 +31,11 @@ enabled = true
 # Second LLM call after proposal for structured memory_ops (fail → deterministic).
 # Override off: ALPHABOUND_LLM_REFLECTION=0
 llm_reflection = true
+
+[review]
+# 定期复盘：本机开发把小周期调短便于观察；生产用 8h / 7d 默认值。
+short_interval_ms = 28800000   # 小周期 8 小时（小时级；4h=14400000，最小 600000）；0 = 关闭
+long_interval_ms = 604800000   # 大周期 7 天（最小 3600000）；0 = 关闭
 
 [storage]
 path = "var/trading.db"

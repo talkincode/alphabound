@@ -3,6 +3,7 @@
 //! process; everything else reads.
 
 const std = @import("std");
+const clock = @import("../core/clock.zig");
 const c = @cImport({
     @cInclude("sqlite3.h");
 });
@@ -22,6 +23,8 @@ const migration_0002: [:0]const u8 = @embedFile("migration_0002");
 const migration_0003: [:0]const u8 = @embedFile("migration_0003");
 const migration_0004: [:0]const u8 = @embedFile("migration_0004");
 const migration_0005: [:0]const u8 = @embedFile("migration_0005");
+const migration_0006: [:0]const u8 = @embedFile("migration_0006");
+const migration_0007: [:0]const u8 = @embedFile("migration_0007");
 
 /// Ordered list of migrations; user_version tracks the applied count.
 const migrations = [_][:0]const u8{
@@ -30,6 +33,8 @@ const migrations = [_][:0]const u8{
     migration_0003,
     migration_0004,
     migration_0005,
+    migration_0006,
+    migration_0007,
 };
 
 /// Expected user_version for a fully migrated database (restore drills).
@@ -764,15 +769,42 @@ pub const EquitySampleRow = struct {
     drawdown: []const u8,
     cash: []const u8,
     btc_value: []const u8,
+    /// Marks added by migration 0006. Empty = unknown (pre-migration rows);
+    /// analytics must skip those samples instead of inventing a price.
+    bid_price: []const u8 = "",
+    btc_qty: []const u8 = "",
+    bh_equity: []const u8 = "",
 };
+
+/// One 1m equity sample decoded for 复盘 analytics. See `listPointsAsc` for why
+/// floats are acceptable in this struct and nowhere near the trading path.
+pub const EquityPoint = struct {
+    ts_ms: i64,
+    equity: f64,
+    hwm: f64,
+    drawdown: f64,
+    cash: f64,
+    btc_value: f64,
+    /// 0 when the row predates migration 0006.
+    bid_price: f64,
+    btc_qty: f64,
+    bh_equity: f64,
+    /// True only when the migration-0006 marks are usable.
+    marks_ok: bool,
+};
+
+fn parseF64(text: []const u8) f64 {
+    if (text.len == 0) return 0;
+    return std.fmt.parseFloat(f64, text) catch 0;
+}
 
 pub const EquityRepo = struct {
     insert: Stmt,
-
     pub fn init(db: *Db) DbError!EquityRepo {
         return .{ .insert = try db.prepare(
-            \\INSERT OR REPLACE INTO equity_samples (ts, interval, equity, hwm, drawdown, cash, btc_value)
-            \\VALUES (?1,?2,?3,?4,?5,?6,?7)
+            \\INSERT OR REPLACE INTO equity_samples
+            \\  (ts, interval, equity, hwm, drawdown, cash, btc_value, bid_price, btc_qty, bh_equity)
+            \\VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
         ) };
     }
 
@@ -789,6 +821,9 @@ pub const EquityRepo = struct {
         try self.insert.bindText(5, row.drawdown);
         try self.insert.bindText(6, row.cash);
         try self.insert.bindText(7, row.btc_value);
+        try self.insert.bindText(8, row.bid_price);
+        try self.insert.bindText(9, row.btc_qty);
+        try self.insert.bindText(10, row.bh_equity);
         _ = try self.insert.stepCritical();
     }
 
@@ -810,7 +845,7 @@ pub const EquityRepo = struct {
     pub fn listRecentJson(self: *EquityRepo, db: *Db, out: []u8, limit: i64) DbError![]const u8 {
         _ = self;
         var stmt = try db.prepare(
-            \\SELECT ts, interval, equity, hwm, drawdown, cash, btc_value
+            \\SELECT ts, interval, equity, hwm, drawdown, cash, btc_value, bid_price
             \\FROM equity_samples ORDER BY ts DESC LIMIT ?1
         );
         defer stmt.finalize();
@@ -821,7 +856,7 @@ pub const EquityRepo = struct {
         while (try stmt.step()) : (i += 1) {
             if (i > 0) w.writeAll(",") catch return DbError.StepFailed;
             w.print(
-                "{{\"ts\":\"{s}\",\"interval\":\"{s}\",\"equity\":\"{s}\",\"hwm\":\"{s}\",\"drawdown\":\"{s}\",\"cash\":\"{s}\",\"btc_value\":\"{s}\"}}",
+                "{{\"ts\":\"{s}\",\"interval\":\"{s}\",\"equity\":\"{s}\",\"hwm\":\"{s}\",\"drawdown\":\"{s}\",\"cash\":\"{s}\",\"btc_value\":\"{s}\",\"bid_price\":\"{s}\"}}",
                 .{
                     stmt.columnText(0),
                     stmt.columnText(1),
@@ -830,11 +865,61 @@ pub const EquityRepo = struct {
                     stmt.columnText(4),
                     stmt.columnText(5),
                     stmt.columnText(6),
+                    stmt.columnText(7),
                 },
             ) catch return DbError.StepFailed;
         }
         w.writeAll("]") catch return DbError.StepFailed;
         return w.buffered();
+    }
+
+    /// Decode 1m samples at or after `since_ts` into `out`, **oldest first**,
+    /// for 复盘 analytics (AB factor). Returns the number of points written;
+    /// stops early when `out` is full.
+    ///
+    /// Floats are deliberate here and only here: these values feed z-scores and
+    /// correlations, never order sizing, admission or risk gates — those stay on
+    /// `Decimal`. Rows missing migration-0006 marks are returned with
+    /// `marks_ok = false` so callers skip them instead of guessing a price.
+    pub fn listPointsAsc(
+        self: *EquityRepo,
+        db: *Db,
+        out: []EquityPoint,
+        since_ts: []const u8,
+    ) DbError!usize {
+        _ = self;
+        if (out.len == 0) return 0;
+        var stmt = try db.prepare(
+            \\SELECT ts, equity, hwm, drawdown, cash, btc_value, bid_price, btc_qty, bh_equity
+            \\FROM equity_samples
+            \\WHERE interval = '1m' AND ts >= ?1
+            \\ORDER BY ts ASC LIMIT ?2
+        );
+        defer stmt.finalize();
+        try stmt.bindText(1, since_ts);
+        try stmt.bindInt(2, @intCast(out.len));
+        var n: usize = 0;
+        while (try stmt.step()) {
+            const ts_ms = clock.parseRfc3339Ms(stmt.columnText(0)) catch continue;
+            const bid = parseF64(stmt.columnText(6));
+            const qty = parseF64(stmt.columnText(7));
+            const bh = parseF64(stmt.columnText(8));
+            out[n] = .{
+                .ts_ms = ts_ms,
+                .equity = parseF64(stmt.columnText(1)),
+                .hwm = parseF64(stmt.columnText(2)),
+                .drawdown = parseF64(stmt.columnText(3)),
+                .cash = parseF64(stmt.columnText(4)),
+                .btc_value = parseF64(stmt.columnText(5)),
+                .bid_price = bid,
+                .btc_qty = qty,
+                .bh_equity = bh,
+                .marks_ok = bid > 0 and bh > 0,
+            };
+            n += 1;
+            if (n == out.len) break;
+        }
+        return n;
     }
 
     /// Latest equity sample at or before `cutoff_ts` (RFC3339, lexicographically
@@ -1371,6 +1456,172 @@ pub const AuditReportsRepo = struct {
             const wrote = blk: {
                 if (i > 0) w.writeAll(",") catch break :blk false;
                 w.print("{s}", .{stmt.columnText(4)}) catch break :blk false;
+                break :blk true;
+            };
+            if (!wrote) {
+                w.end = mark;
+                break;
+            }
+        }
+        out[w.end] = ']';
+        return out[0 .. w.end + 1];
+    }
+};
+
+pub const PeriodicReviewRow = struct {
+    review_id: []const u8,
+    cycle: []const u8,
+    ts: []const u8,
+    window_from: []const u8 = "",
+    window_to: []const u8 = "",
+    status: []const u8 = "degraded",
+    trigger: []const u8 = "schedule",
+    summary: []const u8 = "",
+    memory_id: []const u8 = "",
+    ops_applied: i64 = 0,
+    model: []const u8 = "",
+    report_json: []const u8,
+};
+
+/// Periodic review reports (定期复盘): one row per closed 8h / weekly window.
+/// Analysis-only projection — the trading loop never reads it back.
+pub const PeriodicReviewsRepo = struct {
+    insert: Stmt,
+
+    pub fn init(db: *Db) DbError!PeriodicReviewsRepo {
+        return .{ .insert = try db.prepare(
+            \\INSERT INTO periodic_reviews
+            \\  (review_id, cycle, ts, window_from, window_to, status, trigger,
+            \\   summary, memory_id, ops_applied, model, report_json)
+            \\VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+        ) };
+    }
+
+    pub fn deinit(self: *PeriodicReviewsRepo) void {
+        self.insert.finalize();
+    }
+
+    pub fn append(self: *PeriodicReviewsRepo, row: PeriodicReviewRow) DbError!void {
+        self.insert.reset();
+        try self.insert.bindText(1, row.review_id);
+        try self.insert.bindText(2, row.cycle);
+        try self.insert.bindText(3, row.ts);
+        try self.insert.bindText(4, row.window_from);
+        try self.insert.bindText(5, row.window_to);
+        try self.insert.bindText(6, row.status);
+        try self.insert.bindText(7, row.trigger);
+        try self.insert.bindText(8, row.summary);
+        try self.insert.bindText(9, row.memory_id);
+        try self.insert.bindInt(10, row.ops_applied);
+        try self.insert.bindText(11, row.model);
+        try self.insert.bindText(12, row.report_json);
+        _ = try self.insert.stepCritical();
+    }
+
+    /// RFC3339 ts of the newest report for `cycle`, copied into `out`.
+    /// Null when the cycle has never run (fresh DB / first deploy).
+    pub fn latestTsForCycle(self: *PeriodicReviewsRepo, db: *Db, out: []u8, cycle: []const u8) DbError!?[]const u8 {
+        _ = self;
+        var stmt = try db.prepare(
+            "SELECT ts FROM periodic_reviews WHERE cycle = ?1 ORDER BY id DESC LIMIT 1",
+        );
+        defer stmt.finalize();
+        try stmt.bindText(1, cycle);
+        if (!try stmt.step()) return null;
+        const t = stmt.columnText(0);
+        if (t.len > out.len) return null;
+        @memcpy(out[0..t.len], t);
+        return out[0..t.len];
+    }
+
+    /// Reports inside a window for one cycle (used to feed the weekly review
+    /// with the short reviews it contains).
+    pub fn countInWindow(
+        self: *PeriodicReviewsRepo,
+        db: *Db,
+        cycle: []const u8,
+        ts_from: []const u8,
+        ts_to: []const u8,
+    ) DbError!i64 {
+        _ = self;
+        var stmt = try db.prepare(
+            \\SELECT COUNT(*) FROM periodic_reviews
+            \\WHERE cycle = ?1 AND ts >= ?2 AND ts <= ?3
+        );
+        defer stmt.finalize();
+        try stmt.bindText(1, cycle);
+        try stmt.bindText(2, ts_from);
+        try stmt.bindText(3, ts_to);
+        if (!try stmt.step()) return 0;
+        return stmt.columnInt(0);
+    }
+
+    /// Plain-text digest of recent summaries (oldest→newest) as
+    /// "ts [cycle] summary" lines. Feeds the long-cycle prompt.
+    pub fn summaryTail(
+        self: *PeriodicReviewsRepo,
+        db: *Db,
+        out: []u8,
+        cycle: []const u8,
+        ts_from: []const u8,
+        limit: i64,
+    ) DbError![]const u8 {
+        _ = self;
+        var stmt = try db.prepare(
+            \\SELECT ts, cycle, summary FROM (
+            \\  SELECT id, ts, cycle, summary FROM periodic_reviews
+            \\  WHERE cycle = ?1 AND ts >= ?2 AND summary != ''
+            \\  ORDER BY id DESC LIMIT ?3
+            \\) ORDER BY id ASC
+        );
+        defer stmt.finalize();
+        try stmt.bindText(1, cycle);
+        try stmt.bindText(2, ts_from);
+        try stmt.bindInt(3, limit);
+        var w: std.Io.Writer = .fixed(out);
+        while (try stmt.step()) {
+            const mark = w.end;
+            w.print("{s} [{s}] {s}\n", .{ stmt.columnText(0), stmt.columnText(1), stmt.columnText(2) }) catch {
+                w.end = mark;
+                break;
+            };
+        }
+        return w.buffered();
+    }
+
+    /// Newest reports as a JSON array (newest first); report_json embedded raw.
+    /// Overflowing rows are dropped (with older ones) instead of failing.
+    pub fn listRecentJson(self: *PeriodicReviewsRepo, db: *Db, out: []u8, limit: i64) DbError![]const u8 {
+        _ = self;
+        var stmt = try db.prepare(
+            \\SELECT review_id, cycle, ts, window_from, window_to, status, trigger,
+            \\       summary, memory_id, ops_applied, model, report_json
+            \\FROM periodic_reviews ORDER BY id DESC LIMIT ?1
+        );
+        defer stmt.finalize();
+        try stmt.bindInt(1, limit);
+        if (out.len < 2) return DbError.StepFailed;
+        var w: std.Io.Writer = .fixed(out[0 .. out.len - 1]); // reserve "]"
+        w.writeAll("[") catch return DbError.StepFailed;
+        var i: usize = 0;
+        while (try stmt.step()) : (i += 1) {
+            const mark = w.end;
+            const wrote = blk: {
+                if (i > 0) w.writeAll(",") catch break :blk false;
+                w.print(
+                    "{{\"review_id\":\"{s}\",\"cycle\":\"{s}\",\"ts\":\"{s}\",\"window_from\":\"{s}\"," ++
+                        "\"window_to\":\"{s}\",\"status\":\"{s}\",\"trigger\":\"{s}\",\"summary\":\"",
+                    .{
+                        stmt.columnText(0), stmt.columnText(1), stmt.columnText(2),
+                        stmt.columnText(3), stmt.columnText(4), stmt.columnText(5),
+                        stmt.columnText(6),
+                    },
+                ) catch break :blk false;
+                writeJsonEscaped(&w, stmt.columnText(7)) catch break :blk false;
+                w.print(
+                    "\",\"memory_id\":\"{s}\",\"ops_applied\":{d},\"model\":\"{s}\",\"report\":{s}}}",
+                    .{ stmt.columnText(8), stmt.columnInt(9), stmt.columnText(10), stmt.columnText(11) },
+                ) catch break :blk false;
                 break :blk true;
             };
             if (!wrote) {
@@ -2102,4 +2353,81 @@ test "runtime_kv put/get round-trip and overwrite" {
     // Value larger than out buffer fails closed.
     var tiny: [4]u8 = undefined;
     try testing.expect(kv.get("shadow_bh", &tiny) == null);
+}
+
+test "periodic reviews append, list, cycle cursor and summary tail" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const path = try tmpDbPath(&tmp, &buf);
+
+    var db = try Db.open(path);
+    defer db.close();
+    var repo = try PeriodicReviewsRepo.init(&db);
+    defer repo.deinit();
+
+    var cursor: [64]u8 = undefined;
+    try testing.expect((try repo.latestTsForCycle(&db, &cursor, "short")) == null);
+
+    try repo.append(.{
+        .review_id = "pr_short_1",
+        .cycle = "short",
+        .ts = "2026-08-20T00:00:00.000Z",
+        .window_from = "2026-08-19T16:00:00.000Z",
+        .window_to = "2026-08-20T00:00:00.000Z",
+        .status = "ok",
+        .summary = "10 次 HOLD，超额 -0.5%\n第二行",
+        .memory_id = "PR_short_20260820T00",
+        .ops_applied = 2,
+        .model = "gpt-x",
+        .report_json = "{\"cycle\":\"short\",\"facts\":{\"proposals\":12}}",
+    });
+    try repo.append(.{
+        .review_id = "pr_short_2",
+        .cycle = "short",
+        .ts = "2026-08-20T08:00:00.000Z",
+        .status = "degraded",
+        .summary = "无 LLM，仅记录事实",
+        .report_json = "{\"cycle\":\"short\"}",
+    });
+    try repo.append(.{
+        .review_id = "pr_long_1",
+        .cycle = "long",
+        .ts = "2026-08-20T09:00:00.000Z",
+        .status = "ok",
+        .summary = "周度：策略仍未跑赢买入持有",
+        .report_json = "{\"cycle\":\"long\"}",
+    });
+
+    // Unique review_id is enforced (a retry cannot duplicate a report).
+    try testing.expectError(
+        DbError.StepFailed,
+        repo.append(.{ .review_id = "pr_short_1", .cycle = "short", .ts = "x", .status = "ok", .report_json = "{}" }),
+    );
+
+    const short_cursor = (try repo.latestTsForCycle(&db, &cursor, "short")).?;
+    try testing.expectEqualStrings("2026-08-20T08:00:00.000Z", short_cursor);
+    var cursor2: [64]u8 = undefined;
+    const long_cursor = (try repo.latestTsForCycle(&db, &cursor2, "long")).?;
+    try testing.expectEqualStrings("2026-08-20T09:00:00.000Z", long_cursor);
+
+    try testing.expectEqual(@as(i64, 2), try repo.countInWindow(&db, "short", "2026-08-19T00:00:00.000Z", "2026-08-21T00:00:00.000Z"));
+    try testing.expectEqual(@as(i64, 1), try repo.countInWindow(&db, "short", "2026-08-20T04:00:00.000Z", "2026-08-21T00:00:00.000Z"));
+
+    var tail_buf: [1024]u8 = undefined;
+    const tail = try repo.summaryTail(&db, &tail_buf, "short", "2026-08-19T00:00:00.000Z", 10);
+    try testing.expect(std.mem.indexOf(u8, tail, "[short]") != null);
+    try testing.expect(std.mem.indexOf(u8, tail, "无 LLM") != null);
+
+    var list_buf: [4096]u8 = undefined;
+    const json = try repo.listRecentJson(&db, &list_buf, 10);
+    try testing.expect(std.mem.startsWith(u8, json, "[{"));
+    try testing.expect(std.mem.endsWith(u8, json, "}]"));
+    // Newest first; raw report embedded; summary newlines escaped.
+    try testing.expect(std.mem.indexOf(u8, json, "\"review_id\":\"pr_long_1\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"report\":{\"cycle\":\"short\",\"facts\":{\"proposals\":12}}") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\\n第二行") != null);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 3), parsed.value.array.items.len);
 }

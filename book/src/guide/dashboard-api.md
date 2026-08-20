@@ -40,7 +40,7 @@ curl -sS -H "Authorization: Bearer YOUR_TOKEN" http://127.0.0.1:18180/api/v1/sta
 | 入口 | `GET /` 与 `GET /index.html` |
 | 依赖 | 零 Node 运行时；浏览器直接 `fetch` API |
 | 刷新 | 前端约 2s 轮询 state / shadow / agent-runs / equity / candles / memories / events / system / orders / decisions / review-chats |
-| 内容 | Overview + Shadow vs BH + **Lightweight Charts**（分时/多周期 K 线 + 成交量 + 净值/HWM）+ **复盘**（K 线决策标记 + 指标 + AI 复盘对话）+ 提案/记忆/事件/订单 + System |
+| 内容 | Overview + Shadow vs BH + **Lightweight Charts**（分时/多周期 K 线 + 成交量 + 净值/HWM）+ **复盘**（K 线决策标记 + 指标 + AI 复盘对话 + 复盘记录）+ 提案/记忆/事件/订单 + System |
 
 概览图表使用 [Lightweight Charts](https://www.tradingview.com/lightweight-charts/)（CDN）。周期按钮：**分时**（1m 收盘面积图）、1分/5分/15分/1时/4时/1日。离线无 CDN 时其余 UI 仍可用。
 
@@ -50,7 +50,21 @@ K 线图（1m–1D 周期，MA/EMA/BOLL 主图指标，VOL/RSI/MACD 副图）上
 
 - **决策**：该提案的完整摘要（thesis、invalid_if、准入结论、关联订单/成交、原始 payload）。
 - **事件流**：该时点 ±30 分钟的事件账本窗口（行情、余额、准入、执行、备份等），由核心循环按需从 SQLite 提取。
+- **复盘记录**：定期复盘的报告列表（见下）。
 - **AI 复盘**：与复盘助手就该时点对话。助手可发起**一轮有界工具请求**（≤6 个）：决策时点指标（SMA/EMA/RSI/ATR/VOL/BOLL/RANGE，`at:anchor` 在锚点截断计算）、K 线窗口、提案历史、净值轨迹、记忆检索——全部只读，接触不到交易路径。**克制边界**：助手只做归因分析，不给交易建议、无执行能力，人不能借它直接或间接改变决策；对话全部落库（`review_chats` 表）。点「沉淀为记忆」可将对话压缩成一条 **confidence 0.3 的 reflection 记忆**（`HR_<decision_id>`，每个决策一条、就地更新），作为人类观点进入主 Agent 上下文的唯一通道，由 Agent 自行取舍。
+
+K 线下方另有 **AB 因子曲线图（实验性）**：仓位、净值收益、超额 α、回撤、波动、动量六个成分的 z-score 曲线与合成因子，时间轴与 K 线图双向联动，配 IC 表观测各成分对未来净值收益的预测力。仅用于复盘观测，不参与任何决策（详见下文 `GET /api/v1/review/analytics`）。
+
+#### 复盘记录子页（定期复盘）
+
+前三个子页是人主动挑一个决策去追问；「复盘记录」是系统**按固定节奏自己回看一整段窗口**，两者并存互补，因此放在同一个复盘标签页下。
+
+- **小周期**（小时级，默认 8 小时，常用 4 小时）：这一班的决策是否兑现了自己的论据？HOLD 是不是被当成了胜利？
+- **大周期**（默认 7 天）：策略在跨班次上是否还成立？基准跑赢了吗？该改的是仓位、节奏，还是记忆？
+
+子页顶部是两个周期的间隔与下次运行倒计时、最近一次结果；下方按时间倒序列出报告卡片（可按周期筛选），展开可见摘要、窗口内确定性事实（提案/准入/执行/净值/最大回撤/基准超额/异常计数）、模型给出的发现·经验·风险，以及沉淀出的记忆 ID 与原始 JSON。两个「立即复盘」按钮走同一条邮箱链路，用于手动加跑一次。
+
+**边界与既有复盘一致**：只读账本，不触碰引擎、订单与风控状态，也不产生交易建议。窗口内的每个数字都来自 SQLite（`equity_samples` / `events` / `agent_runs` / `fills` / `audit_reports`），模型只负责归纳；结论压缩成一条 **confidence 0.3 的 reflection 记忆**（`PR_short` / `PR_long`，每周期一条、就地更新），是它影响未来决策的唯一通道，由主 Agent 自行取舍。LLM 未配置或返回不合法 JSON 时，仍会落一份 `degraded` 报告（只含确定性事实）并照常推进调度，坏掉的模型不会把循环卡在重试上。
 
 ### 本地打开
 
@@ -104,6 +118,8 @@ open http://127.0.0.1:18180/
 | `GET /api/v1/orders` | `{"orders":[...],"fills":[...]}` 投影 |
 | `GET /api/v1/review/chats` | 复盘对话最近轮次（newest first，客户端按 `id` 升序重排） |
 | `GET /api/v1/review/context` | 最近一次请求的复盘事件窗口 `{decision_id, from, to, events}` |
+| `GET /api/v1/review/analytics` | AB 因子复盘分析（实验性）：成分指标曲线 + IC 表，见下 |
+| `GET /api/v1/review/periodic` | 定期复盘报告（newest first，含窗口事实与模型结论） |
 | `GET /api/v1/audit` | 定时审计报告（newest first，含完整 findings 与 stats） |
 
 ### `GET /api/v1/shadow`
@@ -167,8 +183,31 @@ open http://127.0.0.1:18180/
 | POST | `/api/v1/review/context` | `{"decision_id","anchor_ts"}` | 提取该时点 ±30min 事件窗口 → `GET /api/v1/review/context` |
 | POST | `/api/v1/review/chat` | `{"decision_id","anchor_ts","message"}` | 复盘提问（≤1500B）；回复落库后出现在 `GET /api/v1/review/chats` |
 | POST | `/api/v1/review/summarize` | `{"decision_id"}` | 将对话压缩为一条低置信度 reflection 记忆（`HR_<decision_id>`） |
+| POST | `/api/v1/review/periodic` | `{"cycle":"short"\|"long"}` | 手动加跑一次定期复盘；结果进 `GET /api/v1/review/periodic` |
 
-限制：队列深度 4（满载 429）；同决策同类请求去重（409）；每决策对话上限 40 轮；每次提问至多一轮工具请求（≤6 个，均为只读）；LLM 未配置时提问仍会保存并得到降级答复。审计事件：`REVIEW_CHAT_OK/FAILED`（含 `tools` 计数）、`REVIEW_SUMMARY_OK`。
+限制：队列深度 4（满载 429）；同决策同类请求去重（409）；每决策对话上限 40 轮；每次提问至多一轮工具请求（≤6 个，均为只读）；LLM 未配置时提问仍会保存并得到降级答复。审计事件：`REVIEW_CHAT_OK/FAILED`（含 `tools` 计数）、`REVIEW_SUMMARY_OK`、`PERIODIC_REVIEW`。手动定期复盘同样会推进调度游标（下一次自动运行相应顺延）。
+
+### `GET /api/v1/review/analytics`（AB 因子，实验性）
+
+复盘标签页 K 线下方曲线图与 IC 表的数据源。核心循环每分钟基于**最近 48 小时的 1m equity 轨迹**重算（`src/analytics/ab_factor.zig`），5 分钟采样输出：
+
+```json
+{
+  "factor_version": "v1",
+  "experimental": true,
+  "n_1m": 2880,
+  "step_minutes": 5,
+  "orientation": {"pos": 1, "ret": 1, "alpha": 1, "dd": -1, "vol": -1, "mom": 1},
+  "points": [{"t": 1786237200, "pos": 0.9497, "ret": -0.0012, "alpha": 0.0034,
+              "dd": 0.0137, "vol": 0.0008, "mom": 0.0021, "ab": -0.42}],
+  "ic": [{"horizon_minutes": 60, "pos": {"r": 0.12, "n": 140}, "ab": {"r": 0.21, "n": 140}}]
+}
+```
+
+- **成分（v1 等权，方向见 `orientation`）**：`pos` 仓位占比（btc_value/equity）、`ret` 30m 净值滚动收益、`alpha` 相对 buy-and-hold 的超额（迁移 0006 marks）、`dd` 回撤、`vol` 30m 已实现波动（1m bid 对数收益 std）、`mom` 30m BTC 动量。`ab` = 各成分 z-score 的定向等权均值（≥3 个成分可用才输出）。
+- **IC 表**：各成分 z 值与 `ab` 对**未来 1h / 4h 净值收益**的皮尔逊相关，`n` 为配对样本数；样本不足（<30）时 `r` 为 `null`。这是"哪些指标与未来表现相关、该不该留在因子里"的观测依据。
+- **数据诚实性**：迁移 0006 之前的行缺 `bid_price/btc_qty/bh_equity` 标记，依赖它们的成分输出 `null`（前端留白），不回填猜测；1m 轨迹出现 >2× 窗口的缺口时滚动窗口同样置 `null`。
+- **边界**：纯研究视图。因子不进提案 prompt、不进准入/风控/下单路径（`src/agent`、`src/risk`、`src/execution` 禁止 import analytics 模块）；调整成分或权重必须升 `factor_version`。
 
 ### 定时审计（`/api/v1/audit` 与告警铃铛）
 

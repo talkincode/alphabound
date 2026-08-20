@@ -15,6 +15,7 @@ const testing = std.testing;
 const context_src = @embedFile("../agent/context.zig");
 const proposal_src = @embedFile("../agent/proposal.zig");
 const reflection_src = @embedFile("../agent/reflection.zig");
+const periodic_review_src = @embedFile("../agent/periodic_review.zig");
 const openai_src = @embedFile("../agent/openai.zig");
 
 /// Sources that assemble untrusted context / parse model output.
@@ -23,6 +24,7 @@ const pure_sources = [_]struct { name: []const u8, src: []const u8 }{
     .{ .name = "agent/context.zig", .src = context_src },
     .{ .name = "agent/proposal.zig", .src = proposal_src },
     .{ .name = "agent/reflection.zig", .src = reflection_src },
+    .{ .name = "agent/periodic_review.zig", .src = periodic_review_src },
 };
 
 fn expectAbsent(name: []const u8, src: []const u8, needle: []const u8) !void {

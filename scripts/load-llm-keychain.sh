@@ -42,7 +42,7 @@ if [[ -z "$URL" ]]; then
 fi
 if [[ -z "$MODEL" ]]; then
   # Azure v1 often still needs a deployment/model name from config/env.
-  MODEL="${LLM_MODEL:-gpt-4o-mini}"
+  MODEL="${LLM_MODEL:-DeepSeek-V4-Flash-0731}"
   echo "[keychain] model service absent — defaulting model=$MODEL (override with LLM_MODEL)" >&2
 fi
 

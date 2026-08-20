@@ -15,6 +15,7 @@ const latency = @import("../observability/latency.zig");
 const openai = @import("../agent/openai.zig");
 const clock = @import("../core/clock.zig");
 const review = @import("review.zig");
+const analytics = @import("../analytics/ab_factor.zig");
 
 fn nowMs() i64 {
     return clock.SystemClock.clock().wallMs();
@@ -63,6 +64,13 @@ pub const WebState = struct {
     /// Recent scheduled-audit reports (newest first).
     audit_buf: [24576]u8 = undefined,
     audit_len: usize = 2,
+    /// Recent 定期复盘 reports (newest first; 8h + weekly cycles).
+    periodic_buf: [49152]u8 = undefined,
+    periodic_len: usize = 2,
+    /// AB 因子复盘 analytics blob (experimental; sized for 48h/5m + IC rows).
+    /// Must match the worst-case test in src/analytics/ab_factor.zig.
+    analytics_buf: [131072]u8 = undefined,
+    analytics_len: usize = 2,
     /// Dashboard / MCP auth (optional; empty token = open).
     auth_cfg: web_auth.Config = .{},
     cred_store: ?*web_auth.CredStore = null,
@@ -97,6 +105,10 @@ pub const WebState = struct {
         self.review_ctx_len = 2;
         @memcpy(self.audit_buf[0..2], "[]");
         self.audit_len = 2;
+        @memcpy(self.periodic_buf[0..2], "[]");
+        self.periodic_len = 2;
+        @memcpy(self.analytics_buf[0..2], "{}");
+        self.analytics_len = 2;
     }
 
     pub fn contextFn(userdata: ?*anyopaque) web.Context {
@@ -116,6 +128,8 @@ pub const WebState = struct {
             var review_chats: [49152]u8 = undefined;
             var review_ctx: [24576]u8 = undefined;
             var audit: [24576]u8 = undefined;
+            var periodic: [49152]u8 = undefined;
+            var analytics: [131072]u8 = undefined;
             var config_hash: [71]u8 = undefined;
             var agent_len: usize = 2;
             var equity_len: usize = 2;
@@ -129,6 +143,8 @@ pub const WebState = struct {
             var review_len: usize = 2;
             var review_ctx_len: usize = 2;
             var audit_len: usize = 2;
+            var periodic_len: usize = 2;
+            var analytics_len: usize = 2;
         };
         const self: *WebState = @ptrCast(@alignCast(userdata.?));
         while (true) {
@@ -151,7 +167,9 @@ pub const WebState = struct {
             const rl = self.review_len;
             const rcl = self.review_ctx_len;
             const aul = self.audit_len;
-            if (al > Tls.agent.len or el > Tls.equity.len or vl > Tls.events.len or sl > Tls.shadow.len or cl > Tls.candles.len or ml > Tls.memories.len or yl > Tls.system.len or dl > Tls.decisions.len or ol > Tls.orders.len or rl > Tls.review_chats.len or rcl > Tls.review_ctx.len or aul > Tls.audit.len) {
+            const pdl = self.periodic_len;
+            const anl = self.analytics_len;
+            if (al > Tls.agent.len or el > Tls.equity.len or vl > Tls.events.len or sl > Tls.shadow.len or cl > Tls.candles.len or ml > Tls.memories.len or yl > Tls.system.len or dl > Tls.decisions.len or ol > Tls.orders.len or rl > Tls.review_chats.len or rcl > Tls.review_ctx.len or aul > Tls.audit.len or pdl > Tls.periodic.len or anl > Tls.analytics.len) {
                 std.atomic.spinLoopHint();
                 continue;
             }
@@ -167,6 +185,8 @@ pub const WebState = struct {
             @memcpy(Tls.review_chats[0..rl], self.review_buf[0..rl]);
             @memcpy(Tls.review_ctx[0..rcl], self.review_ctx_buf[0..rcl]);
             @memcpy(Tls.audit[0..aul], self.audit_buf[0..aul]);
+            @memcpy(Tls.periodic[0..pdl], self.periodic_buf[0..pdl]);
+            @memcpy(Tls.analytics[0..anl], self.analytics_buf[0..anl]);
             @memcpy(Tls.config_hash[0..], self.config_hash[0..]);
             Tls.agent_len = al;
             Tls.equity_len = el;
@@ -180,6 +200,8 @@ pub const WebState = struct {
             Tls.review_len = rl;
             Tls.review_ctx_len = rcl;
             Tls.audit_len = aul;
+            Tls.periodic_len = pdl;
+            Tls.analytics_len = anl;
             const s2 = self.seq.load(.acquire);
             if (s1 == s2) {
                 return .{
@@ -200,6 +222,8 @@ pub const WebState = struct {
                     .review_ctx_json = Tls.review_ctx[0..Tls.review_ctx_len],
                     .review_inbox = self.review_inbox,
                     .audit_json = Tls.audit[0..Tls.audit_len],
+                    .periodic_json = Tls.periodic[0..Tls.periodic_len],
+                    .analytics_json = Tls.analytics[0..Tls.analytics_len],
                     .index_html = self.index_html,
                     .auth_cfg = self.auth_cfg,
                     .cred_store = self.cred_store,
@@ -219,7 +243,7 @@ pub const WebState = struct {
         _ = self.seq.fetchAdd(1, .release); // even: stable
     }
 
-    pub fn setJson(self: *WebState, comptime which: enum { agent, equity, events, shadow, candles, memories, system, decisions, orders, review, review_ctx, audit }, src: []const u8) void {
+    pub fn setJson(self: *WebState, comptime which: enum { agent, equity, events, shadow, candles, memories, system, decisions, orders, review, review_ctx, audit, periodic, analytics }, src: []const u8) void {
         _ = self.seq.fetchAdd(1, .acq_rel);
         switch (which) {
             .agent => {
@@ -282,6 +306,16 @@ pub const WebState = struct {
                 @memcpy(self.audit_buf[0..n], src[0..n]);
                 self.audit_len = n;
             },
+            .periodic => {
+                const n = @min(src.len, self.periodic_buf.len);
+                @memcpy(self.periodic_buf[0..n], src[0..n]);
+                self.periodic_len = n;
+            },
+            .analytics => {
+                const n = @min(src.len, self.analytics_buf.len);
+                @memcpy(self.analytics_buf[0..n], src[0..n]);
+                self.analytics_len = n;
+            },
         }
         _ = self.seq.fetchAdd(1, .release);
     }
@@ -323,6 +357,12 @@ pub const RuntimeStatus = struct {
     audit_findings: u32 = 0,
     audit_alerts: []const u8 = "[]",
     audit_alerts_buf: [3072]u8 = undefined,
+    // 定期复盘 surface: last cycle outcome + next-due countdowns.
+    review_status: []const u8 = "idle",
+    review_cycle: []const u8 = "",
+    review_ms: i64 = 0,
+    review_next_short_ms: i64 = 0,
+    review_next_long_ms: i64 = 0,
     // Owned scratch for mutable strings
     bid_buf: [48]u8 = undefined,
     bid_len: usize = 0,
@@ -398,6 +438,17 @@ pub const RuntimeStatus = struct {
         } else {
             self.audit_alerts = "[]"; // oversized detail lives in audit_reports
         }
+    }
+    /// Publish the latest 定期复盘 outcome. `status` / `cycle` must be static
+    /// strings ("ok"/"degraded"/"failed", "short"/"long").
+    pub fn setPeriodicReview(self: *RuntimeStatus, status: []const u8, cycle: []const u8) void {
+        self.review_status = status;
+        self.review_cycle = cycle;
+        self.review_ms = nowMs();
+    }
+    pub fn setReviewNext(self: *RuntimeStatus, next_short_ms: i64, next_long_ms: i64) void {
+        self.review_next_short_ms = next_short_ms;
+        self.review_next_long_ms = next_long_ms;
     }
     pub fn setEgress(self: *RuntimeStatus, ip: []const u8) void {
         const n = @min(ip.len, self.egress_buf.len);
@@ -491,6 +542,42 @@ pub fn refreshAuditCache(ws: *WebState, db: *storage.Db, repo: *storage.AuditRep
     if (repo.listRecentJson(db, &tmp, 16)) |j| {
         ws.setJson(.audit, j);
     } else |_| {}
+}
+
+/// Re-render recent 定期复盘 reports blob (core loop only).
+pub fn refreshPeriodicReviewCache(ws: *WebState, db: *storage.Db, repo: *storage.PeriodicReviewsRepo) void {
+    var tmp: [49152]u8 = undefined;
+    if (repo.listRecentJson(db, &tmp, 24)) |j| {
+        ws.setJson(.periodic, j);
+    } else |_| {}
+}
+
+/// Re-render the AB 因子复盘 analytics blob from the 1m equity trail (core
+/// loop only). Research-only: the output feeds the 复盘 tab chart + IC table
+/// and never any decision or risk path.
+pub fn refreshAnalyticsCache(ws: *WebState, db: *storage.Db, equity: *storage.EquityRepo) void {
+    // Static scratch: ~2880 EquityPoint (~250KiB) + Series (~350KiB) + JSON.
+    // Single-writer core loop, so plain container-level state is safe.
+    const S = struct {
+        var points: [analytics.max_points]storage.EquityPoint = undefined;
+        var series: analytics.Series = .{};
+        var json: [131072]u8 = undefined;
+    };
+    var since_buf: [40]u8 = undefined;
+    const since_ms = nowMs() - 48 * std.time.ms_per_hour;
+    const since_ts = clock.formatRfc3339Ms(since_ms, &since_buf) catch return;
+    const n = equity.listPointsAsc(db, &S.points, since_ts) catch return;
+    const params: analytics.Params = .{};
+    analytics.compute(S.points[0..n], params, &S.series);
+    const ics = [_]analytics.IcRow{
+        analytics.computeIc(S.points[0..n], &S.series, params, 60),
+        analytics.computeIc(S.points[0..n], &S.series, params, 240),
+    };
+    const json = analytics.writeJson(&S.json, &S.series, &ics) catch {
+        std.debug.print("[dashboard] analytics json overflow\n", .{});
+        return;
+    };
+    ws.setJson(.analytics, json);
 }
 
 const CandleBarSpec = struct { okx_bar: []const u8, limit: u16 };
@@ -645,6 +732,18 @@ pub fn refreshSystemCache(
     w.print(
         "\"audit\":{{\"status\":\"{s}\",\"ts_ms\":{d},\"findings\":{d},\"interval_ms\":{d},\"alerts\":{s}}},",
         .{ st.audit_status, st.audit_ms, st.audit_findings, cfg.audit_interval_ms, st.audit_alerts },
+    ) catch return;
+    w.print(
+        "\"review\":{{\"status\":\"{s}\",\"cycle\":\"{s}\",\"ts_ms\":{d},\"short_interval_ms\":{d},\"long_interval_ms\":{d},\"next_short_ms\":{d},\"next_long_ms\":{d}}},",
+        .{
+            st.review_status,
+            st.review_cycle,
+            st.review_ms,
+            cfg.review_short_interval_ms,
+            cfg.review_long_interval_ms,
+            st.review_next_short_ms,
+            st.review_next_long_ms,
+        },
     ) catch return;
     w.print(
         "\"schedule\":{{\"base_ms\":{d},\"quiet_ms\":{d},\"min_ms\":{d},\"active_hours_utc\":\"{s}\",\"price_move\":\"{f}\",\"drawdown_step\":\"{f}\",\"reflect_on_hold\":{},\"review_backoff_max_ms\":{d},\"noop_backoff_max_ms\":{d}}},",

@@ -85,6 +85,11 @@ pub const Config = struct {
     agent_enabled: bool = true,
     // [audit] — scheduled deterministic self-audit (0 disables).
     audit_interval_ms: u32 = 14_400_000, // 4h default
+    // [review] — 定期复盘 cadence (0 disables the cycle). Analysis-only:
+    // reports land in `periodic_reviews` and may distill low-confidence
+    // memories; they never reach the order path.
+    review_short_interval_ms: u32 = 28_800_000, // 8h 小周期
+    review_long_interval_ms: u32 = 604_800_000, // 7d 大周期
     /// When true, after a valid proposal run a second LLM reflection call
     /// (structured memory_ops). Fail-closed → deterministic fallback.
     agent_llm_reflection: bool = true,
@@ -159,7 +164,7 @@ pub fn parse(gpa: std.mem.Allocator, text: []const u8) ConfigError!Config {
         if (line[0] == '[') {
             if (line[line.len - 1] != ']') return error.SyntaxError;
             section = line[1 .. line.len - 1];
-            const known = [_][]const u8{ "app", "exchange", "risk", "agent", "storage", "web", "audit" };
+            const known = [_][]const u8{ "app", "exchange", "risk", "agent", "storage", "web", "audit", "review" };
             var ok = false;
             for (known) |k| {
                 if (std.mem.eql(u8, section, k)) ok = true;
@@ -306,6 +311,16 @@ fn applyKey(a: std.mem.Allocator, cfg: *Config, section: []const u8, key: []cons
             // Floor guards alert fatigue; 0 disables entirely.
             if (cfg.audit_interval_ms != 0 and cfg.audit_interval_ms < 600_000) return error.InvalidValue;
         } else return error.UnknownKey;
+    } else if (std.mem.eql(u8, section, "review")) {
+        // Floors keep a misconfigured cadence from turning the review into a
+        // second decision loop (each run costs one LLM call).
+        if (std.mem.eql(u8, key, "short_interval_ms")) {
+            cfg.review_short_interval_ms = parseInt(u32, val) catch return error.InvalidValue;
+            if (cfg.review_short_interval_ms != 0 and cfg.review_short_interval_ms < 600_000) return error.InvalidValue;
+        } else if (std.mem.eql(u8, key, "long_interval_ms")) {
+            cfg.review_long_interval_ms = parseInt(u32, val) catch return error.InvalidValue;
+            if (cfg.review_long_interval_ms != 0 and cfg.review_long_interval_ms < 3_600_000) return error.InvalidValue;
+        } else return error.UnknownKey;
     } else {
         return error.UnknownSection;
     }
@@ -395,6 +410,40 @@ test "unknown keys and unsafe values rejected" {
     try testing.expectError(error.InvalidValue, parse(testing.allocator,
         \\[web]
         \\bind = "1.2.3.4:8080"
+    ));
+}
+
+test "[review] section parses, validates floors and stays optional" {
+    var cfg = try parse(testing.allocator,
+        \\[review]
+        \\short_interval_ms = 28800000
+        \\long_interval_ms = 604800000
+    );
+    defer cfg.deinit();
+    try testing.expectEqual(@as(u32, 28_800_000), cfg.review_short_interval_ms);
+    try testing.expectEqual(@as(u32, 604_800_000), cfg.review_long_interval_ms);
+
+    // 0 disables a cycle without tripping the floor.
+    var off = try parse(testing.allocator,
+        \\[review]
+        \\short_interval_ms = 0
+        \\long_interval_ms = 0
+    );
+    defer off.deinit();
+    try testing.expectEqual(@as(u32, 0), off.review_short_interval_ms);
+    try testing.expectEqual(@as(u32, 0), off.review_long_interval_ms);
+
+    try testing.expectError(error.InvalidValue, parse(testing.allocator,
+        \\[review]
+        \\short_interval_ms = 60000
+    ));
+    try testing.expectError(error.InvalidValue, parse(testing.allocator,
+        \\[review]
+        \\long_interval_ms = 600000
+    ));
+    try testing.expectError(error.UnknownKey, parse(testing.allocator,
+        \\[review]
+        \\cadence = 1
     ));
 }
 

@@ -5,7 +5,9 @@
 
 const std = @import("std");
 
-pub const Kind = enum { context, chat, summarize };
+/// `periodic` runs an on-demand 定期复盘 cycle; the cycle name ("short" /
+/// "long") travels in `decision_id` so the queue stays allocation-free.
+pub const Kind = enum { context, chat, summarize, periodic };
 
 pub const max_decision_id = 96;
 pub const max_anchor_ts = 40;
@@ -57,6 +59,9 @@ pub const Inbox = struct {
         if (anchor_ts.len > max_anchor_ts) return EnqueueError.BadInput;
         if (message.len > max_message) return EnqueueError.BadInput;
         if (kind == .chat and message.len == 0) return EnqueueError.BadInput;
+        if (kind == .periodic and
+            !std.mem.eql(u8, decision_id, "short") and
+            !std.mem.eql(u8, decision_id, "long")) return EnqueueError.BadInput;
 
         self.lock();
         defer self.mutex.unlock();
@@ -120,6 +125,21 @@ test "inbox enqueue/drain FIFO with copies" {
     try testing.expectEqual(Kind.context, b.kind);
     try testing.expectEqualStrings("dec_2", b.decisionId());
     try testing.expect(box.drain() == null);
+}
+
+test "periodic requests carry the cycle and dedupe per cycle" {
+    var box: Inbox = .{};
+    try testing.expectError(EnqueueError.BadInput, box.enqueue(.periodic, "yearly", "", ""));
+    try testing.expectError(EnqueueError.BadInput, box.enqueue(.periodic, "", "", ""));
+
+    try box.enqueue(.periodic, "short", "", "");
+    try testing.expectError(EnqueueError.DuplicatePending, box.enqueue(.periodic, "short", "", ""));
+    try box.enqueue(.periodic, "long", "", "");
+
+    const a = box.drain().?;
+    try testing.expectEqual(Kind.periodic, a.kind);
+    try testing.expectEqualStrings("short", a.decisionId());
+    try testing.expectEqualStrings("long", box.drain().?.decisionId());
 }
 
 test "inbox rejects bad input, duplicates and overflow" {

@@ -20,6 +20,11 @@ taker_fee_rate = 0.001
 slippage_rate = 0.0005
 initial_capital = 100.0
 
+[review]
+# 定期复盘（分析用，永不触碰交易路径）：结论只沉淀为低置信度记忆。
+short_interval_ms = 28800000   # 小周期 8 小时（小时级；常用 4h=14400000）；0 = 关闭
+long_interval_ms = 604800000   # 大周期 7 天；0 = 关闭
+
 [storage]
 path = "/var/lib/alphabound/trading.db"
 wal = true
