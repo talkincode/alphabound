@@ -140,6 +140,54 @@
   }
   .token-strip b { color: var(--text); font-weight: 600; }
 
+  /* ===== 概览：紧凑追踪记录 ===== */
+  .ov-ledger {
+    margin-top: 22px; padding: 14px;
+    background: linear-gradient(135deg, rgba(22,27,34,.96), rgba(15,20,27,.96));
+    border: 1px solid var(--border); border-radius: 10px;
+  }
+  .ov-ledger-head {
+    display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-end;
+    gap: 12px 18px; margin-bottom: 12px;
+  }
+  .ov-ledger h2 { margin: 0 0 4px; }
+  .ov-ledger .hint { margin: 0; max-width: 620px; }
+  .ov-subtabs { display: flex; flex-wrap: wrap; gap: 6px; }
+  .ov-subtabs button {
+    appearance: none; display: inline-flex; align-items: center; justify-content: center;
+    min-height: 32px; padding: 6px 11px;
+    background: transparent; color: var(--dim);
+    border: 1px solid var(--border); border-radius: 7px;
+    font: inherit; font-size: 12px; cursor: pointer;
+    transition: color .15s, background .15s, border-color .15s;
+  }
+  .ov-subtabs button:hover { color: var(--text); background: var(--tab); }
+  .ov-subtabs button.active {
+    color: var(--text); background: rgba(88,166,255,.11);
+    border-color: rgba(88,166,255,.65); box-shadow: inset 0 -2px 0 var(--line);
+  }
+  .ov-data-pane { display: none; }
+  .ov-data-pane.active { display: block; }
+  .ov-pane-toolbar {
+    display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center;
+    gap: 8px 14px; margin: 2px 0 10px;
+  }
+  .ov-pane-toolbar .hint { flex: 1 1 320px; }
+  .ov-open-history {
+    appearance: none; padding: 5px 0; background: transparent; border: 0;
+    color: var(--line); font: inherit; font-size: 12px; cursor: pointer; white-space: nowrap;
+  }
+  .ov-open-history:hover { color: var(--text); text-decoration: underline; }
+  .ov-table-scroll { overflow-x: auto; border-radius: 8px; }
+  .ov-table-scroll > table { margin: 0; min-width: 620px; }
+  #ov_pane_events .ov-table-scroll > table { min-width: 560px; }
+  @media (max-width: 620px) {
+    .ov-ledger { padding: 12px; }
+    .ov-subtabs { width: 100%; }
+    .ov-subtabs button { flex: 1 1 calc(50% - 3px); }
+    .ov-pane-toolbar { align-items: flex-start; }
+  }
+
 
   tr.dec-row { cursor: pointer; }
   tr.dec-row td:first-child { white-space: nowrap; }
@@ -479,38 +527,71 @@
       </div>
     </div>
 
-    <h2>最近提案（摘要）</h2>
-    <p class="hint">完整记录见「决策历史」标签页。</p>
-    <table>
-      <thead>
-        <tr><th>时间</th><th>动作</th><th>目标权重</th><th>置信度</th><th>状态</th><th>模型</th></tr>
-      </thead>
-      <tbody id="runs_body"><tr><td colspan="6" class="muted">加载中…</td></tr></tbody>
-    </table>
+    <section class="ov-ledger" aria-labelledby="ov_records_title">
+      <div class="ov-ledger-head">
+        <div>
+          <h2 id="ov_records_title">追踪记录</h2>
+          <p class="hint">把高频流水收进同一处：只展开当前关心的一类，概览不再被四张长表撑开。</p>
+        </div>
+        <div class="ov-subtabs" id="ov_subtabs" role="tablist" aria-label="概览追踪记录">
+          <button type="button" role="tab" id="ov_tab_runs" data-ovtab="runs" aria-controls="ov_pane_runs" aria-selected="true" class="active">决策记录</button>
+          <button type="button" role="tab" id="ov_tab_memories" data-ovtab="memories" aria-controls="ov_pane_memories" aria-selected="false">记忆</button>
+          <button type="button" role="tab" id="ov_tab_events" data-ovtab="events" aria-controls="ov_pane_events" aria-selected="false">事件</button>
+          <button type="button" role="tab" id="ov_tab_equity" data-ovtab="equity" aria-controls="ov_pane_equity" aria-selected="false">净值样本</button>
+        </div>
+      </div>
 
-    <h2>记忆</h2>
-    <table>
-      <thead>
-        <tr><th>ID</th><th>类型</th><th>状态</th><th>置信度</th><th>证据</th><th>内容</th></tr>
-      </thead>
-      <tbody id="mem_body"><tr><td colspan="6" class="muted">加载中…</td></tr></tbody>
-    </table>
+      <div class="ov-data-pane active" id="ov_pane_runs" role="tabpanel" aria-labelledby="ov_tab_runs">
+        <div class="ov-pane-toolbar">
+          <p class="hint">最近 8 条提案摘要；完整审计记录可在独立的决策历史页查看。</p>
+          <button type="button" class="ov-open-history" data-go-tab="decisions">打开决策历史 ↗</button>
+        </div>
+        <div class="ov-table-scroll" tabindex="0" aria-label="最近提案摘要表">
+          <table>
+            <thead>
+              <tr><th>时间</th><th>动作</th><th>目标权重</th><th>置信度</th><th>状态</th><th>模型</th></tr>
+            </thead>
+            <tbody id="runs_body"><tr><td colspan="6" class="muted">加载中…</td></tr></tbody>
+          </table>
+        </div>
+      </div>
 
-    <h2>事件</h2>
-    <table>
-      <thead>
-        <tr><th>时间</th><th>类型</th><th>来源</th><th>级别</th><th>版本</th></tr>
-      </thead>
-      <tbody id="ev_body"><tr><td colspan="5" class="muted">加载中…</td></tr></tbody>
-    </table>
+      <div class="ov-data-pane" id="ov_pane_memories" role="tabpanel" aria-labelledby="ov_tab_memories" aria-hidden="true">
+        <div class="ov-pane-toolbar"><p class="hint">最近沉淀的工作、策略、反思与假设记忆。</p></div>
+        <div class="ov-table-scroll" tabindex="0" aria-label="记忆表">
+          <table>
+            <thead>
+              <tr><th>ID</th><th>类型</th><th>状态</th><th>置信度</th><th>证据</th><th>内容</th></tr>
+            </thead>
+            <tbody id="mem_body"><tr><td colspan="6" class="muted">加载中…</td></tr></tbody>
+          </table>
+        </div>
+      </div>
 
-    <h2>净值样本</h2>
-    <table>
-      <thead>
-        <tr><th>时间</th><th>净值</th><th>高水位</th><th>回撤</th><th>现金</th><th>BTC 市值</th></tr>
-      </thead>
-      <tbody id="eq_body"><tr><td colspan="6" class="muted">加载中…</td></tr></tbody>
-    </table>
+      <div class="ov-data-pane" id="ov_pane_events" role="tabpanel" aria-labelledby="ov_tab_events" aria-hidden="true">
+        <div class="ov-pane-toolbar"><p class="hint">最近的系统事件流，用于快速确认状态变更与执行链路。</p></div>
+        <div class="ov-table-scroll" tabindex="0" aria-label="事件表">
+          <table>
+            <thead>
+              <tr><th>时间</th><th>类型</th><th>来源</th><th>级别</th><th>版本</th></tr>
+            </thead>
+            <tbody id="ev_body"><tr><td colspan="5" class="muted">加载中…</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="ov-data-pane" id="ov_pane_equity" role="tabpanel" aria-labelledby="ov_tab_equity" aria-hidden="true">
+        <div class="ov-pane-toolbar"><p class="hint">最近的账本净值轨迹样本；完整走势仍在上方净值图中。</p></div>
+        <div class="ov-table-scroll" tabindex="0" aria-label="净值样本表">
+          <table>
+            <thead>
+              <tr><th>时间</th><th>净值</th><th>高水位</th><th>回撤</th><th>现金</th><th>BTC 市值</th></tr>
+            </thead>
+            <tbody id="eq_body"><tr><td colspan="6" class="muted">加载中…</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
   </div>
 
   <!-- ========== 复盘 ========== -->
@@ -780,6 +861,14 @@
 const $ = (id) => document.getElementById(id);
 let lastOk = 0;
 let activeTab = "overview";
+let ovActivePane = (() => {
+  try {
+    const saved = localStorage.getItem("ab_ov_pane");
+    return ["runs", "memories", "events", "equity"].includes(saved) ? saved : "runs";
+  } catch (_) {
+    return "runs";
+  }
+})();
 let openDecisionId = null;
 let lastDecisionsSig = "";
 let decFilter = localStorage.getItem("ab_dec_filter") || "all";
@@ -1996,6 +2085,22 @@ function showReviewPane(name) {
   }
 }
 
+function showOverviewPane(name) {
+  const pane = ["runs", "memories", "events", "equity"].includes(name) ? name : "runs";
+  ovActivePane = pane;
+  try { localStorage.setItem("ab_ov_pane", ovActivePane); } catch (_) {}
+  document.querySelectorAll("#ov_subtabs button").forEach(b => {
+    const active = b.getAttribute("data-ovtab") === ovActivePane;
+    b.classList.toggle("active", active);
+    b.setAttribute("aria-selected", active ? "true" : "false");
+  });
+  document.querySelectorAll(".ov-data-pane").forEach(p => {
+    const active = p.id === "ov_pane_" + ovActivePane;
+    p.classList.toggle("active", active);
+    p.setAttribute("aria-hidden", active ? "false" : "true");
+  });
+}
+
 function onReviewTabVisible() {
   if (reviewChart) {
     const el = $("chart_review");
@@ -2284,6 +2389,10 @@ document.querySelectorAll("#rv_ind_filters button[data-sub]").forEach(btn => {
 document.querySelectorAll("#rv_subtabs button").forEach(btn => {
   btn.addEventListener("click", () => showReviewPane(btn.getAttribute("data-rvtab")));
 });
+document.querySelectorAll("#ov_subtabs button").forEach(btn => {
+  btn.addEventListener("click", () => showOverviewPane(btn.getAttribute("data-ovtab")));
+});
+showOverviewPane(ovActivePane);
 {
   const sel = $("rv_select");
   if (sel) sel.addEventListener("change", () => { if (sel.value) selectReviewDecision(sel.value); });
@@ -2774,6 +2883,9 @@ function showTab(name) {
 }
 document.querySelectorAll(".tab").forEach(btn => {
   btn.addEventListener("click", () => showTab(btn.getAttribute("data-tab")));
+});
+document.querySelectorAll("[data-go-tab]").forEach(btn => {
+  btn.addEventListener("click", () => showTab(btn.getAttribute("data-go-tab")));
 });
 showTab(activeTab);
 
