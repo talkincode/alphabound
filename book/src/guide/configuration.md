@@ -86,6 +86,7 @@ long_interval_ms = 604800000   # 定期复盘·大周期 7d（最小 3600000；0
 | `taker_fee_rate` | decimal | `0.001` | 保守估值 taker 费率 |
 | `slippage_rate` | decimal | `0.0005` | 退出滑点缓冲 |
 | `initial_capital` | decimal | `100` | shadow 模拟账户起始 USDT；须 `> 0` |
+| `min_trade_notional` | decimal | `0` | 每笔最低名义金额（USDT）。只**抬高**交易所 `min_notional`，不降低。低于此值的再平衡会 `plan_hold`；`0` = 仅用交易所下限 |
 
 > 改 `max_drawdown` / 费率类参数 = **版本发布 + 人工确认**，不是运行中调参。
 
@@ -112,7 +113,8 @@ long_interval_ms = 604800000   # 定期复盘·大周期 7d（最小 3600000；0
 
 慢环调度是多因素的：活跃/静默时段各有基础节奏，价格突变、回撤加深、
 风险模式切换会提前触发一次决策，且所有触发都受 `decision_min_interval_ms`
-冷却下限约束。风险内核不受此影响——它始终在快环独立执行。
+冷却下限约束。HOLD 以及因低于最小下单额而 `plan_hold` 的 REBALANCE 会按提案的
+`review_after` 推迟常规节奏（价格/回撤/风险模式事件仍可穿透）。风险内核不受此影响——它始终在快环独立执行。
 每次触发在事件流记录 `AGENT_TRIGGER`（含 reason），便于审计调用频率。
 
 ### `[storage]`

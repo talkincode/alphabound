@@ -20,6 +20,7 @@ allow_runtime_override = false
 taker_fee_rate = 0.001         # 保守估值用 taker 费率
 slippage_rate = 0.0005         # 保守估值滑点缓冲
 initial_capital = 100.0        # shadow 模式模拟起始资金 (USDT)
+# min_trade_notional = 10      # 每笔最低 USDT；低于此值的再平衡 plan_hold（0 = 仅用交易所下限）
 
 [agent]
 provider = "configured-adapter"

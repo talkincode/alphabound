@@ -167,6 +167,43 @@ test "dust delta holds" {
     try testing.expect(p == .hold);
 }
 
+test "buy below min_notional holds even with leftover cash" {
+    // Near-full BTC book: 98.15% → 99% is ~3.75 USDT, under a 10 USDT floor.
+    const floor10 = Instrument{
+        .tick_size = d("0.1"),
+        .lot_size = d("0.00000001"),
+        .min_size = d("0.00001"),
+        .min_notional = d("10"),
+    };
+    const p = try plan(.{
+        .cash_usdt = d("8.82"),
+        .btc_total = d("0.00574788"),
+        .equity = d("442.37"),
+        .mark_price = d("75540.9"),
+        .admitted_btc_weight = d("0.99"),
+        .instrument = floor10,
+    });
+    try testing.expect(p == .hold);
+}
+
+test "all remaining cash below min_notional cannot buy" {
+    const floor10 = Instrument{
+        .tick_size = d("0.1"),
+        .lot_size = d("0.00000001"),
+        .min_size = d("0.00001"),
+        .min_notional = d("10"),
+    };
+    const p = try plan(.{
+        .cash_usdt = d("8.82"),
+        .btc_total = d("0.00574788"),
+        .equity = d("442.37"),
+        .mark_price = d("75540.9"),
+        .admitted_btc_weight = d("1"),
+        .instrument = floor10,
+    });
+    try testing.expect(p == .hold);
+}
+
 test "buy capped by available cash" {
     const p = try plan(.{
         .cash_usdt = d("10"),

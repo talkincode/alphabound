@@ -2224,6 +2224,19 @@ fn jsonStr(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     };
 }
 
+fn applyReviewAfterBackoff(
+    sched: *ab.scheduler.Scheduler,
+    now_ms: i64,
+    review_after: ?[]const u8,
+    why: []const u8,
+) void {
+    const ra = review_after orelse return;
+    const ra_ms = ab.scheduler.parseIsoDurationMs(ra) orelse return;
+    const applied = sched.deferAfterHold(now_ms, ra_ms);
+    if (applied > 0)
+        std.debug.print("[agent] {s} backoff review_after={s} applied_ms={d}\n", .{ why, ra, applied });
+}
+
 fn runAgentDecision(
     gpa: std.mem.Allocator,
     client: *ab.openai.Client,
@@ -2360,6 +2373,8 @@ fn runAgentDecision(
         .max_drawdown = cfg.max_drawdown,
         .instrument = cfg.instrument,
         .now_ms = nowMs(),
+        .min_size = instrument.min_size,
+        .min_notional = instrument.min_notional,
     }) catch {
         std.debug.print("[agent] context render failed\n", .{});
         completeRun(runs, run_id, "error_context", "", "", nowMs());
@@ -2478,6 +2493,8 @@ fn runAgentDecision(
             .max_drawdown = cfg.max_drawdown,
             .instrument = cfg.instrument,
             .now_ms = nowMs(),
+            .min_size = instrument.min_size,
+            .min_notional = instrument.min_notional,
         }) catch {
             std.debug.print("[agent] context render (tool round) failed\n", .{});
             break :tool_round;
@@ -2574,13 +2591,7 @@ fn runAgentDecision(
         // Honor the model's own review_after as a regular-cadence backoff
         // (clamped; event triggers still cut through). Quiet markets stop
         // burning LLM calls re-stating the same HOLD.
-        if (prop.review_after) |ra| {
-            if (ab.scheduler.parseIsoDurationMs(ra)) |ra_ms| {
-                const applied = sched.deferAfterHold(admit_now, ra_ms);
-                if (applied > 0)
-                    std.debug.print("[agent] hold backoff review_after={s} applied_ms={d}\n", .{ ra, applied });
-            }
-        }
+        applyReviewAfterBackoff(sched, admit_now, prop.review_after, "hold");
     } else if (ab.okx_trade.executionAllowed(cfg.mode.isTrading(), exec_venue_authorized)) {
         exec_note = tryDemoExecute(
             gpa,
@@ -2596,6 +2607,12 @@ fn runAgentDecision(
             admit_snap,
             prop.order_policy,
         );
+        // Dust / below-min rebalances are the same no-op as HOLD: honor
+        // review_after so leftover cash below the trade floor does not
+        // re-ask the LLM every base interval.
+        if (std.mem.eql(u8, exec_note, "plan_hold")) {
+            applyReviewAfterBackoff(sched, admit_now, prop.review_after, "plan_hold");
+        }
     }
     // Feed the outcome back to the scheduler: consecutive no-ops (HOLD or
     // plan-held rebalance) escalate the price_move cooldown so trending

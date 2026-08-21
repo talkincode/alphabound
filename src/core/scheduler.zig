@@ -235,10 +235,12 @@ pub const Scheduler = struct {
         self.hold_until_ms = 0;
     }
 
-    /// Honor a HOLD proposal's `review_after` by deferring the next regular-
-    /// cadence fire. Clamped into [current effective interval,
-    /// review_backoff_max_ms]; returns the applied backoff in ms, or 0 when
-    /// the feature is disabled. Event triggers still cut through.
+    /// Honor `review_after` on a no-op decision (HOLD, or REBALANCE that
+    /// planned to HOLD because the delta was dust / below min notional) by
+    /// deferring the next regular-cadence fire. Clamped into [current
+    /// effective interval, review_backoff_max_ms]; returns the applied
+    /// backoff in ms, or 0 when the feature is disabled. Event triggers
+    /// still cut through.
     pub fn deferAfterHold(self: *Scheduler, now_ms: i64, review_after_ms: i64) i64 {
         const cap = self.params.review_backoff_max_ms;
         if (cap <= 0 or review_after_ms <= 0) return 0;
