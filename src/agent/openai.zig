@@ -21,7 +21,12 @@ pub const Error = error{
 };
 
 pub const Usage = struct {
+    /// True only when the provider returned a `usage` object. Zero-token
+    /// responses are still distinguishable from models that omitted usage.
+    reported: bool = false,
     prompt_tokens: u64 = 0,
+    /// Provider-reported cached portion of prompt_tokens, when available.
+    cached_prompt_tokens: u64 = 0,
     completion_tokens: u64 = 0,
     total_tokens: u64 = 0,
 };
@@ -353,9 +358,25 @@ pub fn parseChatResult(gpa: std.mem.Allocator, body: []const u8) Error!ChatResul
     var usage: Usage = .{};
     if (obj.get("usage")) |uv| {
         if (uv == .object) {
+            usage.reported = true;
             usage.prompt_tokens = jsonU64(uv.object.get("prompt_tokens"));
             usage.completion_tokens = jsonU64(uv.object.get("completion_tokens"));
             usage.total_tokens = jsonU64(uv.object.get("total_tokens"));
+            usage.cached_prompt_tokens = jsonU64(uv.object.get("prompt_cache_hit_tokens"));
+            if (usage.cached_prompt_tokens == 0) {
+                usage.cached_prompt_tokens = jsonU64(uv.object.get("cached_tokens"));
+            }
+            if (usage.cached_prompt_tokens == 0) {
+                if (uv.object.get("prompt_tokens_details")) |details| {
+                    if (details == .object) {
+                        usage.cached_prompt_tokens = jsonU64(details.object.get("cached_tokens"));
+                        if (usage.cached_prompt_tokens == 0) {
+                            usage.cached_prompt_tokens = jsonU64(details.object.get("cache_hit_tokens"));
+                        }
+                    }
+                }
+            }
+            usage.cached_prompt_tokens = @min(usage.cached_prompt_tokens, usage.prompt_tokens);
             if (usage.total_tokens == 0)
                 usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
         }
@@ -459,11 +480,13 @@ test "extractJsonObject nested braces in strings" {
 
 test "parses usage tokens" {
     const body =
-        \\{"choices":[{"message":{"role":"assistant","content":"{\"a\":1}"}}],"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18}}
+        \\{"choices":[{"message":{"role":"assistant","content":"{\"a\":1}"}}],"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18,"prompt_tokens_details":{"cached_tokens":4}}}
     ;
     const r = try parseChatResult(std.testing.allocator, body);
     defer std.testing.allocator.free(r.content);
+    try std.testing.expect(r.usage.reported);
     try std.testing.expectEqual(@as(u64, 11), r.usage.prompt_tokens);
+    try std.testing.expectEqual(@as(u64, 4), r.usage.cached_prompt_tokens);
     try std.testing.expectEqual(@as(u64, 7), r.usage.completion_tokens);
     try std.testing.expectEqual(@as(u64, 18), r.usage.total_tokens);
 }

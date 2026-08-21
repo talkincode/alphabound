@@ -39,8 +39,8 @@ curl -sS -H "Authorization: Bearer YOUR_TOKEN" http://127.0.0.1:18180/api/v1/sta
 | 形态 | 单文件 HTML + favicon 集，**编译期嵌入**二进制（`dashboard/`） |
 | 入口 | `GET /` 与 `GET /index.html` |
 | 依赖 | 零 Node 运行时；浏览器直接 `fetch` API |
-| 刷新 | 前端约 2s 轮询 state / shadow / agent-runs / equity / candles / memories / events / system / orders / decisions / review-chats |
-| 内容 | Overview + Shadow vs BH + **Lightweight Charts**（分时/多周期 K 线 + 成交量 + 净值/HWM）+ **复盘**（K 线决策标记 + 指标 + AI 复盘对话 + 复盘记录）+ 提案/记忆/事件/订单 + System |
+| 刷新 | 前端约 2s 轮询 state / shadow / agent-runs / equity / candles / memories / events / system / orders / decisions / review-chats / statistics |
+| 内容 | Overview + Shadow vs BH + **Lightweight Charts**（分时/多周期 K 线 + 成交量 + 净值/HWM）+ **复盘**（K 线决策标记 + 指标 + AI 复盘对话 + 复盘记录）+ **统计**（持久化 LLM Token/成本账本）+ 提案/记忆/事件/订单 + System |
 
 概览图表使用 [Lightweight Charts](https://www.tradingview.com/lightweight-charts/)（CDN）。周期按钮：**分时**（1m 收盘面积图）、1分/5分/15分/1时/4时/1日。离线无 CDN 时其余 UI 仍可用。
 
@@ -114,6 +114,7 @@ open http://127.0.0.1:18180/
 | `GET /api/v1/candles` | 多周期 K 线缓存 `bars.{1m,5m,15m,1H,4H,1D}` |
 | `GET /api/v1/memories` | 最新版本记忆 |
 | `GET /api/v1/system` | 进程/agent/paused/disk/latency 等 |
+| `GET /api/v1/statistics` | 持久化 LLM 调用、Token、市场价成本、覆盖率与近期账本 |
 | `GET /api/v1/decisions` | 提案/反思审计事件（含 thesis） |
 | `GET /api/v1/orders` | `{"orders":[...],"fills":[...]}` 投影 |
 | `GET /api/v1/review/chats` | 复盘对话最近轮次（newest first，客户端按 `id` 升序重排） |
@@ -156,6 +157,38 @@ open http://127.0.0.1:18180/
   "agent": {"total": 4, "ok": 3, "invalid": 0, "errors": 1, "valid_rate": 75.0, "tool_calls": 8}
 }
 ```
+
+### `GET /api/v1/statistics`
+
+Dashboard「统计」页的数据源。核心循环从 SQLite `llm_usage` 逐调用账本预渲染快照；HTTP 线程不直接查询 SQLite。响应按 **UTC** 聚合，提供过去 24 小时、7 天、30 天总计，最近 30 天日序列、按调用类型/模型分布，以及最近 32 次调用：
+
+```json
+{
+  "timezone": "UTC",
+  "currency": "USD",
+  "cost_unit": "nano_usd",
+  "price_basis": "market_estimate",
+  "last_24h": {
+    "calls": 12,
+    "ok_calls": 11,
+    "usage_reported_calls": 10,
+    "priced_calls": 10,
+    "prompt_tokens": 120000,
+    "cached_prompt_tokens": 30000,
+    "completion_tokens": 8000,
+    "input_cost_nano_usd": 25000000,
+    "output_cost_nano_usd": 5300000
+  },
+  "daily_utc": [{"day": "2026-08-21", "totals": {"calls": 12}}],
+  "by_kind_30d": [{"kind": "proposal", "totals": {"calls": 8}}],
+  "by_model_30d": [{"model": "DeepSeek-V4-Flash-0731", "totals": {"calls": 12}}],
+  "recent": [{"ts": "2026-08-21T00:00:00.000Z", "kind": "proposal", "outcome": "ok"}]
+}
+```
+
+- **完整性优先**：每次模型调用（成功、业务输出无效、超时/HTTP/解析失败）都写一条账本。`usage_reported=false` 表示 Provider 没有给出 usage；`cost_known=false` 表示模型未识别、usage 缺失或调用失败。二者都不能当作零成本。
+- **价格边界**：目前识别 DeepSeek V4 Flash 的版本化市场价档；按调用开始时的 UTC 峰/非峰段分别计算缓存命中输入、缓存未命中输入和输出成本，使用整数 nano USD 结算。它是**市场价估算，不是供应商、网关或代理商账单**；未知模型保持未定价。
+- **隐私边界**：账本仅保存时间、调用类型、模型、关联 run/decision、延迟、Token、价格档、费用和短错误类别；不保存 Prompt、Completion、Provider URL、密钥或原始错误响应。
 
 ### `GET /api/v1/candles`
 
@@ -253,6 +286,7 @@ curl -sS "${AUTH[@]}" "$HOST/api/v1/shadow" | jq .
 curl -sS "${AUTH[@]}" "$HOST/api/v1/orders" | jq .
 curl -sS "${AUTH[@]}" "$HOST/api/v1/decisions" | jq '.[0:3]'
 curl -sS "${AUTH[@]}" "$HOST/api/v1/system" | jq .
+curl -sS "${AUTH[@]}" "$HOST/api/v1/statistics" | jq .
 curl -sS -o /dev/null -w "%{http_code}\n" "$HOST/"
 ```
 

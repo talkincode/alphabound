@@ -71,6 +71,9 @@ pub const WebState = struct {
     /// Must match the worst-case test in src/analytics/ab_factor.zig.
     analytics_buf: [131072]u8 = undefined,
     analytics_len: usize = 2,
+    /// Durable LLM usage/cost statistics (UTC market-price estimate).
+    statistics_buf: [65536]u8 = undefined,
+    statistics_len: usize = 2,
     /// Dashboard / MCP auth (optional; empty token = open).
     auth_cfg: web_auth.Config = .{},
     cred_store: ?*web_auth.CredStore = null,
@@ -109,6 +112,8 @@ pub const WebState = struct {
         self.periodic_len = 2;
         @memcpy(self.analytics_buf[0..2], "{}");
         self.analytics_len = 2;
+        @memcpy(self.statistics_buf[0..2], "{}");
+        self.statistics_len = 2;
     }
 
     pub fn contextFn(userdata: ?*anyopaque) web.Context {
@@ -130,6 +135,7 @@ pub const WebState = struct {
             var audit: [24576]u8 = undefined;
             var periodic: [49152]u8 = undefined;
             var analytics: [131072]u8 = undefined;
+            var statistics: [65536]u8 = undefined;
             var config_hash: [71]u8 = undefined;
             var agent_len: usize = 2;
             var equity_len: usize = 2;
@@ -145,6 +151,7 @@ pub const WebState = struct {
             var audit_len: usize = 2;
             var periodic_len: usize = 2;
             var analytics_len: usize = 2;
+            var statistics_len: usize = 2;
         };
         const self: *WebState = @ptrCast(@alignCast(userdata.?));
         while (true) {
@@ -169,7 +176,8 @@ pub const WebState = struct {
             const aul = self.audit_len;
             const pdl = self.periodic_len;
             const anl = self.analytics_len;
-            if (al > Tls.agent.len or el > Tls.equity.len or vl > Tls.events.len or sl > Tls.shadow.len or cl > Tls.candles.len or ml > Tls.memories.len or yl > Tls.system.len or dl > Tls.decisions.len or ol > Tls.orders.len or rl > Tls.review_chats.len or rcl > Tls.review_ctx.len or aul > Tls.audit.len or pdl > Tls.periodic.len or anl > Tls.analytics.len) {
+            const stl = self.statistics_len;
+            if (al > Tls.agent.len or el > Tls.equity.len or vl > Tls.events.len or sl > Tls.shadow.len or cl > Tls.candles.len or ml > Tls.memories.len or yl > Tls.system.len or dl > Tls.decisions.len or ol > Tls.orders.len or rl > Tls.review_chats.len or rcl > Tls.review_ctx.len or aul > Tls.audit.len or pdl > Tls.periodic.len or anl > Tls.analytics.len or stl > Tls.statistics.len) {
                 std.atomic.spinLoopHint();
                 continue;
             }
@@ -187,6 +195,7 @@ pub const WebState = struct {
             @memcpy(Tls.audit[0..aul], self.audit_buf[0..aul]);
             @memcpy(Tls.periodic[0..pdl], self.periodic_buf[0..pdl]);
             @memcpy(Tls.analytics[0..anl], self.analytics_buf[0..anl]);
+            @memcpy(Tls.statistics[0..stl], self.statistics_buf[0..stl]);
             @memcpy(Tls.config_hash[0..], self.config_hash[0..]);
             Tls.agent_len = al;
             Tls.equity_len = el;
@@ -202,6 +211,7 @@ pub const WebState = struct {
             Tls.audit_len = aul;
             Tls.periodic_len = pdl;
             Tls.analytics_len = anl;
+            Tls.statistics_len = stl;
             const s2 = self.seq.load(.acquire);
             if (s1 == s2) {
                 return .{
@@ -224,6 +234,7 @@ pub const WebState = struct {
                     .audit_json = Tls.audit[0..Tls.audit_len],
                     .periodic_json = Tls.periodic[0..Tls.periodic_len],
                     .analytics_json = Tls.analytics[0..Tls.analytics_len],
+                    .statistics_json = Tls.statistics[0..Tls.statistics_len],
                     .index_html = self.index_html,
                     .auth_cfg = self.auth_cfg,
                     .cred_store = self.cred_store,
@@ -243,7 +254,7 @@ pub const WebState = struct {
         _ = self.seq.fetchAdd(1, .release); // even: stable
     }
 
-    pub fn setJson(self: *WebState, comptime which: enum { agent, equity, events, shadow, candles, memories, system, decisions, orders, review, review_ctx, audit, periodic, analytics }, src: []const u8) void {
+    pub fn setJson(self: *WebState, comptime which: enum { agent, equity, events, shadow, candles, memories, system, decisions, orders, review, review_ctx, audit, periodic, analytics, statistics }, src: []const u8) void {
         _ = self.seq.fetchAdd(1, .acq_rel);
         switch (which) {
             .agent => {
@@ -315,6 +326,11 @@ pub const WebState = struct {
                 const n = @min(src.len, self.analytics_buf.len);
                 @memcpy(self.analytics_buf[0..n], src[0..n]);
                 self.analytics_len = n;
+            },
+            .statistics => {
+                const n = @min(src.len, self.statistics_buf.len);
+                @memcpy(self.statistics_buf[0..n], src[0..n]);
+                self.statistics_len = n;
             },
         }
         _ = self.seq.fetchAdd(1, .release);
@@ -550,6 +566,17 @@ pub fn refreshPeriodicReviewCache(ws: *WebState, db: *storage.Db, repo: *storage
     if (repo.listRecentJson(db, &tmp, 24)) |j| {
         ws.setJson(.periodic, j);
     } else |_| {}
+}
+
+/// Re-render the durable LLM metering ledger for the HTTP cache. The web
+/// thread never opens SQLite; this preserves the core-loop single-writer model.
+pub fn refreshStatisticsCache(ws: *WebState, db: *storage.Db, repo: *storage.LlmUsageRepo) void {
+    var tmp: [65536]u8 = undefined;
+    if (repo.writeStatisticsJson(db, &tmp, nowMs())) |json| {
+        ws.setJson(.statistics, json);
+    } else |err| {
+        std.debug.print("[dashboard] statistics json render failed: {t}\n", .{err});
+    }
 }
 
 /// Re-render the AB 因子复盘 analytics blob from the 1m equity trail (core

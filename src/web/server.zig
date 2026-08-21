@@ -74,6 +74,8 @@ pub const Context = struct {
     periodic_json: []const u8 = "[]",
     /// AB 因子复盘 analytics blob (experimental, research-only).
     analytics_json: []const u8 = "{}",
+    /// Durable LLM token/cost statistics, pre-rendered by the core loop.
+    statistics_json: []const u8 = "{}",
     /// Dashboard HTML served at "/". Embedded at comptime; empty = 404.
     index_html: []const u8 = "",
     auth_cfg: auth.Config = .{},
@@ -270,6 +272,7 @@ pub fn handleReq(buf: []u8, req: RequestInfo, ctx: Context) Response {
     if (std.mem.eql(u8, path, "/api/v1/review/analytics")) return copyBody(buf, ctx.analytics_json);
     if (std.mem.eql(u8, path, "/api/v1/review/periodic")) return copyBody(buf, ctx.periodic_json);
     if (std.mem.eql(u8, path, "/api/v1/audit")) return copyBody(buf, ctx.audit_json);
+    if (std.mem.eql(u8, path, "/api/v1/statistics")) return copyBody(buf, ctx.statistics_json);
     return .{ .status = .not_found, .body = "{\"error\":\"not found\"}" };
 }
 
@@ -1048,6 +1051,7 @@ test "agent-runs equity shadow endpoints serve context blobs" {
     ctx.audit_json = "[{\"audit_id\":\"aud_1\",\"status\":\"ok\"}]";
     ctx.periodic_json = "[{\"review_id\":\"pr_1\",\"cycle\":\"short\"}]";
     ctx.analytics_json = "{\"factor_version\":\"v1\",\"points\":[]}";
+    ctx.statistics_json = "{\"timezone\":\"UTC\",\"last_24h\":{\"calls\":1}}";
     try testing.expectEqualStrings("[{\"run_id\":\"r1\"}]", handle(&buf, .GET, "/api/v1/agent-runs", ctx).body);
     try testing.expectEqualStrings("[{\"equity\":\"100\"}]", handle(&buf, .GET, "/api/v1/equity", ctx).body);
     try testing.expectEqualStrings("{\"alpha\":\"0\"}", handle(&buf, .GET, "/api/v1/shadow", ctx).body);
@@ -1061,6 +1065,7 @@ test "agent-runs equity shadow endpoints serve context blobs" {
     try testing.expectEqualStrings("[{\"audit_id\":\"aud_1\",\"status\":\"ok\"}]", handle(&buf, .GET, "/api/v1/audit", ctx).body);
     try testing.expectEqualStrings("{\"factor_version\":\"v1\",\"points\":[]}", handle(&buf, .GET, "/api/v1/review/analytics", ctx).body);
     try testing.expectEqualStrings("[{\"review_id\":\"pr_1\",\"cycle\":\"short\"}]", handle(&buf, .GET, "/api/v1/review/periodic", ctx).body);
+    try testing.expectEqualStrings("{\"timezone\":\"UTC\",\"last_24h\":{\"calls\":1}}", handle(&buf, .GET, "/api/v1/statistics", ctx).body);
 }
 
 test "review POST enqueues into inbox; validation and limits enforced" {

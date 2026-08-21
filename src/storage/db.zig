@@ -18,6 +18,8 @@ pub const DbError = error{
     Busy,
 };
 
+const StatsWriteError = DbError || error{WriteFailed};
+
 const migration_0001: [:0]const u8 = @embedFile("migration_0001");
 const migration_0002: [:0]const u8 = @embedFile("migration_0002");
 const migration_0003: [:0]const u8 = @embedFile("migration_0003");
@@ -25,6 +27,7 @@ const migration_0004: [:0]const u8 = @embedFile("migration_0004");
 const migration_0005: [:0]const u8 = @embedFile("migration_0005");
 const migration_0006: [:0]const u8 = @embedFile("migration_0006");
 const migration_0007: [:0]const u8 = @embedFile("migration_0007");
+const migration_0008: [:0]const u8 = @embedFile("migration_0008");
 
 /// Ordered list of migrations; user_version tracks the applied count.
 const migrations = [_][:0]const u8{
@@ -35,6 +38,7 @@ const migrations = [_][:0]const u8{
     migration_0005,
     migration_0006,
     migration_0007,
+    migration_0008,
 };
 
 /// Expected user_version for a fully migrated database (restore drills).
@@ -1144,6 +1148,348 @@ pub const ToolCallsRepo = struct {
     }
 };
 
+/// One provider invocation, persisted without prompt/completion content so
+/// statistics can remain useful and safe to expose through the Dashboard.
+pub const LlmUsageRow = struct {
+    ts: []const u8,
+    call_kind: []const u8,
+    run_id: []const u8 = "",
+    decision_id: []const u8 = "",
+    model: []const u8,
+    outcome: []const u8,
+    error_class: []const u8 = "",
+    latency_ms: i64 = 0,
+    usage_reported: bool = false,
+    prompt_tokens: u64 = 0,
+    cached_prompt_tokens: u64 = 0,
+    completion_tokens: u64 = 0,
+    total_tokens: u64 = 0,
+    price_profile: []const u8 = "",
+    input_cost_nano_usd: u64 = 0,
+    output_cost_nano_usd: u64 = 0,
+    cost_known: bool = false,
+};
+
+pub const LlmUsageRepo = struct {
+    insert: Stmt,
+
+    pub fn init(db: *Db) DbError!LlmUsageRepo {
+        return .{ .insert = try db.prepare(
+            \\INSERT INTO llm_usage (
+            \\  ts, call_kind, run_id, decision_id, model, outcome, error_class,
+            \\  latency_ms, usage_reported, prompt_tokens, cached_prompt_tokens,
+            \\  completion_tokens, total_tokens, price_profile,
+            \\  input_cost_nano_usd, output_cost_nano_usd, cost_known
+            \\) VALUES (
+            \\  ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+            \\  ?14, ?15, ?16, ?17
+            \\)
+        ) };
+    }
+
+    pub fn deinit(self: *LlmUsageRepo) void {
+        self.insert.finalize();
+    }
+
+    pub fn append(self: *LlmUsageRepo, row: LlmUsageRow) DbError!void {
+        self.insert.reset();
+        try self.insert.bindText(1, row.ts);
+        try self.insert.bindText(2, row.call_kind);
+        try self.insert.bindText(3, row.run_id);
+        try self.insert.bindText(4, row.decision_id);
+        try self.insert.bindText(5, row.model);
+        try self.insert.bindText(6, row.outcome);
+        try self.insert.bindText(7, row.error_class);
+        try self.insert.bindInt(8, @max(@as(i64, 0), row.latency_ms));
+        try self.insert.bindInt(9, if (row.usage_reported) 1 else 0);
+        try self.insert.bindInt(10, boundedU64(row.prompt_tokens));
+        try self.insert.bindInt(11, boundedU64(row.cached_prompt_tokens));
+        try self.insert.bindInt(12, boundedU64(row.completion_tokens));
+        try self.insert.bindInt(13, boundedU64(row.total_tokens));
+        try self.insert.bindText(14, row.price_profile);
+        try self.insert.bindInt(15, boundedU64(row.input_cost_nano_usd));
+        try self.insert.bindInt(16, boundedU64(row.output_cost_nano_usd));
+        try self.insert.bindInt(17, if (row.cost_known) 1 else 0);
+        _ = try self.insert.stepCritical();
+    }
+
+    /// Pre-render a bounded read-only analytics payload. It intentionally
+    /// includes coverage fields so unknown model prices or omitted provider
+    /// usage cannot masquerade as zero spending.
+    pub fn writeStatisticsJson(
+        self: *LlmUsageRepo,
+        db: *Db,
+        out: []u8,
+        now_ms: i64,
+    ) StatsWriteError![]const u8 {
+        _ = self;
+        var since_24h_buf: [40]u8 = undefined;
+        var since_7d_buf: [40]u8 = undefined;
+        var since_30d_buf: [40]u8 = undefined;
+        const since_24h = clock.formatRfc3339Ms(now_ms - 24 * std.time.ms_per_hour, &since_24h_buf) catch return error.StepFailed;
+        const since_7d = clock.formatRfc3339Ms(now_ms - 7 * 24 * std.time.ms_per_hour, &since_7d_buf) catch return error.StepFailed;
+        const since_30d = clock.formatRfc3339Ms(now_ms - 30 * 24 * std.time.ms_per_hour, &since_30d_buf) catch return error.StepFailed;
+
+        const last_24h = try llmUsageTotalsSince(db, since_24h);
+        const last_7d = try llmUsageTotalsSince(db, since_7d);
+        const last_30d = try llmUsageTotalsSince(db, since_30d);
+
+        var w: std.Io.Writer = .fixed(out);
+        w.print(
+            "{{\"as_of_ms\":{d},\"timezone\":\"UTC\",\"currency\":\"USD\",\"cost_unit\":\"nano_usd\",\"price_basis\":\"market_estimate\",\"last_24h\":",
+            .{now_ms},
+        ) catch return error.StepFailed;
+        try writeLlmUsageTotals(&w, last_24h);
+        w.writeAll(",\"last_7d\":") catch return error.StepFailed;
+        try writeLlmUsageTotals(&w, last_7d);
+        w.writeAll(",\"last_30d\":") catch return error.StepFailed;
+        try writeLlmUsageTotals(&w, last_30d);
+        w.writeAll(",\"daily_utc\":") catch return error.StepFailed;
+        try writeLlmUsageDaily(db, &w, since_30d);
+        w.writeAll(",\"by_kind_30d\":") catch return error.StepFailed;
+        try writeLlmUsageByKind(db, &w, since_30d);
+        w.writeAll(",\"by_model_30d\":") catch return error.StepFailed;
+        try writeLlmUsageByModel(db, &w, since_30d);
+        w.writeAll(",\"recent\":") catch return error.StepFailed;
+        try writeRecentLlmUsage(db, &w, 32);
+        w.writeByte('}') catch return error.StepFailed;
+        return w.buffered();
+    }
+};
+
+fn boundedU64(v: u64) i64 {
+    return @intCast(@min(v, @as(u64, std.math.maxInt(i64))));
+}
+
+const LlmUsageTotals = struct {
+    calls: i64 = 0,
+    ok_calls: i64 = 0,
+    error_calls: i64 = 0,
+    usage_reported_calls: i64 = 0,
+    priced_calls: i64 = 0,
+    prompt_tokens: i64 = 0,
+    cached_prompt_tokens: i64 = 0,
+    completion_tokens: i64 = 0,
+    total_tokens: i64 = 0,
+    input_cost_nano_usd: i64 = 0,
+    output_cost_nano_usd: i64 = 0,
+    avg_latency_ms: i64 = 0,
+    max_latency_ms: i64 = 0,
+};
+
+fn llmUsageTotalsSince(db: *Db, since: []const u8) DbError!LlmUsageTotals {
+    var stmt = try db.prepare(
+        \\SELECT
+        \\  COUNT(*),
+        \\  COALESCE(SUM(CASE WHEN outcome = 'ok' THEN 1 ELSE 0 END), 0),
+        \\  COALESCE(SUM(CASE WHEN outcome = 'error' THEN 1 ELSE 0 END), 0),
+        \\  COALESCE(SUM(usage_reported), 0),
+        \\  COALESCE(SUM(cost_known), 0),
+        \\  COALESCE(SUM(prompt_tokens), 0),
+        \\  COALESCE(SUM(cached_prompt_tokens), 0),
+        \\  COALESCE(SUM(completion_tokens), 0),
+        \\  COALESCE(SUM(total_tokens), 0),
+        \\  COALESCE(SUM(input_cost_nano_usd), 0),
+        \\  COALESCE(SUM(output_cost_nano_usd), 0),
+        \\  COALESCE(AVG(latency_ms), 0),
+        \\  COALESCE(MAX(latency_ms), 0)
+        \\FROM llm_usage WHERE ts >= ?1
+    );
+    defer stmt.finalize();
+    try stmt.bindText(1, since);
+    if (!try stmt.step()) return .{};
+    return totalsFromStmt(&stmt, 0);
+}
+
+fn totalsFromStmt(stmt: *Stmt, base: c_int) LlmUsageTotals {
+    return .{
+        .calls = stmt.columnInt(base + 0),
+        .ok_calls = stmt.columnInt(base + 1),
+        .error_calls = stmt.columnInt(base + 2),
+        .usage_reported_calls = stmt.columnInt(base + 3),
+        .priced_calls = stmt.columnInt(base + 4),
+        .prompt_tokens = stmt.columnInt(base + 5),
+        .cached_prompt_tokens = stmt.columnInt(base + 6),
+        .completion_tokens = stmt.columnInt(base + 7),
+        .total_tokens = stmt.columnInt(base + 8),
+        .input_cost_nano_usd = stmt.columnInt(base + 9),
+        .output_cost_nano_usd = stmt.columnInt(base + 10),
+        .avg_latency_ms = stmt.columnInt(base + 11),
+        .max_latency_ms = stmt.columnInt(base + 12),
+    };
+}
+
+fn writeLlmUsageTotals(w: *std.Io.Writer, totals: LlmUsageTotals) DbError!void {
+    w.print(
+        "{{\"calls\":{d},\"ok_calls\":{d},\"error_calls\":{d},\"usage_reported_calls\":{d},\"priced_calls\":{d},\"prompt_tokens\":{d},\"cached_prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d},\"input_cost_nano_usd\":{d},\"output_cost_nano_usd\":{d},\"avg_latency_ms\":{d},\"max_latency_ms\":{d}}}",
+        .{
+            totals.calls,
+            totals.ok_calls,
+            totals.error_calls,
+            totals.usage_reported_calls,
+            totals.priced_calls,
+            totals.prompt_tokens,
+            totals.cached_prompt_tokens,
+            totals.completion_tokens,
+            totals.total_tokens,
+            totals.input_cost_nano_usd,
+            totals.output_cost_nano_usd,
+            totals.avg_latency_ms,
+            totals.max_latency_ms,
+        },
+    ) catch return error.StepFailed;
+}
+
+fn writeLlmUsageDaily(db: *Db, w: *std.Io.Writer, since: []const u8) StatsWriteError!void {
+    var stmt = try db.prepare(
+        \\SELECT substr(ts, 1, 10),
+        \\  COUNT(*),
+        \\  COALESCE(SUM(CASE WHEN outcome = 'ok' THEN 1 ELSE 0 END), 0),
+        \\  COALESCE(SUM(CASE WHEN outcome = 'error' THEN 1 ELSE 0 END), 0),
+        \\  COALESCE(SUM(usage_reported), 0),
+        \\  COALESCE(SUM(cost_known), 0),
+        \\  COALESCE(SUM(prompt_tokens), 0),
+        \\  COALESCE(SUM(cached_prompt_tokens), 0),
+        \\  COALESCE(SUM(completion_tokens), 0),
+        \\  COALESCE(SUM(total_tokens), 0),
+        \\  COALESCE(SUM(input_cost_nano_usd), 0),
+        \\  COALESCE(SUM(output_cost_nano_usd), 0),
+        \\  COALESCE(AVG(latency_ms), 0),
+        \\  COALESCE(MAX(latency_ms), 0)
+        \\FROM llm_usage WHERE ts >= ?1
+        \\GROUP BY substr(ts, 1, 10) ORDER BY 1 ASC
+    );
+    defer stmt.finalize();
+    try stmt.bindText(1, since);
+    try w.writeByte('[');
+    var first = true;
+    while (try stmt.step()) {
+        if (!first) try w.writeByte(',');
+        first = false;
+        try w.writeAll("{\"day\":\"");
+        try writeJsonEscaped(w, stmt.columnText(0));
+        try w.writeAll("\",\"totals\":");
+        try writeLlmUsageTotals(w, totalsFromStmt(&stmt, 1));
+        try w.writeByte('}');
+    }
+    try w.writeByte(']');
+}
+
+fn writeLlmUsageByKind(db: *Db, w: *std.Io.Writer, since: []const u8) StatsWriteError!void {
+    var stmt = try db.prepare(
+        \\SELECT call_kind,
+        \\  COUNT(*),
+        \\  COALESCE(SUM(CASE WHEN outcome = 'ok' THEN 1 ELSE 0 END), 0),
+        \\  COALESCE(SUM(CASE WHEN outcome = 'error' THEN 1 ELSE 0 END), 0),
+        \\  COALESCE(SUM(usage_reported), 0),
+        \\  COALESCE(SUM(cost_known), 0),
+        \\  COALESCE(SUM(prompt_tokens), 0),
+        \\  COALESCE(SUM(cached_prompt_tokens), 0),
+        \\  COALESCE(SUM(completion_tokens), 0),
+        \\  COALESCE(SUM(total_tokens), 0),
+        \\  COALESCE(SUM(input_cost_nano_usd), 0),
+        \\  COALESCE(SUM(output_cost_nano_usd), 0),
+        \\  COALESCE(AVG(latency_ms), 0),
+        \\  COALESCE(MAX(latency_ms), 0)
+        \\FROM llm_usage WHERE ts >= ?1
+        \\GROUP BY call_kind ORDER BY SUM(input_cost_nano_usd + output_cost_nano_usd) DESC, call_kind ASC
+    );
+    defer stmt.finalize();
+    try stmt.bindText(1, since);
+    try w.writeByte('[');
+    var first = true;
+    while (try stmt.step()) {
+        if (!first) try w.writeByte(',');
+        first = false;
+        try w.writeAll("{\"kind\":\"");
+        try writeJsonEscaped(w, stmt.columnText(0));
+        try w.writeAll("\",\"totals\":");
+        try writeLlmUsageTotals(w, totalsFromStmt(&stmt, 1));
+        try w.writeByte('}');
+    }
+    try w.writeByte(']');
+}
+
+fn writeLlmUsageByModel(db: *Db, w: *std.Io.Writer, since: []const u8) StatsWriteError!void {
+    var stmt = try db.prepare(
+        \\SELECT model,
+        \\  COUNT(*),
+        \\  COALESCE(SUM(CASE WHEN outcome = 'ok' THEN 1 ELSE 0 END), 0),
+        \\  COALESCE(SUM(CASE WHEN outcome = 'error' THEN 1 ELSE 0 END), 0),
+        \\  COALESCE(SUM(usage_reported), 0),
+        \\  COALESCE(SUM(cost_known), 0),
+        \\  COALESCE(SUM(prompt_tokens), 0),
+        \\  COALESCE(SUM(cached_prompt_tokens), 0),
+        \\  COALESCE(SUM(completion_tokens), 0),
+        \\  COALESCE(SUM(total_tokens), 0),
+        \\  COALESCE(SUM(input_cost_nano_usd), 0),
+        \\  COALESCE(SUM(output_cost_nano_usd), 0),
+        \\  COALESCE(AVG(latency_ms), 0),
+        \\  COALESCE(MAX(latency_ms), 0)
+        \\FROM llm_usage WHERE ts >= ?1
+        \\GROUP BY model ORDER BY SUM(input_cost_nano_usd + output_cost_nano_usd) DESC, model ASC
+    );
+    defer stmt.finalize();
+    try stmt.bindText(1, since);
+    try w.writeByte('[');
+    var first = true;
+    while (try stmt.step()) {
+        if (!first) try w.writeByte(',');
+        first = false;
+        try w.writeAll("{\"model\":\"");
+        try writeJsonEscaped(w, stmt.columnText(0));
+        try w.writeAll("\",\"totals\":");
+        try writeLlmUsageTotals(w, totalsFromStmt(&stmt, 1));
+        try w.writeByte('}');
+    }
+    try w.writeByte(']');
+}
+
+fn writeRecentLlmUsage(db: *Db, w: *std.Io.Writer, limit: i64) StatsWriteError!void {
+    var stmt = try db.prepare(
+        \\SELECT ts, call_kind, model, outcome, error_class, latency_ms,
+        \\  usage_reported, prompt_tokens, cached_prompt_tokens, completion_tokens,
+        \\  total_tokens, price_profile, input_cost_nano_usd, output_cost_nano_usd,
+        \\  cost_known
+        \\FROM llm_usage ORDER BY id DESC LIMIT ?1
+    );
+    defer stmt.finalize();
+    try stmt.bindInt(1, limit);
+    try w.writeByte('[');
+    var first = true;
+    while (try stmt.step()) {
+        if (!first) try w.writeByte(',');
+        first = false;
+        try w.writeAll("{\"ts\":\"");
+        try writeJsonEscaped(w, stmt.columnText(0));
+        try w.writeAll("\",\"kind\":\"");
+        try writeJsonEscaped(w, stmt.columnText(1));
+        try w.writeAll("\",\"model\":\"");
+        try writeJsonEscaped(w, stmt.columnText(2));
+        try w.writeAll("\",\"outcome\":\"");
+        try writeJsonEscaped(w, stmt.columnText(3));
+        try w.writeAll("\",\"error_class\":\"");
+        try writeJsonEscaped(w, stmt.columnText(4));
+        try w.print(
+            "\",\"latency_ms\":{d},\"usage_reported\":{},\"prompt_tokens\":{d},\"cached_prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d},\"price_profile\":\"",
+            .{
+                stmt.columnInt(5),
+                stmt.columnInt(6) != 0,
+                stmt.columnInt(7),
+                stmt.columnInt(8),
+                stmt.columnInt(9),
+                stmt.columnInt(10),
+            },
+        );
+        try writeJsonEscaped(w, stmt.columnText(11));
+        try w.print(
+            "\",\"input_cost_nano_usd\":{d},\"output_cost_nano_usd\":{d},\"cost_known\":{}}}",
+            .{ stmt.columnInt(12), stmt.columnInt(13), stmt.columnInt(14) != 0 },
+        );
+    }
+    try w.writeByte(']');
+}
+
 pub const MemoryRow = struct {
     memory_id: []const u8,
     version: i64,
@@ -1725,6 +2071,92 @@ test "open runs migrations and sets WAL" {
     // Re-open: migrations must be idempotent.
     var db2 = try Db.open(path);
     db2.close();
+}
+
+test "LLM usage ledger aggregates priced and unmetered calls explicitly" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const path = try tmpDbPath(&tmp, &path_buf);
+    var db = try Db.open(path);
+    defer db.close();
+    var repo = try LlmUsageRepo.init(&db);
+    defer repo.deinit();
+
+    const now_ms: i64 = 1_800_000_000_000;
+    var ts_priced_buf: [40]u8 = undefined;
+    var ts_error_buf: [40]u8 = undefined;
+    var ts_unknown_buf: [40]u8 = undefined;
+    var ts_old_buf: [40]u8 = undefined;
+    const ts_priced = try clock.formatRfc3339Ms(now_ms - std.time.ms_per_hour, &ts_priced_buf);
+    const ts_error = try clock.formatRfc3339Ms(now_ms - 2 * std.time.ms_per_hour, &ts_error_buf);
+    const ts_unknown = try clock.formatRfc3339Ms(now_ms - 3 * std.time.ms_per_hour, &ts_unknown_buf);
+    const ts_old = try clock.formatRfc3339Ms(now_ms - 31 * 24 * std.time.ms_per_hour, &ts_old_buf);
+
+    try repo.append(.{
+        .ts = ts_priced,
+        .call_kind = "proposal",
+        .run_id = "run_1",
+        .model = "DeepSeek-V4-Flash-0731",
+        .outcome = "ok",
+        .latency_ms = 120,
+        .usage_reported = true,
+        .prompt_tokens = 100,
+        .cached_prompt_tokens = 10,
+        .completion_tokens = 20,
+        .total_tokens = 120,
+        .price_profile = "test-rate",
+        .input_cost_nano_usd = 1_000,
+        .output_cost_nano_usd = 2_000,
+        .cost_known = true,
+    });
+    try repo.append(.{
+        .ts = ts_error,
+        .call_kind = "reflection",
+        .run_id = "run_1",
+        .model = "DeepSeek-V4-Flash-0731",
+        .outcome = "error",
+        .error_class = "timeout",
+        .latency_ms = 200,
+    });
+    try repo.append(.{
+        .ts = ts_unknown,
+        .call_kind = "review_chat",
+        .decision_id = "dec_1",
+        .model = "unpriced-model",
+        .outcome = "ok",
+        .latency_ms = 80,
+        .usage_reported = true,
+        .prompt_tokens = 7,
+        .completion_tokens = 3,
+        .total_tokens = 10,
+    });
+    try repo.append(.{
+        .ts = ts_old,
+        .call_kind = "proposal",
+        .model = "DeepSeek-V4-Flash-0731",
+        .outcome = "ok",
+        .usage_reported = true,
+        .prompt_tokens = 1,
+        .total_tokens = 1,
+        .cost_known = true,
+        .input_cost_nano_usd = 99,
+    });
+
+    var out: [65536]u8 = undefined;
+    const json = try repo.writeStatisticsJson(&db, &out, now_ms);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try testing.expectEqualStrings("UTC", root.get("timezone").?.string);
+    try testing.expectEqualStrings("market_estimate", root.get("price_basis").?.string);
+    const totals = root.get("last_24h").?.object;
+    try testing.expectEqual(@as(i64, 3), totals.get("calls").?.integer);
+    try testing.expectEqual(@as(i64, 1), totals.get("error_calls").?.integer);
+    try testing.expectEqual(@as(i64, 2), totals.get("usage_reported_calls").?.integer);
+    try testing.expectEqual(@as(i64, 1), totals.get("priced_calls").?.integer);
+    try testing.expectEqual(@as(i64, 3_000), totals.get("input_cost_nano_usd").?.integer + totals.get("output_cost_nano_usd").?.integer);
+    try testing.expectEqual(@as(usize, 4), root.get("recent").?.array.items.len);
 }
 
 test "events append and read back" {

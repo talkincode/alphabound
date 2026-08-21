@@ -24,6 +24,65 @@ fn nowMs() i64 {
     return ab.clock.SystemClock.clock().wallMs();
 }
 
+/// Execute a provider call and append a privacy-safe accounting row regardless
+/// of result. The durable ledger is best-effort operational telemetry: an
+/// insert failure is surfaced in logs but must not turn a safe HOLD path into
+/// a crash.
+fn meteredChat(
+    client: *ab.openai.Client,
+    usage_repo: *ab.storage.LlmUsageRepo,
+    call_kind: []const u8,
+    run_id: []const u8,
+    decision_id: []const u8,
+    system: []const u8,
+    user: []const u8,
+) ab.openai.Error!ab.openai.ChatResult {
+    const started_ms = nowMs();
+    const result = client.chat(system, user) catch |err| {
+        persistLlmUsage(usage_repo, .{
+            .ts_ms = started_ms,
+            .call_kind = call_kind,
+            .run_id = run_id,
+            .decision_id = decision_id,
+            .model = client.model,
+            .outcome = .failed,
+            .error_class = llmErrorClass(err),
+            .latency_ms = nowMs() - started_ms,
+        });
+        return err;
+    };
+    persistLlmUsage(usage_repo, .{
+        .ts_ms = started_ms,
+        .call_kind = call_kind,
+        .run_id = run_id,
+        .decision_id = decision_id,
+        .model = client.model,
+        .outcome = .ok,
+        .latency_ms = nowMs() - started_ms,
+        .usage = result.usage,
+    });
+    return result;
+}
+
+fn persistLlmUsage(repo: *ab.storage.LlmUsageRepo, call: ab.llm_usage.Call) void {
+    var ts_buf: [40]u8 = undefined;
+    repo.append(ab.llm_usage.row(call, &ts_buf)) catch |err| {
+        std.debug.print("[llm] usage ledger append failed: {t}\n", .{err});
+    };
+}
+
+fn llmErrorClass(err: ab.openai.Error) []const u8 {
+    return switch (err) {
+        error.HttpFailed => "http_failed",
+        error.Timeout => "timeout",
+        error.ApiError => "api_error",
+        error.MalformedResponse => "malformed_response",
+        error.EmptyContent => "empty_content",
+        error.OutOfMemory => "oom",
+        error.BufferTooSmall => "buffer",
+    };
+}
+
 /// runtime_kv key for the persisted shadow buy-and-hold baseline.
 const shadow_bh_kv_key = "shadow_bh_baseline";
 
@@ -385,6 +444,8 @@ pub fn main(init: std.process.Init) !u8 {
     defer agent_runs.deinit();
     var tool_calls = try ab.storage.ToolCallsRepo.init(&db);
     defer tool_calls.deinit();
+    var llm_usage_repo = try ab.storage.LlmUsageRepo.init(&db);
+    defer llm_usage_repo.deinit();
     var memories_repo = try ab.storage.MemoriesRepo.init(&db);
     defer memories_repo.deinit();
     var orders_repo = try ab.storage.OrdersRepo.init(&db);
@@ -713,6 +774,7 @@ pub fn main(init: std.process.Init) !u8 {
     // AC-NFR01: market tick → risk state update latency (µs), in-process.
     var risk_latency = ab.latency.Histogram{};
     refreshWebCaches(&web_state, &db, &agent_runs, &equity_repo, &events_repo, &memories_repo, &orders_repo, &fills_repo, last_bh_cmp);
+    ab.web_cache.refreshStatisticsCache(&web_state, &db, &llm_usage_repo);
     ab.web_cache.refreshReviewCache(&web_state, &db, &review_repo);
     ab.web_cache.refreshAuditCache(&web_state, &db, &audit_repo);
     ab.web_cache.refreshAnalyticsCache(&web_state, &db, &equity_repo);
@@ -1053,8 +1115,9 @@ pub fn main(init: std.process.Init) !u8 {
                         .{ reason_txt, ab.scheduler.hourUtc(tnow), agent_sched.params.effectiveInterval(ab.scheduler.hourUtc(tnow)) },
                     ) catch "{\"reason\":\"unknown\"}";
                     logEventPayload(&events_repo, &engine, "AGENT_TRIGGER", "agent", "INFO", &cfg, trig_payload);
-                    runAgentDecision(gpa, client, &okx, &cfg, &engine, &tool_reg, &agent_runs, &tool_calls, &events_repo, &orders_repo, &fills_repo, &equity_repo, &db, &mem_store, &memories_repo, env, &runtime_status, trade_instrument, &agent_sched, last_bh_cmp);
+                    runAgentDecision(gpa, client, &okx, &cfg, &engine, &tool_reg, &agent_runs, &tool_calls, &llm_usage_repo, &events_repo, &orders_repo, &fills_repo, &equity_repo, &db, &mem_store, &memories_repo, env, &runtime_status, trade_instrument, &agent_sched, last_bh_cmp);
                     refreshWebCaches(&web_state, &db, &agent_runs, &equity_repo, &events_repo, &memories_repo, &orders_repo, &fills_repo, last_bh_cmp);
+                    ab.web_cache.refreshStatisticsCache(&web_state, &db, &llm_usage_repo);
                     refreshSystemCache(&web_state, &db, &cfg, &mem_store, boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), llm_client != null, admin_paused, &runtime_status, &risk_latency);
                 }
             }
@@ -1070,6 +1133,7 @@ pub fn main(init: std.process.Init) !u8 {
                 &okx,
                 &db,
                 &review_repo,
+                &llm_usage_repo,
                 &events_repo,
                 &memories_repo,
                 &equity_repo,
@@ -1089,6 +1153,7 @@ pub fn main(init: std.process.Init) !u8 {
             if (last_dashboard_ms == 0 or tnow - last_dashboard_ms >= dashboard_refresh_ms) {
                 last_dashboard_ms = tnow;
                 refreshWebCaches(&web_state, &db, &agent_runs, &equity_repo, &events_repo, &memories_repo, &orders_repo, &fills_repo, last_bh_cmp);
+                ab.web_cache.refreshStatisticsCache(&web_state, &db, &llm_usage_repo);
                 refreshCandlesCache(gpa, &web_state, &okx, &cfg);
                 refreshSystemCache(&web_state, &db, &cfg, &mem_store, boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), llm_client != null, admin_paused, &runtime_status, &risk_latency);
             }
@@ -1130,6 +1195,7 @@ pub fn main(init: std.process.Init) !u8 {
                         if (llm_client) |*c| @as(?*ab.openai.Client, c) else null,
                         &db,
                         &periodic_repo,
+                        &llm_usage_repo,
                         &events_repo,
                         &memories_repo,
                         &mem_store,
@@ -1159,6 +1225,7 @@ pub fn main(init: std.process.Init) !u8 {
     std.debug.print("[shutdown] draining after {d} ticks\n", .{tick_count});
     writeEquitySample(&equity_repo, engine.snapshot(), last_bh_cmp);
     refreshWebCaches(&web_state, &db, &agent_runs, &equity_repo, &events_repo, &memories_repo, &orders_repo, &fills_repo, last_bh_cmp);
+    ab.web_cache.refreshStatisticsCache(&web_state, &db, &llm_usage_repo);
     logEvent(&events_repo, &engine, "SHUTDOWN_CLEAN", "core", "CRITICAL", &cfg);
     return 0;
 }
@@ -2166,6 +2233,7 @@ fn runAgentDecision(
     registry: *const ab.tools.Registry,
     runs: *ab.storage.AgentRunsRepo,
     tools_repo: *ab.storage.ToolCallsRepo,
+    llm_usage_repo: *ab.storage.LlmUsageRepo,
     events_repo: *ab.storage.EventsRepo,
     orders_repo: *ab.storage.OrdersRepo,
     fills_repo: *ab.storage.FillsRepo,
@@ -2317,7 +2385,15 @@ fn runAgentDecision(
         return;
     };
 
-    const chat_res = client.chat(default_system_prompt, user_msg) catch |err| {
+    const chat_res = meteredChat(
+        client,
+        llm_usage_repo,
+        "proposal",
+        run_id,
+        "",
+        default_system_prompt,
+        user_msg,
+    ) catch |err| {
         const tag: []const u8 = switch (err) {
             error.HttpFailed => "http_failed",
             error.Timeout => "timeout",
@@ -2411,7 +2487,15 @@ fn runAgentDecision(
         var user_buf2: [64 * 1024]u8 = undefined;
         const user_msg2 = std.fmt.bufPrint(&user_buf2, "{s}{s}", .{ user_msg_prefix, ctx_json2 }) catch break :tool_round;
 
-        const chat2 = client.chat(default_system_prompt, user_msg2) catch |err| {
+        const chat2 = meteredChat(
+            client,
+            llm_usage_repo,
+            "proposal_tool_round",
+            run_id,
+            "",
+            default_system_prompt,
+            user_msg2,
+        ) catch |err| {
             const tag: []const u8 = switch (err) {
                 error.HttpFailed => "http_failed",
                 error.Timeout => "timeout",
@@ -2537,6 +2621,7 @@ fn runAgentDecision(
         reflected = tryLlmReflection(
             gpa,
             client,
+            llm_usage_repo,
             mem_store,
             memories_repo,
             events_repo,
@@ -2956,6 +3041,7 @@ fn sanitizeJsonString(s: []const u8, buf: []u8) []const u8 {
 fn tryLlmReflection(
     gpa: std.mem.Allocator,
     client: *ab.openai.Client,
+    llm_usage_repo: *ab.storage.LlmUsageRepo,
     store: *ab.memory.Store,
     repo: *ab.storage.MemoriesRepo,
     events_repo: *ab.storage.EventsRepo,
@@ -2995,7 +3081,15 @@ fn tryLlmReflection(
     };
 
     std.debug.print("[reflect] LLM calling model={s}\n", .{client.model});
-    const chat_res = client.chat(default_reflection_prompt, user_msg) catch |err| {
+    const chat_res = meteredChat(
+        client,
+        llm_usage_repo,
+        "reflection",
+        run_id,
+        decision_id,
+        default_reflection_prompt,
+        user_msg,
+    ) catch |err| {
         std.debug.print("[reflect] LLM failed ({t}) → deterministic\n", .{err});
         var fail_buf: [200]u8 = undefined;
         const payload = std.fmt.bufPrint(
@@ -3126,6 +3220,7 @@ fn processReviewInbox(
     okx: *ab.okx_rest.Client,
     db: *ab.storage.Db,
     review_repo: *ab.storage.ReviewChatsRepo,
+    llm_usage_repo: *ab.storage.LlmUsageRepo,
     events_repo: *ab.storage.EventsRepo,
     memories_repo: *ab.storage.MemoriesRepo,
     equity_repo: *ab.storage.EquityRepo,
@@ -3142,8 +3237,8 @@ fn processReviewInbox(
     const req = inbox.drain() orelse return;
     switch (req.kind) {
         .context => renderReviewContext(db, events_repo, web_state, &req),
-        .chat => runReviewChat(gpa, client, okx, db, review_repo, events_repo, equity_repo, mem_store, engine, cfg, web_state, st, &req),
-        .summarize => runReviewSummarize(gpa, client, db, review_repo, events_repo, memories_repo, mem_store, engine, cfg, web_state, st, &req),
+        .chat => runReviewChat(gpa, client, okx, db, review_repo, llm_usage_repo, events_repo, equity_repo, mem_store, engine, cfg, web_state, st, &req),
+        .summarize => runReviewSummarize(gpa, client, db, review_repo, llm_usage_repo, events_repo, memories_repo, mem_store, engine, cfg, web_state, st, &req),
         // Manual 定期复盘: same code path as the scheduled one, and it also
         // commits the cursor so an on-demand run pushes the next auto run out.
         .periodic => {
@@ -3156,6 +3251,7 @@ fn processReviewInbox(
                 client,
                 db,
                 periodic_repo,
+                llm_usage_repo,
                 events_repo,
                 memories_repo,
                 mem_store,
@@ -3238,6 +3334,7 @@ fn runReviewChat(
     okx: *ab.okx_rest.Client,
     db: *ab.storage.Db,
     review_repo: *ab.storage.ReviewChatsRepo,
+    llm_usage_repo: *ab.storage.LlmUsageRepo,
     events_repo: *ab.storage.EventsRepo,
     equity_repo: *ab.storage.EquityRepo,
     mem_store: *ab.memory.Store,
@@ -3306,7 +3403,15 @@ fn runReviewChat(
     defer client.timeout_ms = saved_timeout;
 
     std.debug.print("[review] chat decision={s} model={s}\n", .{ decision_id, client.model });
-    const chat_res = client.chat(default_review_prompt, user_msg) catch |err| {
+    const chat_res = meteredChat(
+        client,
+        llm_usage_repo,
+        "review_chat",
+        "",
+        decision_id,
+        default_review_prompt,
+        user_msg,
+    ) catch |err| {
         std.debug.print("[review] LLM failed ({t})\n", .{err});
         appendReviewTurn(review_repo, decision_id, req.anchorTs(), "assistant", "模型调用失败，本轮未生成回复；问题已保存，可稍后重试。", "");
         var fail_buf: [256]u8 = undefined;
@@ -3358,7 +3463,15 @@ fn runReviewChat(
             .{ user_msg, obs },
         ) catch break :tool_round;
 
-        const chat2 = client.chat(default_review_prompt, user_msg2) catch |err| {
+        const chat2 = meteredChat(
+            client,
+            llm_usage_repo,
+            "review_chat_tool_round",
+            "",
+            decision_id,
+            default_review_prompt,
+            user_msg2,
+        ) catch |err| {
             std.debug.print("[review] LLM failed (tool round, {t})\n", .{err});
             appendReviewTurn(review_repo, decision_id, req.anchorTs(), "assistant", "查询工具后模型调用失败，本轮未生成回复；问题已保存，可稍后重试。", "");
             logEventPayload(events_repo, engine, "REVIEW_CHAT_FAILED", "review", "WARN", cfg, "{\"error\":\"llm_tool_round\"}");
@@ -3743,6 +3856,7 @@ fn runPeriodicReview(
     client_opt: ?*ab.openai.Client,
     db: *ab.storage.Db,
     periodic_repo: *ab.storage.PeriodicReviewsRepo,
+    llm_usage_repo: *ab.storage.LlmUsageRepo,
     events_repo: *ab.storage.EventsRepo,
     memories_repo: *ab.storage.MemoriesRepo,
     mem_store: *ab.memory.Store,
@@ -3832,7 +3946,15 @@ fn runPeriodicReview(
         client.timeout_ms = @min(periodic_review_timeout_ms, cfg.decision_timeout_ms);
         defer client.timeout_ms = saved_timeout;
 
-        if (client.chat(default_periodic_review_prompt, user_msg)) |res| {
+        if (meteredChat(
+            client,
+            llm_usage_repo,
+            "periodic_review",
+            review_id,
+            "",
+            default_periodic_review_prompt,
+            user_msg,
+        )) |res| {
             defer gpa.free(res.content);
             st.addUsage(res.usage);
             model_name = client.model;
@@ -4292,6 +4414,7 @@ fn runReviewSummarize(
     client_opt: ?*ab.openai.Client,
     db: *ab.storage.Db,
     review_repo: *ab.storage.ReviewChatsRepo,
+    llm_usage_repo: *ab.storage.LlmUsageRepo,
     events_repo: *ab.storage.EventsRepo,
     memories_repo: *ab.storage.MemoriesRepo,
     mem_store: *ab.memory.Store,
@@ -4331,7 +4454,15 @@ fn runReviewSummarize(
     client.timeout_ms = @min(review_chat_timeout_ms, cfg.decision_timeout_ms);
     defer client.timeout_ms = saved_timeout;
 
-    const chat_res = client.chat(summarize_system, user_msg) catch |err| {
+    const chat_res = meteredChat(
+        client,
+        llm_usage_repo,
+        "review_summary",
+        "",
+        decision_id,
+        summarize_system,
+        user_msg,
+    ) catch |err| {
         std.debug.print("[review] summarize LLM failed ({t})\n", .{err});
         appendReviewTurn(review_repo, decision_id, req.anchorTs(), "summary", "沉淀失败：模型调用失败，可稍后重试。", "");
         return;

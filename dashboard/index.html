@@ -140,6 +140,80 @@
   }
   .token-strip b { color: var(--text); font-weight: 600; }
 
+  /* ===== LLM statistics: durable ledger, not process-local counters ===== */
+  .usage-deck {
+    position: relative; overflow: hidden; margin-bottom: 14px; padding: 18px;
+    background:
+      linear-gradient(112deg, rgba(53,216,255,.10), transparent 42%),
+      linear-gradient(160deg, rgba(11,30,39,.97), rgba(10,16,22,.98));
+    border: 1px solid rgba(53,216,255,.30); border-radius: 10px;
+  }
+  .usage-deck::after {
+    content: ""; pointer-events: none; position: absolute; inset: 0;
+    background: repeating-linear-gradient(90deg, transparent 0 42px, rgba(128,207,227,.025) 42px 43px);
+  }
+  .usage-head, .usage-kpis, .usage-footnote { position: relative; z-index: 1; }
+  .usage-head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-end; gap: 12px 20px; }
+  .usage-kicker { color: #6cd7ee; font-size: 10px; font-weight: 700; letter-spacing: .15em; text-transform: uppercase; }
+  .usage-title { margin-top: 2px; color: var(--text); font-size: 18px; font-weight: 650; letter-spacing: -.02em; }
+  .usage-asof { color: var(--dim); font-size: 11px; text-align: right; }
+  .usage-period { margin: 14px 0 14px; }
+  .usage-period button {
+    border-color: rgba(78,170,197,.35); background: rgba(8,22,29,.72);
+  }
+  .usage-period button.active {
+    color: #8bedff; border-color: #35d8ff;
+    background: rgba(53,216,255,.12); box-shadow: 0 0 0 1px rgba(53,216,255,.08) inset;
+  }
+  .usage-kpis {
+    display: grid; grid-template-columns: repeat(5, minmax(145px, 1fr));
+    gap: 8px;
+  }
+  .usage-kpi {
+    min-height: 112px; padding: 12px 13px; border: 1px solid rgba(77,125,140,.30);
+    background: rgba(3,13,18,.46); border-radius: 6px;
+  }
+  .usage-kpi.cost { border-top: 2px solid #35d8ff; }
+  .usage-kpi.health { border-top: 2px solid var(--ok); }
+  .usage-kpi.coverage { border-top: 2px solid var(--warn); }
+  .usage-k { color: #7894a0; font-size: 10px; letter-spacing: .07em; }
+  .usage-v { margin-top: 5px; color: #eefcff; font-size: 22px; line-height: 1.15; font-weight: 650; font-variant-numeric: tabular-nums; letter-spacing: -.035em; }
+  .usage-v.sm { font-size: 18px; }
+  .usage-sub { margin-top: 7px; color: var(--dim); font-size: 11px; line-height: 1.35; }
+  .usage-sub b { color: var(--text); font-weight: 600; }
+  .usage-footnote { margin: 13px 0 0; color: #7894a0; font-size: 11px; line-height: 1.5; }
+  .usage-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-bottom: 12px; }
+  .usage-section {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 9px; padding: 12px;
+  }
+  .usage-section h2 { margin: 0 0 4px; color: var(--text); font-size: 13px; letter-spacing: .04em; }
+  .usage-section .hint { margin-bottom: 10px; }
+  .usage-scroll { overflow-x: auto; border-radius: 6px; }
+  .usage-scroll > table { min-width: 540px; }
+  .usage-scroll th, .usage-scroll td { white-space: nowrap; }
+  .usage-scope { color: #6cd7ee; font-size: 11px; }
+  .usage-price { color: #9fd39f; }
+  .usage-unpriced { color: var(--warn); }
+  .usage-bad { color: var(--bad); }
+  .usage-latency { color: #a8c5cf; }
+  .usage-kind-bar {
+    display: inline-block; width: 48px; height: 5px; margin-right: 7px; vertical-align: middle;
+    border-radius: 999px; background: rgba(53,216,255,.14); overflow: hidden;
+  }
+  .usage-kind-bar i { display: block; height: 100%; background: #35d8ff; border-radius: inherit; }
+  .usage-day-cost { display: flex; align-items: center; gap: 8px; min-width: 128px; }
+  .usage-day-cost .usage-kind-bar { width: 46px; margin: 0; }
+  @media (max-width: 1020px) {
+    .usage-kpis { grid-template-columns: repeat(3, minmax(145px, 1fr)); }
+  }
+  @media (max-width: 720px) {
+    .usage-grid { grid-template-columns: 1fr; }
+    .usage-kpis { grid-template-columns: repeat(2, minmax(130px, 1fr)); }
+    .usage-deck { padding: 14px; }
+    .usage-asof { text-align: left; }
+  }
+  @media (max-width: 410px) { .usage-kpis { grid-template-columns: 1fr; } }
+
   /* ===== 概览：紧凑追踪记录 ===== */
   .ov-ledger {
     margin-top: 22px; padding: 14px;
@@ -1007,6 +1081,7 @@
     <button class="tab" data-tab="review" type="button">复盘</button>
     <button class="tab" data-tab="decisions" type="button">决策历史</button>
     <button class="tab" data-tab="orders" type="button">订单</button>
+    <button class="tab" data-tab="statistics" type="button">统计</button>
     <button class="tab" data-tab="status" type="button">状态</button>
   </div>
 
@@ -1389,6 +1464,100 @@
     </table>
   </div>
 
+  <!-- ========== 统计 ========== -->
+  <div class="panel" id="panel-statistics">
+    <section class="usage-deck" aria-labelledby="usage_title">
+      <div class="usage-head">
+        <div>
+          <div class="usage-kicker">LLM usage ledger / market estimate</div>
+          <div class="usage-title" id="usage_title">模型调用账本</div>
+        </div>
+        <div class="usage-asof" id="usage_asof">等待首个持久化快照…</div>
+      </div>
+      <div class="filters usage-period" id="usage_range" role="group" aria-label="统计时间范围">
+        <span class="range-label">观察窗口</span>
+        <button type="button" data-usage-range="24h">24 小时</button>
+        <button type="button" data-usage-range="7d">7 天</button>
+        <button type="button" data-usage-range="30d">30 天</button>
+      </div>
+      <div class="usage-kpis">
+        <div class="usage-kpi cost">
+          <div class="usage-k">市场价成本估算</div>
+          <div class="usage-v" id="usage_cost">—</div>
+          <div class="usage-sub" id="usage_cost_sub">只累计已定价调用</div>
+        </div>
+        <div class="usage-kpi">
+          <div class="usage-k">日均消耗（推算）</div>
+          <div class="usage-v" id="usage_daily_cost">—</div>
+          <div class="usage-sub" id="usage_daily_cost_sub">按当前窗口折算</div>
+        </div>
+        <div class="usage-kpi">
+          <div class="usage-k">Token 总量</div>
+          <div class="usage-v" id="usage_tokens">—</div>
+          <div class="usage-sub" id="usage_tokens_sub">输入 / 缓存 / 输出</div>
+        </div>
+        <div class="usage-kpi health">
+          <div class="usage-k">调用可靠性</div>
+          <div class="usage-v" id="usage_success">—</div>
+          <div class="usage-sub" id="usage_success_sub">成功率 / 延迟</div>
+        </div>
+        <div class="usage-kpi coverage">
+          <div class="usage-k">数据完整性</div>
+          <div class="usage-v sm" id="usage_coverage">—</div>
+          <div class="usage-sub" id="usage_coverage_sub">usage / 定价覆盖率</div>
+        </div>
+      </div>
+      <p class="usage-footnote" id="usage_footnote">
+        仅记录调用元数据与用量，不保存 Prompt、Completion、端点、密钥或原始错误响应。费用为 UTC 峰谷价档的市场价估算，不是供应商账单。
+      </p>
+    </section>
+
+    <div class="usage-grid">
+      <section class="usage-section" aria-labelledby="usage_kind_title">
+        <h2 id="usage_kind_title">成本与 Token 归因</h2>
+        <p class="hint">近 30 天按调用类型汇总；反思、工具后二轮和人工复盘可单独观察。</p>
+        <div class="usage-scroll">
+          <table>
+            <thead><tr><th>调用类型</th><th>调用</th><th>Token</th><th>成本</th><th>成功</th></tr></thead>
+            <tbody id="usage_kind_body"><tr><td colspan="5" class="muted">加载中…</td></tr></tbody>
+          </table>
+        </div>
+      </section>
+      <section class="usage-section" aria-labelledby="usage_model_title">
+        <h2 id="usage_model_title">模型与计价覆盖</h2>
+        <p class="hint">未知模型或未返回 usage 会显式标为未定价，不会被当作零成本。</p>
+        <div class="usage-scroll">
+          <table>
+            <thead><tr><th>模型</th><th>调用</th><th>Token</th><th>成本</th><th>已定价</th></tr></thead>
+            <tbody id="usage_model_body"><tr><td colspan="5" class="muted">加载中…</td></tr></tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+
+    <section class="usage-section" aria-labelledby="usage_daily_title">
+      <h2 id="usage_daily_title">日账本（UTC）</h2>
+      <p class="hint">最近 30 天有调用的日期；费用条仅代表已定价部分。</p>
+      <div class="usage-scroll">
+        <table>
+          <thead><tr><th>日期</th><th>调用</th><th>Token</th><th>市场价成本</th><th>usage 覆盖</th><th>成功率</th></tr></thead>
+          <tbody id="usage_daily_body"><tr><td colspan="6" class="muted">暂无持久化调用记录</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="usage-section" style="margin-top:12px" aria-labelledby="usage_recent_title">
+      <h2 id="usage_recent_title">近期调用账本</h2>
+      <p class="hint">最多展示 32 次最新调用；失败、usage 缺失和未定价模型都保留可审计痕迹。</p>
+      <div class="usage-scroll">
+        <table>
+          <thead><tr><th>时间（UTC）</th><th>类型</th><th>模型</th><th>结果</th><th>Token</th><th>成本</th><th>延迟</th><th>计价档</th></tr></thead>
+          <tbody id="usage_recent_body"><tr><td colspan="8" class="muted">暂无调用记录</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+
   <!-- ========== 状态 ========== -->
   <div class="panel" id="panel-status">
     <h2>运行状态</h2>
@@ -1458,6 +1627,15 @@ let ordHours = parseInt(localStorage.getItem("ab_ord_hours") || "0", 10);
 let cachedDecisions = [];
 let cachedRuns = [];
 let cachedOrdersBundle = { orders: [], fills: [] };
+let cachedStatistics = {};
+let usageRange = (() => {
+  try {
+    const saved = localStorage.getItem("ab_usage_range");
+    return ["24h", "7d", "30d"].includes(saved) ? saved : "24h";
+  } catch (_) {
+    return "24h";
+  }
+})();
 
 // --- 复盘 (review) state ---
 let cachedReviewChats = [];
@@ -3468,6 +3646,23 @@ document.querySelectorAll("[data-go-tab]").forEach(btn => {
 });
 showTab(activeTab);
 
+function syncUsageRangeButtons() {
+  document.querySelectorAll("#usage_range button[data-usage-range]").forEach(btn => {
+    const on = btn.getAttribute("data-usage-range") === usageRange;
+    btn.classList.toggle("active", on);
+    btn.setAttribute("aria-pressed", on ? "true" : "false");
+  });
+}
+document.querySelectorAll("#usage_range button[data-usage-range]").forEach(btn => {
+  btn.addEventListener("click", () => {
+    usageRange = btn.getAttribute("data-usage-range") || "24h";
+    try { localStorage.setItem("ab_usage_range", usageRange); } catch (_) {}
+    syncUsageRangeButtons();
+    renderLlmStatistics(cachedStatistics);
+  });
+});
+syncUsageRangeButtons();
+
 document.querySelectorAll("#dec_filters button").forEach(btn => {
   btn.classList.toggle("active", btn.getAttribute("data-filter") === decFilter);
   btn.addEventListener("click", () => {
@@ -3669,6 +3864,158 @@ function renderAuditPanel() {
   }
 }
 
+const LLM_CALL_KIND_ZH = {
+  proposal: "提案",
+  proposal_tool_round: "提案工具轮",
+  reflection: "反思",
+  review_chat: "人工复盘",
+  review_chat_tool_round: "复盘工具轮",
+  periodic_review: "定期复盘",
+  review_summary: "复盘沉淀",
+};
+const USAGE_RANGE_META = {
+  "24h": { key: "last_24h", label: "过去 24 小时", days: 1 },
+  "7d": { key: "last_7d", label: "过去 7 天", days: 7 },
+  "30d": { key: "last_30d", label: "过去 30 天", days: 30 },
+};
+
+function usageNum(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+function usageInt(v) {
+  return Math.round(usageNum(v)).toLocaleString("en-US");
+}
+function usagePct(n, d) {
+  if (!(d > 0)) return "—";
+  return (100 * n / d).toFixed(1) + "%";
+}
+function usageCostNano(totals) {
+  return usageNum(totals && totals.input_cost_nano_usd) + usageNum(totals && totals.output_cost_nano_usd);
+}
+function fmtNanoUsd(nano) {
+  const usd = usageNum(nano) / 1e9;
+  if (!Number.isFinite(usd)) return "—";
+  if (usd >= 100) return "$" + usd.toFixed(2);
+  if (usd >= 1) return "$" + usd.toFixed(3);
+  if (usd >= 0.01) return "$" + usd.toFixed(4);
+  return "$" + usd.toFixed(6);
+}
+function usageTs(ts) {
+  if (!ts) return "—";
+  return String(ts).replace("T", " ").replace(/\.\d{3}Z$/, "Z");
+}
+function usageKind(kind) {
+  return LLM_CALL_KIND_ZH[kind] || kind || "未知";
+}
+function usageOutcome(row) {
+  if (row && row.outcome === "error") return "失败" + (row.error_class ? " · " + row.error_class : "");
+  return "成功";
+}
+function renderLlmStatistics(data) {
+  data = (data && typeof data === "object") ? data : {};
+  const meta = USAGE_RANGE_META[usageRange] || USAGE_RANGE_META["24h"];
+  const totals = (data[meta.key] && typeof data[meta.key] === "object") ? data[meta.key] : {};
+  const calls = usageNum(totals.calls);
+  const ok = usageNum(totals.ok_calls);
+  const errors = usageNum(totals.error_calls);
+  const reported = usageNum(totals.usage_reported_calls);
+  const priced = usageNum(totals.priced_calls);
+  const cost = usageCostNano(totals);
+  const tokens = usageNum(totals.total_tokens);
+  const prompt = usageNum(totals.prompt_tokens);
+  const cached = usageNum(totals.cached_prompt_tokens);
+  const completion = usageNum(totals.completion_tokens);
+  const asOf = usageNum(data.as_of_ms);
+  const asOfText = asOf
+    ? new Date(asOf).toISOString().replace("T", " ").replace(/\.\d{3}Z$/, " UTC")
+    : "尚无账本快照";
+
+  $("usage_asof").textContent = meta.label + " · 快照 " + asOfText;
+  $("usage_cost").textContent = fmtNanoUsd(cost);
+  $("usage_cost_sub").innerHTML = "已定价 <b>" + usageInt(priced) + " / " + usageInt(calls) + "</b> 次 · 未知不按零计";
+  $("usage_daily_cost").textContent = fmtNanoUsd(cost / meta.days);
+  $("usage_daily_cost_sub").textContent = meta.label + "内已定价成本 ÷ " + meta.days + " 天";
+  $("usage_tokens").textContent = usageInt(tokens);
+  $("usage_tokens_sub").innerHTML = "输入 <b>" + usageInt(prompt) + "</b> · 缓存 <b>" + usageInt(cached) + "</b> · 输出 <b>" + usageInt(completion) + "</b>";
+  $("usage_success").textContent = usagePct(ok, calls);
+  $("usage_success_sub").textContent = "成功 " + usageInt(ok) + " · 失败 " + usageInt(errors) +
+    " · 均 " + usageInt(totals.avg_latency_ms) + " ms · 最慢 " + usageInt(totals.max_latency_ms) + " ms";
+  $("usage_coverage").textContent = "usage " + usagePct(reported, calls);
+  $("usage_coverage_sub").textContent = "定价 " + usagePct(priced, calls) +
+    " · " + usageInt(Math.max(0, calls - priced)) + " 次未定价/未计量";
+
+  const daily = Array.isArray(data.daily_utc) ? data.daily_utc.slice().reverse() : [];
+  const dailyMax = Math.max(1, ...daily.map(d => usageCostNano(d && d.totals)));
+  const dailyBody = $("usage_daily_body");
+  dailyBody.innerHTML = daily.length ? daily.map(d => {
+    const t = (d && d.totals) || {};
+    const n = usageCostNano(t);
+    const width = Math.max(2, Math.min(100, 100 * n / dailyMax));
+    const dCalls = usageNum(t.calls);
+    return "<tr>" +
+      "<td>" + esc(d.day || "—") + "</td>" +
+      "<td>" + usageInt(dCalls) + "</td>" +
+      "<td>" + usageInt(t.total_tokens) + "</td>" +
+      '<td><div class="usage-day-cost"><span class="usage-kind-bar"><i style="width:' + width.toFixed(1) + '%"></i></span><span>' + fmtNanoUsd(n) + "</span></div></td>" +
+      "<td>" + usagePct(usageNum(t.usage_reported_calls), dCalls) + "</td>" +
+      "<td>" + usagePct(usageNum(t.ok_calls), dCalls) + "</td>" +
+      "</tr>";
+  }).join("") : '<tr><td colspan="6" class="muted">暂无持久化调用记录</td></tr>';
+
+  const byKind = Array.isArray(data.by_kind_30d) ? data.by_kind_30d : [];
+  const kindMax = Math.max(1, ...byKind.map(r => usageCostNano(r && r.totals)));
+  const kindBody = $("usage_kind_body");
+  kindBody.innerHTML = byKind.length ? byKind.map(row => {
+    const t = (row && row.totals) || {};
+    const n = usageCostNano(t);
+    const rowCalls = usageNum(t.calls);
+    const width = Math.max(2, Math.min(100, 100 * n / kindMax));
+    return "<tr>" +
+      '<td><span class="usage-kind-bar"><i style="width:' + width.toFixed(1) + '%"></i></span><span class="usage-scope">' + esc(usageKind(row.kind)) + "</span></td>" +
+      "<td>" + usageInt(rowCalls) + "</td>" +
+      "<td>" + usageInt(t.total_tokens) + "</td>" +
+      '<td class="' + (usageNum(t.priced_calls) ? "usage-price" : "usage-unpriced") + '">' + fmtNanoUsd(n) + "</td>" +
+      "<td>" + usagePct(usageNum(t.ok_calls), rowCalls) + "</td>" +
+      "</tr>";
+  }).join("") : '<tr><td colspan="5" class="muted">暂无近 30 天调用</td></tr>';
+
+  const byModel = Array.isArray(data.by_model_30d) ? data.by_model_30d : [];
+  const modelBody = $("usage_model_body");
+  modelBody.innerHTML = byModel.length ? byModel.map(row => {
+    const t = (row && row.totals) || {};
+    const rowCalls = usageNum(t.calls);
+    const pricedCalls = usageNum(t.priced_calls);
+    return "<tr>" +
+      '<td title="' + esc(row.model || "") + '">' + esc(short(row.model || "未知模型", 28)) + "</td>" +
+      "<td>" + usageInt(rowCalls) + "</td>" +
+      "<td>" + usageInt(t.total_tokens) + "</td>" +
+      '<td class="' + (pricedCalls ? "usage-price" : "usage-unpriced") + '">' + fmtNanoUsd(usageCostNano(t)) + "</td>" +
+      '<td class="' + (pricedCalls === rowCalls && rowCalls > 0 ? "usage-price" : "usage-unpriced") + '">' + usageInt(pricedCalls) + " / " + usageInt(rowCalls) + "</td>" +
+      "</tr>";
+  }).join("") : '<tr><td colspan="5" class="muted">暂无近 30 天模型调用</td></tr>';
+
+  const recent = Array.isArray(data.recent) ? data.recent : [];
+  const recentBody = $("usage_recent_body");
+  recentBody.innerHTML = recent.length ? recent.map(row => {
+    const hasUsage = !!row.usage_reported;
+    const hasCost = !!row.cost_known;
+    const token = hasUsage
+      ? usageInt(row.total_tokens) + (usageNum(row.cached_prompt_tokens) ? "（缓存 " + usageInt(row.cached_prompt_tokens) + "）" : "")
+      : "未报告";
+    return "<tr>" +
+      "<td>" + esc(usageTs(row.ts)) + "</td>" +
+      "<td>" + esc(usageKind(row.kind)) + "</td>" +
+      '<td title="' + esc(row.model || "") + '">' + esc(short(row.model || "—", 25)) + "</td>" +
+      '<td class="' + (row.outcome === "error" ? "usage-bad" : "usage-price") + '">' + esc(usageOutcome(row)) + "</td>" +
+      '<td class="' + (hasUsage ? "" : "usage-unpriced") + '">' + token + "</td>" +
+      '<td class="' + (hasCost ? "usage-price" : "usage-unpriced") + '">' + (hasCost ? fmtNanoUsd(usageCostNano(row)) : "未定价") + "</td>" +
+      '<td class="usage-latency">' + usageInt(row.latency_ms) + " ms</td>" +
+      '<td class="' + (hasCost ? "usage-scope" : "muted") + '" title="' + esc(row.price_profile || "") + '">' + esc(short(row.price_profile || "—", 34)) + "</td>" +
+      "</tr>";
+  }).join("") : '<tr><td colspan="8" class="muted">暂无调用记录</td></tr>';
+}
+
 function renderOrders(bundle) {
   const allOrders = (bundle && Array.isArray(bundle.orders)) ? bundle.orders : [];
   const allFills = (bundle && Array.isArray(bundle.fills)) ? bundle.fills : [];
@@ -3734,7 +4081,7 @@ function renderOrders(bundle) {
 
 async function poll() {
   try {
-    const [s, shadow, runs, equity, candles, memories, events, system, decisions, ordersBundle, reviewChats, auditReports, periodicReviews] = await Promise.all([
+    const [s, shadow, runs, equity, candles, memories, events, system, decisions, ordersBundle, reviewChats, auditReports, periodicReviews, statistics] = await Promise.all([
       jget("/api/v1/state"),
       jget("/api/v1/shadow"),
       jget("/api/v1/agent-runs"),
@@ -3748,6 +4095,7 @@ async function poll() {
       jget("/api/v1/review/chats"),
       jget("/api/v1/audit"),
       jget("/api/v1/review/periodic"),
+      jget("/api/v1/statistics"),
     ]);
     lastOk = Date.now();
 
@@ -3814,6 +4162,7 @@ async function poll() {
     cachedReviewChats = Array.isArray(reviewChats) ? reviewChats : [];
     cachedAudit = Array.isArray(auditReports) ? auditReports : [];
     cachedPeriodic = Array.isArray(periodicReviews) ? periodicReviews : [];
+    cachedStatistics = statistics && typeof statistics === "object" ? statistics : {};
     cachedSystem = system;
     try { renderAuditBell(system); } catch (err) { console.error("audit bell", err); }
     try { renderPeriodicReviews(system); } catch (err) { console.error("periodic review", err); }
@@ -3833,6 +4182,7 @@ async function poll() {
     renderDecisions(decisions, runs);
     try { renderOrders(cachedOrdersBundle); } catch (err) { console.error("renderOrders", err); }
     try { renderStatus(system, s); } catch (err) { console.error("renderStatus", err); }
+    try { renderLlmStatistics(cachedStatistics); } catch (err) { console.error("renderLlmStatistics", err); }
     // overview token strip
     {
       const st = (system && system.status) || {};
