@@ -247,6 +247,9 @@
   .usage-kpi.alpha { border-top: 2px solid #f0c674; }
   .usage-kpi.flow { border-top: 2px solid #3fb950; }
   .usage-kpi.warn-top { border-top: 2px solid var(--warn); }
+  .stats-compare { margin-bottom: 12px; }
+  .stats-compare .chart-host { height: 240px; background: #07141d; border-radius: 8px; }
+  .stats-compare .chart-meta { margin: 0 0 8px; }
 
   /* ===== 概览：紧凑追踪记录 ===== */
   .ov-ledger {
@@ -1588,6 +1591,15 @@
         <p class="usage-footnote">订单按创建时间、成交按成交时间计入窗口。未关联订单的成交、非 USDT 费用不会被当成零成本或零仓位。</p>
       </section>
 
+      <section class="usage-section stats-compare" aria-labelledby="stats_chart_title">
+        <h2 id="stats_chart_title">净值与成交对照</h2>
+        <p class="hint">同一 UTC 日轴：右轴净值曲线，左轴成交名义额柱。无成交日不补零柱，缺净值日不连成零。</p>
+        <div class="chart-meta" id="stats_chart_meta">
+          <span>等待日账本…</span>
+        </div>
+        <div class="chart-host" id="chart_stats_book"></div>
+      </section>
+
       <div class="usage-grid">
         <section class="usage-section" aria-labelledby="book_daily_title">
           <h2 id="book_daily_title">日终净值（UTC）</h2>
@@ -1833,8 +1845,10 @@ let rvLastMarkerSig = "";
 // --- Lightweight Charts state (lazy-init, incremental setData) ---
 let candleChart = null, candleSeries = null, volumeSeries = null, timeSeries = null;
 let equityChart = null, equitySeries = null, hwmSeries = null;
+let statsBookChart = null, statsEqSeries = null, statsBhSeries = null, statsTurnSeries = null;
 let lastCandleSig = "";
 let lastEquitySig = "";
+let lastStatsBookSig = "";
 let cachedCandlesPayload = null;
 /** @type {string} UI bar key: time | 1m | 5m | 15m | 1H | 4H | 1D */
 let selectedBar = localStorage.getItem("ab_candle_bar") || "1H";
@@ -2309,6 +2323,123 @@ function ensureEquityChart() {
   return true;
 }
 
+function utcDayTime(day) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(day || "") ? day : null;
+}
+
+function ensureStatsBookChart() {
+  if (statsBookChart || !lwAvailable()) return !!statsBookChart;
+  const el = $("chart_stats_book");
+  if (!el) return false;
+  statsBookChart = LightweightCharts.createChart(el, Object.assign(chartBaseOptions(240), {
+    leftPriceScale: { visible: true, borderColor: CHART_BORDER },
+    rightPriceScale: { visible: true, borderColor: CHART_BORDER },
+    timeScale: {
+      borderColor: CHART_BORDER,
+      timeVisible: false,
+      secondsVisible: false,
+    },
+  }));
+  statsTurnSeries = statsBookChart.addHistogramSeries({
+    priceScaleId: "left",
+    priceFormat: { type: "volume" },
+    title: "成交额",
+  });
+  statsEqSeries = statsBookChart.addAreaSeries({
+    priceScaleId: "right",
+    lineColor: "#f0c674",
+    topColor: "rgba(240,198,116,0.28)",
+    bottomColor: "rgba(240,198,116,0.02)",
+    lineWidth: 2,
+    title: "净值",
+  });
+  statsBhSeries = statsBookChart.addLineSeries({
+    priceScaleId: "right",
+    color: "#8aa5b4",
+    lineWidth: 1,
+    lineStyle: LightweightCharts.LineStyle.Dashed,
+    title: "买入持有",
+  });
+  statsBookChart.priceScale("left").applyOptions({
+    scaleMargins: { top: 0.55, bottom: 0.02 },
+  });
+  statsBookChart.priceScale("right").applyOptions({
+    scaleMargins: { top: 0.06, bottom: 0.28 },
+  });
+  statsBookChart.applyOptions({ width: el.clientWidth || el.offsetWidth || 600 });
+  bindChartResize(statsBookChart, el);
+  return true;
+}
+
+function updateStatsBookChart(equityDays, tradeDays) {
+  const meta = $("stats_chart_meta");
+  if (!meta) return;
+  if (!lwAvailable()) {
+    meta.innerHTML = "<span>净值 / 成交名义额</span><span class=\"warn\">图表库未加载（需出网 CDN）</span>";
+    return;
+  }
+  if (!ensureStatsBookChart()) return;
+
+  const eq = [];
+  const bh = [];
+  for (const row of equityDays || []) {
+    const t = utcDayTime(row && row.day);
+    const v = parseFloat(row && row.equity);
+    if (!t || !Number.isFinite(v)) continue;
+    eq.push({ time: t, value: v });
+    const b = parseFloat(row && row.bh_equity);
+    if (Number.isFinite(b) && b > 0) bh.push({ time: t, value: b });
+  }
+  const bars = [];
+  for (const row of tradeDays || []) {
+    const t = utcDayTime(row && row.day);
+    const v = parseFloat(row && row.turnover);
+    if (!t || !Number.isFinite(v) || v <= 0) continue;
+    const buy = parseFloat(row.buy_notional);
+    const sell = parseFloat(row.sell_notional);
+    let color = "rgba(240,198,116,0.55)";
+    if (Number.isFinite(buy) && Number.isFinite(sell)) {
+      if (buy > sell) color = "rgba(63,185,80,0.55)";
+      else if (sell > buy) color = "rgba(248,81,73,0.55)";
+    }
+    bars.push({ time: t, value: v, color });
+  }
+  eq.sort((a, b) => a.time < b.time ? -1 : (a.time > b.time ? 1 : 0));
+  bh.sort((a, b) => a.time < b.time ? -1 : (a.time > b.time ? 1 : 0));
+  bars.sort((a, b) => a.time < b.time ? -1 : (a.time > b.time ? 1 : 0));
+
+  if (!eq.length && !bars.length) {
+    lastStatsBookSig = "";
+    statsEqSeries.setData([]);
+    statsBhSeries.setData([]);
+    statsTurnSeries.setData([]);
+    meta.innerHTML = "<span>净值 / 成交名义额</span><span class=\"muted\">暂无日账本</span>";
+    return;
+  }
+
+  const sig = eq.map(p => p.time + ":" + p.value).join(",") + "|" +
+    bars.map(p => p.time + ":" + p.value).join(",") + "|" +
+    bh.map(p => p.time + ":" + p.value).join(",");
+  if (sig !== lastStatsBookSig) {
+    lastStatsBookSig = sig;
+    statsEqSeries.setData(eq);
+    statsBhSeries.setData(bh);
+    statsTurnSeries.setData(bars);
+    statsBookChart.timeScale().fitContent();
+  }
+
+  const lastEq = eq.length ? eq[eq.length - 1].value : null;
+  const lastBar = bars.length ? bars[bars.length - 1].value : null;
+  meta.innerHTML =
+    "<span>右轴 <b>净值</b>" + (bh.length ? " / 虚线买入持有" : "") +
+    " · 左轴 <b>成交名义额</b></span>" +
+    "<span>" +
+    (lastEq != null ? "最新净值 <b>" + fmtMoney(lastEq) + "</b>" : "无净值点") +
+    " · " +
+    (lastBar != null ? "最近成交日 <b>" + fmtMoney(lastBar) + "</b>" : "无成交柱") +
+    " · " + eq.length + " 个净值日 / " + bars.length + " 个成交日</span>";
+}
+
 function toUnixSec(tsMsOrIso) {
   if (tsMsOrIso == null || tsMsOrIso === "") return null;
   if (typeof tsMsOrIso === "number" && isFinite(tsMsOrIso)) {
@@ -2481,6 +2612,12 @@ function onOverviewChartsVisible() {
     const el = $("chart_equity");
     if (el && el.clientWidth) equityChart.applyOptions({ width: el.clientWidth });
   }
+}
+
+function onStatsChartsVisible() {
+  if (!statsBookChart) return;
+  const el = $("chart_stats_book");
+  if (el && el.clientWidth) statsBookChart.applyOptions({ width: el.clientWidth });
 }
 
 /* ===================== 复盘 (review) tab ===================== */
@@ -3810,6 +3947,9 @@ function showTab(name) {
   if (activeTab === "review") {
     setTimeout(onReviewTabVisible, 0);
   }
+  if (activeTab === "statistics") {
+    setTimeout(onStatsChartsVisible, 0);
+  }
 }
 document.querySelectorAll(".tab").forEach(btn => {
   btn.addEventListener("click", () => showTab(btn.getAttribute("data-tab")));
@@ -3851,6 +3991,7 @@ document.querySelectorAll("#stats_subtabs button[data-stats-pane]").forEach(btn 
     statsPane = btn.getAttribute("data-stats-pane") || "book";
     try { localStorage.setItem("ab_stats_pane", statsPane); } catch (_) {}
     syncStatsPaneButtons();
+    if (statsPane === "book") setTimeout(onStatsChartsVisible, 0);
   });
 });
 syncStatsPaneButtons();
@@ -4225,6 +4366,8 @@ function renderBookStatistics(data) {
   statusBody.innerHTML = statuses.length ? statuses.map(row => {
     return "<tr><td>" + esc(row.status || "—") + "</td><td>" + usageInt(row.orders) + "</td></tr>";
   }).join("") : '<tr><td colspan="2" class="muted">暂无近 30 天订单</td></tr>';
+
+  try { updateStatsBookChart(daily, tradeDaily); } catch (err) { console.error("stats book chart", err); }
 }
 function renderLlmStatistics(data) {
   data = (data && typeof data === "object") ? data : {};
