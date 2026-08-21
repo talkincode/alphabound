@@ -162,7 +162,7 @@ open http://127.0.0.1:18180/
 
 Dashboard「统计」页的数据源，含两个子页：**资产与交易**、**模型用量**。核心循环从 SQLite 预渲染快照；HTTP 线程不直接查询 SQLite。响应按 **UTC** 聚合。
 
-顶层仍保留 LLM 字段（`last_24h` / `daily_utc` / `recent` 等），并新增 `portfolio` 与 `trading`：
+顶层仍保留 LLM 字段（`last_24h` / `last_7d` / `last_30d` / `all_time` / `ledger_from` / `daily_utc` / `recent` 等），并新增 `portfolio` 与 `trading`。`all_time` 是账本累计；`ledger_from` 是第一条入账时间，更早的调用不会补记：
 
 ```json
 {

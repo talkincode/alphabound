@@ -1234,6 +1234,9 @@ pub const LlmUsageRepo = struct {
         const last_24h = try llmUsageTotalsSince(db, since_24h);
         const last_7d = try llmUsageTotalsSince(db, since_7d);
         const last_30d = try llmUsageTotalsSince(db, since_30d);
+        const all_time = try llmUsageTotalsAll(db);
+        var ledger_from_buf: [40]u8 = undefined;
+        const ledger_from = try llmUsageFirstTs(db, &ledger_from_buf);
 
         var w: std.Io.Writer = .fixed(out);
         w.print(
@@ -1245,6 +1248,10 @@ pub const LlmUsageRepo = struct {
         try writeLlmUsageTotals(&w, last_7d);
         w.writeAll(",\"last_30d\":") catch return error.StepFailed;
         try writeLlmUsageTotals(&w, last_30d);
+        w.writeAll(",\"all_time\":") catch return error.StepFailed;
+        try writeLlmUsageTotals(&w, all_time);
+        w.writeAll(",\"ledger_from\":") catch return error.StepFailed;
+        try writeOptText(&w, ledger_from);
         w.writeAll(",\"daily_utc\":") catch return error.StepFailed;
         try writeLlmUsageDaily(db, &w, since_30d);
         w.writeAll(",\"by_kind_30d\":") catch return error.StepFailed;
@@ -1320,6 +1327,39 @@ fn llmUsageTotalsSince(db: *Db, since: []const u8) DbError!LlmUsageTotals {
     try stmt.bindText(1, since);
     if (!try stmt.step()) return .{};
     return totalsFromStmt(&stmt, 0);
+}
+
+fn llmUsageTotalsAll(db: *Db) DbError!LlmUsageTotals {
+    var stmt = try db.prepare(
+        \\SELECT
+        \\  COUNT(*),
+        \\  COALESCE(SUM(CASE WHEN outcome = 'ok' THEN 1 ELSE 0 END), 0),
+        \\  COALESCE(SUM(CASE WHEN outcome = 'error' THEN 1 ELSE 0 END), 0),
+        \\  COALESCE(SUM(usage_reported), 0),
+        \\  COALESCE(SUM(cost_known), 0),
+        \\  COALESCE(SUM(prompt_tokens), 0),
+        \\  COALESCE(SUM(cached_prompt_tokens), 0),
+        \\  COALESCE(SUM(completion_tokens), 0),
+        \\  COALESCE(SUM(total_tokens), 0),
+        \\  COALESCE(SUM(input_cost_nano_usd), 0),
+        \\  COALESCE(SUM(output_cost_nano_usd), 0),
+        \\  COALESCE(AVG(latency_ms), 0),
+        \\  COALESCE(MAX(latency_ms), 0)
+        \\FROM llm_usage
+    );
+    defer stmt.finalize();
+    if (!try stmt.step()) return .{};
+    return totalsFromStmt(&stmt, 0);
+}
+
+fn llmUsageFirstTs(db: *Db, buf: *[40]u8) DbError![]const u8 {
+    var stmt = try db.prepare("SELECT MIN(ts) FROM llm_usage WHERE ts != ''");
+    defer stmt.finalize();
+    if (!try stmt.step()) return "";
+    const text = stmt.columnText(0);
+    if (text.len == 0 or text.len > buf.len) return "";
+    @memcpy(buf[0..text.len], text);
+    return buf[0..text.len];
 }
 
 fn totalsFromStmt(stmt: *Stmt, base: c_int) LlmUsageTotals {
@@ -2662,6 +2702,10 @@ test "LLM usage ledger aggregates priced and unmetered calls explicitly" {
     try testing.expectEqual(@as(i64, 1), totals.get("priced_calls").?.integer);
     try testing.expectEqual(@as(i64, 3_000), totals.get("input_cost_nano_usd").?.integer + totals.get("output_cost_nano_usd").?.integer);
     try testing.expectEqual(@as(usize, 4), root.get("recent").?.array.items.len);
+    const all_time = root.get("all_time").?.object;
+    try testing.expectEqual(@as(i64, 4), all_time.get("calls").?.integer);
+    try testing.expectEqual(@as(i64, 3_099), all_time.get("input_cost_nano_usd").?.integer + all_time.get("output_cost_nano_usd").?.integer);
+    try testing.expectEqualStrings(ts_old, root.get("ledger_from").?.string);
 
     var equity = try EquityRepo.init(&db);
     defer equity.deinit();

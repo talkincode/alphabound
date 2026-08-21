@@ -1658,14 +1658,14 @@
       </div>
       <div class="usage-kpis">
         <div class="usage-kpi cost">
-          <div class="usage-k">市场价成本估算</div>
+          <div class="usage-k">窗口合计</div>
           <div class="usage-v" id="usage_cost">—</div>
-          <div class="usage-sub" id="usage_cost_sub">只累计已定价调用</div>
+          <div class="usage-sub" id="usage_cost_sub">当前观察窗口已定价成本</div>
         </div>
         <div class="usage-kpi">
-          <div class="usage-k">日均消耗（推算）</div>
-          <div class="usage-v" id="usage_daily_cost">—</div>
-          <div class="usage-sub" id="usage_daily_cost_sub">按当前窗口折算</div>
+          <div class="usage-k">账本累计</div>
+          <div class="usage-v" id="usage_total_cost">—</div>
+          <div class="usage-sub" id="usage_total_cost_sub">自首次入账起的全部已定价成本</div>
         </div>
         <div class="usage-kpi">
           <div class="usage-k">Token 总量</div>
@@ -1684,7 +1684,7 @@
         </div>
       </div>
       <p class="usage-footnote" id="usage_footnote">
-        仅记录调用元数据与用量，不保存 Prompt、Completion、端点、密钥或原始错误响应。费用为 UTC 峰谷价档的市场价估算，不是供应商账单。
+        窗口合计随上方 24 小时 / 7 天 / 30 天切换；账本累计是入账以来的全部已定价成本。Flash 市场价约 $0.22 / $0.66 每百万未命中输入 / 输出 Token（UTC 高峰翻倍，缓存输入更低），所以十几万 Token 通常只有几美分。账本从第一次落库开始，部署前的进程计数不会补记。费用是市场价估算，不是供应商账单。
       </p>
     </section>
 
@@ -4234,6 +4234,13 @@ function fmtNanoUsd(nano) {
   if (usd >= 0.01) return "$" + usd.toFixed(4);
   return "$" + usd.toFixed(6);
 }
+function fmtUsdCny(nano) {
+  const usd = usageNum(nano) / 1e9;
+  if (!Number.isFinite(usd)) return "—";
+  const cny = usd * 7.2;
+  const cnyTxt = cny >= 1 ? cny.toFixed(2) : (cny >= 0.01 ? cny.toFixed(3) : cny.toFixed(4));
+  return fmtNanoUsd(nano) + " · ≈¥" + cnyTxt;
+}
 function usageTs(ts) {
   if (!ts) return "—";
   return String(ts).replace("T", " ").replace(/\.\d{3}Z$/, "Z");
@@ -4388,11 +4395,16 @@ function renderLlmStatistics(data) {
     ? new Date(asOf).toISOString().replace("T", " ").replace(/\.\d{3}Z$/, " UTC")
     : "尚无账本快照";
 
+  const allTime = (data.all_time && typeof data.all_time === "object") ? data.all_time : {};
+  const allCost = usageCostNano(allTime);
+  const ledgerFrom = data.ledger_from ? usageTs(data.ledger_from) : "";
   $("usage_asof").textContent = meta.label + " · 快照 " + asOfText;
-  $("usage_cost").textContent = fmtNanoUsd(cost);
-  $("usage_cost_sub").innerHTML = "已定价 <b>" + usageInt(priced) + " / " + usageInt(calls) + "</b> 次 · 未知不按零计";
-  $("usage_daily_cost").textContent = fmtNanoUsd(cost / meta.days);
-  $("usage_daily_cost_sub").textContent = meta.label + "内已定价成本 ÷ " + meta.days + " 天";
+  $("usage_cost").textContent = fmtUsdCny(cost);
+  $("usage_cost_sub").innerHTML = meta.label + "已定价 <b>" + usageInt(priced) + " / " + usageInt(calls) + "</b> 次 · 折合日均 " + fmtNanoUsd(cost / meta.days);
+  $("usage_total_cost").textContent = fmtUsdCny(allCost);
+  $("usage_total_cost_sub").textContent = ledgerFrom
+    ? "自 " + ledgerFrom + " 起入账 · 更早调用未补记"
+    : "尚无持久化调用";
   $("usage_tokens").textContent = usageInt(tokens);
   $("usage_tokens_sub").innerHTML = "输入 <b>" + usageInt(prompt) + "</b> · 缓存 <b>" + usageInt(cached) + "</b> · 输出 <b>" + usageInt(completion) + "</b>";
   $("usage_success").textContent = usagePct(ok, calls);
