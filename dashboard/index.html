@@ -1746,6 +1746,9 @@
       <div class="card"><div class="label">运行时长</div><div class="value" id="st_up" style="font-size:16px">—</div></div>
       <div class="card"><div class="label">进程出口 IP</div><div class="value" id="st_ip" style="font-size:14px">—</div></div>
       <div class="card"><div class="label">磁盘（DB 卷）</div><div class="value" id="st_disk" style="font-size:14px">—</div></div>
+      <div class="card"><div class="label">CPU</div><div class="value" id="st_cpu" style="font-size:14px">—</div></div>
+      <div class="card"><div class="label">内存</div><div class="value" id="st_ram" style="font-size:14px">—</div></div>
+      <div class="card"><div class="label">网络</div><div class="value" id="st_net" style="font-size:14px">—</div></div>
     </div>
 
     <h2>接口连接</h2>
@@ -1774,7 +1777,7 @@
       <div class="card"><div class="label">Completion tokens</div><div class="value" id="tk_comp" style="font-size:16px">—</div></div>
       <div class="card"><div class="label">Total tokens</div><div class="value" id="tk_total" style="font-size:16px">—</div></div>
     </div>
-    <p class="hint" id="st_hint">状态由守护进程实时上报；出口 IP 约每小时刷新。私有账户若显示 ip_whitelist，请把出口 IP 加入 OKX API 白名单。</p>
+    <p class="hint" id="st_hint">状态由守护进程实时上报；CPU / 内存 / 网络约每 5 秒采样；出口 IP 约每小时刷新。私有账户若显示 ip_whitelist，请把出口 IP 加入 OKX API 白名单。</p>
   </div>
 
   <div class="footer" id="meta"></div>
@@ -4047,6 +4050,26 @@ function ageText(ms) {
   if (sec < 120) return sec + " 秒前";
   return Math.floor(sec/60) + " 分前";
 }
+function fmtPctX10(x10) {
+  const n = Number(x10);
+  if (!Number.isFinite(n) || n < 0) return "—";
+  return (n / 10).toFixed(1) + "%";
+}
+function fmtBytes(n) {
+  const v = Number(n);
+  if (!Number.isFinite(v) || v <= 0) return "—";
+  if (v >= 1024*1024*1024) return (v / (1024*1024*1024)).toFixed(1) + " GiB";
+  if (v >= 1024*1024) return (v / (1024*1024)).toFixed(1) + " MiB";
+  if (v >= 1024) return Math.round(v / 1024) + " KiB";
+  return Math.round(v) + " B";
+}
+function fmtBps(n) {
+  const v = Number(n);
+  if (!Number.isFinite(v) || v < 0) return "—";
+  if (v >= 1024*1024) return (v / (1024*1024)).toFixed(1) + " MiB/s";
+  if (v >= 1024) return (v / 1024).toFixed(1) + " KiB/s";
+  return Math.round(v) + " B/s";
+}
 function connClass(s) {
   if (s === "ok") return "value ok";
   if (s === "error" || s === "ip_whitelist") return "value err";
@@ -4082,6 +4105,42 @@ function renderStatus(system, state) {
     }
     $("st_disk").textContent = band + " · free " + freeTxt + (st.disk_ms ? " · " + ageText(st.disk_ms) : "");
     $("st_disk").className = "value" + (band === "critical" ? " bad" : band === "low" ? " warn" : band === "ok" ? " ok" : "");
+  }
+  if ($("st_cpu")) {
+    if (!st.res_ready) {
+      $("st_cpu").textContent = "采样中";
+      $("st_cpu").className = "value";
+    } else {
+      const procCpu = fmtPctX10(st.cpu_pct_x10);
+      const hostCpu = fmtPctX10(st.host_cpu_pct_x10);
+      $("st_cpu").textContent = "进程 " + procCpu + " · 主机 " + hostCpu;
+      const hostN = Number(st.host_cpu_pct_x10) || 0;
+      $("st_cpu").className = "value" + (hostN >= 850 ? " bad" : hostN >= 700 ? " warn" : " ok");
+    }
+  }
+  if ($("st_ram")) {
+    const rss = fmtBytes(st.rss_bytes);
+    const used = Number(st.mem_used_bytes) || 0;
+    const total = Number(st.mem_total_bytes) || 0;
+    let host = "";
+    if (total > 0) {
+      const pct = Math.round(used * 1000 / total) / 10;
+      host = " · 主机 " + pct.toFixed(1) + "% (" + fmtBytes(used) + "/" + fmtBytes(total) + ")";
+    }
+    $("st_ram").textContent = rss === "—" ? "—" : rss + " RSS" + host;
+    const ramPct = total > 0 ? used * 100 / total : 0;
+    $("st_ram").className = "value" + (ramPct >= 90 ? " bad" : ramPct >= 80 ? " warn" : rss !== "—" ? " ok" : "");
+  }
+  if ($("st_net")) {
+    if (!st.res_ready) {
+      $("st_net").textContent = "采样中";
+      $("st_net").className = "value";
+    } else {
+      const rx = Number(st.net_rx_bps) || 0;
+      const tx = Number(st.net_tx_bps) || 0;
+      $("st_net").textContent = "↓" + fmtBps(rx) + " · ↑" + fmtBps(tx);
+      $("st_net").className = "value" + ((rx + tx) >= 50*1024*1024 ? " warn" : " ok");
+    }
   }
 
   const pub = st.okx_public || "unknown";

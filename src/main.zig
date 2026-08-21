@@ -725,6 +725,7 @@ pub fn main(init: std.process.Init) !u8 {
     // Local admin pause flag (control file). Risk/market loop keeps running.
     var admin_paused: bool = false;
     var runtime_status = RuntimeStatus{};
+    var res_sampler = ab.resources.Sampler.init();
 
     var control_path_buf: [640]u8 = undefined;
     const control_path = ab.admin_control.pathFromDb(cfg.db_path, &control_path_buf) catch "var/trading.control";
@@ -781,6 +782,7 @@ pub fn main(init: std.process.Init) !u8 {
     refreshCandlesCache(gpa, &web_state, &okx, &cfg);
     refreshEgressIp(&okx, &runtime_status);
     refreshDiskStatus(&cfg, &engine, &events_repo, &runtime_status);
+    runtime_status.setResources(res_sampler.sample(nowMs()));
     refreshSystemCache(&web_state, &db, &cfg, &mem_store, boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), llm_client != null, admin_paused, &runtime_status, &risk_latency);
     logEvent(&events_repo, &engine, "STATE_READY", "core", "INFO", &cfg);
 
@@ -1152,6 +1154,7 @@ pub fn main(init: std.process.Init) !u8 {
             const tnow = nowMs();
             if (last_dashboard_ms == 0 or tnow - last_dashboard_ms >= dashboard_refresh_ms) {
                 last_dashboard_ms = tnow;
+                runtime_status.setResources(res_sampler.sample(tnow));
                 refreshWebCaches(&web_state, &db, &agent_runs, &equity_repo, &events_repo, &memories_repo, &orders_repo, &fills_repo, last_bh_cmp);
                 ab.web_cache.refreshStatisticsCache(&web_state, &db, &llm_usage_repo);
                 refreshCandlesCache(gpa, &web_state, &okx, &cfg);

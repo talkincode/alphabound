@@ -26,6 +26,7 @@ pub const retention = @import("storage/retention.zig");
 pub const backup = @import("storage/backup.zig");
 pub const security_limits = @import("security/limits.zig");
 pub const latency = @import("observability/latency.zig");
+pub const resources = @import("observability/resources.zig");
 pub const okx_auth = @import("exchange/okx/auth.zig");
 pub const okx_rest = @import("exchange/okx/rest.zig");
 pub const okx_ws = @import("exchange/okx/ws.zig");

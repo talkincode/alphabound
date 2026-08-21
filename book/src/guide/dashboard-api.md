@@ -113,7 +113,7 @@ open http://127.0.0.1:18180/
 | `GET /api/v1/shadow` | 实盘净值 vs 同起点 buy-and-hold |
 | `GET /api/v1/candles` | 多周期 K 线缓存 `bars.{1m,5m,15m,1H,4H,1D}` |
 | `GET /api/v1/memories` | 最新版本记忆 |
-| `GET /api/v1/system` | 进程/agent/paused/disk/latency 等 |
+| `GET /api/v1/system` | 进程/agent/paused/disk/CPU/内存/网络/latency 等 |
 | `GET /api/v1/statistics` | 资产/交易窗口账本 + 持久化 LLM 调用、Token、市场价成本、覆盖率与近期账本 |
 | `GET /api/v1/decisions` | 提案/反思审计事件（含 thesis） |
 | `GET /api/v1/orders` | `{"orders":[...],"fills":[...]}` 投影 |
@@ -154,7 +154,18 @@ open http://127.0.0.1:18180/
   "memories": 6,
   "private_keys": true,
   "private_ws_opt_in": false,
-  "agent": {"total": 4, "ok": 3, "invalid": 0, "errors": 1, "valid_rate": 75.0, "tool_calls": 8}
+  "agent": {"total": 4, "ok": 3, "invalid": 0, "errors": 1, "valid_rate": 75.0, "tool_calls": 8},
+  "status": {
+    "disk": "ok",
+    "disk_free_bytes": 12884901888,
+    "cpu_pct_x10": 8,
+    "host_cpu_pct_x10": 41,
+    "rss_bytes": 16000000,
+    "mem_used_bytes": 800000000,
+    "mem_total_bytes": 2000000000,
+    "net_rx_bps": 12000,
+    "net_tx_bps": 4000
+  }
 }
 ```
 

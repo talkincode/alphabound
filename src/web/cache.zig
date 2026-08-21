@@ -12,6 +12,7 @@ const okx_rest = @import("../exchange/okx/rest.zig");
 const config = @import("../config.zig");
 const memory = @import("../memory/store.zig");
 const latency = @import("../observability/latency.zig");
+const resources = @import("../observability/resources.zig");
 const openai = @import("../agent/openai.zig");
 const clock = @import("../core/clock.zig");
 const review = @import("review.zig");
@@ -355,6 +356,15 @@ pub const RuntimeStatus = struct {
     disk: []const u8 = "unknown",
     disk_free_bytes: u64 = 0,
     disk_ms: i64 = 0,
+    cpu_pct_x10: u32 = 0,
+    host_cpu_pct_x10: u32 = 0,
+    rss_bytes: u64 = 0,
+    mem_used_bytes: u64 = 0,
+    mem_total_bytes: u64 = 0,
+    net_rx_bps: u64 = 0,
+    net_tx_bps: u64 = 0,
+    res_ms: i64 = 0,
+    res_ready: bool = false,
     // LLM token totals since process start
     llm_calls: u64 = 0,
     prompt_tokens: u64 = 0,
@@ -477,6 +487,17 @@ pub const RuntimeStatus = struct {
         self.disk = band;
         self.disk_free_bytes = free_bytes;
         self.disk_ms = nowMs();
+    }
+    pub fn setResources(self: *RuntimeStatus, snap: resources.Snapshot) void {
+        self.cpu_pct_x10 = snap.cpu_pct_x10;
+        self.host_cpu_pct_x10 = snap.host_cpu_pct_x10;
+        self.rss_bytes = snap.rss_bytes;
+        self.mem_used_bytes = snap.mem_used_bytes;
+        self.mem_total_bytes = snap.mem_total_bytes;
+        self.net_rx_bps = snap.net_rx_bps;
+        self.net_tx_bps = snap.net_tx_bps;
+        self.res_ms = nowMs();
+        self.res_ready = snap.ready;
     }
 };
 
@@ -806,13 +827,22 @@ pub fn refreshSystemCache(
         .{ risk_lat.percentile(50), risk_lat.percentile(99), risk_lat.maxUs(), risk_lat.count() },
     ) catch return;
     w.print(
-        "\"egress_ip\":\"{s}\",\"egress_ip_ms\":{d},\"disk\":\"{s}\",\"disk_free_bytes\":{d},\"disk_ms\":{d},\"llm_calls\":{d},\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d},\"acct_usdt\":\"{s}\",\"acct_btc\":\"{s}\",\"last_decision\":\"{s}\",\"last_decision_ms\":{d}}}}}",
+        "\"egress_ip\":\"{s}\",\"egress_ip_ms\":{d},\"disk\":\"{s}\",\"disk_free_bytes\":{d},\"disk_ms\":{d},\"cpu_pct_x10\":{d},\"host_cpu_pct_x10\":{d},\"rss_bytes\":{d},\"mem_used_bytes\":{d},\"mem_total_bytes\":{d},\"net_rx_bps\":{d},\"net_tx_bps\":{d},\"res_ms\":{d},\"res_ready\":{},\"llm_calls\":{d},\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d},\"acct_usdt\":\"{s}\",\"acct_btc\":\"{s}\",\"last_decision\":\"{s}\",\"last_decision_ms\":{d}}}}}",
         .{
             st.egress_ip,
             st.egress_ip_ms,
             st.disk,
             st.disk_free_bytes,
             st.disk_ms,
+            st.cpu_pct_x10,
+            st.host_cpu_pct_x10,
+            st.rss_bytes,
+            st.mem_used_bytes,
+            st.mem_total_bytes,
+            st.net_rx_bps,
+            st.net_tx_bps,
+            st.res_ms,
+            st.res_ready,
             st.llm_calls,
             st.prompt_tokens,
             st.completion_tokens,
