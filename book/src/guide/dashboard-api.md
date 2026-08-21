@@ -40,7 +40,7 @@ curl -sS -H "Authorization: Bearer YOUR_TOKEN" http://127.0.0.1:18180/api/v1/sta
 | 入口 | `GET /` 与 `GET /index.html` |
 | 依赖 | 零 Node 运行时；浏览器直接 `fetch` API |
 | 刷新 | 前端约 2s 轮询 state / shadow / agent-runs / equity / candles / memories / events / system / orders / decisions / review-chats / statistics |
-| 内容 | Overview + Shadow vs BH + **Lightweight Charts**（分时/多周期 K 线 + 成交量 + 净值/HWM）+ **复盘**（K 线决策标记 + 指标 + AI 复盘对话 + 复盘记录）+ **统计**（持久化 LLM Token/成本账本）+ 提案/记忆/事件/订单 + System |
+| 内容 | Overview + Shadow vs BH + **Lightweight Charts**（分时/多周期 K 线 + 成交量 + 净值/HWM）+ **复盘**（K 线决策标记 + 指标 + AI 复盘对话 + 复盘记录）+ **统计**（资产/交易窗口账本 + 持久化 LLM Token/成本账本）+ 提案/记忆/事件/订单 + System |
 
 概览图表使用 [Lightweight Charts](https://www.tradingview.com/lightweight-charts/)（CDN）。周期按钮：**分时**（1m 收盘面积图）、1分/5分/15分/1时/4时/1日。离线无 CDN 时其余 UI 仍可用。
 
@@ -114,7 +114,7 @@ open http://127.0.0.1:18180/
 | `GET /api/v1/candles` | 多周期 K 线缓存 `bars.{1m,5m,15m,1H,4H,1D}` |
 | `GET /api/v1/memories` | 最新版本记忆 |
 | `GET /api/v1/system` | 进程/agent/paused/disk/latency 等 |
-| `GET /api/v1/statistics` | 持久化 LLM 调用、Token、市场价成本、覆盖率与近期账本 |
+| `GET /api/v1/statistics` | 资产/交易窗口账本 + 持久化 LLM 调用、Token、市场价成本、覆盖率与近期账本 |
 | `GET /api/v1/decisions` | 提案/反思审计事件（含 thesis） |
 | `GET /api/v1/orders` | `{"orders":[...],"fills":[...]}` 投影 |
 | `GET /api/v1/review/chats` | 复盘对话最近轮次（newest first，客户端按 `id` 升序重排） |
@@ -160,7 +160,9 @@ open http://127.0.0.1:18180/
 
 ### `GET /api/v1/statistics`
 
-Dashboard「统计」页的数据源。核心循环从 SQLite `llm_usage` 逐调用账本预渲染快照；HTTP 线程不直接查询 SQLite。响应按 **UTC** 聚合，提供过去 24 小时、7 天、30 天总计，最近 30 天日序列、按调用类型/模型分布，以及最近 32 次调用：
+Dashboard「统计」页的数据源，含两个子页：**资产与交易**、**模型用量**。核心循环从 SQLite 预渲染快照；HTTP 线程不直接查询 SQLite。响应按 **UTC** 聚合。
+
+顶层仍保留 LLM 字段（`last_24h` / `daily_utc` / `recent` 等），并新增 `portfolio` 与 `trading`：
 
 ```json
 {
@@ -189,6 +191,8 @@ Dashboard「统计」页的数据源。核心循环从 SQLite `llm_usage` 逐调
 - **完整性优先**：每次模型调用（成功、业务输出无效、超时/HTTP/解析失败）都写一条账本。`usage_reported=false` 表示 Provider 没有给出 usage；`cost_known=false` 表示模型未识别、usage 缺失或调用失败。二者都不能当作零成本。
 - **价格边界**：目前识别 DeepSeek V4 Flash 的版本化市场价档；按调用开始时的 UTC 峰/非峰段分别计算缓存命中输入、缓存未命中输入和输出成本，使用整数 nano USD 结算。它是**市场价估算，不是供应商、网关或代理商账单**；未知模型保持未定价。
 - **隐私边界**：账本仅保存时间、调用类型、模型、关联 run/decision、延迟、Token、价格档、费用和短错误类别；不保存 Prompt、Completion、Provider URL、密钥或原始错误响应。
+- **资产窗口**：`portfolio.last_24h/7d/30d` 来自 1 分钟 `equity_samples`。缺起点/终点或买入持有标记时对应字段为 `null`，不会把未知收益或超额写成 0。
+- **交易窗口**：`trading.*` 按订单创建时间和成交时间计入。名义额与数量用 Decimal 累加；未关联订单的成交计入 `unlinked_fills`，非 USDT 费用计入 `fee_other_fills`，都不并入 USDT 费用合计。
 
 ### `GET /api/v1/candles`
 

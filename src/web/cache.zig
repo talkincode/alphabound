@@ -71,8 +71,8 @@ pub const WebState = struct {
     /// Must match the worst-case test in src/analytics/ab_factor.zig.
     analytics_buf: [131072]u8 = undefined,
     analytics_len: usize = 2,
-    /// Durable LLM usage/cost statistics (UTC market-price estimate).
-    statistics_buf: [65536]u8 = undefined,
+    /// Durable LLM / portfolio / trading statistics (UTC windows).
+    statistics_buf: [98304]u8 = undefined,
     statistics_len: usize = 2,
     /// Dashboard / MCP auth (optional; empty token = open).
     auth_cfg: web_auth.Config = .{},
@@ -135,7 +135,7 @@ pub const WebState = struct {
             var audit: [24576]u8 = undefined;
             var periodic: [49152]u8 = undefined;
             var analytics: [131072]u8 = undefined;
-            var statistics: [65536]u8 = undefined;
+            var statistics: [98304]u8 = undefined;
             var config_hash: [71]u8 = undefined;
             var agent_len: usize = 2;
             var equity_len: usize = 2;

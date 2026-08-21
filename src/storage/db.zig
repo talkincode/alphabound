@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const clock = @import("../core/clock.zig");
+const dec = @import("../core/decimal.zig");
 const c = @cImport({
     @cInclude("sqlite3.h");
 });
@@ -1252,7 +1253,27 @@ pub const LlmUsageRepo = struct {
         try writeLlmUsageByModel(db, &w, since_30d);
         w.writeAll(",\"recent\":") catch return error.StepFailed;
         try writeRecentLlmUsage(db, &w, 32);
-        w.writeByte('}') catch return error.StepFailed;
+        w.writeAll(",\"portfolio\":{\"last_24h\":") catch return error.StepFailed;
+        try writePortfolioWindow(db, &w, since_24h);
+        w.writeAll(",\"last_7d\":") catch return error.StepFailed;
+        try writePortfolioWindow(db, &w, since_7d);
+        w.writeAll(",\"last_30d\":") catch return error.StepFailed;
+        try writePortfolioWindow(db, &w, since_30d);
+        w.writeAll(",\"daily_utc\":") catch return error.StepFailed;
+        try writePortfolioDaily(db, &w, since_30d);
+        w.writeAll("},\"trading\":{\"last_24h\":") catch return error.StepFailed;
+        try writeTradingWindow(db, &w, since_24h);
+        w.writeAll(",\"last_7d\":") catch return error.StepFailed;
+        try writeTradingWindow(db, &w, since_7d);
+        w.writeAll(",\"last_30d\":") catch return error.StepFailed;
+        try writeTradingWindow(db, &w, since_30d);
+        w.writeAll(",\"daily_utc\":") catch return error.StepFailed;
+        try writeTradingDaily(db, &w, since_30d);
+        w.writeAll(",\"by_status_30d\":") catch return error.StepFailed;
+        try writeOrderStatusCounts(db, &w, since_30d);
+        w.writeAll(",\"by_side_30d\":") catch return error.StepFailed;
+        try writeFillSideCounts(db, &w, since_30d);
+        w.writeAll("}}") catch return error.StepFailed;
         return w.buffered();
     }
 };
@@ -1486,6 +1507,490 @@ fn writeRecentLlmUsage(db: *Db, w: *std.Io.Writer, limit: i64) StatsWriteError!v
             "\",\"input_cost_nano_usd\":{d},\"output_cost_nano_usd\":{d},\"cost_known\":{}}}",
             .{ stmt.columnInt(12), stmt.columnInt(13), stmt.columnInt(14) != 0 },
         );
+    }
+    try w.writeByte(']');
+}
+
+fn parseDec(text: []const u8) ?dec.Decimal {
+    if (text.len == 0) return null;
+    return dec.Decimal.parse(text) catch null;
+}
+
+fn addDec(a: dec.Decimal, b: dec.Decimal) dec.Decimal {
+    return a.add(b) catch a;
+}
+
+fn ratioMinusOne(start: dec.Decimal, end: dec.Decimal) ?dec.Decimal {
+    if (!start.gt(dec.Decimal.zero)) return null;
+    const ratio = end.div(start, .down) catch return null;
+    return ratio.sub(dec.Decimal.one) catch null;
+}
+
+fn writeQuotedDec(w: *std.Io.Writer, value: dec.Decimal) error{WriteFailed}!void {
+    try w.writeByte('"');
+    value.format(w) catch return error.WriteFailed;
+    try w.writeByte('"');
+}
+
+fn writeOptQuotedDec(w: *std.Io.Writer, value: ?dec.Decimal) error{WriteFailed}!void {
+    if (value) |v| {
+        try writeQuotedDec(w, v);
+    } else {
+        try w.writeAll("null");
+    }
+}
+
+fn writeOptText(w: *std.Io.Writer, value: []const u8) error{WriteFailed}!void {
+    if (value.len == 0) {
+        try w.writeAll("null");
+        return;
+    }
+    try w.writeByte('"');
+    try writeJsonEscaped(w, value);
+    try w.writeByte('"');
+}
+
+const PortfolioEdge = struct {
+    ts: []const u8 = "",
+    equity: ?dec.Decimal = null,
+    cash: ?dec.Decimal = null,
+    btc_value: ?dec.Decimal = null,
+    btc_qty: ?dec.Decimal = null,
+    hwm: ?dec.Decimal = null,
+    bh_equity: ?dec.Decimal = null,
+};
+
+fn copyPortfolioTs(dest: *[40]u8, src: []const u8) []const u8 {
+    const n = @min(src.len, dest.len);
+    @memcpy(dest[0..n], src[0..n]);
+    return dest[0..n];
+}
+
+fn readPortfolioEdge(db: *Db, since: []const u8, comptime newest: bool, ts_buf: *[40]u8) DbError!PortfolioEdge {
+    const sql: [:0]const u8 = if (newest)
+        \\SELECT ts, equity, cash, btc_value, btc_qty, hwm, bh_equity
+        \\FROM equity_samples
+        \\WHERE interval = '1m' AND ts >= ?1
+        \\ORDER BY ts DESC LIMIT 1
+    else
+        \\SELECT ts, equity, cash, btc_value, btc_qty, hwm, bh_equity
+        \\FROM equity_samples
+        \\WHERE interval = '1m' AND ts >= ?1
+        \\ORDER BY ts ASC LIMIT 1
+    ;
+    var stmt = try db.prepare(sql);
+    defer stmt.finalize();
+    try stmt.bindText(1, since);
+    if (!try stmt.step()) return .{};
+    return .{
+        .ts = copyPortfolioTs(ts_buf, stmt.columnText(0)),
+        .equity = parseDec(stmt.columnText(1)),
+        .cash = parseDec(stmt.columnText(2)),
+        .btc_value = parseDec(stmt.columnText(3)),
+        .btc_qty = parseDec(stmt.columnText(4)),
+        .hwm = parseDec(stmt.columnText(5)),
+        .bh_equity = parseDec(stmt.columnText(6)),
+    };
+}
+
+fn countEquitySamples(db: *Db, since: []const u8) DbError!struct { total: i64, marked: i64 } {
+    var stmt = try db.prepare(
+        \\SELECT COUNT(*),
+        \\  COALESCE(SUM(CASE WHEN bid_price != '' AND bh_equity != '' THEN 1 ELSE 0 END), 0)
+        \\FROM equity_samples
+        \\WHERE interval = '1m' AND ts >= ?1
+    );
+    defer stmt.finalize();
+    try stmt.bindText(1, since);
+    if (!try stmt.step()) return .{ .total = 0, .marked = 0 };
+    return .{ .total = stmt.columnInt(0), .marked = stmt.columnInt(1) };
+}
+
+fn maxDrawdownSince(db: *Db, since: []const u8) DbError!?dec.Decimal {
+    var stmt = try db.prepare(
+        \\SELECT drawdown FROM equity_samples
+        \\WHERE interval = '1m' AND ts >= ?1 AND drawdown != ''
+        \\ORDER BY CAST(drawdown AS REAL) DESC LIMIT 1
+    );
+    defer stmt.finalize();
+    try stmt.bindText(1, since);
+    if (!try stmt.step()) return null;
+    return parseDec(stmt.columnText(0));
+}
+
+fn writePortfolioWindow(db: *Db, w: *std.Io.Writer, since: []const u8) StatsWriteError!void {
+    var start_ts_buf: [40]u8 = undefined;
+    var end_ts_buf: [40]u8 = undefined;
+    const counts = try countEquitySamples(db, since);
+    const start = try readPortfolioEdge(db, since, false, &start_ts_buf);
+    const end = try readPortfolioEdge(db, since, true, &end_ts_buf);
+    const max_dd = try maxDrawdownSince(db, since);
+    const window_return = if (start.equity != null and end.equity != null)
+        ratioMinusOne(start.equity.?, end.equity.?)
+    else
+        null;
+    const btc_weight = if (end.equity) |eq|
+        if (eq.gt(dec.Decimal.zero) and end.btc_value != null)
+            end.btc_value.?.div(eq, .down) catch null
+        else
+            null
+    else
+        null;
+    const bh_return = if (start.bh_equity != null and end.bh_equity != null)
+        ratioMinusOne(start.bh_equity.?, end.bh_equity.?)
+    else
+        null;
+    const alpha_return = if (window_return != null and bh_return != null)
+        window_return.?.sub(bh_return.?) catch null
+    else
+        null;
+
+    try w.writeAll("{\"sample_count\":");
+    try w.print("{d}", .{counts.total});
+    try w.writeAll(",\"marked_sample_count\":");
+    try w.print("{d}", .{counts.marked});
+    try w.writeAll(",\"start_ts\":");
+    try writeOptText(w, start.ts);
+    try w.writeAll(",\"end_ts\":");
+    try writeOptText(w, end.ts);
+    try w.writeAll(",\"equity_start\":");
+    try writeOptQuotedDec(w, start.equity);
+    try w.writeAll(",\"equity_end\":");
+    try writeOptQuotedDec(w, end.equity);
+    try w.writeAll(",\"cash_end\":");
+    try writeOptQuotedDec(w, end.cash);
+    try w.writeAll(",\"btc_value_end\":");
+    try writeOptQuotedDec(w, end.btc_value);
+    try w.writeAll(",\"btc_qty_end\":");
+    try writeOptQuotedDec(w, end.btc_qty);
+    try w.writeAll(",\"hwm_end\":");
+    try writeOptQuotedDec(w, end.hwm);
+    try w.writeAll(",\"btc_weight_end\":");
+    try writeOptQuotedDec(w, btc_weight);
+    try w.writeAll(",\"window_return\":");
+    try writeOptQuotedDec(w, window_return);
+    try w.writeAll(",\"max_drawdown\":");
+    try writeOptQuotedDec(w, max_dd);
+    try w.writeAll(",\"bh_equity_start\":");
+    try writeOptQuotedDec(w, start.bh_equity);
+    try w.writeAll(",\"bh_equity_end\":");
+    try writeOptQuotedDec(w, end.bh_equity);
+    try w.writeAll(",\"bh_return\":");
+    try writeOptQuotedDec(w, bh_return);
+    try w.writeAll(",\"alpha_return\":");
+    try writeOptQuotedDec(w, alpha_return);
+    try w.writeByte('}');
+}
+
+fn writePortfolioDaily(db: *Db, w: *std.Io.Writer, since: []const u8) StatsWriteError!void {
+    var stmt = try db.prepare(
+        \\SELECT d.day, e.equity, e.cash, e.btc_value, e.drawdown, e.bh_equity
+        \\FROM (
+        \\  SELECT substr(ts, 1, 10) AS day, MAX(ts) AS ts
+        \\  FROM equity_samples
+        \\  WHERE interval = '1m' AND ts >= ?1
+        \\  GROUP BY 1
+        \\) d
+        \\JOIN equity_samples e ON e.interval = '1m' AND e.ts = d.ts
+        \\ORDER BY d.day ASC
+    );
+    defer stmt.finalize();
+    try stmt.bindText(1, since);
+    try w.writeByte('[');
+    var first = true;
+    var prev_equity: ?dec.Decimal = null;
+    while (try stmt.step()) {
+        if (!first) try w.writeByte(',');
+        first = false;
+        const equity = parseDec(stmt.columnText(1));
+        const day_return = if (prev_equity != null and equity != null)
+            ratioMinusOne(prev_equity.?, equity.?)
+        else
+            null;
+        prev_equity = equity;
+        try w.writeAll("{\"day\":\"");
+        try writeJsonEscaped(w, stmt.columnText(0));
+        try w.writeAll("\",\"equity\":");
+        try writeOptQuotedDec(w, equity);
+        try w.writeAll(",\"cash\":");
+        try writeOptQuotedDec(w, parseDec(stmt.columnText(2)));
+        try w.writeAll(",\"btc_value\":");
+        try writeOptQuotedDec(w, parseDec(stmt.columnText(3)));
+        try w.writeAll(",\"drawdown\":");
+        try writeOptQuotedDec(w, parseDec(stmt.columnText(4)));
+        try w.writeAll(",\"bh_equity\":");
+        try writeOptQuotedDec(w, parseDec(stmt.columnText(5)));
+        try w.writeAll(",\"day_return\":");
+        try writeOptQuotedDec(w, day_return);
+        try w.writeByte('}');
+    }
+    try w.writeByte(']');
+}
+
+const OrderCounts = struct {
+    orders: i64 = 0,
+    filled: i64 = 0,
+    canceled: i64 = 0,
+    rejected: i64 = 0,
+    open: i64 = 0,
+};
+
+fn readOrderCounts(db: *Db, since: []const u8) DbError!OrderCounts {
+    var stmt = try db.prepare(
+        \\SELECT
+        \\  COUNT(*),
+        \\  COALESCE(SUM(CASE WHEN status = 'FILLED' THEN 1 ELSE 0 END), 0),
+        \\  COALESCE(SUM(CASE WHEN status = 'CANCELED' THEN 1 ELSE 0 END), 0),
+        \\  COALESCE(SUM(CASE WHEN status = 'REJECTED' THEN 1 ELSE 0 END), 0),
+        \\  COALESCE(SUM(CASE WHEN status IN ('PLANNED','SUBMITTED','ACKNOWLEDGED','PARTIAL') THEN 1 ELSE 0 END), 0)
+        \\FROM orders WHERE created_ts >= ?1
+    );
+    defer stmt.finalize();
+    try stmt.bindText(1, since);
+    if (!try stmt.step()) return .{};
+    return .{
+        .orders = stmt.columnInt(0),
+        .filled = stmt.columnInt(1),
+        .canceled = stmt.columnInt(2),
+        .rejected = stmt.columnInt(3),
+        .open = stmt.columnInt(4),
+    };
+}
+
+const FillTotals = struct {
+    fills: i64 = 0,
+    buy_fills: i64 = 0,
+    sell_fills: i64 = 0,
+    unlinked_fills: i64 = 0,
+    buy_qty: dec.Decimal = dec.Decimal.zero,
+    sell_qty: dec.Decimal = dec.Decimal.zero,
+    buy_notional: dec.Decimal = dec.Decimal.zero,
+    sell_notional: dec.Decimal = dec.Decimal.zero,
+    fee_usdt: dec.Decimal = dec.Decimal.zero,
+    fee_other_fills: i64 = 0,
+    truncated: bool = false,
+};
+
+fn accumulateFill(totals: *FillTotals, side: []const u8, qty_text: []const u8, price_text: []const u8, fee_text: []const u8, fee_ccy: []const u8) void {
+    totals.fills += 1;
+    const qty = parseDec(qty_text) orelse dec.Decimal.zero;
+    const price = parseDec(price_text) orelse dec.Decimal.zero;
+    const notional = qty.mul(price, .down) catch dec.Decimal.zero;
+    if (std.mem.eql(u8, side, "buy")) {
+        totals.buy_fills += 1;
+        totals.buy_qty = addDec(totals.buy_qty, qty);
+        totals.buy_notional = addDec(totals.buy_notional, notional);
+    } else if (std.mem.eql(u8, side, "sell")) {
+        totals.sell_fills += 1;
+        totals.sell_qty = addDec(totals.sell_qty, qty);
+        totals.sell_notional = addDec(totals.sell_notional, notional);
+    } else {
+        totals.unlinked_fills += 1;
+    }
+    if (fee_ccy.len == 0 or std.mem.eql(u8, fee_ccy, "USDT")) {
+        if (parseDec(fee_text)) |fee| totals.fee_usdt = addDec(totals.fee_usdt, fee);
+    } else if (parseDec(fee_text) != null) {
+        totals.fee_other_fills += 1;
+    }
+}
+
+fn readFillTotals(db: *Db, since: []const u8) DbError!FillTotals {
+    var stmt = try db.prepare(
+        \\SELECT COALESCE(o.side, ''), f.qty, f.price, f.fee, f.fee_ccy
+        \\FROM fills f LEFT JOIN orders o ON o.client_order_id = f.order_id
+        \\WHERE f.ts >= ?1
+        \\ORDER BY f.ts ASC
+        \\LIMIT 20001
+    );
+    defer stmt.finalize();
+    try stmt.bindText(1, since);
+    var totals = FillTotals{};
+    var n: i64 = 0;
+    while (try stmt.step()) {
+        n += 1;
+        if (n > 20000) {
+            totals.truncated = true;
+            break;
+        }
+        accumulateFill(
+            &totals,
+            stmt.columnText(0),
+            stmt.columnText(1),
+            stmt.columnText(2),
+            stmt.columnText(3),
+            stmt.columnText(4),
+        );
+    }
+    return totals;
+}
+
+fn writeTradingWindow(db: *Db, w: *std.Io.Writer, since: []const u8) StatsWriteError!void {
+    const orders = try readOrderCounts(db, since);
+    const fills = try readFillTotals(db, since);
+    const net_btc = fills.buy_qty.sub(fills.sell_qty) catch fills.buy_qty;
+    const turnover = addDec(fills.buy_notional, fills.sell_notional);
+    try w.writeAll("{\"orders\":");
+    try w.print("{d}", .{orders.orders});
+    try w.writeAll(",\"filled_orders\":");
+    try w.print("{d}", .{orders.filled});
+    try w.writeAll(",\"canceled_orders\":");
+    try w.print("{d}", .{orders.canceled});
+    try w.writeAll(",\"rejected_orders\":");
+    try w.print("{d}", .{orders.rejected});
+    try w.writeAll(",\"open_orders\":");
+    try w.print("{d}", .{orders.open});
+    try w.writeAll(",\"fills\":");
+    try w.print("{d}", .{fills.fills});
+    try w.writeAll(",\"buy_fills\":");
+    try w.print("{d}", .{fills.buy_fills});
+    try w.writeAll(",\"sell_fills\":");
+    try w.print("{d}", .{fills.sell_fills});
+    try w.writeAll(",\"unlinked_fills\":");
+    try w.print("{d}", .{fills.unlinked_fills});
+    try w.writeAll(",\"buy_qty\":");
+    try writeQuotedDec(w, fills.buy_qty);
+    try w.writeAll(",\"sell_qty\":");
+    try writeQuotedDec(w, fills.sell_qty);
+    try w.writeAll(",\"net_btc\":");
+    try writeQuotedDec(w, net_btc);
+    try w.writeAll(",\"buy_notional\":");
+    try writeQuotedDec(w, fills.buy_notional);
+    try w.writeAll(",\"sell_notional\":");
+    try writeQuotedDec(w, fills.sell_notional);
+    try w.writeAll(",\"turnover\":");
+    try writeQuotedDec(w, turnover);
+    try w.writeAll(",\"fee_usdt\":");
+    try writeQuotedDec(w, fills.fee_usdt);
+    try w.writeAll(",\"fee_other_fills\":");
+    try w.print("{d}", .{fills.fee_other_fills});
+    try w.writeAll(",\"truncated\":");
+    try w.writeAll(if (fills.truncated) "true" else "false");
+    try w.writeByte('}');
+}
+
+fn writeTradingDaily(db: *Db, w: *std.Io.Writer, since: []const u8) StatsWriteError!void {
+    var stmt = try db.prepare(
+        \\SELECT substr(f.ts, 1, 10), COALESCE(o.side, ''), f.qty, f.price, f.fee, f.fee_ccy
+        \\FROM fills f LEFT JOIN orders o ON o.client_order_id = f.order_id
+        \\WHERE f.ts >= ?1
+        \\ORDER BY f.ts ASC
+        \\LIMIT 20001
+    );
+    defer stmt.finalize();
+    try stmt.bindText(1, since);
+
+    const Daily = struct {
+        day: [10]u8 = undefined,
+        day_len: usize = 0,
+        fills: i64 = 0,
+        buy_fills: i64 = 0,
+        sell_fills: i64 = 0,
+        buy_notional: dec.Decimal = dec.Decimal.zero,
+        sell_notional: dec.Decimal = dec.Decimal.zero,
+        fee_usdt: dec.Decimal = dec.Decimal.zero,
+    };
+    var days: [32]Daily = undefined;
+    var n_days: usize = 0;
+    var n: i64 = 0;
+    while (try stmt.step()) {
+        n += 1;
+        if (n > 20000) break;
+        const day = stmt.columnText(0);
+        var slot: ?*Daily = null;
+        if (n_days > 0) {
+            const last = &days[n_days - 1];
+            if (std.mem.eql(u8, last.day[0..last.day_len], day)) slot = last;
+        }
+        if (slot == null and n_days < days.len) {
+            days[n_days] = .{};
+            const copied = @min(day.len, days[n_days].day.len);
+            @memcpy(days[n_days].day[0..copied], day[0..copied]);
+            days[n_days].day_len = copied;
+            slot = &days[n_days];
+            n_days += 1;
+        }
+        const row = slot orelse continue;
+        var tmp = FillTotals{};
+        accumulateFill(&tmp, stmt.columnText(1), stmt.columnText(2), stmt.columnText(3), stmt.columnText(4), stmt.columnText(5));
+        row.fills += tmp.fills;
+        row.buy_fills += tmp.buy_fills;
+        row.sell_fills += tmp.sell_fills;
+        row.buy_notional = addDec(row.buy_notional, tmp.buy_notional);
+        row.sell_notional = addDec(row.sell_notional, tmp.sell_notional);
+        row.fee_usdt = addDec(row.fee_usdt, tmp.fee_usdt);
+    }
+
+    try w.writeByte('[');
+    var i: usize = 0;
+    while (i < n_days) : (i += 1) {
+        if (i > 0) try w.writeByte(',');
+        const row = days[i];
+        try w.writeAll("{\"day\":\"");
+        try writeJsonEscaped(w, row.day[0..row.day_len]);
+        try w.writeAll("\",\"fills\":");
+        try w.print("{d}", .{row.fills});
+        try w.writeAll(",\"buy_fills\":");
+        try w.print("{d}", .{row.buy_fills});
+        try w.writeAll(",\"sell_fills\":");
+        try w.print("{d}", .{row.sell_fills});
+        try w.writeAll(",\"buy_notional\":");
+        try writeQuotedDec(w, row.buy_notional);
+        try w.writeAll(",\"sell_notional\":");
+        try writeQuotedDec(w, row.sell_notional);
+        try w.writeAll(",\"turnover\":");
+        try writeQuotedDec(w, addDec(row.buy_notional, row.sell_notional));
+        try w.writeAll(",\"fee_usdt\":");
+        try writeQuotedDec(w, row.fee_usdt);
+        try w.writeByte('}');
+    }
+    try w.writeByte(']');
+}
+
+fn writeOrderStatusCounts(db: *Db, w: *std.Io.Writer, since: []const u8) StatsWriteError!void {
+    var stmt = try db.prepare(
+        \\SELECT status, COUNT(*)
+        \\FROM orders WHERE created_ts >= ?1
+        \\GROUP BY status ORDER BY COUNT(*) DESC, status ASC
+    );
+    defer stmt.finalize();
+    try stmt.bindText(1, since);
+    try w.writeByte('[');
+    var first = true;
+    while (try stmt.step()) {
+        if (!first) try w.writeByte(',');
+        first = false;
+        try w.writeAll("{\"status\":\"");
+        try writeJsonEscaped(w, stmt.columnText(0));
+        try w.writeAll("\",\"orders\":");
+        try w.print("{d}", .{stmt.columnInt(1)});
+        try w.writeByte('}');
+    }
+    try w.writeByte(']');
+}
+
+fn writeFillSideCounts(db: *Db, w: *std.Io.Writer, since: []const u8) StatsWriteError!void {
+    const totals = try readFillTotals(db, since);
+    try w.writeByte('[');
+    var first = true;
+    if (totals.buy_fills > 0) {
+        try w.writeAll("{\"side\":\"buy\",\"fills\":");
+        try w.print("{d}", .{totals.buy_fills});
+        try w.writeAll(",\"qty\":");
+        try writeQuotedDec(w, totals.buy_qty);
+        try w.writeAll(",\"notional\":");
+        try writeQuotedDec(w, totals.buy_notional);
+        try w.writeByte('}');
+        first = false;
+    }
+    if (totals.sell_fills > 0) {
+        if (!first) try w.writeByte(',');
+        try w.writeAll("{\"side\":\"sell\",\"fills\":");
+        try w.print("{d}", .{totals.sell_fills});
+        try w.writeAll(",\"qty\":");
+        try writeQuotedDec(w, totals.sell_qty);
+        try w.writeAll(",\"notional\":");
+        try writeQuotedDec(w, totals.sell_notional);
+        try w.writeByte('}');
     }
     try w.writeByte(']');
 }
@@ -2157,6 +2662,73 @@ test "LLM usage ledger aggregates priced and unmetered calls explicitly" {
     try testing.expectEqual(@as(i64, 1), totals.get("priced_calls").?.integer);
     try testing.expectEqual(@as(i64, 3_000), totals.get("input_cost_nano_usd").?.integer + totals.get("output_cost_nano_usd").?.integer);
     try testing.expectEqual(@as(usize, 4), root.get("recent").?.array.items.len);
+
+    var equity = try EquityRepo.init(&db);
+    defer equity.deinit();
+    var orders = try OrdersRepo.init(&db);
+    defer orders.deinit();
+    var fills = try FillsRepo.init(&db);
+    defer fills.deinit();
+    try equity.append(.{
+        .ts = ts_error,
+        .interval = "1m",
+        .equity = "98",
+        .hwm = "100",
+        .drawdown = "0.02",
+        .cash = "40",
+        .btc_value = "58",
+        .bid_price = "58000",
+        .btc_qty = "0.001",
+        .bh_equity = "100",
+    });
+    try equity.append(.{
+        .ts = ts_priced,
+        .interval = "1m",
+        .equity = "101",
+        .hwm = "101",
+        .drawdown = "0",
+        .cash = "41",
+        .btc_value = "60",
+        .bid_price = "60000",
+        .btc_qty = "0.001",
+        .bh_equity = "103",
+    });
+    try orders.upsert(.{
+        .client_order_id = "ab_stats_buy",
+        .decision_id = "dec_stats",
+        .side = "buy",
+        .qty = "0.001",
+        .price = "100",
+        .status = "FILLED",
+        .created_ts = ts_priced,
+        .updated_ts = ts_priced,
+    });
+    try fills.append(.{
+        .fill_id = "f_stats_buy",
+        .order_id = "ab_stats_buy",
+        .price = "100",
+        .qty = "0.001",
+        .fee = "0.01",
+        .fee_ccy = "USDT",
+        .ts = ts_priced,
+    });
+
+    const json2 = try repo.writeStatisticsJson(&db, &out, now_ms);
+    var parsed2 = try std.json.parseFromSlice(std.json.Value, testing.allocator, json2, .{});
+    defer parsed2.deinit();
+    const portfolio = parsed2.value.object.get("portfolio").?.object.get("last_24h").?.object;
+    try testing.expectEqual(@as(i64, 2), portfolio.get("sample_count").?.integer);
+    try testing.expectEqualStrings("98", portfolio.get("equity_start").?.string);
+    try testing.expectEqualStrings("101", portfolio.get("equity_end").?.string);
+    try testing.expect(portfolio.get("window_return").? == .string);
+    try testing.expect(portfolio.get("alpha_return").? == .string);
+    const trading = parsed2.value.object.get("trading").?.object.get("last_24h").?.object;
+    try testing.expectEqual(@as(i64, 1), trading.get("orders").?.integer);
+    try testing.expectEqual(@as(i64, 1), trading.get("filled_orders").?.integer);
+    try testing.expectEqual(@as(i64, 1), trading.get("fills").?.integer);
+    try testing.expectEqualStrings("0.001", trading.get("buy_qty").?.string);
+    try testing.expectEqualStrings("0.1", trading.get("buy_notional").?.string);
+    try testing.expectEqualStrings("0.01", trading.get("fee_usdt").?.string);
 }
 
 test "events append and read back" {

@@ -214,6 +214,40 @@
   }
   @media (max-width: 410px) { .usage-kpis { grid-template-columns: 1fr; } }
 
+  .stats-subtabs { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 12px; }
+  .stats-subtabs button {
+    appearance: none; min-height: 34px; padding: 7px 14px;
+    background: transparent; color: var(--dim);
+    border: 1px solid var(--border); border-radius: 8px;
+    font: inherit; font-size: 13px; cursor: pointer;
+  }
+  .stats-subtabs button:hover { color: var(--text); background: var(--tab); }
+  .stats-subtabs button.active {
+    color: var(--text); background: rgba(88,166,255,.12);
+    border-color: rgba(88,166,255,.7);
+  }
+  .stats-pane { display: none; }
+  .stats-pane.active { display: block; }
+  .book-deck {
+    position: relative; overflow: hidden; margin-bottom: 12px; padding: 18px;
+    background:
+      linear-gradient(112deg, rgba(242,186,82,.12), transparent 44%),
+      linear-gradient(160deg, rgba(28,22,12,.97), rgba(12,16,18,.98));
+    border: 1px solid rgba(242,186,82,.32); border-radius: 10px;
+  }
+  .trade-deck {
+    position: relative; overflow: hidden; margin-bottom: 12px; padding: 18px;
+    background:
+      linear-gradient(112deg, rgba(63,185,80,.10), transparent 44%),
+      linear-gradient(160deg, rgba(10,24,16,.97), rgba(10,16,22,.98));
+    border: 1px solid rgba(63,185,80,.30); border-radius: 10px;
+  }
+  .book-deck .usage-kicker { color: #f0c674; }
+  .trade-deck .usage-kicker { color: #8ee59a; }
+  .usage-kpi.alpha { border-top: 2px solid #f0c674; }
+  .usage-kpi.flow { border-top: 2px solid #3fb950; }
+  .usage-kpi.warn-top { border-top: 2px solid var(--warn); }
+
   /* ===== 概览：紧凑追踪记录 ===== */
   .ov-ledger {
     margin-top: 22px; padding: 14px;
@@ -1466,6 +1500,142 @@
 
   <!-- ========== 统计 ========== -->
   <div class="panel" id="panel-statistics">
+    <div class="stats-subtabs" id="stats_subtabs" role="tablist" aria-label="统计分类">
+      <button type="button" class="active" data-stats-pane="book">资产与交易</button>
+      <button type="button" data-stats-pane="llm">模型用量</button>
+    </div>
+    <div class="filters usage-period" id="usage_range" role="group" aria-label="统计时间范围">
+      <span class="range-label">观察窗口</span>
+      <button type="button" data-usage-range="24h">24 小时</button>
+      <button type="button" data-usage-range="7d">7 天</button>
+      <button type="button" data-usage-range="30d">30 天</button>
+    </div>
+
+    <div class="stats-pane active" id="stats_pane_book">
+      <section class="book-deck" aria-labelledby="book_title">
+        <div class="usage-head">
+          <div>
+            <div class="usage-kicker">Portfolio ledger / UTC windows</div>
+            <div class="usage-title" id="book_title">资产账本</div>
+          </div>
+          <div class="usage-asof" id="book_asof">等待净值样本…</div>
+        </div>
+        <div class="usage-kpis">
+          <div class="usage-kpi cost alpha">
+            <div class="usage-k">窗口净值变化</div>
+            <div class="usage-v" id="book_return">—</div>
+            <div class="usage-sub" id="book_return_sub">起止净值尚未形成窗口</div>
+          </div>
+          <div class="usage-kpi">
+            <div class="usage-k">期末保守净值</div>
+            <div class="usage-v" id="book_equity">—</div>
+            <div class="usage-sub" id="book_equity_sub">现金 / BTC 市值</div>
+          </div>
+          <div class="usage-kpi">
+            <div class="usage-k">相对买入持有</div>
+            <div class="usage-v" id="book_alpha">—</div>
+            <div class="usage-sub" id="book_alpha_sub">缺标记时不回填基准</div>
+          </div>
+          <div class="usage-kpi health">
+            <div class="usage-k">窗口最大回撤</div>
+            <div class="usage-v" id="book_dd">—</div>
+            <div class="usage-sub" id="book_dd_sub">期末 BTC 权重</div>
+          </div>
+          <div class="usage-kpi coverage">
+            <div class="usage-k">样本覆盖</div>
+            <div class="usage-v sm" id="book_coverage">—</div>
+            <div class="usage-sub" id="book_coverage_sub">1 分钟净值 / 基准标记</div>
+          </div>
+        </div>
+        <p class="usage-footnote">净值、回撤与超额来自持久化净值样本的 UTC 窗口，不是概览上的瞬时快照。买入持有基准仅在带标记的样本上计算，缺标记不会回填。</p>
+      </section>
+
+      <section class="trade-deck" aria-labelledby="trade_title">
+        <div class="usage-head">
+          <div>
+            <div class="usage-kicker">Execution ledger / fills and fees</div>
+            <div class="usage-title" id="trade_title">交易账本</div>
+          </div>
+          <div class="usage-asof" id="trade_asof">等待成交记录…</div>
+        </div>
+        <div class="usage-kpis">
+          <div class="usage-kpi cost flow">
+            <div class="usage-k">成交名义额</div>
+            <div class="usage-v" id="trade_turnover">—</div>
+            <div class="usage-sub" id="trade_turnover_sub">买 / 卖名义额</div>
+          </div>
+          <div class="usage-kpi">
+            <div class="usage-k">净 BTC 成交</div>
+            <div class="usage-v" id="trade_net">—</div>
+            <div class="usage-sub" id="trade_net_sub">买量 − 卖量</div>
+          </div>
+          <div class="usage-kpi">
+            <div class="usage-k">成交手续费</div>
+            <div class="usage-v" id="trade_fee">—</div>
+            <div class="usage-sub" id="trade_fee_sub">仅累计 USDT 费用</div>
+          </div>
+          <div class="usage-kpi health">
+            <div class="usage-k">订单成交率</div>
+            <div class="usage-v" id="trade_fill_rate">—</div>
+            <div class="usage-sub" id="trade_fill_rate_sub">成交 / 取消 / 拒绝</div>
+          </div>
+          <div class="usage-kpi warn-top">
+            <div class="usage-k">数据完整性</div>
+            <div class="usage-v sm" id="trade_coverage">—</div>
+            <div class="usage-sub" id="trade_coverage_sub">未关联成交 / 非 USDT 费用</div>
+          </div>
+        </div>
+        <p class="usage-footnote">订单按创建时间、成交按成交时间计入窗口。未关联订单的成交、非 USDT 费用不会被当成零成本或零仓位。</p>
+      </section>
+
+      <div class="usage-grid">
+        <section class="usage-section" aria-labelledby="book_daily_title">
+          <h2 id="book_daily_title">日终净值（UTC）</h2>
+          <p class="hint">每天最后一条 1 分钟样本；日收益相对前一日日终净值。</p>
+          <div class="usage-scroll">
+            <table>
+              <thead><tr><th>日期</th><th>净值</th><th>日收益</th><th>回撤</th><th>现金</th><th>BTC 市值</th></tr></thead>
+              <tbody id="book_daily_body"><tr><td colspan="6" class="muted">暂无净值样本</td></tr></tbody>
+            </table>
+          </div>
+        </section>
+        <section class="usage-section" aria-labelledby="trade_daily_title">
+          <h2 id="trade_daily_title">日成交（UTC）</h2>
+          <p class="hint">按成交时间归入 UTC 日；名义额 = 价格 × 数量。</p>
+          <div class="usage-scroll">
+            <table>
+              <thead><tr><th>日期</th><th>成交</th><th>买 / 卖</th><th>名义额</th><th>USDT 费用</th></tr></thead>
+              <tbody id="trade_daily_body"><tr><td colspan="5" class="muted">暂无成交记录</td></tr></tbody>
+            </table>
+          </div>
+        </section>
+      </div>
+
+      <div class="usage-grid">
+        <section class="usage-section" aria-labelledby="trade_side_title">
+          <h2 id="trade_side_title">近 30 天买卖</h2>
+          <p class="hint">成交侧来自订单投影；无法关联的成交单独计数，不猜测方向。</p>
+          <div class="usage-scroll">
+            <table>
+              <thead><tr><th>方向</th><th>成交</th><th>数量</th><th>名义额</th></tr></thead>
+              <tbody id="trade_side_body"><tr><td colspan="4" class="muted">暂无近 30 天成交</td></tr></tbody>
+            </table>
+          </div>
+        </section>
+        <section class="usage-section" aria-labelledby="trade_status_title">
+          <h2 id="trade_status_title">近 30 天订单状态</h2>
+          <p class="hint">按创建时间计入；状态是投影，不是交易所原始回报全文。</p>
+          <div class="usage-scroll">
+            <table>
+              <thead><tr><th>状态</th><th>订单</th></tr></thead>
+              <tbody id="trade_status_body"><tr><td colspan="2" class="muted">暂无近 30 天订单</td></tr></tbody>
+            </table>
+          </div>
+        </section>
+      </div>
+    </div>
+
+    <div class="stats-pane" id="stats_pane_llm">
     <section class="usage-deck" aria-labelledby="usage_title">
       <div class="usage-head">
         <div>
@@ -1473,12 +1643,6 @@
           <div class="usage-title" id="usage_title">模型调用账本</div>
         </div>
         <div class="usage-asof" id="usage_asof">等待首个持久化快照…</div>
-      </div>
-      <div class="filters usage-period" id="usage_range" role="group" aria-label="统计时间范围">
-        <span class="range-label">观察窗口</span>
-        <button type="button" data-usage-range="24h">24 小时</button>
-        <button type="button" data-usage-range="7d">7 天</button>
-        <button type="button" data-usage-range="30d">30 天</button>
       </div>
       <div class="usage-kpis">
         <div class="usage-kpi cost">
@@ -1556,6 +1720,7 @@
         </table>
       </div>
     </section>
+    </div>
   </div>
 
   <!-- ========== 状态 ========== -->
@@ -1634,6 +1799,14 @@ let usageRange = (() => {
     return ["24h", "7d", "30d"].includes(saved) ? saved : "24h";
   } catch (_) {
     return "24h";
+  }
+})();
+let statsPane = (() => {
+  try {
+    const saved = localStorage.getItem("ab_stats_pane");
+    return ["book", "llm"].includes(saved) ? saved : "book";
+  } catch (_) {
+    return "book";
   }
 })();
 
@@ -3658,10 +3831,29 @@ document.querySelectorAll("#usage_range button[data-usage-range]").forEach(btn =
     usageRange = btn.getAttribute("data-usage-range") || "24h";
     try { localStorage.setItem("ab_usage_range", usageRange); } catch (_) {}
     syncUsageRangeButtons();
-    renderLlmStatistics(cachedStatistics);
+    renderStatistics(cachedStatistics);
   });
 });
 syncUsageRangeButtons();
+
+function syncStatsPaneButtons() {
+  document.querySelectorAll("#stats_subtabs button[data-stats-pane]").forEach(btn => {
+    const on = btn.getAttribute("data-stats-pane") === statsPane;
+    btn.classList.toggle("active", on);
+    btn.setAttribute("aria-selected", on ? "true" : "false");
+  });
+  document.querySelectorAll(".stats-pane").forEach(p => {
+    p.classList.toggle("active", p.id === "stats_pane_" + statsPane);
+  });
+}
+document.querySelectorAll("#stats_subtabs button[data-stats-pane]").forEach(btn => {
+  btn.addEventListener("click", () => {
+    statsPane = btn.getAttribute("data-stats-pane") || "book";
+    try { localStorage.setItem("ab_stats_pane", statsPane); } catch (_) {}
+    syncStatsPaneButtons();
+  });
+});
+syncStatsPaneButtons();
 
 document.querySelectorAll("#dec_filters button").forEach(btn => {
   btn.classList.toggle("active", btn.getAttribute("data-filter") === decFilter);
@@ -3911,6 +4103,128 @@ function usageKind(kind) {
 function usageOutcome(row) {
   if (row && row.outcome === "error") return "失败" + (row.error_class ? " · " + row.error_class : "");
   return "成功";
+}
+function signedPct(v) {
+  const n = parseFloat(v);
+  if (!Number.isFinite(n)) return "—";
+  return (n > 0 ? "+" : "") + (n * 100).toFixed(2) + "%";
+}
+function absPct(v) {
+  const n = parseFloat(v);
+  if (!Number.isFinite(n)) return "—";
+  return (n * 100).toFixed(2) + "%";
+}
+function signedClass(v) {
+  const n = parseFloat(v);
+  if (!Number.isFinite(n) || n === 0) return "usage-v";
+  return "usage-v " + (n > 0 ? "pos" : "neg");
+}
+function statsWindow(data, group) {
+  const meta = USAGE_RANGE_META[usageRange] || USAGE_RANGE_META["24h"];
+  const root = (data && data[group] && typeof data[group] === "object") ? data[group] : {};
+  const totals = (root[meta.key] && typeof root[meta.key] === "object") ? root[meta.key] : {};
+  return { meta, root, totals };
+}
+function renderStatistics(data) {
+  data = (data && typeof data === "object") ? data : {};
+  renderBookStatistics(data);
+  renderLlmStatistics(data);
+}
+function renderBookStatistics(data) {
+  const book = statsWindow(data, "portfolio");
+  const trade = statsWindow(data, "trading");
+  const asOf = usageNum(data && data.as_of_ms);
+  const asOfText = asOf
+    ? new Date(asOf).toISOString().replace("T", " ").replace(/\.\d{3}Z$/, " UTC")
+    : "尚无账本快照";
+  const samples = usageNum(book.totals.sample_count);
+  const marked = usageNum(book.totals.marked_sample_count);
+  const ret = book.totals.window_return;
+  const alpha = book.totals.alpha_return;
+  $("book_asof").textContent = book.meta.label + " · 快照 " + asOfText;
+  $("book_return").textContent = signedPct(ret);
+  $("book_return").className = signedClass(ret);
+  $("book_return_sub").innerHTML = samples
+    ? "起 <b>" + esc(fmtMoney(book.totals.equity_start)) + "</b> → 止 <b>" + esc(fmtMoney(book.totals.equity_end)) + "</b>"
+    : "窗口内尚无 1 分钟净值样本";
+  $("book_equity").textContent = fmtMoney(book.totals.equity_end);
+  $("book_equity_sub").innerHTML = "现金 <b>" + esc(fmtMoney(book.totals.cash_end)) + "</b> · BTC <b>" + esc(fmtMoney(book.totals.btc_value_end)) + "</b>";
+  $("book_alpha").textContent = alpha == null ? "—" : signedPct(alpha);
+  $("book_alpha").className = signedClass(alpha);
+  $("book_alpha_sub").textContent = book.totals.bh_return == null
+    ? "窗口两端缺少买入持有标记"
+    : "基准 " + signedPct(book.totals.bh_return) + " · 超额 = 净值收益 − 基准";
+  $("book_dd").textContent = book.totals.max_drawdown == null ? "—" : absPct(book.totals.max_drawdown);
+  $("book_dd_sub").textContent = "期末权重 " + (book.totals.btc_weight_end == null ? "—" : absPct(book.totals.btc_weight_end)) +
+    " · HWM " + fmtMoney(book.totals.hwm_end);
+  $("book_coverage").textContent = samples ? usageInt(samples) + " 条" : "—";
+  $("book_coverage_sub").textContent = "基准标记 " + usagePct(marked, samples) + " · " + usageInt(Math.max(0, samples - marked)) + " 条无 BH";
+
+  const daily = Array.isArray(book.root.daily_utc) ? book.root.daily_utc.slice().reverse() : [];
+  const dailyBody = $("book_daily_body");
+  dailyBody.innerHTML = daily.length ? daily.map(d => {
+    const r = d && d.day_return;
+    return "<tr>" +
+      "<td>" + esc(d.day || "—") + "</td>" +
+      "<td>" + esc(fmtMoney(d.equity)) + "</td>" +
+      '<td class="' + (parseFloat(r) > 0 ? "pos" : (parseFloat(r) < 0 ? "neg" : "")) + '">' + signedPct(r) + "</td>" +
+      "<td>" + (d.drawdown == null ? "—" : absPct(d.drawdown)) + "</td>" +
+      "<td>" + esc(fmtMoney(d.cash)) + "</td>" +
+      "<td>" + esc(fmtMoney(d.btc_value)) + "</td>" +
+      "</tr>";
+  }).join("") : '<tr><td colspan="6" class="muted">暂无净值样本</td></tr>';
+
+  const t = trade.totals;
+  const orders = usageNum(t.orders);
+  const filled = usageNum(t.filled_orders);
+  const canceled = usageNum(t.canceled_orders);
+  const rejected = usageNum(t.rejected_orders);
+  const fills = usageNum(t.fills);
+  $("trade_asof").textContent = trade.meta.label + " · 快照 " + asOfText;
+  $("trade_turnover").textContent = fmtMoney(t.turnover);
+  $("trade_turnover_sub").innerHTML = "买 <b>" + esc(fmtMoney(t.buy_notional)) + "</b> · 卖 <b>" + esc(fmtMoney(t.sell_notional)) + "</b>";
+  $("trade_net").textContent = fmtBtc(t.net_btc);
+  $("trade_net_sub").innerHTML = "买 <b>" + esc(fmtBtc(t.buy_qty)) + "</b> · 卖 <b>" + esc(fmtBtc(t.sell_qty)) + "</b>";
+  $("trade_fee").textContent = fmtMoney(t.fee_usdt);
+  $("trade_fee_sub").textContent = usageNum(t.fee_other_fills)
+    ? usageInt(t.fee_other_fills) + " 笔非 USDT 费用未计入"
+    : "窗口内费用均为 USDT 或为空";
+  $("trade_fill_rate").textContent = usagePct(filled, orders);
+  $("trade_fill_rate_sub").textContent = "订单 " + usageInt(orders) + " · 成交 " + usageInt(filled) +
+    " · 取消 " + usageInt(canceled) + " · 拒绝 " + usageInt(rejected);
+  $("trade_coverage").textContent = fills ? usageInt(fills) + " 笔" : "—";
+  $("trade_coverage_sub").textContent = "未关联 " + usageInt(t.unlinked_fills) +
+    (t.truncated ? " · 扫描截断，总量可能不全" : "");
+
+  const tradeDaily = Array.isArray(trade.root.daily_utc) ? trade.root.daily_utc.slice().reverse() : [];
+  const tradeDailyBody = $("trade_daily_body");
+  tradeDailyBody.innerHTML = tradeDaily.length ? tradeDaily.map(d => {
+    return "<tr>" +
+      "<td>" + esc(d.day || "—") + "</td>" +
+      "<td>" + usageInt(d.fills) + "</td>" +
+      "<td>" + usageInt(d.buy_fills) + " / " + usageInt(d.sell_fills) + "</td>" +
+      "<td>" + esc(fmtMoney(d.turnover)) + "</td>" +
+      "<td>" + esc(fmtMoney(d.fee_usdt)) + "</td>" +
+      "</tr>";
+  }).join("") : '<tr><td colspan="5" class="muted">暂无成交记录</td></tr>';
+
+  const sides = Array.isArray(trade.root.by_side_30d) ? trade.root.by_side_30d : [];
+  const sideBody = $("trade_side_body");
+  const SIDE_ZH = { buy: "买入", sell: "卖出" };
+  sideBody.innerHTML = sides.length ? sides.map(row => {
+    return "<tr>" +
+      "<td>" + esc(SIDE_ZH[row.side] || row.side || "—") + "</td>" +
+      "<td>" + usageInt(row.fills) + "</td>" +
+      "<td>" + esc(fmtBtc(row.qty)) + "</td>" +
+      "<td>" + esc(fmtMoney(row.notional)) + "</td>" +
+      "</tr>";
+  }).join("") : '<tr><td colspan="4" class="muted">暂无近 30 天成交</td></tr>';
+
+  const statuses = Array.isArray(trade.root.by_status_30d) ? trade.root.by_status_30d : [];
+  const statusBody = $("trade_status_body");
+  statusBody.innerHTML = statuses.length ? statuses.map(row => {
+    return "<tr><td>" + esc(row.status || "—") + "</td><td>" + usageInt(row.orders) + "</td></tr>";
+  }).join("") : '<tr><td colspan="2" class="muted">暂无近 30 天订单</td></tr>';
 }
 function renderLlmStatistics(data) {
   data = (data && typeof data === "object") ? data : {};
@@ -4182,7 +4496,7 @@ async function poll() {
     renderDecisions(decisions, runs);
     try { renderOrders(cachedOrdersBundle); } catch (err) { console.error("renderOrders", err); }
     try { renderStatus(system, s); } catch (err) { console.error("renderStatus", err); }
-    try { renderLlmStatistics(cachedStatistics); } catch (err) { console.error("renderLlmStatistics", err); }
+    try { renderStatistics(cachedStatistics); } catch (err) { console.error("renderStatistics", err); }
     // overview token strip
     {
       const st = (system && system.status) || {};
