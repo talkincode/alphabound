@@ -29,6 +29,8 @@ const migration_0005: [:0]const u8 = @embedFile("migration_0005");
 const migration_0006: [:0]const u8 = @embedFile("migration_0006");
 const migration_0007: [:0]const u8 = @embedFile("migration_0007");
 const migration_0008: [:0]const u8 = @embedFile("migration_0008");
+const migration_0009: [:0]const u8 = @embedFile("migration_0009");
+const intel = @import("../intel/protocol.zig");
 
 /// Ordered list of migrations; user_version tracks the applied count.
 const migrations = [_][:0]const u8{
@@ -40,6 +42,7 @@ const migrations = [_][:0]const u8{
     migration_0006,
     migration_0007,
     migration_0008,
+    migration_0009,
 };
 
 /// Expected user_version for a fully migrated database (restore drills).
@@ -128,6 +131,10 @@ pub const Db = struct {
 
     pub fn lastInsertRowid(self: *Db) i64 {
         return c.sqlite3_last_insert_rowid(self.handle);
+    }
+
+    pub fn changes(self: *Db) i64 {
+        return c.sqlite3_changes(self.handle);
     }
 };
 
@@ -2567,6 +2574,154 @@ pub const KvRepo = struct {
     }
 };
 
+pub const IntelInsert = struct {
+    duplicate: bool,
+};
+
+/// Signed external intel. Single-writer ingest; list payloads never include
+/// signature or nonce.
+pub const IntelRepo = struct {
+    insert: Stmt,
+    db: *Db,
+
+    pub fn init(db: *Db) DbError!IntelRepo {
+        return .{
+            .db = db,
+            .insert = try db.prepare(
+                \\INSERT OR IGNORE INTO intel (
+                \\  id, source_id, kind, instrument, headline, body,
+                \\  claims_json, tags_json, refs_json, conf_milles,
+                \\  as_of_ms, expires_ms, dedup_key, nonce, signature, accepted_ms
+                \\) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
+            ),
+        };
+    }
+
+    pub fn deinit(self: *IntelRepo) void {
+        self.insert.finalize();
+    }
+
+    pub fn append(self: *IntelRepo, item: *const intel.Item, accepted_ms: i64) DbError!IntelInsert {
+        self.insert.reset();
+        try self.insert.bindText(1, item.id());
+        try self.insert.bindText(2, item.sourceId());
+        try self.insert.bindText(3, item.kind.text());
+        try self.insert.bindText(4, item.instrument());
+        try self.insert.bindText(5, item.headline());
+        try self.insert.bindText(6, item.body());
+        try self.insert.bindText(7, item.claimsJson());
+        try self.insert.bindText(8, item.tagsJson());
+        try self.insert.bindText(9, item.refsJson());
+        try self.insert.bindInt(10, item.conf_milles);
+        try self.insert.bindInt(11, item.as_of_ms);
+        try self.insert.bindInt(12, item.expires_ms);
+        try self.insert.bindText(13, item.dedupKey());
+        try self.insert.bindText(14, item.nonce());
+        try self.insert.bindText(15, item.signature());
+        try self.insert.bindInt(16, accepted_ms);
+        _ = try self.insert.stepCritical();
+        return .{ .duplicate = self.db.changes() == 0 };
+    }
+
+    pub fn listRecentJson(self: *IntelRepo, db: *Db, out: []u8, now_ms: i64, limit: i64) DbError![]const u8 {
+        _ = self;
+        var stmt = try db.prepare(
+            \\SELECT id, source_id, kind, instrument, headline, body,
+            \\  claims_json, tags_json, refs_json, conf_milles,
+            \\  as_of_ms, expires_ms, accepted_ms
+            \\FROM intel ORDER BY accepted_ms DESC LIMIT ?1
+        );
+        defer stmt.finalize();
+        try stmt.bindInt(1, limit);
+        if (out.len < 2) return DbError.StepFailed;
+        var w: std.Io.Writer = .fixed(out[0 .. out.len - 1]);
+        w.writeAll("[") catch return DbError.StepFailed;
+        var i: usize = 0;
+        while (try stmt.step()) : (i += 1) {
+            const mark = w.end;
+            const wrote = blk: {
+                if (i > 0) w.writeByte(',') catch break :blk false;
+                var item = itemFromStmt(&stmt) orelse break :blk false;
+                const accepted = stmt.columnInt(12);
+                intel.writeApiObject(&w, &item, now_ms, accepted) catch break :blk false;
+                break :blk true;
+            };
+            if (!wrote) {
+                w.end = mark;
+                break;
+            }
+        }
+        out[w.end] = ']';
+        return out[0 .. w.end + 1];
+    }
+
+    /// Ranked, unexpired, non-D intel as JSON objects (oldest-to-newest not
+    /// required; rank order is score desc). Copies into `backing`.
+    pub fn listForContext(
+        self: *IntelRepo,
+        db: *Db,
+        now_ms: i64,
+        backing: []u8,
+        ptrs: [][]const u8,
+    ) DbError!usize {
+        _ = self;
+        var stmt = try db.prepare(
+            \\SELECT id, source_id, kind, instrument, headline, body,
+            \\  claims_json, tags_json, refs_json, conf_milles,
+            \\  as_of_ms, expires_ms, accepted_ms
+            \\FROM intel WHERE expires_ms > ?1
+            \\ORDER BY accepted_ms DESC LIMIT 32
+        );
+        defer stmt.finalize();
+        try stmt.bindInt(1, now_ms);
+        var items: [32]intel.Item = undefined;
+        var n: usize = 0;
+        while (try stmt.step()) {
+            if (n >= items.len) break;
+            items[n] = itemFromStmt(&stmt) orelse continue;
+            n += 1;
+        }
+        var ranked_buf: [32]intel.Ranked = undefined;
+        const ranked = intel.rank(items[0..n], now_ms, intel.default_source_trust_milles, &ranked_buf);
+        var w: std.Io.Writer = .fixed(backing);
+        var count: usize = 0;
+        for (ranked) |r| {
+            if (count >= ptrs.len) break;
+            const start = w.end;
+            intel.writeContextObject(&w, r.item, r.score, r.grade) catch break;
+            ptrs[count] = backing[start..w.end];
+            count += 1;
+        }
+        return count;
+    }
+};
+
+fn itemFromStmt(stmt: *Stmt) ?intel.Item {
+    var item = intel.Item{};
+    const kind = intel.Kind.fromString(stmt.columnText(2)) orelse return null;
+    item.kind = kind;
+    const conf = stmt.columnInt(9);
+    if (conf < 0 or conf > 1000) return null;
+    item.conf_milles = @intCast(conf);
+    item.as_of_ms = stmt.columnInt(10);
+    item.expires_ms = stmt.columnInt(11);
+    copyCol(&item.id_buf, &item.id_len, stmt.columnText(0));
+    copyCol(&item.source_buf, &item.source_len, stmt.columnText(1));
+    copyCol(&item.instrument_buf, &item.instrument_len, stmt.columnText(3));
+    copyCol(&item.headline_buf, &item.headline_len, stmt.columnText(4));
+    copyCol(&item.body_buf, &item.body_len, stmt.columnText(5));
+    copyCol(&item.claims_json_buf, &item.claims_json_len, stmt.columnText(6));
+    copyCol(&item.tags_json_buf, &item.tags_json_len, stmt.columnText(7));
+    copyCol(&item.refs_json_buf, &item.refs_json_len, stmt.columnText(8));
+    return item;
+}
+
+fn copyCol(dest: []u8, len: *usize, src: []const u8) void {
+    const n = @min(src.len, dest.len);
+    @memcpy(dest[0..n], src[0..n]);
+    len.* = n;
+}
+
 /// Escape raw text into a JSON string value (no surrounding quotes).
 fn writeJsonEscaped(w: *std.Io.Writer, s: []const u8) error{WriteFailed}!void {
     for (s) |ch| {
@@ -3478,4 +3633,79 @@ test "periodic reviews append, list, cycle cursor and summary tail" {
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
     defer parsed.deinit();
     try testing.expectEqual(@as(usize, 3), parsed.value.array.items.len);
+}
+
+fn fillIntelItem(item: *intel.Item, id: []const u8, as_of: i64) void {
+    item.kind = .macro;
+    item.conf_milles = 620;
+    item.as_of_ms = as_of;
+    item.expires_ms = as_of + 7 * 86_400_000;
+    const src = "collector.macro";
+    const inst = "BTC-USDT";
+    const hl = "US spot BTC ETF saw net inflows";
+    const body = "Issuers reported a second consecutive session of net creations.";
+    const nonce = "0123456789abcdef0123456789abcdef";
+    const claims = "[{\"text\":\"ETF creations continued\",\"polarity\":\"bull\"}]";
+    const n = @min(id.len, item.id_buf.len);
+    @memcpy(item.id_buf[0..n], id[0..n]);
+    item.id_len = n;
+    @memcpy(item.source_buf[0..src.len], src);
+    item.source_len = src.len;
+    @memcpy(item.instrument_buf[0..inst.len], inst);
+    item.instrument_len = inst.len;
+    @memcpy(item.headline_buf[0..hl.len], hl);
+    item.headline_len = hl.len;
+    @memcpy(item.body_buf[0..body.len], body);
+    item.body_len = body.len;
+    @memcpy(item.nonce_buf[0..nonce.len], nonce);
+    item.nonce_len = nonce.len;
+    @memcpy(item.claims_json_buf[0..claims.len], claims);
+    item.claims_json_len = claims.len;
+    @memcpy(item.tags_json_buf[0..2], "[]");
+    item.tags_json_len = 2;
+    @memcpy(item.refs_json_buf[0..2], "[]");
+    item.refs_json_len = 2;
+    intel.computeDedup(item);
+}
+
+test "intel repo appends, dedups, and lists without signature" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const path = try tmpDbPath(&tmp, &path_buf);
+    var db = try Db.open(path);
+    defer db.close();
+    var repo = try IntelRepo.init(&db);
+    defer repo.deinit();
+
+    const as_of: i64 = 1_700_000_000_000;
+    var item = intel.Item{};
+    fillIntelItem(&item, "intel_db_test_01", as_of);
+    try intel.signItem(intel.test_hmac_key, &item);
+
+    const first = try repo.append(&item, as_of + 1_000);
+    try testing.expect(!first.duplicate);
+    const second = try repo.append(&item, as_of + 2_000);
+    try testing.expect(second.duplicate);
+
+    var other = item;
+    const id2 = "intel_db_test_02";
+    @memcpy(other.id_buf[0..id2.len], id2);
+    other.id_len = id2.len;
+    const third = try repo.append(&other, as_of + 3_000);
+    try testing.expect(third.duplicate);
+
+    var out: [8192]u8 = undefined;
+    const json = try repo.listRecentJson(&db, &out, as_of + 1_000, 10);
+    try testing.expect(std.mem.indexOf(u8, json, "\"id\":\"intel_db_test_01\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"signature\"") == null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"nonce\"") == null);
+    try testing.expect(std.mem.indexOf(u8, json, item.signature()) == null);
+
+    var backing: [8192]u8 = undefined;
+    var ptrs: [8][]const u8 = undefined;
+    const n = try repo.listForContext(&db, as_of + 1_000, &backing, &ptrs);
+    try testing.expectEqual(@as(usize, 1), n);
+    try testing.expect(std.mem.indexOf(u8, ptrs[0], "intel_db_test_01") != null);
+    try testing.expect(std.mem.indexOf(u8, ptrs[0], "\"untrusted\":true") != null);
 }

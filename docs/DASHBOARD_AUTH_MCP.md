@@ -90,6 +90,11 @@ ssh -L 8080:127.0.0.1:8080 USER@HOST
 2. Run `tools/alphabound-mcp` with the same token + `ALPHABOUND_API_BASE`.
 3. stdio for IDE agents; `npm run http` for a small remote tool gateway (bind loopback; tunnel as needed).
 
-Hard rule: MCP is **read-only**. Control stays on `--control` / local admin.
+Hard rule: MCP does **not** place orders, flatten, resume, or read secrets.
+Control stays on `--control` / local admin.
+
+The sole write is `submit_intel`: a **pre-signed** `alphabound.intel.v1`
+envelope forwarded to `POST /api/v1/intel`. MCP never holds
+`ALPHABOUND_INTEL_HMAC`. See `docs/INTEL.md`.
 
 See also: `docs/AGENT_ANALYTICS_MCP_PLAN.md`.

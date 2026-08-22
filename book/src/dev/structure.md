@@ -22,11 +22,12 @@ alphabound/
 │   ├── admin/                # 本机控制文件
 │   ├── security/             # isolation / limits 不变量
 │   ├── fault/                # 故障矩阵单测 FD1–10
+│   ├── intel/                # alphabound.intel.v1 协议 + ingest mailbox
 │   ├── web/                  # server 路由 + auth（token/session/passkey）
 │   └── observability/        # redaction, latency
 ├── migrations/               # SQL
 ├── dashboard/                # 嵌入式 Overview + favicon
-├── tools/alphabound-mcp/     # 只读 Analytics MCP
+├── tools/alphabound-mcp/     # Analytics MCP（只读观察 + 签名 intel ingest）
 ├── config/                   # alphabound.toml / local.toml / docker.toml
 ├── deploy/                   # systemd, nginx 示例, install 脚本
 ├── docs/                     # 设计分析 / 路线图 / 验收 / Gate / Auth
@@ -41,7 +42,7 @@ agent → core/decimal, memory, tools   （禁止 → exchange 私钥路径）
 risk  → core/decimal, state 类型
 execution → core/decimal, orders 类型
 tools / memory → 仅 core 与标准库
-web/auth → 不持有交易所密钥；MCP 只读 HTTP
+web/auth → 不持有交易所密钥；MCP 不碰交易控制面
 ```
 
 新增 `use` / `@import` 时保持：**慢路径依赖快路径类型可以，反向把密钥或 socket 塞进 agent 不行**。

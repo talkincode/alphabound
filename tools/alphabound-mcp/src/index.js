@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /**
- * stdio MCP server — read-only AlphaBound analytics.
+ * stdio MCP server — AlphaBound analytics plus signed intel ingest.
+ * Trading control (orders / flatten / secrets) is never exposed.
  */
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -8,7 +9,9 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { TOOLS, apiGet, apiBase } from "./client.js";
+import { TOOLS, apiGet, apiPost, apiBase } from "./client.js";
+
+const EMPTY_SCHEMA = { type: "object", properties: {}, additionalProperties: false };
 
 const server = new Server(
   { name: "alphabound-analytics", version: "0.1.0" },
@@ -19,7 +22,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: TOOLS.map((t) => ({
     name: t.name,
     description: t.description,
-    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    inputSchema: t.inputSchema || EMPTY_SCHEMA,
   })),
 }));
 
@@ -33,12 +36,15 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     };
   }
   try {
-    const data = await apiGet(tool.path);
+    const data =
+      tool.method === "POST"
+        ? await apiPost(tool.path, req.params.arguments || {})
+        : await apiGet(tool.path);
     return {
       content: [
         {
           type: "text",
-          text: JSON.stringify({ base: apiBase(), path: tool.path, data }, null, 2),
+          text: JSON.stringify({ base: apiBase(), path: tool.path, method: tool.method || "GET", data }, null, 2),
         },
       ],
     };
