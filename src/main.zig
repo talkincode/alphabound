@@ -1156,6 +1156,7 @@ pub fn main(init: std.process.Init) !u8 {
                 &events_repo,
                 &memories_repo,
                 &equity_repo,
+                &intel_repo,
                 &mem_store,
                 &engine,
                 &cfg,
@@ -3304,6 +3305,7 @@ fn processReviewInbox(
     events_repo: *ab.storage.EventsRepo,
     memories_repo: *ab.storage.MemoriesRepo,
     equity_repo: *ab.storage.EquityRepo,
+    intel_repo: *ab.storage.IntelRepo,
     mem_store: *ab.memory.Store,
     engine: *ab.state.Engine,
     cfg: *const ab.config.Config,
@@ -3319,7 +3321,7 @@ fn processReviewInbox(
     const req = inbox.drain() orelse return;
     switch (req.kind) {
         .context => renderReviewContext(db, events_repo, web_state, &req),
-        .chat => runReviewChat(gpa, client, okx, db, review_repo, llm_usage_repo, events_repo, equity_repo, mem_store, engine, cfg, web_state, st, &req),
+        .chat => runReviewChat(gpa, client, okx, db, review_repo, llm_usage_repo, events_repo, equity_repo, intel_repo, mem_store, engine, cfg, web_state, st, &req),
         .summarize => runReviewSummarize(gpa, client, db, review_repo, llm_usage_repo, events_repo, memories_repo, mem_store, engine, cfg, web_state, st, &req),
         // Manual 定期复盘: same code path as the scheduled one, and it also
         // commits the cursor so an on-demand run pushes the next auto run out.
@@ -3411,7 +3413,7 @@ fn appendReviewTurn(
 /// One review chat turn: persist the question, answer strictly from stored
 /// history via the restrained review prompt, persist the reply. The model
 /// may spend ONE bounded tool round (indicators / candles window / proposal
-/// history / equity trail / memories) before its final answer.
+/// history / equity trail / memories / signed intel) before its final answer.
 fn runReviewChat(
     gpa: std.mem.Allocator,
     client_opt: ?*ab.openai.Client,
@@ -3421,6 +3423,7 @@ fn runReviewChat(
     llm_usage_repo: *ab.storage.LlmUsageRepo,
     events_repo: *ab.storage.EventsRepo,
     equity_repo: *ab.storage.EquityRepo,
+    intel_repo: *ab.storage.IntelRepo,
     mem_store: *ab.memory.Store,
     engine: *ab.state.Engine,
     cfg: *const ab.config.Config,
@@ -3472,7 +3475,7 @@ fn runReviewChat(
         \\{s}
         \\操作者的新问题：{s}
         \\
-        \\（若回答该问题需要快照之外的数据——如任意时点的指标数值、决策后的走势、提案历史、净值轨迹——你的这条回复必须是纯 tool_requests JSON，不带其他文字；否则直接给最终回答。）
+        \\（若回答该问题需要快照之外的数据——如任意时点的指标数值、决策后的走势、提案历史、净值轨迹、外部情报——你的这条回复必须是纯 tool_requests JSON，不带其他文字；否则直接给最终回答。）
         \\
     ,
         .{ decision_id, req.anchorTs(), payload, events_json, transcript, req.message() },
@@ -3525,10 +3528,10 @@ fn runReviewChat(
         var req_backing: [96]u8 = undefined;
         var tool_reqs: [ab.review_tools.MAX_REQUESTS]ab.review_tools.Tool = undefined;
         var obs: []const u8 = undefined;
-        var obs_buf: [16 * 1024]u8 = undefined;
+        var obs_buf: [32 * 1024]u8 = undefined;
         if (ab.review_tools.parseRequests(gpa, json_slice, &req_backing, &tool_reqs)) |req_n| {
             std.debug.print("[review] tool_requests: {d}\n", .{req_n});
-            obs = executeReviewTools(gpa, okx, db, events_repo, equity_repo, mem_store, cfg, anchor_ms, tool_reqs[0..req_n], &obs_buf) orelse break :tool_round;
+            obs = executeReviewTools(gpa, okx, db, events_repo, equity_repo, intel_repo, mem_store, cfg, anchor_ms, tool_reqs[0..req_n], &obs_buf) orelse break :tool_round;
             tools_used = req_n;
         } else |err| switch (err) {
             error.NotToolRequest => break :tool_round,
@@ -3536,11 +3539,11 @@ fn runReviewChat(
             // tell the model why and let it answer from existing context.
             else => {
                 std.debug.print("[review] tool_requests invalid ({t})\n", .{err});
-                obs = "{\"results\":[],\"error\":\"invalid_tool_requests: name must be ONE of sma/ema/rsi/atr/vol/bollinger/range/candles/decisions/equity/memories, bar one of 1m/5m/15m/30m/1H/4H/1D, at most 6 items\"}";
+                obs = "{\"results\":[],\"error\":\"invalid_tool_requests: name must be ONE of sma/ema/rsi/atr/vol/bollinger/range/candles/decisions/equity/memories/intel, bar one of 1m/5m/15m/30m/1H/4H/1D, at most 6 items\"}";
             },
         }
 
-        var user_buf2: [40 * 1024]u8 = undefined;
+        var user_buf2: [64 * 1024]u8 = undefined;
         const user_msg2 = std.fmt.bufPrint(
             &user_buf2,
             "{s}\ntool_results={s}\n请基于以上工具结果给出最终回答（不要再请求工具；若工具结果为错误说明，就用已有上下文直接回答）。\n",
@@ -3616,13 +3619,14 @@ fn fetchCandlesOrdered(
 }
 
 /// Execute one bounded review tool round; returns `{"results":[...]}` in `obs_buf`.
-/// Every tool is read-only (market data / audit projections / memories).
+/// Every tool is read-only (market data / audit projections / memories / intel).
 fn executeReviewTools(
     gpa: std.mem.Allocator,
     okx: *ab.okx_rest.Client,
     db: *ab.storage.Db,
     events_repo: *ab.storage.EventsRepo,
     equity_repo: *ab.storage.EquityRepo,
+    intel_repo: *ab.storage.IntelRepo,
     mem_store: *ab.memory.Store,
     cfg: *const ab.config.Config,
     anchor_ms: i64,
@@ -3715,6 +3719,25 @@ fn executeReviewTools(
                         s.memory.confidence,
                         snip,
                     }) catch return null;
+                }
+                w.writeAll("]}") catch return null;
+            },
+            .intel => |spec| {
+                const as_of: i64 = if (spec.at == .anchor) anchor_ms else nowMs();
+                var backing: [24 * 1024]u8 = undefined;
+                var ptrs: [ab.context.MAX_INTEL][]const u8 = undefined;
+                const n = intel_repo.listForContext(db, as_of, &backing, &ptrs) catch {
+                    w.writeAll("{\"name\":\"intel\",\"error\":\"query_failed\"}") catch return null;
+                    continue;
+                };
+                const at_s: []const u8 = if (spec.at == .anchor) "anchor" else "now";
+                w.print(
+                    "{{\"name\":\"intel\",\"at\":\"{s}\",\"as_of_ms\":{d},\"untrusted\":true,\"rows\":[",
+                    .{ at_s, as_of },
+                ) catch return null;
+                for (ptrs[0..n], 0..) |row, i| {
+                    if (i > 0) w.writeByte(',') catch return null;
+                    w.writeAll(row) catch return null;
                 }
                 w.writeAll("]}") catch return null;
             },

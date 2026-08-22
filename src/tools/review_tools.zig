@@ -7,6 +7,7 @@
 //!   {"name":"decisions","hours":48}                       // proposals around anchor
 //!   {"name":"equity","hours":48}                          // equity trail around anchor
 //!   {"name":"memories"}                                   // retrieved agent memories
+//!   {"name":"intel","at":"now"}                           // signed intel; now or at anchor
 //!
 //! Everything is read-only market/audit data; nothing here can reach the
 //! trading path. Parsing is strict and bounded like indicators.parseRequests.
@@ -31,6 +32,7 @@ pub const Tool = union(enum) {
     decisions: struct { hours: u32 },
     equity: struct { hours: u32 },
     memories: void,
+    intel: struct { at: At },
 
     pub fn name(self: Tool) []const u8 {
         return switch (self) {
@@ -39,6 +41,7 @@ pub const Tool = union(enum) {
             .decisions => "decisions",
             .equity => "equity",
             .memories => "memories",
+            .intel => "intel",
         };
     }
 };
@@ -130,6 +133,17 @@ pub fn parseRequests(
             out[i] = .{ .equity = .{ .hours = try parseHours(obj) } };
         } else if (std.mem.eql(u8, nm, "memories")) {
             out[i] = .memories;
+        } else if (std.mem.eql(u8, nm, "intel")) {
+            var at: At = .now;
+            if (obj.get("at")) |a| {
+                if (a != .string) return error.BadRequest;
+                if (std.mem.eql(u8, a.string, "now")) {
+                    at = .now;
+                } else if (std.mem.eql(u8, a.string, "anchor")) {
+                    at = .anchor;
+                } else return error.BadRequest;
+            }
+            out[i] = .{ .intel = .{ .at = at } };
         } else {
             return error.BadRequest;
         }
@@ -200,7 +214,7 @@ test "parseRequests handles mixed review tools" {
         \\ {"name":"candles","bar":"4H","count":12},
         \\ {"name":"decisions","hours":72},
         \\ {"name":"equity"},
-        \\ {"name":"memories"}
+        \\ {"name":"intel","at":"anchor"}
         \\]}
     ;
     const n = try parseRequests(testing.allocator, j, &backing, &out);
@@ -211,7 +225,16 @@ test "parseRequests handles mixed review tools" {
     try testing.expectEqual(@as(usize, 12), out[1].candles.count);
     try testing.expectEqual(@as(u32, 72), out[2].decisions.hours);
     try testing.expectEqual(@as(u32, DEFAULT_HOURS), out[3].equity.hours);
-    try testing.expectEqualStrings("memories", out[4].name());
+    try testing.expectEqualStrings("intel", out[4].name());
+    try testing.expectEqual(At.anchor, out[4].intel.at);
+}
+
+test "parseRequests intel defaults to now" {
+    var backing: [32]u8 = undefined;
+    var out: [MAX_REQUESTS]Tool = undefined;
+    const n = try parseRequests(testing.allocator, "{\"tool_requests\":[{\"name\":\"intel\"}]}", &backing, &out);
+    try testing.expectEqual(@as(usize, 1), n);
+    try testing.expectEqual(At.now, out[0].intel.at);
 }
 
 test "parseRequests rejects bad input and non-tool replies" {

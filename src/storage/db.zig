@@ -2669,7 +2669,7 @@ pub const IntelRepo = struct {
             \\SELECT id, source_id, kind, instrument, headline, body,
             \\  claims_json, tags_json, refs_json, conf_milles,
             \\  as_of_ms, expires_ms, accepted_ms
-            \\FROM intel WHERE expires_ms > ?1
+            \\FROM intel WHERE expires_ms > ?1 AND accepted_ms <= ?1
             \\ORDER BY accepted_ms DESC LIMIT 32
         );
         defer stmt.finalize();
