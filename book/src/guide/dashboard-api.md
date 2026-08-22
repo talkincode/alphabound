@@ -39,8 +39,8 @@ curl -sS -H "Authorization: Bearer YOUR_TOKEN" http://127.0.0.1:18180/api/v1/sta
 | 形态 | 单文件 HTML + favicon 集，**编译期嵌入**二进制（`dashboard/`） |
 | 入口 | `GET /` 与 `GET /index.html` |
 | 依赖 | 零 Node 运行时；浏览器直接 `fetch` API |
-| 刷新 | 前端约 2s 轮询 state / shadow / agent-runs / equity / candles / memories / events / system / orders / decisions / review-chats / statistics / intel |
-| 内容 | Overview + Shadow vs BH + **Lightweight Charts**（分时/多周期 K 线 + 成交量 + 净值/HWM）+ **复盘**（K 线决策标记 + 指标 + AI 复盘对话 + 复盘记录）+ **统计**（资产/交易窗口账本 + 持久化 LLM Token/成本账本）+ **情报**（签名外部投资情报历史）+ 提案/记忆/事件/订单 + System |
+| 刷新 | 前端约 2s 轮询 state / shadow / agent-runs / equity / candles / memories / events / system / orders / decisions / review-chats / statistics / intel / sentiment |
+| 内容 | Overview + Shadow vs BH + **Lightweight Charts**（分时/多周期 K 线 + 成交量 + 净值/HWM + 恐惧贪婪指数日频曲线）+ **复盘**（K 线决策标记 + 指标 + AI 复盘对话 + 复盘记录）+ **统计**（资产/交易窗口账本 + 持久化 LLM Token/成本账本）+ **情报**（签名外部投资情报历史）+ 提案/记忆/事件/订单 + System |
 
 概览图表使用 [Lightweight Charts](https://www.tradingview.com/lightweight-charts/)（CDN）。周期按钮：**分时**（1m 收盘面积图）、1分/5分/15分/1时/4时/1日。离线无 CDN 时其余 UI 仍可用。
 
@@ -123,6 +123,7 @@ open http://127.0.0.1:18180/
 | `GET /api/v1/review/periodic` | 定期复盘报告（newest first，含窗口事实与模型结论） |
 | `GET /api/v1/audit` | 定时审计报告（newest first，含完整 findings 与 stats） |
 | `GET /api/v1/intel` | 外部签名情报历史（无 signature/nonce；含 grade/score/expired） |
+| `GET /api/v1/sentiment` | 恐惧贪婪指数日频曲线：`now` / `class` / `as_of_ms` / `points[{t,v}]`（oldest first；class 由数值重推导） |
 | `POST /api/v1/intel` | 推送 `alphabound.intel.v1` 信封（需 `ALPHABOUND_INTEL_HMAC`） |
 
 协议、TTL、HMAC 与评分见 [投资情报协议](intel.md)。`POST` 在核心环落库前只入 mailbox（202 Accepted）。未配置 HMAC 时 ingest 返回 503，GET 历史仍可用。

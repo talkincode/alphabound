@@ -126,6 +126,15 @@
   .tv-attr { color: var(--dim); font-size: 11px; margin-top: 8px; }
   .tv-attr a { color: var(--line); text-decoration: none; }
   .tv-attr a:hover { text-decoration: underline; }
+  .fng-legend {
+    display: flex; flex-wrap: wrap; gap: 6px 12px; margin-top: 8px;
+    color: var(--dim); font-size: 11px;
+  }
+  .fng-legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .fng-legend i {
+    width: 8px; height: 8px; border-radius: 2px; display: inline-block;
+    box-shadow: 0 0 0 1px rgba(255,255,255,.08) inset;
+  }
   .pill { display: inline-block; padding: 1px 6px; border-radius: 999px; border: 1px solid var(--border); font-size: 11px; }
   .pill.hold { border-color: var(--ok); color: var(--ok); }
   .pill.rebalance { border-color: var(--warn); color: var(--warn); }
@@ -1251,6 +1260,20 @@
       </div>
     </div>
 
+    <h2>恐惧贪婪指数</h2>
+    <div class="chart-wrap">
+      <div class="chart-meta" id="fng_meta"><span>alternative.me Fear &amp; Greed</span><span class="muted">加载中…</span></div>
+      <div class="chart-host sm" id="chart_fng" role="img" aria-label="恐惧贪婪指数曲线"></div>
+      <div class="fng-legend" aria-hidden="true">
+        <span><i style="background:#ff6b7b"></i>极度恐惧 0–24</span>
+        <span><i style="background:#ffca5c"></i>恐惧 25–44</span>
+        <span><i style="background:#8aa5b4"></i>中性 45–55</span>
+        <span><i style="background:#4ff5a2"></i>贪婪 56–75</span>
+        <span><i style="background:#35d8ff"></i>极度贪婪 76–100</span>
+      </div>
+      <div class="tv-attr">日频 · 曲线按区间变色 · 数据来自 alternative.me，仅供参考</div>
+    </div>
+
     <section class="ov-ledger" aria-labelledby="ov_records_title">
       <div class="ov-ledger-head">
         <div>
@@ -1909,9 +1932,11 @@ let rvLastMarkerSig = "";
 // --- Lightweight Charts state (lazy-init, incremental setData) ---
 let candleChart = null, candleSeries = null, volumeSeries = null, timeSeries = null;
 let equityChart = null, equitySeries = null, hwmSeries = null;
+let fngChart = null, fngLineSeries = [], fngBandSeries = [], fngMidSeries = null;
 let statsBookChart = null, statsEqSeries = null, statsBhSeries = null, statsTurnSeries = null;
 let lastCandleSig = "";
 let lastEquitySig = "";
+let lastFngSig = "";
 let lastStatsBookSig = "";
 let cachedCandlesPayload = null;
 /** @type {string} UI bar key: time | 1m | 5m | 15m | 1H | 4H | 1D */
@@ -2712,6 +2737,189 @@ function updateEquityChart(equity) {
     " · 相对 HWM 回撤 <span" + ddStyle(dd / 100) + ">" + dd.toFixed(2) + "%</span></span>";
 }
 
+const FNG_ZONES = [
+  { id: "extreme_fear", lo: 0, hi: 24, color: "#ff6b7b", fill: "rgba(255,107,123,0.16)", zh: "极度恐惧" },
+  { id: "fear", lo: 24, hi: 44, color: "#ffca5c", fill: "rgba(255,202,92,0.13)", zh: "恐惧" },
+  { id: "neutral", lo: 44, hi: 55, color: "#8aa5b4", fill: "rgba(138,165,180,0.12)", zh: "中性" },
+  { id: "greed", lo: 55, hi: 75, color: "#4ff5a2", fill: "rgba(79,245,162,0.13)", zh: "贪婪" },
+  { id: "extreme_greed", lo: 75, hi: 100, color: "#35d8ff", fill: "rgba(53,216,255,0.16)", zh: "极度贪婪" },
+];
+const FNG_CUTS = [24, 44, 55, 75];
+
+function fngZoneOf(v) {
+  if (v <= 24) return 0;
+  if (v <= 44) return 1;
+  if (v <= 55) return 2;
+  if (v <= 75) return 3;
+  return 4;
+}
+
+function fngClassZh(cls) {
+  for (let i = 0; i < FNG_ZONES.length; i++) {
+    if (FNG_ZONES[i].id === cls) return FNG_ZONES[i].zh;
+  }
+  return cls || "—";
+}
+
+function fngTone(cls) {
+  if (cls === "extreme_fear" || cls === "fear") return "neg";
+  if (cls === "greed" || cls === "extreme_greed") return "pos";
+  return "";
+}
+
+function fngSplitByZone(line) {
+  const out = FNG_ZONES.map(() => []);
+  if (!line.length) return out;
+
+  function addVal(zi, t, v) {
+    const arr = out[zi];
+    const pt = { time: Math.round(t), value: v };
+    if (arr.length && arr[arr.length - 1].time === pt.time) {
+      arr[arr.length - 1] = pt;
+      return;
+    }
+    arr.push(pt);
+  }
+  function addBreak(zi, t) {
+    const arr = out[zi];
+    if (!arr.length || arr[arr.length - 1].value == null) return;
+    let time = Math.round(t);
+    if (arr[arr.length - 1].time >= time) time = arr[arr.length - 1].time + 1;
+    arr.push({ time });
+  }
+  function lerpT(t0, v0, t1, v1, v) {
+    if (v1 === v0) return t1;
+    return t0 + (t1 - t0) * ((v - v0) / (v1 - v0));
+  }
+
+  addVal(fngZoneOf(line[0].value), line[0].time, line[0].value);
+  for (let i = 1; i < line.length; i++) {
+    let t0 = line[i - 1].time, v0 = line[i - 1].value;
+    const t1 = line[i].time, v1 = line[i].value;
+    let z0 = fngZoneOf(v0);
+    const z1 = fngZoneOf(v1);
+    if (z0 !== z1) {
+      const step = z1 > z0 ? 1 : -1;
+      for (let z = z0; z !== z1; z += step) {
+        const cut = step > 0 ? FNG_CUTS[z] : FNG_CUTS[z - 1];
+        const tc = lerpT(t0, v0, t1, v1, cut);
+        addVal(z, tc, cut);
+        addBreak(z, tc + 1);
+        addVal(z + step, tc, cut);
+        t0 = tc;
+        v0 = cut;
+        z0 = z + step;
+      }
+    }
+    addVal(z1, t1, v1);
+    for (let z = 0; z < FNG_ZONES.length; z++) {
+      if (z !== z1) addBreak(z, t1);
+    }
+  }
+  return out;
+}
+
+function ensureFngChart() {
+  if (fngChart || !lwAvailable()) return !!fngChart;
+  const el = $("chart_fng");
+  if (!el) return false;
+  fngChart = LightweightCharts.createChart(el, Object.assign(chartBaseOptions(200), {
+    rightPriceScale: {
+      borderColor: CHART_BORDER,
+      scaleMargins: { top: 0.06, bottom: 0.06 },
+    },
+  }));
+  fngBandSeries = FNG_ZONES.map((z) => fngChart.addBaselineSeries({
+    baseValue: { type: "price", price: z.lo },
+    topLineColor: "rgba(0,0,0,0)",
+    topFillColor1: z.fill,
+    topFillColor2: z.fill,
+    bottomLineColor: "rgba(0,0,0,0)",
+    bottomFillColor1: "rgba(0,0,0,0)",
+    bottomFillColor2: "rgba(0,0,0,0)",
+    lastValueVisible: false,
+    priceLineVisible: false,
+    crosshairMarkerVisible: false,
+    priceFormat: { type: "price", precision: 0, minMove: 1 },
+    autoscaleInfoProvider: () => ({ priceRange: { minValue: 0, maxValue: 100 } }),
+  }));
+  fngLineSeries = FNG_ZONES.map((z) => fngChart.addLineSeries({
+    color: z.color,
+    lineWidth: 2,
+    title: z.zh,
+    lastValueVisible: false,
+    priceLineVisible: false,
+    crosshairMarkerVisible: true,
+  }));
+  fngMidSeries = fngChart.addLineSeries({
+    color: "rgba(138,165,180,0.55)",
+    lineWidth: 1,
+    lineStyle: LightweightCharts.LineStyle.Dashed,
+    title: "中性 50",
+    lastValueVisible: false,
+    priceLineVisible: false,
+    crosshairMarkerVisible: false,
+  });
+  fngChart.applyOptions({ width: el.clientWidth || el.offsetWidth || 600 });
+  bindChartResize(fngChart, el);
+  return true;
+}
+
+function updateFngChart(payload) {
+  const meta = $("fng_meta");
+  if (!meta) return;
+  if (!lwAvailable()) {
+    meta.innerHTML = "<span>恐惧贪婪指数</span><span class=\"warn\">图表库未加载</span>";
+    return;
+  }
+  if (!ensureFngChart()) return;
+
+  const pts = payload && Array.isArray(payload.points) ? payload.points : [];
+  const line = [];
+  for (let i = 0; i < pts.length; i++) {
+    const t = Number(pts[i] && pts[i].t);
+    const v = Number(pts[i] && pts[i].v);
+    if (!Number.isFinite(t) || !Number.isFinite(v)) continue;
+    line.push({ time: t, value: v });
+  }
+  if (line.length < 1) {
+    meta.innerHTML = "<span>恐惧贪婪指数</span><span class=\"muted\">暂无数据</span>";
+    return;
+  }
+
+  const now = Number.isFinite(Number(payload && payload.now)) ? Number(payload.now) : line[line.length - 1].value;
+  const cls = (payload && payload.class) || FNG_ZONES[fngZoneOf(now)].id;
+  const sig = line.map(p => p.time + ":" + p.value).join(",") + "|" + cls + "|" + now;
+  if (sig !== lastFngSig) {
+    lastFngSig = sig;
+    const t0 = line[0].time, t1 = line[line.length - 1].time;
+    const split = fngSplitByZone(line);
+    const ziNow = fngZoneOf(now);
+    for (let z = 0; z < FNG_ZONES.length; z++) {
+      fngBandSeries[z].setData([
+        { time: t0, value: FNG_ZONES[z].hi },
+        { time: t1, value: FNG_ZONES[z].hi },
+      ]);
+      fngLineSeries[z].applyOptions({ lastValueVisible: z === ziNow });
+      fngLineSeries[z].setData(split[z]);
+    }
+    fngMidSeries.setData([
+      { time: t0, value: 50 },
+      { time: t1, value: 50 },
+    ]);
+    fngChart.timeScale().fitContent();
+  }
+
+  const first = line[0].value;
+  const delta = now - first;
+  const tone = fngTone(cls);
+  meta.innerHTML =
+    "<span>近 <b>" + line.length + "</b> 日</span>" +
+    "<span>当前 <b class=\"" + tone + "\">" + now + "</b> · " +
+    "<b class=\"" + tone + "\">" + fngClassZh(cls) + "</b>" +
+    " · 区间 " + (delta >= 0 ? "+" : "") + delta + "</span>";
+}
+
 function onOverviewChartsVisible() {
   // Reflow after tab switch / first paint.
   if (candleChart) {
@@ -2721,6 +2929,10 @@ function onOverviewChartsVisible() {
   if (equityChart) {
     const el = $("chart_equity");
     if (el && el.clientWidth) equityChart.applyOptions({ width: el.clientWidth });
+  }
+  if (fngChart) {
+    const el = $("chart_fng");
+    if (el && el.clientWidth) fngChart.applyOptions({ width: el.clientWidth });
   }
 }
 
@@ -4798,7 +5010,7 @@ function renderIntel(rows) {
 
 async function poll() {
   try {
-    const [s, shadow, runs, equity, candles, memories, events, system, decisions, ordersBundle, reviewChats, auditReports, periodicReviews, statistics, intelRows] = await Promise.all([
+    const [s, shadow, runs, equity, candles, memories, events, system, decisions, ordersBundle, reviewChats, auditReports, periodicReviews, statistics, intelRows, sentiment] = await Promise.all([
       jget("/api/v1/state"),
       jget("/api/v1/shadow"),
       jget("/api/v1/agent-runs"),
@@ -4814,6 +5026,7 @@ async function poll() {
       jget("/api/v1/review/periodic"),
       jget("/api/v1/statistics"),
       jget("/api/v1/intel"),
+      jget("/api/v1/sentiment"),
     ]);
     lastOk = Date.now();
 
@@ -4875,6 +5088,7 @@ async function poll() {
 
     updateCandleChart(candles || {});
     updateEquityChart(equity);
+    try { updateFngChart(sentiment && typeof sentiment === "object" ? sentiment : {}); } catch (err) { console.error("fng chart", err); }
     if (activeTab === "overview") onOverviewChartsVisible();
     cachedDecisions = decisions;
     cachedRuns = runs;

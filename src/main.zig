@@ -795,6 +795,7 @@ pub fn main(init: std.process.Init) !u8 {
     ab.web_cache.refreshAuditCache(&web_state, &db, &audit_repo);
     ab.web_cache.refreshAnalyticsCache(&web_state, &db, &equity_repo);
     refreshCandlesCache(gpa, &web_state, &okx, &cfg);
+    refreshSentimentCache(gpa, &web_state, &okx);
     refreshEgressIp(&okx, &runtime_status);
     refreshDiskStatus(&cfg, &engine, &events_repo, &runtime_status);
     runtime_status.setResources(res_sampler.sample(nowMs()));
@@ -805,6 +806,7 @@ pub fn main(init: std.process.Init) !u8 {
     var last_sample_min: i64 = 0;
     var last_private_ms: i64 = 0;
     var last_dashboard_ms: i64 = 0;
+    var last_sentiment_ms: i64 = nowMs();
     var agent_done_once = false;
     // Multi-factor decision scheduler: session-aware base cadence + event
     // triggers (price move / drawdown step / risk-mode change) + cooldown floor.
@@ -825,6 +827,7 @@ pub fn main(init: std.process.Init) !u8 {
     // (30s) or the risk kernel flaps NORMAL→EXIT_ONLY between reconciles.
     const private_reconcile_ms: i64 = if (cfg.mode.isTrading()) 20_000 else 60_000;
     const dashboard_refresh_ms: i64 = 5_000;
+    const sentiment_refresh_ms: i64 = 1_800_000;
     const private_ws_reprobe_ms: i64 = 300_000;
     const backup_interval_ms: i64 = 3_600_000;
     const egress_refresh_ms: i64 = 3_600_000;
@@ -1179,6 +1182,10 @@ pub fn main(init: std.process.Init) !u8 {
                 ab.web_cache.refreshIntelCache(&web_state, &db, &intel_repo, tnow);
                 ab.web_cache.refreshStatisticsCache(&web_state, &db, &llm_usage_repo);
                 refreshCandlesCache(gpa, &web_state, &okx, &cfg);
+                if (last_sentiment_ms == 0 or tnow - last_sentiment_ms >= sentiment_refresh_ms) {
+                    last_sentiment_ms = tnow;
+                    refreshSentimentCache(gpa, &web_state, &okx);
+                }
                 refreshSystemCache(&web_state, &db, &cfg, &mem_store, boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), llm_client != null, admin_paused, &runtime_status, &risk_latency);
             }
             if (last_egress_ms == 0 or tnow - last_egress_ms >= egress_refresh_ms) {
@@ -1426,6 +1433,7 @@ fn printAgentStats(db: *ab.storage.Db) void {
 
 const refreshWebCaches = ab.web_cache.refreshWebCaches;
 const refreshCandlesCache = ab.web_cache.refreshCandlesCache;
+const refreshSentimentCache = ab.web_cache.refreshSentimentCache;
 
 /// One-shot private WS TLS login/subscribe probe. Never places orders.
 fn runPrivateWsProbe(
