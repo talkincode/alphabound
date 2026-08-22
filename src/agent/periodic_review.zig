@@ -151,6 +151,11 @@ pub const Facts = struct {
     max_drawdown: Decimal = Decimal.zero,
     hwm: Decimal = Decimal.zero,
     btc_weight: Decimal = Decimal.zero,
+    cash_usdt: Decimal = Decimal.zero,
+    cash_weight: Decimal = Decimal.zero,
+    min_size: Decimal = Decimal.zero,
+    min_notional: Decimal = Decimal.zero,
+    cash_covers_min_buy: bool = false,
     risk_mode: []const u8 = "NORMAL",
     // --- benchmark (shadow buy-and-hold) ---
     has_benchmark: bool = false,
@@ -173,14 +178,18 @@ pub const Facts = struct {
                 "\"admission\":{{\"approved\":{d},\"reduced\":{d},\"rejected\":{d}}}," ++
                 "\"execution\":{{\"executed\":{d},\"fills\":{d}}}," ++
                 "\"portfolio\":{{\"equity_start\":\"{f}\",\"equity_end\":\"{f}\",\"return\":\"{f}\"," ++
-                "\"max_drawdown\":\"{f}\",\"hwm\":\"{f}\",\"btc_weight\":\"{f}\",\"risk_mode\":\"{s}\"}},",
+                "\"max_drawdown\":\"{f}\",\"hwm\":\"{f}\",\"btc_weight\":\"{f}\"," ++
+                "\"cash_usdt\":\"{f}\",\"cash_weight\":\"{f}\",\"min_size\":\"{f}\",\"min_notional\":\"{f}\"," ++
+                "\"cash_covers_min_buy\":{},\"risk_mode\":\"{s}\"}},",
             .{
                 self.cycle.text(),        self.window_from, self.window_to,   self.window_hours,
                 self.mode,                self.instrument,  self.proposals,   self.holds,
                 self.rebalances,          self.runs_invalid, self.runs_error, self.admitted,
                 self.reduced,             self.rejected,    self.executed,    self.fills,
                 self.equity_start,        self.equity_end,  self.window_return,
-                self.max_drawdown,        self.hwm,         self.btc_weight,  self.risk_mode,
+                self.max_drawdown,        self.hwm,         self.btc_weight,  self.cash_usdt,
+                self.cash_weight,         self.min_size,    self.min_notional,
+                self.cash_covers_min_buy, self.risk_mode,
             },
         );
         if (self.has_benchmark) {
@@ -349,7 +358,7 @@ test "downtime longer than the interval fires once, not once per missed slot" {
 }
 
 test "facts render compact json with and without benchmark" {
-    var buf: [2048]u8 = undefined;
+    var buf: [3072]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     const f: Facts = .{
         .cycle = .short,
@@ -368,6 +377,11 @@ test "facts render compact json with and without benchmark" {
         .equity_end = try Decimal.parse("101.5"),
         .window_return = try Decimal.parse("0.015"),
         .max_drawdown = try Decimal.parse("0.004"),
+        .btc_weight = try Decimal.parse("0.98"),
+        .cash_usdt = try Decimal.parse("8.82"),
+        .cash_weight = try Decimal.parse("0.02"),
+        .min_notional = try Decimal.parse("10"),
+        .cash_covers_min_buy = false,
         .has_benchmark = true,
         .bh_return = try Decimal.parse("0.02"),
         .alpha_return = try Decimal.parse("-0.005"),
@@ -379,11 +393,13 @@ test "facts render compact json with and without benchmark" {
     try testing.expect(std.mem.indexOf(u8, out, "\"hours\":8") != null);
     try testing.expect(std.mem.indexOf(u8, out, "\"hold\":10") != null);
     try testing.expect(std.mem.indexOf(u8, out, "\"alpha\":\"-0.005\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"cash_usdt\":\"8.82\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"cash_covers_min_buy\":false") != null);
     // Must be valid JSON.
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out, .{});
     parsed.deinit();
 
-    var buf2: [2048]u8 = undefined;
+    var buf2: [3072]u8 = undefined;
     var w2: std.Io.Writer = .fixed(&buf2);
     var f2 = f;
     f2.has_benchmark = false;

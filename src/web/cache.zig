@@ -12,9 +12,11 @@ const okx_rest = @import("../exchange/okx/rest.zig");
 const config = @import("../config.zig");
 const memory = @import("../memory/store.zig");
 const latency = @import("../observability/latency.zig");
+const resources = @import("../observability/resources.zig");
 const openai = @import("../agent/openai.zig");
 const clock = @import("../core/clock.zig");
 const review = @import("review.zig");
+const intel_inbox = @import("../intel/inbox.zig");
 const analytics = @import("../analytics/ab_factor.zig");
 
 fn nowMs() i64 {
@@ -74,6 +76,11 @@ pub const WebState = struct {
     /// Durable LLM / portfolio / trading statistics (UTC windows).
     statistics_buf: [98304]u8 = undefined,
     statistics_len: usize = 2,
+    /// Signed intel history for Dashboard / MCP list.
+    intel_buf: [49152]u8 = undefined,
+    intel_len: usize = 2,
+    intel_inbox: ?*intel_inbox.Inbox = null,
+    intel_hmac: []const u8 = "",
     /// Dashboard / MCP auth (optional; empty token = open).
     auth_cfg: web_auth.Config = .{},
     cred_store: ?*web_auth.CredStore = null,
@@ -114,6 +121,8 @@ pub const WebState = struct {
         self.analytics_len = 2;
         @memcpy(self.statistics_buf[0..2], "{}");
         self.statistics_len = 2;
+        @memcpy(self.intel_buf[0..2], "[]");
+        self.intel_len = 2;
     }
 
     pub fn contextFn(userdata: ?*anyopaque) web.Context {
@@ -136,6 +145,7 @@ pub const WebState = struct {
             var periodic: [49152]u8 = undefined;
             var analytics: [131072]u8 = undefined;
             var statistics: [98304]u8 = undefined;
+            var intel: [49152]u8 = undefined;
             var config_hash: [71]u8 = undefined;
             var agent_len: usize = 2;
             var equity_len: usize = 2;
@@ -152,6 +162,7 @@ pub const WebState = struct {
             var periodic_len: usize = 2;
             var analytics_len: usize = 2;
             var statistics_len: usize = 2;
+            var intel_len: usize = 2;
         };
         const self: *WebState = @ptrCast(@alignCast(userdata.?));
         while (true) {
@@ -177,7 +188,8 @@ pub const WebState = struct {
             const pdl = self.periodic_len;
             const anl = self.analytics_len;
             const stl = self.statistics_len;
-            if (al > Tls.agent.len or el > Tls.equity.len or vl > Tls.events.len or sl > Tls.shadow.len or cl > Tls.candles.len or ml > Tls.memories.len or yl > Tls.system.len or dl > Tls.decisions.len or ol > Tls.orders.len or rl > Tls.review_chats.len or rcl > Tls.review_ctx.len or aul > Tls.audit.len or pdl > Tls.periodic.len or anl > Tls.analytics.len or stl > Tls.statistics.len) {
+            const il = self.intel_len;
+            if (al > Tls.agent.len or el > Tls.equity.len or vl > Tls.events.len or sl > Tls.shadow.len or cl > Tls.candles.len or ml > Tls.memories.len or yl > Tls.system.len or dl > Tls.decisions.len or ol > Tls.orders.len or rl > Tls.review_chats.len or rcl > Tls.review_ctx.len or aul > Tls.audit.len or pdl > Tls.periodic.len or anl > Tls.analytics.len or stl > Tls.statistics.len or il > Tls.intel.len) {
                 std.atomic.spinLoopHint();
                 continue;
             }
@@ -196,6 +208,7 @@ pub const WebState = struct {
             @memcpy(Tls.periodic[0..pdl], self.periodic_buf[0..pdl]);
             @memcpy(Tls.analytics[0..anl], self.analytics_buf[0..anl]);
             @memcpy(Tls.statistics[0..stl], self.statistics_buf[0..stl]);
+            @memcpy(Tls.intel[0..il], self.intel_buf[0..il]);
             @memcpy(Tls.config_hash[0..], self.config_hash[0..]);
             Tls.agent_len = al;
             Tls.equity_len = el;
@@ -212,6 +225,7 @@ pub const WebState = struct {
             Tls.periodic_len = pdl;
             Tls.analytics_len = anl;
             Tls.statistics_len = stl;
+            Tls.intel_len = il;
             const s2 = self.seq.load(.acquire);
             if (s1 == s2) {
                 return .{
@@ -235,6 +249,9 @@ pub const WebState = struct {
                     .periodic_json = Tls.periodic[0..Tls.periodic_len],
                     .analytics_json = Tls.analytics[0..Tls.analytics_len],
                     .statistics_json = Tls.statistics[0..Tls.statistics_len],
+                    .intel_json = Tls.intel[0..Tls.intel_len],
+                    .intel_inbox = self.intel_inbox,
+                    .intel_hmac = self.intel_hmac,
                     .index_html = self.index_html,
                     .auth_cfg = self.auth_cfg,
                     .cred_store = self.cred_store,
@@ -254,7 +271,7 @@ pub const WebState = struct {
         _ = self.seq.fetchAdd(1, .release); // even: stable
     }
 
-    pub fn setJson(self: *WebState, comptime which: enum { agent, equity, events, shadow, candles, memories, system, decisions, orders, review, review_ctx, audit, periodic, analytics, statistics }, src: []const u8) void {
+    pub fn setJson(self: *WebState, comptime which: enum { agent, equity, events, shadow, candles, memories, system, decisions, orders, review, review_ctx, audit, periodic, analytics, statistics, intel }, src: []const u8) void {
         _ = self.seq.fetchAdd(1, .acq_rel);
         switch (which) {
             .agent => {
@@ -332,6 +349,11 @@ pub const WebState = struct {
                 @memcpy(self.statistics_buf[0..n], src[0..n]);
                 self.statistics_len = n;
             },
+            .intel => {
+                const n = @min(src.len, self.intel_buf.len);
+                @memcpy(self.intel_buf[0..n], src[0..n]);
+                self.intel_len = n;
+            },
         }
         _ = self.seq.fetchAdd(1, .release);
     }
@@ -355,6 +377,15 @@ pub const RuntimeStatus = struct {
     disk: []const u8 = "unknown",
     disk_free_bytes: u64 = 0,
     disk_ms: i64 = 0,
+    cpu_pct_x10: u32 = 0,
+    host_cpu_pct_x10: u32 = 0,
+    rss_bytes: u64 = 0,
+    mem_used_bytes: u64 = 0,
+    mem_total_bytes: u64 = 0,
+    net_rx_bps: u64 = 0,
+    net_tx_bps: u64 = 0,
+    res_ms: i64 = 0,
+    res_ready: bool = false,
     // LLM token totals since process start
     llm_calls: u64 = 0,
     prompt_tokens: u64 = 0,
@@ -478,6 +509,17 @@ pub const RuntimeStatus = struct {
         self.disk_free_bytes = free_bytes;
         self.disk_ms = nowMs();
     }
+    pub fn setResources(self: *RuntimeStatus, snap: resources.Snapshot) void {
+        self.cpu_pct_x10 = snap.cpu_pct_x10;
+        self.host_cpu_pct_x10 = snap.host_cpu_pct_x10;
+        self.rss_bytes = snap.rss_bytes;
+        self.mem_used_bytes = snap.mem_used_bytes;
+        self.mem_total_bytes = snap.mem_total_bytes;
+        self.net_rx_bps = snap.net_rx_bps;
+        self.net_tx_bps = snap.net_tx_bps;
+        self.res_ms = nowMs();
+        self.res_ready = snap.ready;
+    }
 };
 
 pub fn refreshWebCaches(
@@ -544,7 +586,14 @@ pub fn refreshWebCaches(
     ws.setJson(.orders, bw.buffered());
 }
 
-/// Re-render 复盘 chat transcripts blob from SQLite (core loop only).
+/// Re-render signed intel history blob from SQLite (core loop only).
+pub fn refreshIntelCache(ws: *WebState, db: *storage.Db, repo: *storage.IntelRepo, now_ms: i64) void {
+    var tmp: [49152]u8 = undefined;
+    if (repo.listRecentJson(db, &tmp, now_ms, 80)) |j| {
+        ws.setJson(.intel, j);
+    } else |_| {}
+}
+
 pub fn refreshReviewCache(ws: *WebState, db: *storage.Db, repo: *storage.ReviewChatsRepo) void {
     var tmp: [49152]u8 = undefined;
     if (repo.listRecentJson(db, &tmp, 150)) |j| {
@@ -680,6 +729,25 @@ pub fn refreshCandlesCache(
     } else {
         w.writeAll("[]") catch return;
     }
+    // Same blob, not a new API: BTC-USDT → BTC-USDT-SWAP funding snapshot.
+    var funding_ok = false;
+    var swap_buf: [48]u8 = undefined;
+    if (std.fmt.bufPrint(&swap_buf, "{s}-SWAP", .{cfg.instrument})) |swap_inst| {
+        var fr_path_buf: [128]u8 = undefined;
+        if (std.fmt.bufPrint(&fr_path_buf, "/api/v5/public/funding-rate?instId={s}", .{swap_inst})) |fr_path| {
+            if (okx.getPublic(fr_path)) |fr_body| {
+                defer gpa.free(fr_body);
+                if (okx_rest.parseFundingRate(gpa, fr_body)) |fr| {
+                    w.print(
+                        ",\"funding_rate\":\"{f}\",\"next_funding_ms\":{d}",
+                        .{ fr.funding_rate, fr.next_funding_ms },
+                    ) catch return;
+                    funding_ok = true;
+                } else |_| {}
+            } else |_| {}
+        } else |_| {}
+    } else |_| {}
+    if (!funding_ok) w.writeAll(",\"funding_rate\":null,\"next_funding_ms\":null") catch return;
     w.writeAll("}") catch return;
     ws.setJson(.candles, w.buffered());
 }
@@ -806,13 +874,22 @@ pub fn refreshSystemCache(
         .{ risk_lat.percentile(50), risk_lat.percentile(99), risk_lat.maxUs(), risk_lat.count() },
     ) catch return;
     w.print(
-        "\"egress_ip\":\"{s}\",\"egress_ip_ms\":{d},\"disk\":\"{s}\",\"disk_free_bytes\":{d},\"disk_ms\":{d},\"llm_calls\":{d},\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d},\"acct_usdt\":\"{s}\",\"acct_btc\":\"{s}\",\"last_decision\":\"{s}\",\"last_decision_ms\":{d}}}}}",
+        "\"egress_ip\":\"{s}\",\"egress_ip_ms\":{d},\"disk\":\"{s}\",\"disk_free_bytes\":{d},\"disk_ms\":{d},\"cpu_pct_x10\":{d},\"host_cpu_pct_x10\":{d},\"rss_bytes\":{d},\"mem_used_bytes\":{d},\"mem_total_bytes\":{d},\"net_rx_bps\":{d},\"net_tx_bps\":{d},\"res_ms\":{d},\"res_ready\":{},\"llm_calls\":{d},\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d},\"acct_usdt\":\"{s}\",\"acct_btc\":\"{s}\",\"last_decision\":\"{s}\",\"last_decision_ms\":{d}}}}}",
         .{
             st.egress_ip,
             st.egress_ip_ms,
             st.disk,
             st.disk_free_bytes,
             st.disk_ms,
+            st.cpu_pct_x10,
+            st.host_cpu_pct_x10,
+            st.rss_bytes,
+            st.mem_used_bytes,
+            st.mem_total_bytes,
+            st.net_rx_bps,
+            st.net_tx_bps,
+            st.res_ms,
+            st.res_ready,
             st.llm_calls,
             st.prompt_tokens,
             st.completion_tokens,

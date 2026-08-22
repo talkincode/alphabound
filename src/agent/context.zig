@@ -19,6 +19,7 @@ const Decimal = dec.Decimal;
 pub const MAX_EVENTS = 16;
 pub const MAX_MEMORIES = 12;
 pub const MAX_SELF_ITEMS = 8;
+pub const MAX_INTEL = 8;
 
 pub const Input = struct {
     snapshot: state_mod.PortfolioState,
@@ -37,6 +38,8 @@ pub const Input = struct {
     equity_marks: []const []const u8 = &.{},
     /// First-party facts (not verdicts): current weight, HOLD streak, BH gap.
     facts: ReviewFacts = .{},
+    /// Ranked external intel JSON objects (untrusted). Empty when none.
+    intel: []const []const u8 = &.{},
     /// Immutable risk boundary echoed verbatim into the context.
     max_drawdown: Decimal,
     instrument: []const u8,
@@ -171,6 +174,14 @@ fn writeContext(w: *std.Io.Writer, input: Input) !void {
     try writeReviewFacts(w, input);
     try w.writeAll("}},");
 
+    try w.writeAll("\"intel\":[");
+    const intel_n = @min(input.intel.len, MAX_INTEL);
+    for (input.intel[0..intel_n], 0..) |row, i| {
+        if (i > 0) try w.writeByte(',');
+        try w.writeAll(row);
+    }
+    try w.writeAll("],");
+
     // Immutable boundary: stated, not negotiable, never sourced from agent input.
     try w.writeAll("\"risk_rules\":{");
     try w.print("\"max_drawdown\":\"{f}\",", .{input.max_drawdown});
@@ -181,7 +192,15 @@ fn writeContext(w: *std.Io.Writer, input: Input) !void {
 
 fn writeReviewFacts(w: *std.Io.Writer, input: Input) !void {
     const f = input.facts;
-    try w.print("\"btc_weight\":\"{f}\",\"hold_streak\":{d},", .{ btcWeight(input.snapshot), f.hold_streak });
+    try w.print(
+        "\"btc_weight\":\"{f}\",\"hold_streak\":{d},\"cash_usdt\":\"{f}\",\"cash_covers_min_buy\":{},",
+        .{
+            btcWeight(input.snapshot),
+            f.hold_streak,
+            input.snapshot.cash_usdt,
+            cashCoversMinBuy(input.snapshot.cash_usdt, quotePrice(input.snapshot), input.min_size, input.min_notional),
+        },
+    );
     if (f.ms_since_last_fill) |ms| {
         try w.print("\"ms_since_last_fill\":{d},", .{ms});
     } else {
@@ -299,6 +318,7 @@ test "render is deterministic and structurally complete" {
     try testing.expect(obj.get("tools") != null);
     try testing.expect(obj.get("tool_observations") != null);
     try testing.expect(obj.get("self_review") != null);
+    try testing.expect(obj.get("intel") != null);
     try testing.expect(obj.get("risk_rules") != null);
 
     const sr = obj.get("self_review").?.object;
@@ -318,6 +338,8 @@ test "render is deterministic and structurally complete" {
     try testing.expect(weight.gt(d("0.61")));
     try testing.expect(weight.lt(d("0.62")));
     try testing.expectEqualStrings(cs.get("btc_weight").?.string, facts.get("btc_weight").?.string);
+    try testing.expectEqualStrings("38.5", facts.get("cash_usdt").?.string);
+    try testing.expect(facts.get("cash_covers_min_buy").?.bool);
     try testing.expectEqualStrings("0", cs.get("min_size").?.string);
     try testing.expectEqualStrings("0", cs.get("min_notional").?.string);
     try testing.expect(cs.get("cash_covers_min_buy").?.bool);
@@ -416,4 +438,7 @@ test "render exposes untradeable leftover cash" {
     try testing.expectEqualStrings("8.82", cs.get("cash_usdt").?.string);
     try testing.expectEqualStrings("10", cs.get("min_notional").?.string);
     try testing.expect(!cs.get("cash_covers_min_buy").?.bool);
+    const facts = parsed.value.object.get("self_review").?.object.get("facts").?.object;
+    try testing.expectEqualStrings("8.82", facts.get("cash_usdt").?.string);
+    try testing.expect(!facts.get("cash_covers_min_buy").?.bool);
 }

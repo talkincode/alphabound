@@ -42,6 +42,22 @@
     color: var(--text); background: var(--panel);
     border-color: var(--border); position: relative; top: 1px;
   }
+  .intel-card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 12px 14px; margin-bottom: 10px;
+  }
+  .intel-card.expired { opacity: .48; }
+  .intel-card .intel-top {
+    display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: baseline;
+    margin-bottom: 6px;
+  }
+  .intel-card .intel-hl { font-weight: 600; font-size: 14px; }
+  .intel-card .intel-meta { color: var(--dim); font-size: 12px; }
+  .intel-card .intel-body { font-size: 13px; margin: 6px 0; }
+  .grade-A { color: var(--ok); }
+  .grade-B { color: var(--line); }
+  .grade-C { color: var(--warn); }
+  .grade-D { color: var(--dim); }
   .panel { display: none; }
   .panel.active { display: block; }
   .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; margin-bottom: 12px; }
@@ -179,6 +195,9 @@
   .usage-k { color: #7894a0; font-size: 10px; letter-spacing: .07em; }
   .usage-v { margin-top: 5px; color: #eefcff; font-size: 22px; line-height: 1.15; font-weight: 650; font-variant-numeric: tabular-nums; letter-spacing: -.035em; }
   .usage-v.sm { font-size: 18px; }
+  .usage-v.pos { color: var(--ok); text-shadow: 0 0 16px rgba(79, 245, 162, .22); }
+  .usage-v.neg { color: var(--bad); text-shadow: 0 0 16px rgba(255, 107, 123, .22); }
+  .usage-v.dd { color: var(--dd-color, #ffd6a8); text-shadow: 0 0 16px color-mix(in srgb, var(--dd-color, #ffd6a8) 40%, transparent); }
   .usage-sub { margin-top: 7px; color: var(--dim); font-size: 11px; line-height: 1.35; }
   .usage-sub b { color: var(--text); font-weight: 600; }
   .usage-footnote { margin: 13px 0 0; color: #7894a0; font-size: 11px; line-height: 1.5; }
@@ -806,20 +825,20 @@
   .tabs::before {
     content: "NAV//";
     align-self: center;
-    margin-right: 5px;
+    margin-right: 8px;
     color: rgba(100, 255, 207, .68);
-    font-size: 10px;
+    font-size: 12px;
     font-weight: 700;
     letter-spacing: .1em;
   }
   .tab {
     flex: 0 0 auto;
-    min-height: 34px;
+    min-height: 40px;
     border: 1px solid transparent;
     border-radius: 1px;
-    padding: 8px 15px;
+    padding: 9px 16px;
     color: #7894a1;
-    font: 700 11px/1 "IBM Plex Mono", "PingFang SC", ui-monospace, monospace;
+    font: 700 14px/1 "IBM Plex Mono", "PingFang SC", ui-monospace, monospace;
     letter-spacing: .04em;
   }
   .tab:hover { color: #d7f5ff; background: rgba(43, 154, 194, .12); }
@@ -879,13 +898,26 @@
     text-shadow: 0 0 18px rgba(107, 228, 255, .08);
   }
   .card .value.sm { font-size: 18px; }
+  .card .value.pos { color: var(--ok); text-shadow: 0 0 16px rgba(79, 245, 162, .28); }
+  .card .value.neg { color: var(--bad); text-shadow: 0 0 16px rgba(255, 107, 123, .28); }
+  .card .value.dd {
+    color: var(--dd-color, #ffd6a8);
+    text-shadow: 0 0 16px color-mix(in srgb, var(--dd-color, #ffd6a8) 42%, transparent);
+  }
+  .card .value.mode-NORMAL { color: var(--ok); text-shadow: 0 0 16px rgba(79, 245, 162, .28); }
+  .card .value.mode-EXIT_ONLY { color: var(--warn); text-shadow: 0 0 16px rgba(255, 202, 92, .28); }
+  .card .value.mode-FLATTENING { color: var(--bad); text-shadow: 0 0 16px rgba(255, 107, 123, .28); }
+  .card .value.mode-HALTED { color: var(--halt); text-shadow: 0 0 16px rgba(173, 140, 255, .28); }
   .card .subv {
     border-top-color: rgba(72, 178, 212, .14);
     color: #7995a2;
   }
   .card .subv b { color: #cce8f1; }
   .ddbar { height: 5px; border-radius: 0; background: #0b2632; }
-  .ddbar > div { background: linear-gradient(90deg, var(--signal), var(--line)); box-shadow: 0 0 10px rgba(100, 255, 207, .4); }
+  .ddbar > div {
+    background: var(--dd-color, #ffb060);
+    box-shadow: 0 0 10px color-mix(in srgb, var(--dd-color, #ffb060) 55%, transparent);
+  }
 
   .token-strip {
     min-height: 46px;
@@ -1046,7 +1078,7 @@
     h1 { font-size: 27px; }
     .tabs { margin-bottom: 14px; }
     .tabs::before { display: none; }
-    .tab { padding: 8px 12px; }
+    .tab { padding: 9px 13px; font-size: 13px; min-height: 38px; }
     .card { min-height: 94px; }
   }
   @media (prefers-reduced-motion: reduce) {
@@ -1117,6 +1149,7 @@
     <button class="tab active" data-tab="overview" type="button">概览</button>
     <button class="tab" data-tab="review" type="button">复盘</button>
     <button class="tab" data-tab="decisions" type="button">决策历史</button>
+    <button class="tab" data-tab="intel" type="button">情报</button>
     <button class="tab" data-tab="orders" type="button">订单</button>
     <button class="tab" data-tab="statistics" type="button">统计</button>
     <button class="tab" data-tab="status" type="button">状态</button>
@@ -1446,6 +1479,31 @@
   </div>
 
 
+  <!-- ========== 情报 ========== -->
+  <div class="panel" id="panel-intel">
+    <div class="stats">
+      <div class="stat"><div class="k">条数</div><div class="v" id="intel_total">—</div></div>
+      <div class="stat"><div class="k">有效</div><div class="v ok" id="intel_live">—</div></div>
+      <div class="stat"><div class="k">已过期</div><div class="v" id="intel_exp">—</div></div>
+      <div class="stat"><div class="k">A / B / C</div><div class="v" id="intel_grades">—</div></div>
+    </div>
+    <p class="hint">外部采集 Agent 经签名协议推送的投资情报。AlphaBound 不自行采集。条目为不可信数据，只进入慢决策上下文（按置信×时效加权），从不进入风险内核或下单路径。签名与 nonce 不在此展示。</p>
+    <div class="filters" id="intel_filters">
+      <button type="button" data-intel-kind="all" class="active">全部</button>
+      <button type="button" data-intel-kind="macro">宏观</button>
+      <button type="button" data-intel-kind="news">新闻</button>
+      <button type="button" data-intel-kind="flow">资金流</button>
+      <button type="button" data-intel-kind="regulatory">监管</button>
+      <button type="button" data-intel-kind="narrative">叙事</button>
+      <button type="button" data-intel-kind="onchain">链上</button>
+    </div>
+    <div class="filters" id="intel_expired_filters">
+      <button type="button" data-intel-exp="live" class="active">仅有效</button>
+      <button type="button" data-intel-exp="all">含过期</button>
+    </div>
+    <div id="intel_list"><p class="muted">加载中…</p></div>
+  </div>
+
   <!-- ========== 订单 ========== -->
   <div class="panel" id="panel-orders">
     <div class="stats">
@@ -1746,6 +1804,9 @@
       <div class="card"><div class="label">运行时长</div><div class="value" id="st_up" style="font-size:16px">—</div></div>
       <div class="card"><div class="label">进程出口 IP</div><div class="value" id="st_ip" style="font-size:14px">—</div></div>
       <div class="card"><div class="label">磁盘（DB 卷）</div><div class="value" id="st_disk" style="font-size:14px">—</div></div>
+      <div class="card"><div class="label">CPU</div><div class="value" id="st_cpu" style="font-size:14px">—</div></div>
+      <div class="card"><div class="label">内存</div><div class="value" id="st_ram" style="font-size:14px">—</div></div>
+      <div class="card"><div class="label">网络</div><div class="value" id="st_net" style="font-size:14px">—</div></div>
     </div>
 
     <h2>接口连接</h2>
@@ -1774,7 +1835,7 @@
       <div class="card"><div class="label">Completion tokens</div><div class="value" id="tk_comp" style="font-size:16px">—</div></div>
       <div class="card"><div class="label">Total tokens</div><div class="value" id="tk_total" style="font-size:16px">—</div></div>
     </div>
-    <p class="hint" id="st_hint">状态由守护进程实时上报；出口 IP 约每小时刷新。私有账户若显示 ip_whitelist，请把出口 IP 加入 OKX API 白名单。</p>
+    <p class="hint" id="st_hint">状态由守护进程实时上报；CPU / 内存 / 网络约每 5 秒采样；出口 IP 约每小时刷新。私有账户若显示 ip_whitelist，请把出口 IP 加入 OKX API 白名单。</p>
   </div>
 
   <div class="footer" id="meta"></div>
@@ -1826,6 +1887,9 @@ let statsPane = (() => {
 let cachedReviewChats = [];
 let cachedAudit = [];
 let cachedPeriodic = [];
+let cachedIntel = [];
+let intelKind = (() => { try { return localStorage.getItem("ab_intel_kind") || "all"; } catch (_) { return "all"; } })();
+let intelExp = (() => { try { return localStorage.getItem("ab_intel_exp") || "live"; } catch (_) { return "live"; } })();
 let cachedSystem = null;
 let prLastSig = "";
 let prFilter = (() => { try { return localStorage.getItem("ab_pr_filter") || "all"; } catch (_) { return "all"; } })();
@@ -1934,6 +1998,42 @@ function setRetEl(id, r) {
   const pct = (r * 100).toFixed(2) + "%";
   el.textContent = (r > 0 ? "+" : "") + pct;
   el.className = r > 0 ? "pos" : (r < 0 ? "neg" : "");
+}
+/** Drawdown heat vs the 10% risk cap: pale apricot → orange → red. */
+const DD_CAP = 0.10;
+const DD_STOPS = [
+  [0, [255, 214, 168]],
+  [0.22, [255, 176, 96]],
+  [0.50, [255, 122, 50]],
+  [0.78, [255, 77, 61]],
+  [1, [255, 51, 88]],
+];
+function ddHeat(dd, cap) {
+  const t = Math.max(0, Math.min(1, (parseFloat(dd) || 0) / (cap || DD_CAP)));
+  let i = 1;
+  while (i < DD_STOPS.length - 1 && t > DD_STOPS[i][0]) i++;
+  const a = DD_STOPS[i - 1], b = DD_STOPS[i];
+  const u = (t - a[0]) / ((b[0] - a[0]) || 1);
+  const r = Math.round(a[1][0] + (b[1][0] - a[1][0]) * u);
+  const g = Math.round(a[1][1] + (b[1][1] - a[1][1]) * u);
+  const bl = Math.round(a[1][2] + (b[1][2] - a[1][2]) * u);
+  return "rgb(" + r + "," + g + "," + bl + ")";
+}
+function paintDd(el, dd, className) {
+  if (!el) return;
+  const n = parseFloat(dd);
+  const ok = Number.isFinite(n);
+  if (className) el.className = ok ? className : className.replace(/\bdd\b/g, "").replace(/\s+/g, " ").trim();
+  if (!ok) {
+    el.style.removeProperty("--dd-color");
+    return;
+  }
+  el.style.setProperty("--dd-color", ddHeat(n));
+}
+function ddStyle(dd) {
+  const n = parseFloat(dd);
+  if (!Number.isFinite(n)) return "";
+  return ' style="color:' + ddHeat(n) + '"';
 }
 function statusClass(s) {
   if (!s) return "";
@@ -2536,7 +2636,17 @@ function updateCandleChart(payload) {
     (isTime ? "（1m）" : "") + " · " + nLabel + "</span>" +
     "<span>最新 <b>" + last + "</b> · 高 " + hi + " / 低 " + lo +
     " · 区间涨跌 <span class=\"" + (chg >= 0 ? "pos" : "neg") + "\">" +
-    (chg >= 0 ? "+" : "") + chg.toFixed(2) + "%</span></span>";
+    (chg >= 0 ? "+" : "") + chg.toFixed(2) + "%</span>" +
+    fundingMetaHtml(payload) + "</span>";
+}
+
+function fundingMetaHtml(payload) {
+  const n = parseFloat(payload && payload.funding_rate);
+  if (!isFinite(n)) return "";
+  const pct = n * 100;
+  const cls = pct >= 0 ? "pos" : "neg";
+  const sign = pct > 0 ? "+" : "";
+  return " · 资金费 <span class=\"" + cls + "\">" + sign + pct.toFixed(4) + "%</span>";
 }
 
 function updateEquityChart(equity) {
@@ -2599,7 +2709,7 @@ function updateEquityChart(equity) {
     "<span>净值 <b>" + lastEq.toFixed(4) + "</b> · HWM <b>" + lastHw.toFixed(4) + "</b>" +
     " · 段内 <span class=\"" + (chg >= 0 ? "pos" : "neg") + "\">" +
     (chg >= 0 ? "+" : "") + chg.toFixed(2) + "%</span>" +
-    " · 相对 HWM 回撤 <span class=\"" + (dd > 5 ? "neg" : "muted") + "\">" + dd.toFixed(2) + "%</span></span>";
+    " · 相对 HWM 回撤 <span" + ddStyle(dd / 100) + ">" + dd.toFixed(2) + "%</span></span>";
 }
 
 function onOverviewChartsVisible() {
@@ -3874,7 +3984,7 @@ function prCardHtml(r) {
     "<span>提案 <b>" + (dec.proposals ?? 0) + "</b>（HOLD " + (dec.hold ?? 0) + " · 调仓 " + (dec.rebalance ?? 0) + "）</span>" +
     "<span>准入 <b>" + (adm.approved ?? 0) + "</b> 通过 / " + (adm.reduced ?? 0) + " 缩量 / " + (adm.rejected ?? 0) + " 拒绝</span>" +
     "<span>执行 <b>" + (exe.executed ?? 0) + "</b> · 成交 " + (exe.fills ?? 0) + "</span>" +
-    "<span>净值 <b>" + prPct(pf.return) + "</b> · 最大回撤 " + prPctAbs(pf.max_drawdown) + "</span>" +
+    "<span>净值 <b>" + prPct(pf.return) + "</b> · 最大回撤 <span" + ddStyle(pf.max_drawdown) + ">" + prPctAbs(pf.max_drawdown) + "</span></span>" +
     "<span>仓位 <b>" + prPctAbs(pf.btc_weight) + "</b> · " + esc(pf.risk_mode || "—") + "</span>" +
     (bm ? "<span>基准 " + prPct(bm.buy_and_hold_return) + " · 超额 <b>" + prPct(bm.alpha) + "</b></span>"
         : '<span class="muted">基准：窗口内无标记</span>') +
@@ -4047,6 +4157,26 @@ function ageText(ms) {
   if (sec < 120) return sec + " 秒前";
   return Math.floor(sec/60) + " 分前";
 }
+function fmtPctX10(x10) {
+  const n = Number(x10);
+  if (!Number.isFinite(n) || n < 0) return "—";
+  return (n / 10).toFixed(1) + "%";
+}
+function fmtBytes(n) {
+  const v = Number(n);
+  if (!Number.isFinite(v) || v <= 0) return "—";
+  if (v >= 1024*1024*1024) return (v / (1024*1024*1024)).toFixed(1) + " GiB";
+  if (v >= 1024*1024) return (v / (1024*1024)).toFixed(1) + " MiB";
+  if (v >= 1024) return Math.round(v / 1024) + " KiB";
+  return Math.round(v) + " B";
+}
+function fmtBps(n) {
+  const v = Number(n);
+  if (!Number.isFinite(v) || v < 0) return "—";
+  if (v >= 1024*1024) return (v / (1024*1024)).toFixed(1) + " MiB/s";
+  if (v >= 1024) return (v / 1024).toFixed(1) + " KiB/s";
+  return Math.round(v) + " B/s";
+}
 function connClass(s) {
   if (s === "ok") return "value ok";
   if (s === "error" || s === "ip_whitelist") return "value err";
@@ -4082,6 +4212,42 @@ function renderStatus(system, state) {
     }
     $("st_disk").textContent = band + " · free " + freeTxt + (st.disk_ms ? " · " + ageText(st.disk_ms) : "");
     $("st_disk").className = "value" + (band === "critical" ? " bad" : band === "low" ? " warn" : band === "ok" ? " ok" : "");
+  }
+  if ($("st_cpu")) {
+    if (!st.res_ready) {
+      $("st_cpu").textContent = "采样中";
+      $("st_cpu").className = "value";
+    } else {
+      const procCpu = fmtPctX10(st.cpu_pct_x10);
+      const hostCpu = fmtPctX10(st.host_cpu_pct_x10);
+      $("st_cpu").textContent = "进程 " + procCpu + " · 主机 " + hostCpu;
+      const hostN = Number(st.host_cpu_pct_x10) || 0;
+      $("st_cpu").className = "value" + (hostN >= 850 ? " bad" : hostN >= 700 ? " warn" : " ok");
+    }
+  }
+  if ($("st_ram")) {
+    const rss = fmtBytes(st.rss_bytes);
+    const used = Number(st.mem_used_bytes) || 0;
+    const total = Number(st.mem_total_bytes) || 0;
+    let host = "";
+    if (total > 0) {
+      const pct = Math.round(used * 1000 / total) / 10;
+      host = " · 主机 " + pct.toFixed(1) + "% (" + fmtBytes(used) + "/" + fmtBytes(total) + ")";
+    }
+    $("st_ram").textContent = rss === "—" ? "—" : rss + " RSS" + host;
+    const ramPct = total > 0 ? used * 100 / total : 0;
+    $("st_ram").className = "value" + (ramPct >= 90 ? " bad" : ramPct >= 80 ? " warn" : rss !== "—" ? " ok" : "");
+  }
+  if ($("st_net")) {
+    if (!st.res_ready) {
+      $("st_net").textContent = "采样中";
+      $("st_net").className = "value";
+    } else {
+      const rx = Number(st.net_rx_bps) || 0;
+      const tx = Number(st.net_tx_bps) || 0;
+      $("st_net").textContent = "↓" + fmtBps(rx) + " · ↑" + fmtBps(tx);
+      $("st_net").className = "value" + ((rx + tx) >= 50*1024*1024 ? " warn" : " ok");
+    }
   }
 
   const pub = st.okx_public || "unknown";
@@ -4303,6 +4469,7 @@ function renderBookStatistics(data) {
     ? "窗口两端缺少买入持有标记"
     : "基准 " + signedPct(book.totals.bh_return) + " · 超额 = 净值收益 − 基准";
   $("book_dd").textContent = book.totals.max_drawdown == null ? "—" : absPct(book.totals.max_drawdown);
+  paintDd($("book_dd"), book.totals.max_drawdown, "usage-v dd");
   $("book_dd_sub").textContent = "期末权重 " + (book.totals.btc_weight_end == null ? "—" : absPct(book.totals.btc_weight_end)) +
     " · HWM " + fmtMoney(book.totals.hwm_end);
   $("book_coverage").textContent = samples ? usageInt(samples) + " 条" : "—";
@@ -4316,7 +4483,7 @@ function renderBookStatistics(data) {
       "<td>" + esc(d.day || "—") + "</td>" +
       "<td>" + esc(fmtMoney(d.equity)) + "</td>" +
       '<td class="' + (parseFloat(r) > 0 ? "pos" : (parseFloat(r) < 0 ? "neg" : "")) + '">' + signedPct(r) + "</td>" +
-      "<td>" + (d.drawdown == null ? "—" : absPct(d.drawdown)) + "</td>" +
+      "<td" + ddStyle(d.drawdown) + ">" + (d.drawdown == null ? "—" : absPct(d.drawdown)) + "</td>" +
       "<td>" + esc(fmtMoney(d.cash)) + "</td>" +
       "<td>" + esc(fmtMoney(d.btc_value)) + "</td>" +
       "</tr>";
@@ -4548,9 +4715,90 @@ function renderOrders(bundle) {
   }
 }
 
+const INTEL_KIND_ZH = {
+  macro: "宏观", news: "新闻", flow: "资金流",
+  regulatory: "监管", narrative: "叙事", onchain: "链上"
+};
+
+function syncIntelFilters() {
+  document.querySelectorAll("#intel_filters button[data-intel-kind]").forEach(btn => {
+    btn.classList.toggle("active", btn.getAttribute("data-intel-kind") === intelKind);
+  });
+  document.querySelectorAll("#intel_expired_filters button[data-intel-exp]").forEach(btn => {
+    btn.classList.toggle("active", btn.getAttribute("data-intel-exp") === intelExp);
+  });
+}
+document.querySelectorAll("#intel_filters button[data-intel-kind]").forEach(btn => {
+  btn.addEventListener("click", () => {
+    intelKind = btn.getAttribute("data-intel-kind") || "all";
+    try { localStorage.setItem("ab_intel_kind", intelKind); } catch (_) {}
+    syncIntelFilters();
+    renderIntel(cachedIntel);
+  });
+});
+document.querySelectorAll("#intel_expired_filters button[data-intel-exp]").forEach(btn => {
+  btn.addEventListener("click", () => {
+    intelExp = btn.getAttribute("data-intel-exp") || "live";
+    try { localStorage.setItem("ab_intel_exp", intelExp); } catch (_) {}
+    syncIntelFilters();
+    renderIntel(cachedIntel);
+  });
+});
+syncIntelFilters();
+
+function renderIntel(rows) {
+  const list = $("intel_list");
+  if (!list) return;
+  const all = Array.isArray(rows) ? rows : [];
+  const live = all.filter(r => !r.expired);
+  const expiredN = all.length - live.length;
+  let a = 0, b = 0, c = 0;
+  live.forEach(r => {
+    if (r.grade === "A") a += 1;
+    else if (r.grade === "B") b += 1;
+    else if (r.grade === "C") c += 1;
+  });
+  if ($("intel_total")) $("intel_total").textContent = String(all.length);
+  if ($("intel_live")) $("intel_live").textContent = String(live.length);
+  if ($("intel_exp")) $("intel_exp").textContent = String(expiredN);
+  if ($("intel_grades")) $("intel_grades").textContent = a + " / " + b + " / " + c;
+
+  const shown = all.filter(r => {
+    if (intelKind !== "all" && r.kind !== intelKind) return false;
+    if (intelExp === "live" && r.expired) return false;
+    return true;
+  });
+  if (!shown.length) {
+    list.innerHTML = '<p class="muted">暂无情报。外部采集 Agent 通过签名 MCP / POST /api/v1/intel 推送。</p>';
+    return;
+  }
+  list.innerHTML = shown.map(r => {
+    const claims = Array.isArray(r.claims) ? r.claims.map(cl => esc((cl.polarity || "") + " · " + (cl.text || ""))).join("；") : "";
+    const tags = Array.isArray(r.tags) ? r.tags.map(t => '<span class="pill">' + esc(t) + "</span>").join(" ") : "";
+    const refs = Array.isArray(r.refs) && r.refs.length
+      ? r.refs.map(rf => esc(rf.title || rf.url || "")).join(" · ")
+      : "";
+    const g = r.grade || "";
+    return '<div class="intel-card' + (r.expired ? " expired" : "") + '">' +
+      '<div class="intel-top">' +
+        '<span class="intel-hl">' + esc(r.headline || "") + "</span>" +
+        '<span class="intel-meta grade-' + esc(g) + '">grade ' + esc(g) + " · " + esc(r.confidence || "") + "</span>" +
+        '<span class="intel-meta">' + esc(INTEL_KIND_ZH[r.kind] || r.kind || "") + "</span>" +
+        '<span class="intel-meta">' + esc(r.source_id || "") + "</span>" +
+      "</div>" +
+      '<div class="intel-body">' + esc(r.body || "") + "</div>" +
+      (claims ? '<div class="intel-meta">' + claims + "</div>" : "") +
+      (tags ? '<div style="margin-top:6px">' + tags + "</div>" : "") +
+      '<div class="intel-meta" style="margin-top:6px">' +
+        esc(r.id || "") + (r.expired ? " · 已过期" : "") +
+        (refs ? " · " + refs : "") +
+      "</div></div>";
+  }).join("");
+}
+
 async function poll() {
   try {
-    const [s, shadow, runs, equity, candles, memories, events, system, decisions, ordersBundle, reviewChats, auditReports, periodicReviews, statistics] = await Promise.all([
+    const [s, shadow, runs, equity, candles, memories, events, system, decisions, ordersBundle, reviewChats, auditReports, periodicReviews, statistics, intelRows] = await Promise.all([
       jget("/api/v1/state"),
       jget("/api/v1/shadow"),
       jget("/api/v1/agent-runs"),
@@ -4565,6 +4813,7 @@ async function poll() {
       jget("/api/v1/audit"),
       jget("/api/v1/review/periodic"),
       jget("/api/v1/statistics"),
+      jget("/api/v1/intel"),
     ]);
     lastOk = Date.now();
 
@@ -4594,11 +4843,12 @@ async function poll() {
     setRetEl("ret_vs_hwm", retHwm);
 
     const dd = parseFloat(s.drawdown) || 0;
-    const pct = Math.min(dd / 0.10, 1) * 100;
+    const pct = Math.min(dd / DD_CAP, 1) * 100;
     $("dd").textContent = (dd * 100).toFixed(2) + "%";
+    paintDd($("dd"), dd, "value dd");
     const fill = $("ddfill");
     fill.style.width = pct + "%";
-    fill.style.background = pct < 50 ? "var(--ok)" : pct < 80 ? "var(--warn)" : "var(--bad)";
+    paintDd(fill, dd);
 
     $("sh_shadow").textContent = fmtMoney(shadow.shadow_equity);
     $("sh_bh").textContent = fmtMoney(shadow.bh_equity);
@@ -4652,6 +4902,8 @@ async function poll() {
     try { renderOrders(cachedOrdersBundle); } catch (err) { console.error("renderOrders", err); }
     try { renderStatus(system, s); } catch (err) { console.error("renderStatus", err); }
     try { renderStatistics(cachedStatistics); } catch (err) { console.error("renderStatistics", err); }
+    cachedIntel = Array.isArray(intelRows) ? intelRows : [];
+    try { renderIntel(cachedIntel); } catch (err) { console.error("renderIntel", err); }
     // overview token strip
     {
       const st = (system && system.status) || {};
@@ -4706,7 +4958,7 @@ async function poll() {
           <td>${e.ts || ""}</td>
           <td>${e.equity || ""}</td>
           <td>${e.hwm || ""}</td>
-          <td>${e.drawdown || ""}</td>
+          <td${ddStyle(e.drawdown)}>${e.drawdown || ""}</td>
           <td>${e.cash || ""}</td>
           <td>${e.btc_value || ""}</td>
         </tr>`

@@ -8,7 +8,7 @@
 - **Trust proxy:** leave `ALPHABOUND_TRUST_PROXY` off unless a trusted TLS edge is the *only* path to the process; XFF is taken from the **right** (`TRUSTED_PROXY_HOPS`, default 1). Never trust left-most client-supplied XFF.
 - **Brute-force:** in-process FailGuard rate-limits bad logins / bad tokens per IP (and global login flood). Prefer edge WAF limits as well.
 - **Passkeys** need a browser secure context (HTTPS or localhost). Plain HTTP to a LAN IP supports token login only.
-- **Control plane** is local CLI control files only (`--control …`). HTTP Dashboard and Analytics MCP are **read-only** — no order placement, flatten, or secret readout.
+- **Control plane** is local CLI control files only (`--control …`). HTTP Dashboard and Analytics MCP do not place orders, flatten, or read secrets. The sole HTTP/MCP write besides auth is signed intel ingest (`POST /api/v1/intel` / MCP `submit_intel`); see [docs/INTEL.md](docs/INTEL.md).
 - Logs and events pass through redaction (`src/observability/redaction.zig`) before persistence.
 - Live trading requires explicit `OKX_REAL_MONEY_OK=1` on a small sub-account key with **no withdraw** permission.
 - Report vulnerabilities privately to the maintainers; do not open public issues with secrets.

@@ -1,6 +1,6 @@
 # 鉴权与 Analytics MCP
 
-Dashboard / API 可选用 **Token + Session + Passkey** 保护数据面；外部 Agent 通过 **只读 MCP** 拉取同一批 HTTP API。控制面（pause / flatten / 下单）**永远不走** HTTP 或 MCP。
+Dashboard / API 可选用 **Token + Session + Passkey** 保护数据面；外部 Agent 通过 MCP 拉取同一批 HTTP API，并可用 `submit_intel` 转发**已签名**的情报信封。控制面（pause / flatten / 下单）**永远不走** HTTP 或 MCP。
 
 详细技术说明与仓库文件同步：
 

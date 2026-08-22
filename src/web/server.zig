@@ -8,6 +8,8 @@ const sm = @import("../risk/state_machine.zig");
 const clock = @import("../core/clock.zig");
 const auth = @import("auth.zig");
 const review = @import("review.zig");
+const intel = @import("../intel/protocol.zig");
+const intel_inbox = @import("../intel/inbox.zig");
 
 const favicon_svg: []const u8 = @embedFile("favicon_svg");
 const favicon_ico: []const u8 = @embedFile("favicon_ico");
@@ -72,6 +74,12 @@ pub const Context = struct {
     audit_json: []const u8 = "[]",
     /// Recent 定期复盘 reports (newest first; 8h 小周期 + 周度大周期).
     periodic_json: []const u8 = "[]",
+    /// Signed external intel history (no signature/nonce).
+    intel_json: []const u8 = "[]",
+    /// Intel ingest mailbox; null = ingest unavailable.
+    intel_inbox: ?*intel_inbox.Inbox = null,
+    /// HMAC key for alphabound.intel.v1; empty = ingest disabled.
+    intel_hmac: []const u8 = "",
     /// AB 因子复盘 analytics blob (experimental, research-only).
     analytics_json: []const u8 = "{}",
     /// Durable LLM token/cost statistics, pre-rendered by the core loop.
@@ -250,6 +258,9 @@ pub fn handleReq(buf: []u8, req: RequestInfo, ctx: Context) Response {
     if (method == .POST and std.mem.startsWith(u8, path, "/api/v1/review/")) {
         return handleReviewPost(req, path, ctx);
     }
+    if (method == .POST and std.mem.eql(u8, path, "/api/v1/intel")) {
+        return handleIntelPost(buf, req, ctx);
+    }
 
     if (method != .GET) {
         return .{ .status = .method_not_allowed, .body = "{\"error\":\"method not allowed\"}" };
@@ -273,6 +284,7 @@ pub fn handleReq(buf: []u8, req: RequestInfo, ctx: Context) Response {
     if (std.mem.eql(u8, path, "/api/v1/review/periodic")) return copyBody(buf, ctx.periodic_json);
     if (std.mem.eql(u8, path, "/api/v1/audit")) return copyBody(buf, ctx.audit_json);
     if (std.mem.eql(u8, path, "/api/v1/statistics")) return copyBody(buf, ctx.statistics_json);
+    if (std.mem.eql(u8, path, "/api/v1/intel")) return copyBody(buf, ctx.intel_json);
     return .{ .status = .not_found, .body = "{\"error\":\"not found\"}" };
 }
 
@@ -320,6 +332,46 @@ fn handleReviewPost(req: RequestInfo, path: []const u8, ctx: Context) Response {
         },
     };
     return .{ .status = .accepted, .body = "{\"ok\":true,\"queued\":true}" };
+}
+
+fn handleIntelPost(buf: []u8, req: RequestInfo, ctx: Context) Response {
+    if (ctx.intel_hmac.len < intel.min_hmac_key) {
+        return .{ .status = .service_unavailable, .body = "{\"error\":\"signing_unconfigured\"}" };
+    }
+    const inbox = ctx.intel_inbox orelse {
+        return .{ .status = .service_unavailable, .body = "{\"error\":\"intel_unavailable\"}" };
+    };
+    const now = if (req.now_ms == 0) clock.SystemClock.clock().wallMs() else req.now_ms;
+    var item = intel.Item{};
+    intel.parse(std.heap.page_allocator, ctx.intel_hmac, now, req.body, &item) catch |err| {
+        const reason = intel.errorReason(err);
+        const body = std.fmt.bufPrint(buf, "{{\"error\":\"invalid_intel\",\"reason\":\"{s}\"}}", .{reason}) catch
+            return .{ .status = .bad_request, .body = "{\"error\":\"invalid_intel\"}" };
+        const status: std.http.Status = if (err == error.NoKey) .service_unavailable else .bad_request;
+        return .{ .status = status, .body = body };
+    };
+    inbox.enqueue(item, now) catch |err| switch (err) {
+        intel_inbox.EnqueueError.Full => return .{
+            .status = .too_many_requests,
+            .body = "{\"error\":\"busy\",\"hint\":\"intel_queue_full\"}",
+            .retry_after_sec = 5,
+        },
+        intel_inbox.EnqueueError.DuplicatePending => return .{
+            .status = .conflict,
+            .body = "{\"error\":\"pending\",\"hint\":\"intel_already_queued\"}",
+        },
+        intel_inbox.EnqueueError.RateLimited => return .{
+            .status = .too_many_requests,
+            .body = "{\"error\":\"rate_limited\",\"hint\":\"intel_source_rate\"}",
+            .retry_after_sec = 60,
+        },
+    };
+    const body = std.fmt.bufPrint(
+        buf,
+        "{{\"ok\":true,\"queued\":true,\"id\":\"{s}\",\"dedup_key\":\"{s}\"}}",
+        .{ item.id(), item.dedupKey() },
+    ) catch return .{ .status = .accepted, .body = "{\"ok\":true,\"queued\":true}" };
+    return .{ .status = .accepted, .body = body };
 }
 
 fn jsonGetString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
@@ -846,7 +898,8 @@ fn handleConnection(io: std.Io, stream: std.Io.net.Stream, ctx_fn: ContextFn, us
     const peer_ip = formatPeerIp(stream, &peer_ip_buf);
     const content_length = req.head.content_length;
 
-    var body_storage: [8192]u8 = undefined;
+    // Review chat + alphabound.intel.v1 envelopes (headline+body+claims near caps).
+    var body_storage: [16384]u8 = undefined;
     var body_len: usize = 0;
     if (method == .POST) {
         if (content_length) |cl| {
@@ -1066,6 +1119,8 @@ test "agent-runs equity shadow endpoints serve context blobs" {
     try testing.expectEqualStrings("{\"factor_version\":\"v1\",\"points\":[]}", handle(&buf, .GET, "/api/v1/review/analytics", ctx).body);
     try testing.expectEqualStrings("[{\"review_id\":\"pr_1\",\"cycle\":\"short\"}]", handle(&buf, .GET, "/api/v1/review/periodic", ctx).body);
     try testing.expectEqualStrings("{\"timezone\":\"UTC\",\"last_24h\":{\"calls\":1}}", handle(&buf, .GET, "/api/v1/statistics", ctx).body);
+    ctx.intel_json = "[{\"id\":\"intel_x\"}]";
+    try testing.expectEqualStrings("[{\"id\":\"intel_x\"}]", handle(&buf, .GET, "/api/v1/intel", ctx).body);
 }
 
 test "review POST enqueues into inbox; validation and limits enforced" {
@@ -1167,6 +1222,93 @@ test "review POST enqueues into inbox; validation and limits enforced" {
         while (inbox.drain()) |_| {}
         try testing.expectEqual(@as(usize, 0), inbox.pending());
     }
+}
+
+test "intel POST validates hmac and enqueues" {
+    var buf: [2048]u8 = undefined;
+    var inbox: intel_inbox.Inbox = .{};
+    var ctx = testCtx();
+    ctx.intel_inbox = &inbox;
+    ctx.intel_hmac = intel.test_hmac_key;
+    const now: i64 = 1_700_000_000_000;
+
+    try testing.expectEqual(std.http.Status.service_unavailable, handleReq(&buf, .{
+        .method = .POST,
+        .target = "/api/v1/intel",
+        .body = "{}",
+        .now_ms = now,
+    }, testCtx()).status);
+
+    try testing.expectEqual(std.http.Status.bad_request, handleReq(&buf, .{
+        .method = .POST,
+        .target = "/api/v1/intel",
+        .body = "{\"schema\":\"nope\"}",
+        .now_ms = now,
+    }, ctx).status);
+
+    var item = intel.Item{
+        .kind = .macro,
+        .conf_milles = 620,
+        .as_of_ms = now - 60_000,
+        .expires_ms = now - 60_000 + 7 * 86_400_000,
+    };
+    const id = "intel_web_test_01";
+    @memcpy(item.id_buf[0..id.len], id);
+    item.id_len = id.len;
+    const src = "collector.macro";
+    @memcpy(item.source_buf[0..src.len], src);
+    item.source_len = src.len;
+    const inst = "BTC-USDT";
+    @memcpy(item.instrument_buf[0..inst.len], inst);
+    item.instrument_len = inst.len;
+    const hl = "US spot BTC ETF saw net inflows";
+    @memcpy(item.headline_buf[0..hl.len], hl);
+    item.headline_len = hl.len;
+    const body_s = "Issuers reported a second consecutive session of net creations.";
+    @memcpy(item.body_buf[0..body_s.len], body_s);
+    item.body_len = body_s.len;
+    const nonce = "0123456789abcdef0123456789abcdef";
+    @memcpy(item.nonce_buf[0..nonce.len], nonce);
+    item.nonce_len = nonce.len;
+    const claims = "[{\"text\":\"ETF creations continued\",\"polarity\":\"bull\"}]";
+    @memcpy(item.claims_json_buf[0..claims.len], claims);
+    item.claims_json_len = claims.len;
+    const tags = "[\"etf\"]";
+    @memcpy(item.tags_json_buf[0..tags.len], tags);
+    item.tags_json_len = tags.len;
+    @memcpy(item.refs_json_buf[0..2], "[]");
+    item.refs_json_len = 2;
+    intel.computeDedup(&item);
+    try intel.signItem(intel.test_hmac_key, &item);
+    var env_buf: [2048]u8 = undefined;
+    const env = std.fmt.bufPrint(&env_buf, "{{\"schema\":\"{s}\",\"id\":\"{s}\",\"source_id\":\"{s}\",\"kind\":\"macro\",\"instrument\":\"BTC-USDT\",\"headline\":\"{s}\",\"body\":\"{s}\",\"claims\":{s},\"tags\":{s},\"confidence\":0.620,\"as_of_ms\":{d},\"expires_ms\":{d},\"nonce\":\"{s}\",\"signature\":\"{s}\"}}", .{
+        intel.schema_id,
+        item.id(),
+        item.sourceId(),
+        item.headline(),
+        item.body(),
+        item.claimsJson(),
+        item.tagsJson(),
+        item.as_of_ms,
+        item.expires_ms,
+        item.nonce(),
+        item.signature(),
+    }) catch unreachable;
+
+    const r = handleReq(&buf, .{
+        .method = .POST,
+        .target = "/api/v1/intel",
+        .body = env,
+        .now_ms = now,
+    }, ctx);
+    try testing.expectEqual(std.http.Status.accepted, r.status);
+    try testing.expectEqual(@as(usize, 1), inbox.pending());
+    try testing.expectEqual(std.http.Status.conflict, handleReq(&buf, .{
+        .method = .POST,
+        .target = "/api/v1/intel",
+        .body = env,
+        .now_ms = now,
+    }, ctx).status);
 }
 
 test "review endpoints require auth when token configured" {

@@ -3,7 +3,7 @@
  * Minimal remote MCP-ish HTTP gateway:
  *   GET  /health
  *   GET  /tools
- *   POST /tools/:name   (JSON body ignored; returns tool result)
+ *   POST /tools/:name   (JSON body forwarded only for POST tools such as submit_intel)
  *
  * Optional inbound gate: ALPHABOUND_MCP_REQUIRE_TOKEN=1 checks Bearer/X-API-Token
  * against ALPHABOUND_API_TOKEN before proxying.
@@ -11,7 +11,7 @@
  * Full MCP Streamable HTTP can be layered later; this is the operational remote surface.
  */
 import http from "node:http";
-import { TOOLS, apiGet, apiBase } from "./client.js";
+import { TOOLS, apiGet, apiPost, apiBase } from "./client.js";
 
 const BIND = process.env.ALPHABOUND_MCP_BIND || "127.0.0.1";
 const PORT = Number(process.env.ALPHABOUND_MCP_PORT || "8723");
@@ -35,6 +35,35 @@ function send(res, code, obj) {
   res.end(body);
 }
 
+function readJson(req, limit = 16384) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let n = 0;
+    req.on("data", (c) => {
+      n += c.length;
+      if (n > limit) {
+        const err = new Error("body_too_large");
+        err.status = 413;
+        req.destroy();
+        reject(err);
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on("end", () => {
+      if (!chunks.length) return resolve({});
+      try {
+        resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+      } catch {
+        const err = new Error("bad_json");
+        err.status = 400;
+        reject(err);
+      }
+    });
+    req.on("error", reject);
+  });
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
@@ -47,15 +76,25 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === "GET" && url.pathname === "/tools") {
       return send(res, 200, {
-        tools: TOOLS.map((t) => ({ name: t.name, description: t.description, path: t.path })),
+        tools: TOOLS.map((t) => ({
+          name: t.name,
+          description: t.description,
+          path: t.path,
+          method: t.method || "GET",
+        })),
       });
     }
     const m = url.pathname.match(/^\/tools\/([a-z0-9_]+)$/i);
     if (req.method === "POST" && m) {
       const tool = TOOLS.find((t) => t.name === m[1]);
       if (!tool) return send(res, 404, { error: "unknown_tool" });
+      if (tool.method === "POST") {
+        const payload = await readJson(req);
+        const data = await apiPost(tool.path, payload);
+        return send(res, 200, { name: tool.name, path: tool.path, method: "POST", data });
+      }
       const data = await apiGet(tool.path);
-      return send(res, 200, { name: tool.name, path: tool.path, data });
+      return send(res, 200, { name: tool.name, path: tool.path, method: "GET", data });
     }
     return send(res, 404, { error: "not_found" });
   } catch (e) {

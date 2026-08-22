@@ -10,6 +10,7 @@
 - [CLI 参考](guide/cli.md)
 - [Dashboard 与 API](guide/dashboard-api.md)
 - [鉴权与 MCP](guide/auth-mcp.md)
+- [投资情报协议](guide/intel.md)
 - [运行模式](guide/modes.md)
 - [运维部署](guide/operations.md)
   - [Admin control](guide/admin-control.md)

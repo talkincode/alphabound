@@ -39,8 +39,8 @@ curl -sS -H "Authorization: Bearer YOUR_TOKEN" http://127.0.0.1:18180/api/v1/sta
 | 形态 | 单文件 HTML + favicon 集，**编译期嵌入**二进制（`dashboard/`） |
 | 入口 | `GET /` 与 `GET /index.html` |
 | 依赖 | 零 Node 运行时；浏览器直接 `fetch` API |
-| 刷新 | 前端约 2s 轮询 state / shadow / agent-runs / equity / candles / memories / events / system / orders / decisions / review-chats / statistics |
-| 内容 | Overview + Shadow vs BH + **Lightweight Charts**（分时/多周期 K 线 + 成交量 + 净值/HWM）+ **复盘**（K 线决策标记 + 指标 + AI 复盘对话 + 复盘记录）+ **统计**（资产/交易窗口账本 + 持久化 LLM Token/成本账本）+ 提案/记忆/事件/订单 + System |
+| 刷新 | 前端约 2s 轮询 state / shadow / agent-runs / equity / candles / memories / events / system / orders / decisions / review-chats / statistics / intel |
+| 内容 | Overview + Shadow vs BH + **Lightweight Charts**（分时/多周期 K 线 + 成交量 + 净值/HWM）+ **复盘**（K 线决策标记 + 指标 + AI 复盘对话 + 复盘记录）+ **统计**（资产/交易窗口账本 + 持久化 LLM Token/成本账本）+ **情报**（签名外部投资情报历史）+ 提案/记忆/事件/订单 + System |
 
 概览图表使用 [Lightweight Charts](https://www.tradingview.com/lightweight-charts/)（CDN）。周期按钮：**分时**（1m 收盘面积图）、1分/5分/15分/1时/4时/1日。离线无 CDN 时其余 UI 仍可用。
 
@@ -113,7 +113,7 @@ open http://127.0.0.1:18180/
 | `GET /api/v1/shadow` | 实盘净值 vs 同起点 buy-and-hold |
 | `GET /api/v1/candles` | 多周期 K 线缓存 `bars.{1m,5m,15m,1H,4H,1D}` |
 | `GET /api/v1/memories` | 最新版本记忆 |
-| `GET /api/v1/system` | 进程/agent/paused/disk/latency 等 |
+| `GET /api/v1/system` | 进程/agent/paused/disk/CPU/内存/网络/latency 等 |
 | `GET /api/v1/statistics` | 资产/交易窗口账本 + 持久化 LLM 调用、Token、市场价成本、覆盖率与近期账本 |
 | `GET /api/v1/decisions` | 提案/反思审计事件（含 thesis） |
 | `GET /api/v1/orders` | `{"orders":[...],"fills":[...]}` 投影 |
@@ -122,6 +122,10 @@ open http://127.0.0.1:18180/
 | `GET /api/v1/review/analytics` | AB 因子复盘分析（实验性）：成分指标曲线 + IC 表，见下 |
 | `GET /api/v1/review/periodic` | 定期复盘报告（newest first，含窗口事实与模型结论） |
 | `GET /api/v1/audit` | 定时审计报告（newest first，含完整 findings 与 stats） |
+| `GET /api/v1/intel` | 外部签名情报历史（无 signature/nonce；含 grade/score/expired） |
+| `POST /api/v1/intel` | 推送 `alphabound.intel.v1` 信封（需 `ALPHABOUND_INTEL_HMAC`） |
+
+协议、TTL、HMAC 与评分见 [投资情报协议](intel.md)。`POST` 在核心环落库前只入 mailbox（202 Accepted）。未配置 HMAC 时 ingest 返回 503，GET 历史仍可用。
 
 ### `GET /api/v1/shadow`
 
@@ -154,7 +158,18 @@ open http://127.0.0.1:18180/
   "memories": 6,
   "private_keys": true,
   "private_ws_opt_in": false,
-  "agent": {"total": 4, "ok": 3, "invalid": 0, "errors": 1, "valid_rate": 75.0, "tool_calls": 8}
+  "agent": {"total": 4, "ok": 3, "invalid": 0, "errors": 1, "valid_rate": 75.0, "tool_calls": 8},
+  "status": {
+    "disk": "ok",
+    "disk_free_bytes": 12884901888,
+    "cpu_pct_x10": 8,
+    "host_cpu_pct_x10": 41,
+    "rss_bytes": 16000000,
+    "mem_used_bytes": 800000000,
+    "mem_total_bytes": 2000000000,
+    "net_rx_bps": 12000,
+    "net_tx_bps": 4000
+  }
 }
 ```
 
@@ -203,9 +218,13 @@ Dashboard「统计」页的数据源，含两个子页：**资产与交易**、*
   "instrument": "BTC-USDT",
   "bars": {
     "1H": [{"ts_ms": 1786237200000, "o": "64978.2", "h": "65011.4", "l": "64850", "c": "64871.3", "vol": "50.98"}]
-  }
+  },
+  "funding_rate": "0.00006928",
+  "next_funding_ms": 1786291200000
 }
 ```
+
+`funding_rate` 来自对应永续合约（`BTC-USDT-SWAP`）公开资金费率；拉取失败时为 `null`，不会为此新增接口或图表组件。概览 K 线标题栏直接显示该费率。
 
 ### `GET /api/v1/orders`
 

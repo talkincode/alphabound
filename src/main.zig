@@ -460,6 +460,8 @@ pub fn main(init: std.process.Init) !u8 {
     defer periodic_repo.deinit();
     var kv_repo = try ab.storage.KvRepo.init(&db);
     defer kv_repo.deinit();
+    var intel_repo = try ab.storage.IntelRepo.init(&db);
+    defer intel_repo.deinit();
 
     // In-process memory index rebuilt from SQLite latest versions.
     var mem_store = ab.memory.Store.init(gpa);
@@ -521,6 +523,18 @@ pub fn main(init: std.process.Init) !u8 {
     // 复盘 mailbox: web thread enqueues review requests, this loop drains them.
     var review_inbox = ab.web_review.Inbox{};
     web_state.review_inbox = &review_inbox;
+    var intel_inbox = ab.intel_inbox.Inbox{};
+    web_state.intel_inbox = &intel_inbox;
+    const intel_hmac = env.get("ALPHABOUND_INTEL_HMAC") orelse "";
+    web_state.intel_hmac = intel_hmac;
+    if (intel_hmac.len > 0 and intel_hmac.len < ab.intel.min_hmac_key) {
+        std.debug.print("[boot] WARN ALPHABOUND_INTEL_HMAC is short (<{d}); intel ingest disabled\n", .{ab.intel.min_hmac_key});
+        web_state.intel_hmac = "";
+    } else if (intel_hmac.len >= ab.intel.min_hmac_key) {
+        std.debug.print("[boot] intel ingest enabled (HMAC set)\n", .{});
+    } else {
+        std.debug.print("[boot] intel ingest off (no ALPHABOUND_INTEL_HMAC)\n", .{});
+    }
     // Azure / reverse-proxy: set ALPHABOUND_TRUST_PROXY=1 only when a trusted edge
     // strips/appends XFF. We take the right-most hop (see trusted_proxy_hops) so
     // client-supplied left-most XFF cannot rotate fail-guard keys.
@@ -725,6 +739,7 @@ pub fn main(init: std.process.Init) !u8 {
     // Local admin pause flag (control file). Risk/market loop keeps running.
     var admin_paused: bool = false;
     var runtime_status = RuntimeStatus{};
+    var res_sampler = ab.resources.Sampler.init();
 
     var control_path_buf: [640]u8 = undefined;
     const control_path = ab.admin_control.pathFromDb(cfg.db_path, &control_path_buf) catch "var/trading.control";
@@ -776,11 +791,13 @@ pub fn main(init: std.process.Init) !u8 {
     refreshWebCaches(&web_state, &db, &agent_runs, &equity_repo, &events_repo, &memories_repo, &orders_repo, &fills_repo, last_bh_cmp);
     ab.web_cache.refreshStatisticsCache(&web_state, &db, &llm_usage_repo);
     ab.web_cache.refreshReviewCache(&web_state, &db, &review_repo);
+    ab.web_cache.refreshIntelCache(&web_state, &db, &intel_repo, nowMs());
     ab.web_cache.refreshAuditCache(&web_state, &db, &audit_repo);
     ab.web_cache.refreshAnalyticsCache(&web_state, &db, &equity_repo);
     refreshCandlesCache(gpa, &web_state, &okx, &cfg);
     refreshEgressIp(&okx, &runtime_status);
     refreshDiskStatus(&cfg, &engine, &events_repo, &runtime_status);
+    runtime_status.setResources(res_sampler.sample(nowMs()));
     refreshSystemCache(&web_state, &db, &cfg, &mem_store, boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), llm_client != null, admin_paused, &runtime_status, &risk_latency);
     logEvent(&events_repo, &engine, "STATE_READY", "core", "INFO", &cfg);
 
@@ -1115,13 +1132,15 @@ pub fn main(init: std.process.Init) !u8 {
                         .{ reason_txt, ab.scheduler.hourUtc(tnow), agent_sched.params.effectiveInterval(ab.scheduler.hourUtc(tnow)) },
                     ) catch "{\"reason\":\"unknown\"}";
                     logEventPayload(&events_repo, &engine, "AGENT_TRIGGER", "agent", "INFO", &cfg, trig_payload);
-                    runAgentDecision(gpa, client, &okx, &cfg, &engine, &tool_reg, &agent_runs, &tool_calls, &llm_usage_repo, &events_repo, &orders_repo, &fills_repo, &equity_repo, &db, &mem_store, &memories_repo, env, &runtime_status, trade_instrument, &agent_sched, last_bh_cmp);
+                    runAgentDecision(gpa, client, &okx, &cfg, &engine, &tool_reg, &agent_runs, &tool_calls, &llm_usage_repo, &events_repo, &orders_repo, &fills_repo, &equity_repo, &db, &mem_store, &memories_repo, &intel_repo, env, &runtime_status, trade_instrument, &agent_sched, last_bh_cmp);
                     refreshWebCaches(&web_state, &db, &agent_runs, &equity_repo, &events_repo, &memories_repo, &orders_repo, &fills_repo, last_bh_cmp);
                     ab.web_cache.refreshStatisticsCache(&web_state, &db, &llm_usage_repo);
                     refreshSystemCache(&web_state, &db, &cfg, &mem_store, boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), llm_client != null, admin_paused, &runtime_status, &risk_latency);
                 }
             }
         }
+
+        processIntelInbox(&intel_repo, &events_repo, &engine, &cfg, &web_state, &db);
 
         // Human review mailbox (复盘): analysis-only side channel. Reads DB,
         // may call the LLM, writes review_chats/memories — never trading state.
@@ -1144,6 +1163,8 @@ pub fn main(init: std.process.Init) !u8 {
                 &runtime_status,
                 &periodic_repo,
                 &review_sched,
+                trade_instrument.min_size,
+                trade_instrument.min_notional,
             );
         }
 
@@ -1152,7 +1173,9 @@ pub fn main(init: std.process.Init) !u8 {
             const tnow = nowMs();
             if (last_dashboard_ms == 0 or tnow - last_dashboard_ms >= dashboard_refresh_ms) {
                 last_dashboard_ms = tnow;
+                runtime_status.setResources(res_sampler.sample(tnow));
                 refreshWebCaches(&web_state, &db, &agent_runs, &equity_repo, &events_repo, &memories_repo, &orders_repo, &fills_repo, last_bh_cmp);
+                ab.web_cache.refreshIntelCache(&web_state, &db, &intel_repo, tnow);
                 ab.web_cache.refreshStatisticsCache(&web_state, &db, &llm_usage_repo);
                 refreshCandlesCache(gpa, &web_state, &okx, &cfg);
                 refreshSystemCache(&web_state, &db, &cfg, &mem_store, boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), llm_client != null, admin_paused, &runtime_status, &risk_latency);
@@ -1207,6 +1230,8 @@ pub fn main(init: std.process.Init) !u8 {
                         "schedule",
                         window_ms,
                         tnow,
+                        trade_instrument.min_size,
+                        trade_instrument.min_notional,
                     );
                     runtime_status.setReviewNext(
                         review_sched.msUntil(.short, tnow),
@@ -2254,6 +2279,7 @@ fn runAgentDecision(
     db: *ab.storage.Db,
     mem_store: *ab.memory.Store,
     memories_repo: *ab.storage.MemoriesRepo,
+    intel_repo: *ab.storage.IntelRepo,
     env: *const std.process.Environ.Map,
     st: *RuntimeStatus,
     instrument: ab.planner.Instrument,
@@ -2342,6 +2368,11 @@ fn runAgentDecision(
     }
     const equity_marks = eq_ptrs[0..eq_n];
 
+    var intel_backing: [32 * 1024]u8 = undefined;
+    var intel_ptrs: [ab.context.MAX_INTEL][]const u8 = undefined;
+    const intel_n = intel_repo.listForContext(db, nowMs(), &intel_backing, &intel_ptrs) catch 0;
+    const intel_rows = intel_ptrs[0..intel_n];
+
     var review_facts = ab.context.ReviewFacts{};
     if (mem_store.find("E_hold_streak")) |hm| {
         review_facts.hold_streak = hm.evidence_count;
@@ -2359,7 +2390,7 @@ fn runAgentDecision(
         review_facts.alpha_return = bh_cmp.alpha_return;
     }
 
-    var ctx_buf: [48 * 1024]u8 = undefined;
+    var ctx_buf: [80 * 1024]u8 = undefined;
     const ctx_json = ab.context.render(&ctx_buf, .{
         .snapshot = snap,
         .recent_events = recent_events,
@@ -2370,6 +2401,7 @@ fn runAgentDecision(
         .recent_fills = recent_fills,
         .equity_marks = equity_marks,
         .facts = review_facts,
+        .intel = intel_rows,
         .max_drawdown = cfg.max_drawdown,
         .instrument = cfg.instrument,
         .now_ms = nowMs(),
@@ -2394,7 +2426,7 @@ fn runAgentDecision(
         \\Respond with ONE JSON Decision Proposal only. Context:
         \\
     ;
-    var user_buf: [56 * 1024]u8 = undefined;
+    var user_buf: [88 * 1024]u8 = undefined;
     const user_msg = std.fmt.bufPrint(&user_buf, "{s}{s}", .{ user_msg_prefix, ctx_json }) catch {
         completeRun(runs, run_id, "error_buffer", "", input_digest, nowMs());
         return;
@@ -2479,7 +2511,7 @@ fn runAgentDecision(
         all_obs[obs_n] = ind_line;
         tools_used = obs_n + 1;
 
-        var ctx_buf2: [56 * 1024]u8 = undefined;
+        var ctx_buf2: [88 * 1024]u8 = undefined;
         const ctx_json2 = ab.context.render(&ctx_buf2, .{
             .snapshot = snap,
             .recent_events = recent_events,
@@ -2490,6 +2522,7 @@ fn runAgentDecision(
             .recent_fills = recent_fills,
             .equity_marks = equity_marks,
             .facts = review_facts,
+            .intel = intel_rows,
             .max_drawdown = cfg.max_drawdown,
             .instrument = cfg.instrument,
             .now_ms = nowMs(),
@@ -2501,7 +2534,7 @@ fn runAgentDecision(
         };
         ab.context.digest(ctx_json2, &digest_hex);
 
-        var user_buf2: [64 * 1024]u8 = undefined;
+        var user_buf2: [96 * 1024]u8 = undefined;
         const user_msg2 = std.fmt.bufPrint(&user_buf2, "{s}{s}", .{ user_msg_prefix, ctx_json2 }) catch break :tool_round;
 
         const chat2 = meteredChat(
@@ -3220,6 +3253,36 @@ fn applyReflectionOps(
     return applied;
 }
 
+fn processIntelInbox(
+    intel_repo: *ab.storage.IntelRepo,
+    events_repo: *ab.storage.EventsRepo,
+    engine: *ab.state.Engine,
+    cfg: *const ab.config.Config,
+    web_state: *WebState,
+    db: *ab.storage.Db,
+) void {
+    const inbox = web_state.intel_inbox orelse return;
+    var accepted: usize = 0;
+    while (inbox.drain()) |item| {
+        const now = nowMs();
+        const result = intel_repo.append(&item, now) catch |err| {
+            std.debug.print("[intel] persist failed: {t}\n", .{err});
+            continue;
+        };
+        var payload_buf: [320]u8 = undefined;
+        const payload = std.fmt.bufPrint(
+            &payload_buf,
+            "{{\"id\":\"{s}\",\"source_id\":\"{s}\",\"kind\":\"{s}\",\"duplicate\":{},\"dedup_key\":\"{s}\"}}",
+            .{ item.id(), item.sourceId(), item.kind.text(), result.duplicate, item.dedupKey() },
+        ) catch "{\"id\":\"intel_unknown\"}";
+        logEventPayload(events_repo, engine, "INTEL_ACCEPTED", "intel", "INFO", cfg, payload);
+        accepted += 1;
+    }
+    if (accepted > 0) {
+        ab.web_cache.refreshIntelCache(web_state, db, intel_repo, nowMs());
+    }
+}
+
 // ---- 复盘 (human review) processing ---------------------------------------
 // Analysis-only side channel: reads DB, may call the LLM, writes
 // review_chats / memories / audit events. It never touches the trading
@@ -3248,6 +3311,8 @@ fn processReviewInbox(
     st: *RuntimeStatus,
     periodic_repo: *ab.storage.PeriodicReviewsRepo,
     review_sched: *ab.periodic_review.Schedule,
+    min_size: ab.decimal.Decimal,
+    min_notional: ab.decimal.Decimal,
 ) void {
     const inbox = web_state.review_inbox orelse return;
     // One request per tick keeps the loop responsive between LLM calls.
@@ -3280,6 +3345,8 @@ fn processReviewInbox(
                 "manual",
                 window_ms,
                 now,
+                min_size,
+                min_notional,
             );
             st.setReviewNext(review_sched.msUntil(.short, now), review_sched.msUntil(.long, now));
         },
@@ -3764,6 +3831,8 @@ fn collectPeriodicFacts(
     ts_from: []const u8,
     ts_to: []const u8,
     window_ms: i64,
+    min_size: ab.decimal.Decimal,
+    min_notional: ab.decimal.Decimal,
 ) ab.periodic_review.Facts {
     const snap = engine.snapshot();
     var f: ab.periodic_review.Facts = .{
@@ -3832,6 +3901,18 @@ fn collectPeriodicFacts(
     f.max_drawdown = periodicMaxDrawdown(db, ts_from, ts_to);
     f.hwm = snap.high_watermark;
     f.btc_weight = ab.context.btcWeight(snap);
+    f.cash_usdt = snap.cash_usdt;
+    f.min_size = min_size;
+    f.min_notional = min_notional;
+    f.cash_covers_min_buy = ab.context.cashCoversMinBuy(
+        snap.cash_usdt,
+        ab.context.quotePrice(snap),
+        min_size,
+        min_notional,
+    );
+    if (snap.conservative_equity.gt(ab.decimal.Decimal.zero)) {
+        f.cash_weight = snap.cash_usdt.div(snap.conservative_equity, .down) catch ab.decimal.Decimal.zero;
+    }
     f.risk_mode = switch (snap.risk_mode) {
         .normal => "NORMAL",
         .exit_only => "EXIT_ONLY",
@@ -3885,6 +3966,8 @@ fn runPeriodicReview(
     trigger: []const u8,
     window_ms: i64,
     now_ms: i64,
+    min_size: ab.decimal.Decimal,
+    min_notional: ab.decimal.Decimal,
 ) void {
     defer ab.web_cache.refreshPeriodicReviewCache(web_state, db, periodic_repo);
 
@@ -3893,8 +3976,8 @@ fn runPeriodicReview(
     const ts_from = ab.clock.formatRfc3339Ms(now_ms - window_ms, &from_buf) catch return;
     const ts_to = ab.clock.formatRfc3339Ms(now_ms, &to_buf) catch return;
 
-    const facts = collectPeriodicFacts(db, periodic_repo, mem_store, engine, cfg, cycle, ts_from, ts_to, window_ms);
-    var facts_buf: [3072]u8 = undefined;
+    const facts = collectPeriodicFacts(db, periodic_repo, mem_store, engine, cfg, cycle, ts_from, ts_to, window_ms, min_size, min_notional);
+    var facts_buf: [4096]u8 = undefined;
     var fw: std.Io.Writer = .fixed(&facts_buf);
     facts.writeJson(&fw) catch {
         std.debug.print("[periodic] facts render failed cycle={s}\n", .{cycle.text()});
@@ -4092,12 +4175,12 @@ fn distillPeriodicMemory(
     const content = std.fmt.bufPrint(
         &content_buf,
         "{{\"cycle\":\"{s}\",\"window\":\"{s}..{s}\",\"note\":\"{s}\",\"proposals\":{d},\"hold\":{d}," ++
-            "\"executed\":{d},\"alpha\":\"{s}\",\"source\":\"periodic_review\"," ++
+            "\"executed\":{d},\"alpha\":\"{s}\",\"cash_covers_min_buy\":{},\"source\":\"periodic_review\"," ++
             "\"tags\":[\"periodic_review\",\"{s}\",\"reflection\"]}}",
         .{
-            cycle.text(),   facts.window_from, facts.window_to, note,
-            facts.proposals, facts.holds,      facts.executed,  alpha_s,
-            cfg.instrument,
+            cycle.text(),            facts.window_from, facts.window_to, note,
+            facts.proposals,         facts.holds,       facts.executed,  alpha_s,
+            facts.cash_covers_min_buy, cfg.instrument,
         },
     ) catch return null;
 
