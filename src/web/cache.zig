@@ -18,6 +18,7 @@ const clock = @import("../core/clock.zig");
 const review = @import("review.zig");
 const intel_inbox = @import("../intel/inbox.zig");
 const analytics = @import("../analytics/ab_factor.zig");
+const external = @import("../tools/external.zig");
 
 fn nowMs() i64 {
     return clock.SystemClock.clock().wallMs();
@@ -79,6 +80,9 @@ pub const WebState = struct {
     /// Signed intel history for Dashboard / MCP list.
     intel_buf: [49152]u8 = undefined,
     intel_len: usize = 2,
+    /// Fear & Greed daily curve (alternative.me; ~90 points).
+    sentiment_buf: [8192]u8 = undefined,
+    sentiment_len: usize = 2,
     intel_inbox: ?*intel_inbox.Inbox = null,
     intel_hmac: []const u8 = "",
     /// Dashboard / MCP auth (optional; empty token = open).
@@ -123,6 +127,8 @@ pub const WebState = struct {
         self.statistics_len = 2;
         @memcpy(self.intel_buf[0..2], "[]");
         self.intel_len = 2;
+        @memcpy(self.sentiment_buf[0..2], "{}");
+        self.sentiment_len = 2;
     }
 
     pub fn contextFn(userdata: ?*anyopaque) web.Context {
@@ -146,6 +152,7 @@ pub const WebState = struct {
             var analytics: [131072]u8 = undefined;
             var statistics: [98304]u8 = undefined;
             var intel: [49152]u8 = undefined;
+            var sentiment: [8192]u8 = undefined;
             var config_hash: [71]u8 = undefined;
             var agent_len: usize = 2;
             var equity_len: usize = 2;
@@ -163,6 +170,7 @@ pub const WebState = struct {
             var analytics_len: usize = 2;
             var statistics_len: usize = 2;
             var intel_len: usize = 2;
+            var sentiment_len: usize = 2;
         };
         const self: *WebState = @ptrCast(@alignCast(userdata.?));
         while (true) {
@@ -189,7 +197,8 @@ pub const WebState = struct {
             const anl = self.analytics_len;
             const stl = self.statistics_len;
             const il = self.intel_len;
-            if (al > Tls.agent.len or el > Tls.equity.len or vl > Tls.events.len or sl > Tls.shadow.len or cl > Tls.candles.len or ml > Tls.memories.len or yl > Tls.system.len or dl > Tls.decisions.len or ol > Tls.orders.len or rl > Tls.review_chats.len or rcl > Tls.review_ctx.len or aul > Tls.audit.len or pdl > Tls.periodic.len or anl > Tls.analytics.len or stl > Tls.statistics.len or il > Tls.intel.len) {
+            const sel = self.sentiment_len;
+            if (al > Tls.agent.len or el > Tls.equity.len or vl > Tls.events.len or sl > Tls.shadow.len or cl > Tls.candles.len or ml > Tls.memories.len or yl > Tls.system.len or dl > Tls.decisions.len or ol > Tls.orders.len or rl > Tls.review_chats.len or rcl > Tls.review_ctx.len or aul > Tls.audit.len or pdl > Tls.periodic.len or anl > Tls.analytics.len or stl > Tls.statistics.len or il > Tls.intel.len or sel > Tls.sentiment.len) {
                 std.atomic.spinLoopHint();
                 continue;
             }
@@ -209,6 +218,7 @@ pub const WebState = struct {
             @memcpy(Tls.analytics[0..anl], self.analytics_buf[0..anl]);
             @memcpy(Tls.statistics[0..stl], self.statistics_buf[0..stl]);
             @memcpy(Tls.intel[0..il], self.intel_buf[0..il]);
+            @memcpy(Tls.sentiment[0..sel], self.sentiment_buf[0..sel]);
             @memcpy(Tls.config_hash[0..], self.config_hash[0..]);
             Tls.agent_len = al;
             Tls.equity_len = el;
@@ -226,6 +236,7 @@ pub const WebState = struct {
             Tls.analytics_len = anl;
             Tls.statistics_len = stl;
             Tls.intel_len = il;
+            Tls.sentiment_len = sel;
             const s2 = self.seq.load(.acquire);
             if (s1 == s2) {
                 return .{
@@ -250,6 +261,7 @@ pub const WebState = struct {
                     .analytics_json = Tls.analytics[0..Tls.analytics_len],
                     .statistics_json = Tls.statistics[0..Tls.statistics_len],
                     .intel_json = Tls.intel[0..Tls.intel_len],
+                    .sentiment_json = Tls.sentiment[0..Tls.sentiment_len],
                     .intel_inbox = self.intel_inbox,
                     .intel_hmac = self.intel_hmac,
                     .index_html = self.index_html,
@@ -271,7 +283,7 @@ pub const WebState = struct {
         _ = self.seq.fetchAdd(1, .release); // even: stable
     }
 
-    pub fn setJson(self: *WebState, comptime which: enum { agent, equity, events, shadow, candles, memories, system, decisions, orders, review, review_ctx, audit, periodic, analytics, statistics, intel }, src: []const u8) void {
+    pub fn setJson(self: *WebState, comptime which: enum { agent, equity, events, shadow, candles, memories, system, decisions, orders, review, review_ctx, audit, periodic, analytics, statistics, intel, sentiment }, src: []const u8) void {
         _ = self.seq.fetchAdd(1, .acq_rel);
         switch (which) {
             .agent => {
@@ -353,6 +365,11 @@ pub const WebState = struct {
                 const n = @min(src.len, self.intel_buf.len);
                 @memcpy(self.intel_buf[0..n], src[0..n]);
                 self.intel_len = n;
+            },
+            .sentiment => {
+                const n = @min(src.len, self.sentiment_buf.len);
+                @memcpy(self.sentiment_buf[0..n], src[0..n]);
+                self.sentiment_len = n;
             },
         }
         _ = self.seq.fetchAdd(1, .release);
@@ -752,6 +769,22 @@ pub fn refreshCandlesCache(
     ws.setJson(.candles, w.buffered());
 }
 
+/// Daily Fear & Greed curve for the overview chart. Failures leave the last
+/// good blob in place — never invent values. Independent of the agent tool.
+pub fn refreshSentimentCache(
+    gpa: std.mem.Allocator,
+    ws: *WebState,
+    okx: *okx_rest.Client,
+) void {
+    const body = okx.getAbsoluteUrl("https://api.alternative.me/fng/?limit=90") catch return;
+    defer gpa.free(body);
+    var pts: [external.DASHBOARD_FNG_POINTS]external.FearGreedPoint = undefined;
+    const n = external.parseFearGreed(gpa, body, &pts) catch return;
+    var tmp: [8192]u8 = undefined;
+    const json = external.formatSentimentDashboard(&tmp, pts[0..n]) catch return;
+    ws.setJson(.sentiment, json);
+}
+
 fn writeCandlesArray(w: *std.Io.Writer, candles: []const okx_rest.Candle) error{BufferTooSmall}!void {
     w.writeByte('[') catch return error.BufferTooSmall;
     for (candles, 0..) |c, i| {
@@ -914,9 +947,11 @@ test "web state seqlock roundtrip preserves json blobs" {
     ws.index_html = "<html></html>";
     ws.setJson(.system, "{\"mode\":\"shadow\"}");
     ws.setJson(.orders, "{\"orders\":[1],\"fills\":[]}");
+    ws.setJson(.sentiment, "{\"now\":20,\"class\":\"extreme_fear\"}");
     const ctx = WebState.contextFn(&ws);
     try testing.expectEqualStrings("{\"mode\":\"shadow\"}", ctx.system_json);
     try testing.expectEqualStrings("{\"orders\":[1],\"fills\":[]}", ctx.orders_json);
+    try testing.expectEqualStrings("{\"now\":20,\"class\":\"extreme_fear\"}", ctx.sentiment_json);
     try testing.expectEqualStrings("test", ctx.software_version);
     try testing.expect(!ctx.ready);
 }

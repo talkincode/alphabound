@@ -76,6 +76,8 @@ pub const Context = struct {
     periodic_json: []const u8 = "[]",
     /// Signed external intel history (no signature/nonce).
     intel_json: []const u8 = "[]",
+    /// Fear & Greed daily curve (`now` + chronological `points`).
+    sentiment_json: []const u8 = "{}",
     /// Intel ingest mailbox; null = ingest unavailable.
     intel_inbox: ?*intel_inbox.Inbox = null,
     /// HMAC key for alphabound.intel.v1; empty = ingest disabled.
@@ -285,6 +287,7 @@ pub fn handleReq(buf: []u8, req: RequestInfo, ctx: Context) Response {
     if (std.mem.eql(u8, path, "/api/v1/audit")) return copyBody(buf, ctx.audit_json);
     if (std.mem.eql(u8, path, "/api/v1/statistics")) return copyBody(buf, ctx.statistics_json);
     if (std.mem.eql(u8, path, "/api/v1/intel")) return copyBody(buf, ctx.intel_json);
+    if (std.mem.eql(u8, path, "/api/v1/sentiment")) return copyBody(buf, ctx.sentiment_json);
     return .{ .status = .not_found, .body = "{\"error\":\"not found\"}" };
 }
 
@@ -1121,6 +1124,8 @@ test "agent-runs equity shadow endpoints serve context blobs" {
     try testing.expectEqualStrings("{\"timezone\":\"UTC\",\"last_24h\":{\"calls\":1}}", handle(&buf, .GET, "/api/v1/statistics", ctx).body);
     ctx.intel_json = "[{\"id\":\"intel_x\"}]";
     try testing.expectEqualStrings("[{\"id\":\"intel_x\"}]", handle(&buf, .GET, "/api/v1/intel", ctx).body);
+    ctx.sentiment_json = "{\"now\":20}";
+    try testing.expectEqualStrings("{\"now\":20}", handle(&buf, .GET, "/api/v1/sentiment", ctx).body);
 }
 
 test "review POST enqueues into inbox; validation and limits enforced" {

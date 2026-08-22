@@ -137,6 +137,7 @@ export const TOOLS = [
   { name: "list_agent_runs", description: "Agent run summaries", path: "/api/v1/agent-runs", method: "GET" },
   { name: "query_equity", description: "Equity / HWM time series samples", path: "/api/v1/equity", method: "GET" },
   { name: "get_candles", description: "Cached multi-timeframe BTC candles", path: "/api/v1/candles", method: "GET" },
+  { name: "get_sentiment", description: "Fear & Greed daily curve (now/class/points)", path: "/api/v1/sentiment", method: "GET" },
   { name: "get_auth_status", description: "Whether API auth is required and passkey count", path: "/api/v1/auth/status", method: "GET" },
   {
     name: "list_intel",

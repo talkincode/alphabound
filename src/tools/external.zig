@@ -109,8 +109,10 @@ pub const FearGreedPoint = struct {
 };
 
 pub const MAX_FNG_POINTS = 8;
+/// Dashboard curve: ~3 months of daily points (agent still uses MAX_FNG_POINTS).
+pub const DASHBOARD_FNG_POINTS = 90;
 
-/// GET https://api.alternative.me/fng/?limit=8 — newest first in `data`.
+/// GET https://api.alternative.me/fng/?limit=N — newest first in `data`.
 pub fn parseFearGreed(gpa: std.mem.Allocator, body: []const u8, out: []FearGreedPoint) Error!usize {
     const parsed = std.json.parseFromSlice(std.json.Value, gpa, body, .{}) catch return Error.ParseFailed;
     defer parsed.deinit();
@@ -143,6 +145,27 @@ pub fn formatSentimentData(buf: []u8, points: []const FearGreedPoint) Error![]co
     for (points, 0..) |p, i| {
         if (i > 0) w.writeByte(',') catch return Error.BufferTooSmall;
         w.print("{d}", .{p.value}) catch return Error.BufferTooSmall;
+    }
+    w.writeAll("]}") catch return Error.BufferTooSmall;
+    return w.buffered();
+}
+
+/// Dashboard payload: current reading + chronological `{t,v}` points (oldest first).
+/// Provider free-text is never passed through — class is re-derived from `now`.
+pub fn formatSentimentDashboard(buf: []u8, points: []const FearGreedPoint) Error![]const u8 {
+    if (points.len == 0) return Error.ParseFailed;
+    var w: std.Io.Writer = .fixed(buf);
+    const newest = points[0];
+    w.print(
+        "{{\"index\":\"fear_greed\",\"scale\":\"0=extreme_fear,100=extreme_greed\",\"now\":{d},\"class\":\"{s}\",\"as_of_ms\":{d},\"points\":[",
+        .{ newest.value, classify(newest.value), newest.ts_s * 1000 },
+    ) catch return Error.BufferTooSmall;
+    var i: usize = points.len;
+    while (i > 0) {
+        i -= 1;
+        const p = points[i];
+        if (i + 1 != points.len) w.writeByte(',') catch return Error.BufferTooSmall;
+        w.print("{{\"t\":{d},\"v\":{d}}}", .{ p.ts_s, p.value }) catch return Error.BufferTooSmall;
     }
     w.writeAll("]}") catch return Error.BufferTooSmall;
     return w.buffered();
@@ -231,6 +254,14 @@ test "parseFearGreed + formatSentimentData drops provider text" {
     try testing.expect(std.mem.indexOf(u8, out, "\"class\":\"extreme_fear\"") != null);
     try testing.expect(std.mem.indexOf(u8, out, "IGNORE_ME") == null);
     try testing.expect(std.mem.indexOf(u8, out, "[20,31,55]") != null);
+
+    const dash = try formatSentimentDashboard(&buf, pts[0..n]);
+    try testing.expect(std.mem.indexOf(u8, dash, "\"now\":20") != null);
+    try testing.expect(std.mem.indexOf(u8, dash, "\"class\":\"extreme_fear\"") != null);
+    try testing.expect(std.mem.indexOf(u8, dash, "\"as_of_ms\":1786600000000") != null);
+    // Chronological (oldest first) for Lightweight Charts.
+    try testing.expect(std.mem.indexOf(u8, dash, "{\"t\":1786427200,\"v\":55},{\"t\":1786513600,\"v\":31},{\"t\":1786600000,\"v\":20}") != null);
+    try testing.expect(std.mem.indexOf(u8, dash, "IGNORE_ME") == null);
 }
 
 test "classify vocabulary is total over 0..100" {

@@ -49,6 +49,7 @@ Clients must still present `ALPHABOUND_API_TOKEN` to the **daemon**; the MCP pro
 | `list_agent_runs` | `GET /api/v1/agent-runs` | |
 | `query_equity` | `GET /api/v1/equity` | |
 | `get_candles` | `GET /api/v1/candles` | |
+| `get_sentiment` | `GET /api/v1/sentiment` | Fear & Greed daily curve |
 | `get_auth_status` | `GET /api/v1/auth/status` | |
 | `list_intel` | `GET /api/v1/intel` | history; no signature/nonce |
 | `submit_intel` | `POST /api/v1/intel` | pre-signed envelope only |
