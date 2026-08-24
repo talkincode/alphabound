@@ -64,6 +64,15 @@ pub const ReviewFacts = struct {
     alpha_return: Decimal = Decimal.zero,
 };
 
+/// High BTC weight plus a long HOLD streak. A fact, not a trade instruction.
+pub const TENSION_HOLD_STREAK: u32 = 4;
+
+pub fn positionTension(weight: Decimal, hold_streak: u32) bool {
+    if (hold_streak < TENSION_HOLD_STREAK) return false;
+    const threshold = Decimal.parse("0.85") catch return false;
+    return weight.gte(threshold);
+}
+
 /// BTC notional / conservative equity. Zero when equity is missing or non-positive.
 pub fn btcWeight(s: state_mod.PortfolioState) Decimal {
     if (!s.conservative_equity.gt(Decimal.zero)) return Decimal.zero;
@@ -226,12 +235,13 @@ fn writeReviewFacts(w: *std.Io.Writer, input: Input) !void {
     }
     if (f.has_benchmark) {
         try w.print(
-            "\"shadow_return\":\"{f}\",\"bh_return\":\"{f}\",\"alpha_return\":\"{f}\"",
+            "\"shadow_return\":\"{f}\",\"bh_return\":\"{f}\",\"alpha_return\":\"{f}\",",
             .{ f.shadow_return, f.bh_return, f.alpha_return },
         );
     } else {
-        try w.writeAll("\"shadow_return\":null,\"bh_return\":null,\"alpha_return\":null");
+        try w.writeAll("\"shadow_return\":null,\"bh_return\":null,\"alpha_return\":null,");
     }
+    try w.print("\"position_tension\":{}", .{positionTension(btcWeight(input.snapshot), f.hold_streak)});
 }
 
 fn riskModeText(mode: sm.RiskMode) []const u8 {
@@ -352,6 +362,7 @@ test "render is deterministic and structurally complete" {
     try testing.expectEqual(@as(i64, 6), facts.get("hold_streak").?.integer);
     try testing.expectEqual(@as(i64, 86_400_000), facts.get("ms_since_last_fill").?.integer);
     try testing.expectEqualStrings("-0.031", facts.get("alpha_return").?.string);
+    try testing.expect(!facts.get("position_tension").?.bool);
 
     const cs = obj.get("current_state").?.object;
     try testing.expectEqual(@as(i64, 184392), cs.get("snapshot_version").?.integer);
@@ -466,4 +477,24 @@ test "render exposes untradeable leftover cash" {
     const facts = parsed.value.object.get("self_review").?.object.get("facts").?.object;
     try testing.expectEqualStrings("8.82", facts.get("cash_usdt").?.string);
     try testing.expect(!facts.get("cash_covers_min_buy").?.bool);
+}
+
+test "position_tension is true only at high weight and a long HOLD streak" {
+    var snap = testInput(&tools_mod.Registry{}, &.{}).snapshot;
+    try testing.expect(!positionTension(btcWeight(snap), 6));
+    snap.btc_total = d("0.0014");
+    try testing.expect(btcWeight(snap).gte(d("0.85")));
+    try testing.expect(!positionTension(btcWeight(snap), 3));
+    try testing.expect(positionTension(btcWeight(snap), 4));
+
+    var reg = tools_mod.Registry{};
+    var buf: [4096]u8 = undefined;
+    var input = testInput(&reg, &.{});
+    input.snapshot.btc_total = d("0.0014");
+    input.facts.hold_streak = 8;
+    const rendered = try render(&buf, input);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, rendered, .{});
+    defer parsed.deinit();
+    const facts = parsed.value.object.get("self_review").?.object.get("facts").?.object;
+    try testing.expect(facts.get("position_tension").?.bool);
 }

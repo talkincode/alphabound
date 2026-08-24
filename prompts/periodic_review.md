@@ -33,7 +33,7 @@
 ## 记忆操作
 
 - 只允许结构化 op：CREATE / UPDATE / INVALIDATE / MERGE。
-- `memory_id`：2–64 字符 `[A-Za-z0-9_-]`；周期复盘新建的记忆建议以 `PR_` 开头。
+- `memory_id`：2–64 字符 `[A-Za-z0-9_-]`。滚动更新用稳定 id：`PR_short`、`PR_long`、`PR_opportunity_cost`、`PR_low_execution_rate`。**禁止** CREATE `PR_short_20260824_…` / `E_run_*` / `R_run_*` 这类带日期或 run_id 的一次性副本。
 - `confidence` ∈ [0,1]，`confidence_delta` ∈ [-1,1]；最多 8 个 op。
 - CREATE 的 `content` 必须是 JSON 对象，建议带 `"tags":["periodic_review","BTC-USDT"]`。
 - 不要 INVALIDATE 引导策略记忆（如 `W_shadow_policy`）——除非窗口内有强证据。

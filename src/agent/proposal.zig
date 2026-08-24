@@ -48,6 +48,8 @@ pub const Proposal = struct {
     invalid_if: [][]const u8,
     /// ISO-8601 duration for scheduled review, e.g. "PT4H" (kept as text).
     review_after: ?[]const u8,
+    /// Required on HOLD when `position_tension` is true: did you weigh a cut?
+    reduce_eval: ?ReduceEval = null,
 
     arena: std.heap.ArenaAllocator,
 
@@ -63,6 +65,14 @@ pub const OrderPolicy = struct {
     max_wait_ms: u32 = 120_000,
 };
 
+pub const ReduceVerdict = enum { keep, cut };
+
+/// Explicit REDUCE check. HOLD + `cut` is a schema conflict (must REBALANCE).
+pub const ReduceEval = struct {
+    verdict: ReduceVerdict,
+    reason: []const u8,
+};
+
 pub const ValidationError = error{
     MalformedJson,
     MissingField,
@@ -76,6 +86,9 @@ pub const ValidationError = error{
     ListTooLong,
     StringTooLong,
     RebalanceRequiresTarget,
+    ReduceEvalInvalid,
+    ReduceEvalRequired,
+    ReduceEvalConflict,
     OutOfMemory,
 };
 
@@ -146,6 +159,22 @@ pub fn parse(gpa: std.mem.Allocator, raw: []const u8) ValidationError!Proposal {
         review_after = try dupString(a, rv.string);
     }
 
+    var reduce_eval: ?ReduceEval = null;
+    if (obj.get("reduce_eval")) |rv| {
+        if (rv != .object) return error.WrongType;
+        const verdict_s = try getString(rv.object, "verdict");
+        const verdict: ReduceVerdict = if (std.mem.eql(u8, verdict_s, "keep"))
+            .keep
+        else if (std.mem.eql(u8, verdict_s, "cut"))
+            .cut
+        else
+            return error.ReduceEvalInvalid;
+        const reason = try getString(rv.object, "reason");
+        if (reason.len < 8) return error.ReduceEvalInvalid;
+        if (action == .hold and verdict == .cut) return error.ReduceEvalConflict;
+        reduce_eval = .{ .verdict = verdict, .reason = try dupString(a, reason) };
+    }
+
     return .{
         .decision_id = decision_id,
         .snapshot_version = snapshot_version,
@@ -156,8 +185,15 @@ pub fn parse(gpa: std.mem.Allocator, raw: []const u8) ValidationError!Proposal {
         .thesis = thesis,
         .invalid_if = invalid_if,
         .review_after = review_after,
+        .reduce_eval = reduce_eval,
         .arena = arena,
     };
+}
+
+/// High BTC weight plus a long HOLD streak: the model must weigh a cut.
+pub fn enforceReduceEval(p: *const Proposal, tension: bool) ValidationError!void {
+    if (!tension or p.action != .hold) return;
+    if (p.reduce_eval == null) return error.ReduceEvalRequired;
 }
 
 fn getString(obj: std.json.ObjectMap, key: []const u8) ValidationError![]const u8 {
@@ -352,5 +388,39 @@ test "AC-FR04 fuzz: byte flips keep invariants when they parse at all" {
         try testing.expect(p.thesis.len <= MAX_LIST_ITEMS);
         try testing.expect(p.invalid_if.len <= MAX_LIST_ITEMS);
         if (p.action == .hold) try testing.expect(p.target_btc_weight.isZero());
+        if (p.action == .hold) {
+            if (p.reduce_eval) |re| try testing.expect(re.verdict != .cut);
+        }
     }
+}
+
+test "reduce_eval keep is accepted; cut on HOLD is a conflict" {
+    const gpa = testing.allocator;
+    var keep = try parse(gpa,
+        \\{"decision_id":"dec_k","snapshot_version":1,"action":"HOLD","confidence":0.5,
+        \\ "thesis":["overbought"],"invalid_if":[],
+        \\ "reduce_eval":{"verdict":"keep","reason":"4H SMA20 intact"}}
+    );
+    defer keep.deinit();
+    try testing.expect(keep.reduce_eval != null);
+    try testing.expectEqual(ReduceVerdict.keep, keep.reduce_eval.?.verdict);
+    try enforceReduceEval(&keep, true);
+
+    try testing.expectError(error.ReduceEvalConflict, parse(gpa,
+        \\{"decision_id":"dec_c","snapshot_version":1,"action":"HOLD","confidence":0.5,
+        \\ "thesis":["overbought"],"invalid_if":[],
+        \\ "reduce_eval":{"verdict":"cut","reason":"should have rebalanced"}}
+    ));
+    try testing.expectError(error.ReduceEvalInvalid, parse(gpa,
+        \\{"decision_id":"dec_s","snapshot_version":1,"action":"HOLD","confidence":0.5,
+        \\ "thesis":[],"invalid_if":[],
+        \\ "reduce_eval":{"verdict":"keep","reason":"short"}}
+    ));
+
+    var bare = try parse(gpa,
+        \\{"decision_id":"dec_b","snapshot_version":1,"action":"HOLD","confidence":0.5,"thesis":[],"invalid_if":[]}
+    );
+    defer bare.deinit();
+    try enforceReduceEval(&bare, false);
+    try testing.expectError(error.ReduceEvalRequired, enforceReduceEval(&bare, true));
 }

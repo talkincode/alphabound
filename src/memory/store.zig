@@ -210,40 +210,52 @@ pub const Store = struct {
     /// Deterministic eviction when the index is at MAX_MEMORIES: drop the
     /// least valuable record from the in-process index only — the SQLite
     /// `memories` log keeps full append-only history for audit. Order:
-    /// oldest terminal (invalidated/merged) first, then oldest reflection,
-    /// then oldest episodic. Working and strategy memories are never
-    /// evicted; with none of the above present this fails closed.
+    /// oldest terminal (invalidated/merged), then oldest ephemeral
+    /// (`E_run_*` / `R_run_*` / dated `PR_short_*`), then other reflection,
+    /// then other episodic. Working, strategy, and rolling ids
+    /// (`E_hold_streak`, `R_hold_streak`, `PR_short`, `PR_long`) stay.
+    /// Fails closed if only protected records remain.
     fn evictForCreate(self: *Store) StoreError!void {
-        const Pass = struct { terminal: bool, kind: Kind };
-        const passes = [_]Pass{
-            .{ .terminal = true, .kind = .working }, // kind unused for terminal pass
-            .{ .terminal = false, .kind = .reflection },
-            .{ .terminal = false, .kind = .episodic },
-        };
-        for (passes) |p| {
-            var best: ?usize = null;
-            for (self.items.items, 0..) |m, i| {
-                const terminal = m.status == .invalidated or m.status == .merged;
-                if (p.terminal) {
-                    if (!terminal) continue;
-                } else {
-                    if (terminal or m.kind != p.kind) continue;
-                }
-                if (best) |b| {
-                    const cur = self.items.items[b];
-                    if (m.created_ms < cur.created_ms or
-                        (m.created_ms == cur.created_ms and std.mem.lessThan(u8, m.memory_id, cur.memory_id)))
-                        best = i;
-                } else {
-                    best = i;
-                }
+        if (self.evictMatching(evictableTerminal)) return;
+        if (self.evictMatching(isEphemeralIdMem)) return;
+        if (self.evictMatching(evictableReflection)) return;
+        if (self.evictMatching(evictableEpisodic)) return;
+        return error.StoreFull;
+    }
+
+    /// Drop ephemeral/terminal rows until `count + headroom <= MAX_MEMORIES`.
+    /// Used at boot so a full store has room for new rolling reviews.
+    pub fn compactEphemeral(self: *Store, headroom: usize) usize {
+        var dropped: usize = 0;
+        const target = if (headroom >= MAX_MEMORIES) 0 else MAX_MEMORIES - headroom;
+        while (self.items.items.len > target) {
+            if (self.evictMatching(evictableTerminal) or self.evictMatching(isEphemeralIdMem)) {
+                dropped += 1;
+                continue;
             }
+            break;
+        }
+        return dropped;
+    }
+
+    fn evictMatching(self: *Store, pred: *const fn ([]const u8, Memory) bool) bool {
+        var best: ?usize = null;
+        for (self.items.items, 0..) |m, i| {
+            if (!pred(m.memory_id, m)) continue;
             if (best) |b| {
-                _ = self.items.orderedRemove(b);
-                return;
+                const cur = self.items.items[b];
+                if (m.created_ms < cur.created_ms or
+                    (m.created_ms == cur.created_ms and std.mem.lessThan(u8, m.memory_id, cur.memory_id)))
+                    best = i;
+            } else {
+                best = i;
             }
         }
-        return error.StoreFull;
+        if (best) |b| {
+            _ = self.items.orderedRemove(b);
+            return true;
+        }
+        return false;
     }
 
     fn own(self: *Store, m: Memory) StoreError!Memory {
@@ -262,6 +274,50 @@ fn clamp01(v: Decimal) Decimal {
     if (v.isNegative()) return Decimal.zero;
     if (v.gt(Decimal.one)) return Decimal.one;
     return v;
+}
+
+/// Rolling / policy ids the index must not drop to make room for run noise.
+pub fn isProtectedId(id: []const u8) bool {
+    if (std.mem.eql(u8, id, "E_hold_streak")) return true;
+    if (std.mem.eql(u8, id, "R_hold_streak")) return true;
+    if (std.mem.eql(u8, id, "PR_short")) return true;
+    if (std.mem.eql(u8, id, "PR_long")) return true;
+    if (std.mem.eql(u8, id, "PR_low_execution_rate")) return true;
+    if (std.mem.eql(u8, id, "PR_opportunity_cost")) return true;
+    if (std.mem.startsWith(u8, id, "W_")) return true;
+    if (std.mem.startsWith(u8, id, "H_")) return true;
+    return false;
+}
+
+/// Per-run episodes and dated periodic-review copies. Safe to evict first.
+pub fn isEphemeralId(id: []const u8) bool {
+    return isEphemeralIdMem(id, undefined);
+}
+
+fn isEphemeralIdMem(id: []const u8, _: Memory) bool {
+    if (isProtectedId(id)) return false;
+    if (std.mem.startsWith(u8, id, "E_run_")) return true;
+    if (std.mem.startsWith(u8, id, "R_run_")) return true;
+    if (std.mem.startsWith(u8, id, "PR_short_")) return true;
+    if (std.mem.startsWith(u8, id, "PR_long_")) return true;
+    return false;
+}
+
+fn evictableTerminal(id: []const u8, m: Memory) bool {
+    _ = id;
+    return m.status == .invalidated or m.status == .merged;
+}
+
+fn evictableReflection(id: []const u8, m: Memory) bool {
+    if (isProtectedId(id)) return false;
+    if (m.status == .invalidated or m.status == .merged) return false;
+    return m.kind == .reflection;
+}
+
+fn evictableEpisodic(id: []const u8, m: Memory) bool {
+    if (isProtectedId(id)) return false;
+    if (m.status == .invalidated or m.status == .merged) return false;
+    return m.kind == .episodic;
 }
 
 // ---------------------------------------------------------------------------
@@ -324,7 +380,9 @@ pub fn retrieve(store: *const Store, gpa: std.mem.Allocator, q: Query, matchTags
         // confidence in [0,1000] fixed-point.
         const conf: i64 = @intCast(@divTrunc(m.confidence.raw * 1000, dec.ONE_RAW));
 
-        const score = tag_hits * 4000 + recency + evidence * 200 + conf;
+        var score = tag_hits * 4000 + recency + evidence * 200 + conf;
+        // Per-run / dated-window copies must not crowd rolling reviews.
+        if (isEphemeralId(m.memory_id)) score -= 8000;
         try out.append(gpa, .{ .memory = m, .score = score });
     }
 
@@ -559,4 +617,91 @@ test "create at capacity evicts deterministically: terminal, then oldest reflect
     // Strategy is never evicted and duplicate create still rejected at capacity.
     try testing.expectError(error.DuplicateId, store.applyOp(.{ .create = .{ .memory_id = "R_new_2", .kind = .reflection } }, 9002, &touched));
     try testing.expect(store.find("S_keep") != null);
+}
+
+test "ephemeral run copies evict before rolling PR_short; compact frees headroom" {
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var touched: std.ArrayList(Memory) = .empty;
+    defer touched.deinit(testing.allocator);
+
+    try store.load(.{
+        .memory_id = "PR_short",
+        .version = 14,
+        .kind = .reflection,
+        .status = .active,
+        .confidence = d("0.3"),
+        .evidence_count = 13,
+        .content_json = "{}",
+        .created_ms = 1,
+    });
+    try store.load(.{
+        .memory_id = "E_hold_streak",
+        .version = 2,
+        .kind = .episodic,
+        .status = .active,
+        .confidence = d("0.5"),
+        .evidence_count = 10,
+        .content_json = "{}",
+        .created_ms = 2,
+    });
+    var i: usize = 0;
+    var id_buf: [32]u8 = undefined;
+    while (store.count() < MAX_MEMORIES) : (i += 1) {
+        const id = try std.fmt.bufPrint(&id_buf, "R_run_{d:0>4}", .{i});
+        try store.load(.{
+            .memory_id = id,
+            .version = 1,
+            .kind = .reflection,
+            .status = .active,
+            .confidence = d("0.4"),
+            .evidence_count = 0,
+            .content_json = "{}",
+            .created_ms = 100 + @as(i64, @intCast(i)),
+        });
+    }
+
+    try store.applyOp(.{ .create = .{ .memory_id = "R_new_keep", .kind = .reflection, .content_json = "{}" } }, 9000, &touched);
+    try testing.expect(store.find("R_run_0000") == null);
+    try testing.expect(store.find("PR_short") != null);
+    try testing.expect(store.find("E_hold_streak") != null);
+
+    const dropped = store.compactEphemeral(32);
+    try testing.expect(dropped >= 32);
+    try testing.expect(store.count() <= MAX_MEMORIES - 32);
+    try testing.expect(store.find("PR_short") != null);
+    try testing.expect(store.find("E_hold_streak") != null);
+}
+
+test "retrieve downranks ephemeral dated review copies" {
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    const now: i64 = 100_000_000;
+    try store.load(.{
+        .memory_id = "PR_short",
+        .version = 1,
+        .kind = .reflection,
+        .status = .active,
+        .confidence = d("0.3"),
+        .evidence_count = 2,
+        .content_json = "{\"tags\":[\"periodic_review\",\"BTC-USDT\"]}",
+        .created_ms = now - 60_000,
+    });
+    try store.load(.{
+        .memory_id = "PR_short_20260824_1646",
+        .version = 1,
+        .kind = .reflection,
+        .status = .active,
+        .confidence = d("0.35"),
+        .evidence_count = 0,
+        .content_json = "{\"tags\":[\"periodic_review\",\"BTC-USDT\"]}",
+        .created_ms = now,
+    });
+    var res = try retrieve(&store, testing.allocator, .{
+        .tags = &.{"periodic_review"},
+        .now_ms = now,
+        .limit = 1,
+    }, substringTagMatch);
+    defer res.deinit(testing.allocator);
+    try testing.expectEqualStrings("PR_short", res.items[0].memory.memory_id);
 }

@@ -31,6 +31,9 @@ Or use the helper (requires `sshx` and `HOST=`):
 HOST=your-sshx-host ./scripts/deploy-remote.sh
 # Optional: ship a dedicated secrets file instead of ./secrets.env
 # HOST=your-sshx-host SECRETS_FILE=./secrets.other.env ./scripts/deploy-remote.sh
+# Upgrades keep the remote secrets.env. Overwrite only with:
+# HOST=your-sshx-host FORCE_SECRETS=1 SECRETS_FILE=./secrets.other.env ./scripts/deploy-remote.sh
+# Empty OKX_API_KEY in the local file is never packed.
 HOST=your-sshx-host ./scripts/check-remote.sh
 # Rolling-soak acceptance: deploy restarts (logged to
 # /var/lib/alphabound/deploys.log by install) are expected; only

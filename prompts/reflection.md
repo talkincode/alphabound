@@ -14,6 +14,7 @@ You close the slow decision loop. Output **ONE** JSON Reflection object only —
 - `memory_id` values: 2–64 chars `[A-Za-z0-9_-]`.
 - Confidence values in [0,1]; confidence_delta in [-1,1].
 - CREATE `content` must be a JSON object (not a string). Include `"tags":["BTC-USDT","demo"]` when relevant.
+- Do **not** CREATE `E_run_*`, `R_run_*`, or dated `PR_short_*` ids. HOLD episodes already roll into `E_hold_streak` / `R_hold_streak`; periodic reviews roll into `PR_short`. Prefer UPDATE those, or emit empty `memory_ops`.
 - If unsure, emit empty `memory_ops` and a short lesson — never free-form chain-of-thought outside the schema.
 
 ## Schema

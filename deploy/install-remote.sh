@@ -51,12 +51,38 @@ fi
 
 install -m 0644 -o root -g root "$ROOT/etc/alphabound/prompts/system.md" /etc/alphabound/prompts/system.md
 install -m 0644 -o root -g root "$ROOT/etc/alphabound/prompts/reflection.md" /etc/alphabound/prompts/reflection.md
+if [[ -f "$ROOT/etc/alphabound/prompts/review.md" ]]; then
+  install -m 0644 -o root -g root "$ROOT/etc/alphabound/prompts/review.md" /etc/alphabound/prompts/review.md
+fi
+if [[ -f "$ROOT/etc/alphabound/prompts/periodic_review.md" ]]; then
+  install -m 0644 -o root -g root "$ROOT/etc/alphabound/prompts/periodic_review.md" /etc/alphabound/prompts/periodic_review.md
+fi
 
-if [[ -f "$ROOT/etc/alphabound/secrets.env" ]]; then
-  # Refresh secrets from deploy bundle when provided (local secrets.env filtered).
+# Preserve live secrets on upgrade (same policy as alphabound.toml).
+# Overwrite only when FORCE_SECRETS=1 and the bundle includes a file.
+# Snapshot the current file before any overwrite.
+backup_secrets() {
+  if [[ -f /etc/alphabound/secrets.env ]]; then
+    mkdir -p /var/backups/alphabound
+    local bak="/var/backups/alphabound/secrets.env.$(date -u +%Y%m%d%H%M%S)"
+    install -m 0600 -o root -g alphabound /etc/alphabound/secrets.env "$bak"
+    echo "[install] backed up secrets.env -> $bak"
+  fi
+}
+
+if [[ -f /etc/alphabound/secrets.env ]]; then
+  if [[ "${FORCE_SECRETS:-}" == "1" && -f "$ROOT/etc/alphabound/secrets.env" ]]; then
+    backup_secrets
+    install -m 0600 -o root -g alphabound "$ROOT/etc/alphabound/secrets.env" /etc/alphabound/secrets.env
+    echo "[install] refreshed /etc/alphabound/secrets.env (FORCE_SECRETS=1)"
+  else
+    echo "[install] keep existing /etc/alphabound/secrets.env"
+  fi
+elif [[ -f "$ROOT/etc/alphabound/secrets.env" ]]; then
   install -m 0600 -o root -g alphabound "$ROOT/etc/alphabound/secrets.env" /etc/alphabound/secrets.env
+  echo "[install] seeded /etc/alphabound/secrets.env"
 else
-  test -f /etc/alphabound/secrets.env || install -m 0600 -o root -g alphabound /dev/null /etc/alphabound/secrets.env
+  install -m 0600 -o root -g alphabound /dev/null /etc/alphabound/secrets.env
 fi
 
 chown -R alphabound:alphabound "$DATA_DIR"

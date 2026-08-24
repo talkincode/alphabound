@@ -515,6 +515,10 @@ pub fn main(init: std.process.Init) !u8 {
     } else {
         migrateBootstrapMemories(gpa, &mem_store, &memories_repo, &events_repo, &engine, &cfg);
     }
+    const evicted = mem_store.compactEphemeral(32);
+    if (evicted > 0) {
+        std.debug.print("[boot] compacted {d} ephemeral memories, index={d}\n", .{ evicted, mem_store.count() });
+    }
     std.debug.print("[boot] memories loaded count={d}\n", .{mem_store.count()});
 
     // Restore HWM from durable storage (survives restarts, §5.1).
@@ -2929,7 +2933,12 @@ fn runAgentDecision(
         .{ client.base_url, client.model, snap.version, obs_n, scored.items.len, ev_n },
     );
 
-    const user_msg_prefix =
+    const tension = ab.context.positionTension(ab.context.btcWeight(snap), review_facts.hold_streak);
+    const user_msg_prefix: []const u8 = if (tension)
+        \\Respond with ONE JSON Decision Proposal only. position_tension=true: HOLD requires reduce_eval {verdict:keep|cut, reason>=8 chars}; cut must be action REBALANCE.
+        \\Context:
+        \\
+    else
         \\Respond with ONE JSON Decision Proposal only. Context:
         \\
     ;
@@ -3109,6 +3118,18 @@ fn runAgentDecision(
         return;
     };
     defer prop.deinit();
+    ab.proposal.enforceReduceEval(&prop, tension) catch |err| {
+        std.debug.print("[agent] proposal invalid ({t}) → HOLD\n", .{err});
+        completeRun(runs, run_id, "invalid_proposal", out_digest, input_digest, nowMs());
+        var invr_buf: [360]u8 = undefined;
+        const invr_payload = std.fmt.bufPrint(
+            &invr_buf,
+            "{{\"run_id\":\"{s}\",\"output_digest\":\"{s}\",\"reason\":\"{t}\",\"degraded\":\"HOLD\"}}",
+            .{ run_id, out_digest, err },
+        ) catch "{\"degraded\":\"HOLD\"}";
+        logEventPayload(events_repo, engine, "AGENT_INVALID_PROPOSAL", "agent", "WARN", cfg, invr_payload);
+        return;
+    };
 
     // Risk Kernel admission (always). Demo may execute; shadow never does.
     // Refresh market/account first: LLM latency routinely exceeds market_ttl_ms,
@@ -3683,9 +3704,10 @@ fn tryLlmReflection(
     defer reflection.deinit();
 
     const applied = applyReflectionOps(gpa, store, repo, reflection.memory_ops);
-    // Always journal a reflection memory row summarizing the document.
+    // HOLD reflections roll into R_hold_streak; per-run R_{run_id} is noise.
     var rid_buf: [80]u8 = undefined;
-    const rid = std.fmt.bufPrint(&rid_buf, "R_{s}", .{run_id}) catch return applied > 0;
+    const is_hold = std.mem.eql(u8, action, "HOLD");
+    const rid = if (is_hold) "R_hold_streak" else (std.fmt.bufPrint(&rid_buf, "R_{s}", .{run_id}) catch return applied > 0);
     var content_buf: [1024]u8 = undefined;
     var lesson_buf: [256]u8 = undefined;
     var expected_buf: [256]u8 = undefined;
@@ -3748,6 +3770,9 @@ fn applyReflectionOps(
             },
             .merge => |m| {
                 if (std.mem.eql(u8, m.from_id, "W_shadow_policy") or std.mem.eql(u8, m.into_id, "W_shadow_policy")) continue;
+            },
+            .create => |c| {
+                if (ab.memory.isEphemeralId(c.memory_id)) continue;
             },
             else => {},
         }

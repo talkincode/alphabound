@@ -37,7 +37,8 @@
 - `snapshot_version`
 - `action`: `HOLD` | `REBALANCE`
 - `target`（再平衡时 BTC 权重）
-- `order_policy` / `confidence` / `thesis` / `invalid_if` / …
+- `order_policy` / `confidence` / `thesis` / `invalid_if` / `reduce_eval`
+- `position_tension`（`btc_weight ≥ 0.85` 且连续 HOLD ≥ 4）为真时，HOLD 必须带 `reduce_eval`；`invalid_if` 不是减仓触发器
 
 任何坏 JSON、缺字段、越界置信度 → **整单作废**（fail-closed HOLD）。
 
@@ -78,6 +79,8 @@ raw_ref?
 - `CREATE` / `UPDATE` / `INVALIDATE` / `MERGE`
 
 置信度钳制在 \[0,1\]；非法 op 在 Reflection 解析期整篇作废。
+
+索引上限 1024。满员时确定性淘汰：已终结 → `E_run_*` / `R_run_*` / 带日期的 `PR_short_*` → 其他 reflection → 其他 episodic。`E_hold_streak` / `R_hold_streak` / `PR_short` / `PR_long` / `W_*` / `H_*` 不淘汰。SQLite 仍保留全量审计。启动时会压缩出 32 个空位。
 
 ## Reflection（`agent/reflection.zig`）
 
