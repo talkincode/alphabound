@@ -27,6 +27,12 @@ pub const PlanInputs = struct {
     mark_price: Decimal,
     admitted_btc_weight: Decimal,
     instrument: Instrument,
+    /// Minimum |target − current| portfolio-weight deviation required to
+    /// trade; below the band the plan is HOLD. Suppresses fee-eroding chains
+    /// of tiny rebalances. 0 disables (venue/config notional floors still
+    /// apply). Applies only to the initial leg — residual replans after a
+    /// partial fill pass 0 so they can finish the admitted delta.
+    min_weight_delta: Decimal = Decimal.zero,
 };
 
 pub const Plan = union(enum) {
@@ -57,6 +63,13 @@ pub fn plan(in: PlanInputs) PlanError!Plan {
     const delta = try target_qty.sub(in.btc_total);
 
     if (delta.isZero()) return .hold;
+
+    if (in.min_weight_delta.gt(Decimal.zero)) {
+        const current_value = try in.btc_total.mul(in.mark_price, .down);
+        const current_weight = try current_value.div(in.equity, .down);
+        const wdiff = (try in.admitted_btc_weight.sub(current_weight)).abs();
+        if (wdiff.lt(in.min_weight_delta)) return .hold;
+    }
 
     const side: orders.Side = if (delta.isNegative()) .sell else .buy;
     var qty = try delta.abs().floorToStep(in.instrument.lot_size);
@@ -242,6 +255,57 @@ test "partial fill re-plan shrinks remaining delta" {
     });
     try testing.expect(p == .order);
     try testing.expect(p.order.qty.eql(d("0.0002")));
+}
+
+test "min_weight_delta band suppresses small rebalances" {
+    // Current weight 0.30 → target 0.305 (0.5% deviation) under a 1% band: HOLD.
+    const inside = try plan(.{
+        .cash_usdt = d("70"),
+        .btc_total = d("0.0003"),
+        .equity = d("100"),
+        .mark_price = d("100000"),
+        .admitted_btc_weight = d("0.305"),
+        .instrument = btc_usdt,
+        .min_weight_delta = d("0.01"),
+    });
+    try testing.expect(inside == .hold);
+
+    // Same book, target 0.35 (5% deviation) clears the band: trade.
+    const outside = try plan(.{
+        .cash_usdt = d("70"),
+        .btc_total = d("0.0003"),
+        .equity = d("100"),
+        .mark_price = d("100000"),
+        .admitted_btc_weight = d("0.35"),
+        .instrument = btc_usdt,
+        .min_weight_delta = d("0.01"),
+    });
+    try testing.expect(outside == .order);
+    try testing.expectEqual(orders.Side.buy, outside.order.side);
+
+    // Band of zero (default) keeps legacy behavior: a small deviation that
+    // clears the instrument floors (2 USDT ≥ min_notional 1) still trades.
+    const off = try plan(.{
+        .cash_usdt = d("70"),
+        .btc_total = d("0.0003"),
+        .equity = d("100"),
+        .mark_price = d("100000"),
+        .admitted_btc_weight = d("0.32"),
+        .instrument = btc_usdt,
+    });
+    try testing.expect(off == .order);
+
+    // The same 2% deviation under a 5% band holds.
+    const banded = try plan(.{
+        .cash_usdt = d("70"),
+        .btc_total = d("0.0003"),
+        .equity = d("100"),
+        .mark_price = d("100000"),
+        .admitted_btc_weight = d("0.32"),
+        .instrument = btc_usdt,
+        .min_weight_delta = d("0.05"),
+    });
+    try testing.expect(banded == .hold);
 }
 
 test "price snapping is side-adversarial" {

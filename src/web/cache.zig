@@ -53,8 +53,10 @@ pub const WebState = struct {
     system_len: usize = 2,
     decisions_buf: [49152]u8 = undefined,
     decisions_len: usize = 2,
-    /// Bundle: {"orders":[...],"fills":[...]}.
-    orders_buf: [24576]u8 = undefined,
+    /// Bundle: {"orders":[...],"fills":[...]}. Sized for 80 orders (~320 B
+    /// each) + 80 fills (~220 B each); undersizing silently emptied the
+    /// fills feed in production (list query overflow → catch "[]").
+    orders_buf: [65536]u8 = undefined,
     orders_len: usize = 2,
     /// 复盘 chat transcripts (recent turns, newest first).
     review_buf: [49152]u8 = undefined,
@@ -144,7 +146,7 @@ pub const WebState = struct {
             var memories: [24576]u8 = undefined;
             var system: [8192]u8 = undefined;
             var decisions: [49152]u8 = undefined;
-            var orders: [24576]u8 = undefined;
+            var orders: [65536]u8 = undefined;
             var review_chats: [49152]u8 = undefined;
             var review_ctx: [24576]u8 = undefined;
             var audit: [24576]u8 = undefined;
@@ -590,11 +592,18 @@ pub fn refreshWebCaches(
     } else |_| {}
 
     // Orders bundle for Dashboard / Gate3 trade visibility.
-    var tmp_ord: [16384]u8 = undefined;
-    var tmp_fills: [8192]u8 = undefined;
-    var tmp_bundle: [24576]u8 = undefined;
-    const orders_j = orders.listRecentJson(db, &tmp_ord, 80) catch "[]";
-    const fills_j = fills.listRecentJson(db, &tmp_fills, 80) catch "[]";
+    // Worst case at limit 80: orders ~320 B/row, fills ~220 B/row.
+    var tmp_ord: [32768]u8 = undefined;
+    var tmp_fills: [24576]u8 = undefined;
+    var tmp_bundle: [61440]u8 = undefined;
+    const orders_j = orders.listRecentJson(db, &tmp_ord, 80) catch |err| blk: {
+        std.debug.print("[cache] orders list render failed: {t}\n", .{err});
+        break :blk "[]";
+    };
+    const fills_j = fills.listRecentJson(db, &tmp_fills, 80) catch |err| blk: {
+        std.debug.print("[cache] fills list render failed: {t}\n", .{err});
+        break :blk "[]";
+    };
     var bw: std.Io.Writer = .fixed(&tmp_bundle);
     bw.print("{{\"orders\":{s},\"fills\":{s}}}", .{ orders_j, fills_j }) catch {
         ws.setJson(.orders, "{\"orders\":[],\"fills\":[]}");
@@ -833,7 +842,7 @@ pub fn refreshSystemCache(
     var tmp: [8192]u8 = undefined;
     var w: std.Io.Writer = .fixed(&tmp);
     w.print(
-        "{{\"software_version\":\"{s}\",\"config_hash\":\"{s}\",\"mode\":\"{s}\",\"instrument\":\"{s}\",\"ready\":true,\"paused\":{},\"started_ms\":{d},\"uptime_ms\":{d},\"web_bind\":\"{s}\",\"private_keys\":{},\"private_ws_opt_in\":{},\"agent_enabled\":{},\"memories\":{d},",
+        "{{\"software_version\":\"{s}\",\"config_hash\":\"{s}\",\"mode\":\"{s}\",\"instrument\":\"{s}\",\"ready\":true,\"paused\":{},\"started_ms\":{d},\"uptime_ms\":{d},\"web_bind\":\"{s}\",\"private_keys\":{},\"private_ws_opt_in\":{},\"agent_enabled\":{},\"memories\":{d},\"memories_cap\":{d},",
         .{
             ws.software_version,
             cfg.hash(),
@@ -847,6 +856,7 @@ pub fn refreshSystemCache(
             private_ws,
             agent_on,
             mem_store.count(),
+            memory.MAX_MEMORIES,
         },
     ) catch return;
     w.print(

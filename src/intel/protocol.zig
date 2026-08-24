@@ -421,6 +421,14 @@ pub fn errorReason(err: Error) []const u8 {
     };
 }
 
+/// Split a non-negative milles score into whole/fraction parts as unsigned
+/// values. Signed integers zero-padded with `{d:0>3}` render a sign character
+/// (production emitted "0.+110"); unsigned parts format cleanly.
+fn scoreParts(score: i64) struct { whole: u64, frac: u64 } {
+    const s: u64 = if (score > 0) @intCast(score) else 0;
+    return .{ .whole = s / 1000, .frac = s % 1000 };
+}
+
 pub fn writeContextObject(w: *std.Io.Writer, item: *const Item, score: i64, grade: Grade) !void {
     const conf = formatConf3(item.conf_milles);
     try w.writeAll("{\"id\":\"");
@@ -442,8 +450,8 @@ pub fn writeContextObject(w: *std.Io.Writer, item: *const Item, score: i64, grad
         .{
             conf[0..],
             grade.text(),
-            @divTrunc(score, 1000),
-            @mod(score, 1000),
+            scoreParts(score).whole,
+            scoreParts(score).frac,
             item.as_of_ms,
             item.expires_ms,
         },
@@ -477,8 +485,8 @@ pub fn writeApiObject(w: *std.Io.Writer, item: *const Item, now_ms: i64, accepte
         .{
             conf[0..],
             grade.text(),
-            @divTrunc(score, 1000),
-            @mod(score, 1000),
+            scoreParts(score).whole,
+            scoreParts(score).frac,
             item.as_of_ms,
             item.expires_ms,
             accepted_ms,
@@ -955,6 +963,27 @@ test "canonical confidence is always 3 decimal places" {
     try testing.expectEqualStrings("0.620", formatConf3(620)[0..]);
     try testing.expectEqualStrings("1.000", formatConf3(1000)[0..]);
     try testing.expectEqualStrings("0.000", formatConf3(0)[0..]);
+}
+
+test "score renders as unsigned milles without sign characters" {
+    const now: i64 = 1_000_000;
+    var item = sampleItem(now);
+    item.conf_milles = 620;
+    item.expires_ms = now + day_ms;
+
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try writeApiObject(&w, &item, now, now);
+    const json = w.buffered();
+
+    const key = "\"score\":\"";
+    const start = (std.mem.indexOf(u8, json, key) orelse return error.TestUnexpectedResult) + key.len;
+    const end = std.mem.indexOfScalarPos(u8, json, start, '"') orelse return error.TestUnexpectedResult;
+    const score_s = json[start..end];
+    for (score_s) |ch| try testing.expect((ch >= '0' and ch <= '9') or ch == '.');
+    // whole "." exactly three fraction digits
+    const dot = std.mem.indexOfScalar(u8, score_s, '.') orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 3), score_s.len - dot - 1);
 }
 
 test "html and control chars are rejected in checkText" {

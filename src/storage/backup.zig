@@ -256,7 +256,7 @@ fn pruneRotated(io: std.Io, db_path: []const u8, infix: []const u8, keep: usize)
     }
 }
 
-/// AC-OPS9: prune old tool_calls rows and '1s' equity samples.
+/// AC-OPS9: prune old tool_calls rows, '1s' equity samples, and aged events.
 fn runRetentionSweep(db: *storage.Db, now_ms: i64) void {
     var cut_buf: [40]u8 = undefined;
 
@@ -274,6 +274,22 @@ fn runRetentionSweep(db: *storage.Db, now_ms: i64) void {
         stmt.bindText(1, cutoff) catch return;
         _ = stmt.step() catch |err|
             std.debug.print("[retention] equity_1s prune failed: {t}\n", .{err});
+    } else |_| {}
+
+    if (retention.cutoffRfc3339(&cut_buf, now_ms, retention.events_info_days)) |cutoff| {
+        var stmt = db.prepare(retention.prune_events_info_sql) catch return;
+        defer stmt.finalize();
+        stmt.bindText(1, cutoff) catch return;
+        _ = stmt.step() catch |err|
+            std.debug.print("[retention] events INFO prune failed: {t}\n", .{err});
+    } else |_| {}
+
+    if (retention.cutoffRfc3339(&cut_buf, now_ms, retention.events_all_days)) |cutoff| {
+        var stmt = db.prepare(retention.prune_events_all_sql) catch return;
+        defer stmt.finalize();
+        stmt.bindText(1, cutoff) catch return;
+        _ = stmt.step() catch |err|
+            std.debug.print("[retention] events long prune failed: {t}\n", .{err});
     } else |_| {}
 }
 

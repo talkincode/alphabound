@@ -112,6 +112,13 @@ fn writeContext(w: *std.Io.Writer, input: Input) !void {
     try w.print("\"cash_usdt\":\"{f}\",\"btc_total\":\"{f}\",\"btc_available\":\"{f}\",", .{ s.cash_usdt, s.btc_total, s.btc_available });
     try w.print("\"bid_price\":\"{f}\",\"mark_price\":\"{f}\",", .{ s.bid_price, s.mark_price });
     try w.print("\"conservative_equity\":\"{f}\",\"high_watermark\":\"{f}\",\"drawdown\":\"{f}\",", .{ s.conservative_equity, s.high_watermark, s.drawdown });
+    // Remaining room before the risk boundary trips: max_drawdown − drawdown,
+    // floored at zero. Surfaces boundary convergence without model arithmetic.
+    const dd_buffer = blk: {
+        const diff = input.max_drawdown.sub(s.drawdown) catch break :blk Decimal.zero;
+        break :blk if (diff.isNegative()) Decimal.zero else diff;
+    };
+    try w.print("\"drawdown_buffer\":\"{f}\",", .{dd_buffer});
     try w.print("\"btc_weight\":\"{f}\",", .{btcWeight(s)});
     try w.print("\"min_size\":\"{f}\",\"min_notional\":\"{f}\",\"cash_covers_min_buy\":{},", .{
         input.min_size,
@@ -349,6 +356,9 @@ test "render is deterministic and structurally complete" {
     const cs = obj.get("current_state").?.object;
     try testing.expectEqual(@as(i64, 184392), cs.get("snapshot_version").?.integer);
     try testing.expectEqualStrings("NORMAL", cs.get("risk_mode").?.string);
+    // drawdown_buffer = max_drawdown 0.10 − drawdown 0.0087 = 0.0913
+    const dd_buf = Decimal.parse(cs.get("drawdown_buffer").?.string) catch unreachable;
+    try testing.expect(dd_buf.eql(d("0.0913")));
     const weight = Decimal.parse(cs.get("btc_weight").?.string) catch unreachable;
     try testing.expect(weight.gt(d("0.61")));
     try testing.expect(weight.lt(d("0.62")));

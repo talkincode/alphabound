@@ -82,6 +82,9 @@ pub fn tryDemoExecute(
             .mark_price = mark,
             .admitted_btc_weight = admitted_weight,
             .instrument = instrument,
+            // Band only gates the opening leg; seq>0 legs finish an already
+            // admitted delta after partial fills.
+            .min_weight_delta = if (seq == 0) cfg.min_rebalance_weight_delta else Decimal.zero,
         }) catch return if (seq == 0) "plan_error" else last_note;
 
         const po = switch (planned) {
@@ -532,7 +535,17 @@ fn queryAndResolveOrder(
             .fee = fee_s,
             .fee_ccy = fee_ccy,
             .ts = ts,
-        }) catch {};
+        }) catch |err| {
+            // A lost fill row breaks fee/avg-price auditability — surface it.
+            std.debug.print("[exec] fill projection write failed: {t}\n", .{err});
+            var fbuf: [160]u8 = undefined;
+            const fp = std.fmt.bufPrint(
+                &fbuf,
+                "{{\"clOrdId\":\"{s}\",\"reason\":\"fill_row_write_failed\"}}",
+                .{cl_id},
+            ) catch "{\"reason\":\"fill_row_write_failed\"}";
+            logEventPayload(events_repo, engine, "FILL_PROJECTION_FAILED", "execution", "WARN", cfg, fp);
+        };
     }
 
     if (st == .filled or st == .canceled or st == .rejected) {

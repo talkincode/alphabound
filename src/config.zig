@@ -48,6 +48,10 @@ pub const Config = struct {
     /// min_notional so dust rebalances (fees > edge) plan to HOLD; 0 keeps
     /// the venue minimum only.
     min_trade_notional: Decimal = Decimal.zero,
+    /// Minimum |target − current| portfolio-weight deviation required to
+    /// trade (e.g. 0.01 = 1%). Suppresses chains of tiny fee-eroding
+    /// rebalances. 0 disables. Residual replans are exempt.
+    min_rebalance_weight_delta: Decimal = Decimal.zero,
     // [agent]
     agent_provider: []const u8 = "openai",
     agent_model: []const u8 = "gpt-4o-mini",
@@ -250,6 +254,11 @@ fn applyKey(a: std.mem.Allocator, cfg: *Config, section: []const u8, key: []cons
         } else if (std.mem.eql(u8, key, "min_trade_notional")) {
             cfg.min_trade_notional = Decimal.parse(val) catch return error.InvalidValue;
             if (cfg.min_trade_notional.isNegative()) return error.InvalidValue;
+        } else if (std.mem.eql(u8, key, "min_rebalance_weight_delta")) {
+            cfg.min_rebalance_weight_delta = Decimal.parse(val) catch return error.InvalidValue;
+            if (cfg.min_rebalance_weight_delta.isNegative()) return error.InvalidValue;
+            // Above 0.5 the band would mute nearly all rebalances — reject as misconfig.
+            if (cfg.min_rebalance_weight_delta.gt(Decimal.parse("0.5") catch unreachable)) return error.InvalidValue;
         } else return error.UnknownKey;
     } else if (std.mem.eql(u8, section, "agent")) {
         if (std.mem.eql(u8, key, "provider")) {
@@ -458,6 +467,28 @@ test "min_trade_notional parses with validation" {
     try testing.expectError(error.InvalidValue, parse(testing.allocator,
         \\[risk]
         \\min_trade_notional = -1
+    ));
+}
+
+test "min_rebalance_weight_delta parses with range validation" {
+    var cfg = try parse(testing.allocator,
+        \\[risk]
+        \\min_rebalance_weight_delta = 0.01
+    );
+    defer cfg.deinit();
+    try testing.expect(cfg.min_rebalance_weight_delta.eql(Decimal.parse("0.01") catch unreachable));
+
+    var off = try parse(testing.allocator, "[risk]\n");
+    defer off.deinit();
+    try testing.expect(off.min_rebalance_weight_delta.isZero());
+
+    try testing.expectError(error.InvalidValue, parse(testing.allocator,
+        \\[risk]
+        \\min_rebalance_weight_delta = -0.01
+    ));
+    try testing.expectError(error.InvalidValue, parse(testing.allocator,
+        \\[risk]
+        \\min_rebalance_weight_delta = 0.6
     ));
 }
 

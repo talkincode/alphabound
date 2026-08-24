@@ -93,9 +93,17 @@ pub fn parse(gpa: std.mem.Allocator, raw: []const u8) ValidationError!Proposal {
     if (parsed.value != .object) return error.MalformedJson;
     const obj = parsed.value.object;
 
-    const decision_id = try dupString(a, try getString(obj, "decision_id"));
-    if (decision_id.len < 4 or decision_id.len > 64 or !std.mem.startsWith(u8, decision_id, "dec_"))
+    const raw_id = try getString(obj, "decision_id");
+    if (raw_id.len < 4 or !std.mem.startsWith(u8, raw_id, "dec_"))
         return error.DecisionIdInvalid;
+    // Normalize instead of rejecting recoverable defects: clamp to 64 chars
+    // and map anything outside [A-Za-z0-9_-] to '_' so ids stay stable in
+    // logs, order fingerprints, and JSON payloads.
+    const clamped = raw_id[0..@min(raw_id.len, 64)];
+    const id_buf = try a.alloc(u8, clamped.len);
+    for (clamped, 0..) |ch, i|
+        id_buf[i] = if (std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '-') ch else '_';
+    const decision_id: []const u8 = id_buf;
 
     const snapshot_version = try getU64(obj, "snapshot_version");
 
@@ -272,6 +280,24 @@ test "malformed inputs are rejected fail-closed" {
         \\ "target":{"type":"portfolio_weight","btc":0.5},
         \\ "confidence":0.5,"thesis":[],"invalid_if":[]}
     )); // rebalance without order_policy
+}
+
+test "decision_id normalization: overlong ids clamp, bad chars map to underscore" {
+    const gpa = testing.allocator;
+    // 70-char id (dec_ + 66 'a') clamps to 64 instead of rejecting.
+    var long = try parse(gpa,
+        \\{"decision_id":"dec_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","snapshot_version":1,"action":"HOLD","confidence":0.5,"thesis":[],"invalid_if":[]}
+    );
+    defer long.deinit();
+    try testing.expectEqual(@as(usize, 64), long.decision_id.len);
+    try testing.expect(std.mem.startsWith(u8, long.decision_id, "dec_"));
+
+    // Chars outside [A-Za-z0-9_-] become '_'.
+    var odd = try parse(gpa,
+        \\{"decision_id":"dec_a.b/c d","snapshot_version":1,"action":"HOLD","confidence":0.5,"thesis":[],"invalid_if":[]}
+    );
+    defer odd.deinit();
+    try testing.expectEqualStrings("dec_a_b_c_d", odd.decision_id);
 }
 
 test "fuzz: random bytes never crash the parser" {

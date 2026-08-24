@@ -5,6 +5,7 @@
 //!   - daily  snapshots  <db>.daily.YYYYMMDD.bak      keep 30
 //!   - tool_calls rows older than 30 days are pruned
 //!   - '1s' equity samples older than 7 days are pruned ('1m' kept forever)
+//!   - INFO events older than 30 days are pruned; WARN/CRITICAL kept 180 days
 
 const std = @import("std");
 const clock = @import("../core/clock.zig");
@@ -13,6 +14,8 @@ pub const keep_hourly: usize = 24;
 pub const keep_daily: usize = 30;
 pub const tool_calls_days: i64 = 30;
 pub const equity_1s_days: i64 = 7;
+pub const events_info_days: i64 = 30;
+pub const events_all_days: i64 = 180;
 
 pub const hourly_infix = ".hourly.";
 pub const daily_infix = ".daily.";
@@ -82,6 +85,12 @@ pub const prune_tool_calls_sql =
 /// SQL for pruning old 1s equity samples; '1m' rows are kept forever.
 pub const prune_equity_1s_sql =
     "DELETE FROM equity_samples WHERE interval = '1s' AND ts < ?1";
+/// SQL for pruning old INFO events (routine telemetry; WARN/CRITICAL live longer).
+pub const prune_events_info_sql =
+    "DELETE FROM events WHERE severity = 'INFO' AND ts < ?1";
+/// SQL for pruning events of any severity past the long horizon.
+pub const prune_events_all_sql =
+    "DELETE FROM events WHERE ts < ?1";
 
 /// RFC3339 cutoff string for "now − days".
 pub fn cutoffRfc3339(buf: []u8, now_ms: i64, days: i64) error{BufferTooSmall}![]const u8 {
@@ -142,6 +151,20 @@ test "cutoff formatting and lexicographic comparability" {
     // Text comparison works for retention: older < cutoff < newer.
     try testing.expect(std.mem.lessThan(u8, "2026-08-01T00:00:00.000Z", cut7));
     try testing.expect(std.mem.lessThan(u8, cut7, "2026-08-12T00:00:00.000Z"));
+}
+
+test "events retention horizons: INFO short, all-severity long" {
+    try testing.expect(events_info_days < events_all_days);
+    var buf: [40]u8 = undefined;
+    const ms: i64 = 1786505841787; // 2026-08-12T03:37:21.787Z
+    const cut_info = try cutoffRfc3339(&buf, ms, events_info_days);
+    try testing.expectEqualStrings("2026-07-13T03:37:21.787Z", cut_info);
+    var buf2: [40]u8 = undefined;
+    const cut_all = try cutoffRfc3339(&buf2, ms, events_all_days);
+    try testing.expect(std.mem.lessThan(u8, cut_all, cut_info));
+    // Only the INFO prune filters by severity; the long prune covers everything.
+    try testing.expect(std.mem.indexOf(u8, prune_events_info_sql, "severity = 'INFO'") != null);
+    try testing.expect(std.mem.indexOf(u8, prune_events_all_sql, "severity") == null);
 }
 
 test "property: selectDoomed never deletes any of the newest keep names" {

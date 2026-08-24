@@ -4477,7 +4477,13 @@ function renderStatus(system, state) {
   $("st_llm").className = connClass(llm);
   $("st_rate").textContent = (ag.valid_rate != null ? ag.valid_rate + "%" : "—") + "（" + (ag.ok||0) + "/" + (ag.total||0) + "）";
   $("st_agent_on").textContent = system.agent_enabled ? "开启" : "关闭";
-  $("st_mem").textContent = system.memories ?? "—";
+  if (system.memories_cap != null && system.memories != null) {
+    const memFull = system.memories >= system.memories_cap;
+    $("st_mem").textContent = system.memories + "/" + system.memories_cap + (memFull ? "（满，驱逐中）" : "");
+    $("st_mem").className = memFull ? "value warn" : "value";
+  } else {
+    $("st_mem").textContent = system.memories ?? "—";
+  }
 
   $("tk_calls").textContent = st.llm_calls != null ? st.llm_calls : "—";
   $("tk_prompt").textContent = st.prompt_tokens != null ? st.prompt_tokens : "—";

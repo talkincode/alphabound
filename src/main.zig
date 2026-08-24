@@ -1700,6 +1700,33 @@ fn runPrivateWsProbe(
 }
 
 /// Read-only private balance probe for Gate 1 connectivity (no engine cash mutation in shadow).
+/// Dedup guard for PRIVATE_BALANCE_OK events (§observability): identical
+/// balances re-log only after a heartbeat interval so the events table is not
+/// flooded by the poll loop. Runtime status still refreshes every poll and
+/// PRIVATE_BALANCE_FAILED always logs. Main-loop only — not thread-safe.
+const balance_event_heartbeat_ms: i64 = 3_600_000;
+var last_balance_event: struct {
+    usdt_buf: [48]u8 = undefined,
+    usdt_len: usize = 0,
+    btc_buf: [48]u8 = undefined,
+    btc_len: usize = 0,
+    ts_ms: i64 = 0,
+
+    fn shouldLog(self: *@This(), usdt: []const u8, btc: []const u8, now_ms: i64) bool {
+        const same = std.mem.eql(u8, self.usdt_buf[0..self.usdt_len], usdt) and
+            std.mem.eql(u8, self.btc_buf[0..self.btc_len], btc);
+        if (same and now_ms - self.ts_ms < balance_event_heartbeat_ms) return false;
+        if (usdt.len <= self.usdt_buf.len and btc.len <= self.btc_buf.len) {
+            @memcpy(self.usdt_buf[0..usdt.len], usdt);
+            self.usdt_len = usdt.len;
+            @memcpy(self.btc_buf[0..btc.len], btc);
+            self.btc_len = btc.len;
+        }
+        self.ts_ms = now_ms;
+        return true;
+    }
+} = .{};
+
 fn runPrivateReconcile(
     gpa: std.mem.Allocator,
     okx: *ab.okx_rest.Client,
@@ -1811,9 +1838,12 @@ fn runPrivateReconcile(
             ) catch "{}";
             var u_buf: [48]u8 = undefined;
             var b_buf: [48]u8 = undefined;
-            st.setAccount(decFmt(&u_buf, b.usdt_cash), decFmt(&b_buf, b.btc_cash));
+            const usdt_s = decFmt(&u_buf, b.usdt_cash);
+            const btc_s = decFmt(&b_buf, b.btc_cash);
+            st.setAccount(usdt_s, btc_s);
             st.setPriv("ok", "balance");
-            logEventPayload(events_repo, engine, "PRIVATE_BALANCE_OK", "exchange", "INFO", cfg, payload);
+            if (last_balance_event.shouldLog(usdt_s, btc_s, ts_ms))
+                logEventPayload(events_repo, engine, "PRIVATE_BALANCE_OK", "exchange", "INFO", cfg, payload);
             return .{ .ok = true, .flow = detected };
         },
         .err => |e| {

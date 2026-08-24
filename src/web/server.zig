@@ -269,6 +269,8 @@ pub fn handleReq(buf: []u8, req: RequestInfo, ctx: Context) Response {
     }
     if (std.mem.eql(u8, path, "/api/v1/state")) return renderState(buf, ctx);
     if (std.mem.eql(u8, path, "/api/v1/events")) {
+        const filter = EventFilter.fromTarget(req.target);
+        if (filter.active()) return filterEventsJson(buf, ctx.events_json, filter);
         if (ctx.recent_events.len > 0) return renderEvents(buf, ctx);
         return copyBody(buf, ctx.events_json);
     }
@@ -725,6 +727,153 @@ fn renderEvents(buf: []u8, ctx: Context) Response {
     return .{ .status = .internal_server_error, .body = "{\"error\":\"render\"}" };
 }
 
+/// Query-string filter for /api/v1/events: ?type= / ?severity= / ?exclude_type=.
+/// Values are matched case-insensitively against top-level event fields.
+const EventFilter = struct {
+    type_eq: ?[]const u8 = null,
+    exclude_type: ?[]const u8 = null,
+    severity_eq: ?[]const u8 = null,
+
+    fn active(self: EventFilter) bool {
+        return self.type_eq != null or self.exclude_type != null or self.severity_eq != null;
+    }
+
+    fn fromTarget(target: []const u8) EventFilter {
+        const qpos = std.mem.indexOfScalar(u8, target, '?') orelse return .{};
+        var f = EventFilter{};
+        var it = std.mem.splitScalar(u8, target[qpos + 1 ..], '&');
+        while (it.next()) |pair| {
+            const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+            const key = pair[0..eq];
+            const val = pair[eq + 1 ..];
+            if (val.len == 0 or val.len > 64) continue;
+            if (std.mem.eql(u8, key, "type")) f.type_eq = val;
+            if (std.mem.eql(u8, key, "exclude_type")) f.exclude_type = val;
+            if (std.mem.eql(u8, key, "severity")) f.severity_eq = val;
+        }
+        return f;
+    }
+
+    fn matches(self: EventFilter, obj: []const u8) bool {
+        if (self.type_eq) |want| {
+            const got = topLevelString(obj, "type") orelse return false;
+            if (!std.ascii.eqlIgnoreCase(got, want)) return false;
+        }
+        if (self.exclude_type) |skip| {
+            if (topLevelString(obj, "type")) |got| {
+                if (std.ascii.eqlIgnoreCase(got, skip)) return false;
+            }
+        }
+        if (self.severity_eq) |want| {
+            const got = topLevelString(obj, "severity") orelse return false;
+            if (!std.ascii.eqlIgnoreCase(got, want)) return false;
+        }
+        return true;
+    }
+};
+
+/// Extract a top-level (depth-1) string value from a rendered JSON object.
+/// Depth/string-aware so keys inside nested payload objects never match.
+fn topLevelString(obj: []const u8, key: []const u8) ?[]const u8 {
+    var depth: i32 = 0;
+    var in_str = false;
+    var escaped = false;
+    var i: usize = 0;
+    while (i < obj.len) : (i += 1) {
+        const ch = obj[i];
+        if (in_str) {
+            if (escaped) {
+                escaped = false;
+            } else if (ch == '\\') {
+                escaped = true;
+            } else if (ch == '"') {
+                in_str = false;
+            }
+            continue;
+        }
+        switch (ch) {
+            '{', '[' => depth += 1,
+            '}', ']' => depth -= 1,
+            '"' => {
+                if (depth == 1) {
+                    // Candidate key at top level: "key":"value"
+                    const rest = obj[i + 1 ..];
+                    if (rest.len > key.len + 3 and
+                        std.mem.startsWith(u8, rest, key) and
+                        std.mem.startsWith(u8, rest[key.len..], "\":\""))
+                    {
+                        const vstart = i + 1 + key.len + 3;
+                        var j = vstart;
+                        while (j < obj.len) : (j += 1) {
+                            if (obj[j] == '\\') {
+                                j += 1;
+                                continue;
+                            }
+                            if (obj[j] == '"') return obj[vstart..j];
+                        }
+                        return null;
+                    }
+                }
+                in_str = true;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// Stream the pre-rendered events array through the filter into `buf`.
+/// Splits top-level array elements with a string/escape-aware scanner.
+fn filterEventsJson(buf: []u8, src: []const u8, filter: EventFilter) Response {
+    var w: std.Io.Writer = .fixed(buf);
+    render: {
+        w.writeAll("[") catch break :render;
+        var wrote = false;
+        var depth: i32 = 0;
+        var in_str = false;
+        var escaped = false;
+        var obj_start: ?usize = null;
+        for (src, 0..) |ch, i| {
+            if (in_str) {
+                if (escaped) {
+                    escaped = false;
+                } else if (ch == '\\') {
+                    escaped = true;
+                } else if (ch == '"') {
+                    in_str = false;
+                }
+                continue;
+            }
+            switch (ch) {
+                '"' => in_str = true,
+                '{' => {
+                    if (depth == 1 and obj_start == null) obj_start = i;
+                    depth += 1;
+                },
+                '[' => depth += 1,
+                '}', ']' => {
+                    depth -= 1;
+                    if (depth == 1) {
+                        if (obj_start) |s| {
+                            const obj = src[s .. i + 1];
+                            obj_start = null;
+                            if (filter.matches(obj)) {
+                                if (wrote) w.writeAll(",") catch break :render;
+                                w.writeAll(obj) catch break :render;
+                                wrote = true;
+                            }
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+        w.writeAll("]") catch break :render;
+        return .{ .status = .ok, .body = w.buffered() };
+    }
+    return .{ .status = .internal_server_error, .body = "{\"error\":\"render\"}" };
+}
+
 /// Copy a pre-rendered JSON blob into the per-request body buffer so the
 /// seqlock snapshot need not remain valid across the full socket write.
 fn copyBody(buf: []u8, src: []const u8) Response {
@@ -1089,6 +1238,44 @@ test "unknown route 404, non-GET 405, query string stripped" {
     try testing.expectEqual(std.http.Status.not_found, handle(&buf, .GET, "/nope", testCtx()).status);
     try testing.expectEqual(std.http.Status.method_not_allowed, handle(&buf, .POST, "/api/v1/state", testCtx()).status);
     try testing.expectEqual(std.http.Status.ok, handle(&buf, .GET, "/health/live?x=1", testCtx()).status);
+}
+
+test "events endpoint filters by type, exclude_type and severity" {
+    var buf: [2048]u8 = undefined;
+    var ctx = testCtx();
+    ctx.events_json =
+        "[{\"event_id\":\"e1\",\"type\":\"PRIVATE_BALANCE_OK\",\"severity\":\"INFO\",\"payload\":{\"type\":\"nested\"}}," ++
+        "{\"event_id\":\"e2\",\"type\":\"ORDER_REJECTED\",\"severity\":\"WARN\",\"payload\":{}}," ++
+        "{\"event_id\":\"e3\",\"type\":\"ORDER_ACK\",\"severity\":\"INFO\",\"payload\":{\"note\":\"a{b}c\"}}]";
+
+    const by_type = handle(&buf, .GET, "/api/v1/events?type=ORDER_REJECTED", ctx);
+    try testing.expectEqual(std.http.Status.ok, by_type.status);
+    try testing.expect(std.mem.indexOf(u8, by_type.body, "e2") != null);
+    try testing.expect(std.mem.indexOf(u8, by_type.body, "e1") == null);
+
+    const excl = handle(&buf, .GET, "/api/v1/events?exclude_type=PRIVATE_BALANCE_OK", ctx);
+    try testing.expect(std.mem.indexOf(u8, excl.body, "e1") == null);
+    try testing.expect(std.mem.indexOf(u8, excl.body, "e2") != null);
+    try testing.expect(std.mem.indexOf(u8, excl.body, "e3") != null);
+
+    const by_sev = handle(&buf, .GET, "/api/v1/events?severity=warn", ctx);
+    try testing.expect(std.mem.indexOf(u8, by_sev.body, "e2") != null);
+    try testing.expect(std.mem.indexOf(u8, by_sev.body, "e1") == null);
+    try testing.expect(std.mem.indexOf(u8, by_sev.body, "e3") == null);
+
+    // Nested payload "type" key must not leak into top-level matching.
+    const nested = handle(&buf, .GET, "/api/v1/events?type=nested", ctx);
+    try testing.expectEqualStrings("[]", nested.body);
+
+    // Combined filters AND together.
+    const combo = handle(&buf, .GET, "/api/v1/events?severity=INFO&exclude_type=PRIVATE_BALANCE_OK", ctx);
+    try testing.expect(std.mem.indexOf(u8, combo.body, "e3") != null);
+    try testing.expect(std.mem.indexOf(u8, combo.body, "e1") == null);
+    try testing.expect(std.mem.indexOf(u8, combo.body, "e2") == null);
+
+    // No filter params -> unfiltered blob passthrough.
+    const plain = handle(&buf, .GET, "/api/v1/events", ctx);
+    try testing.expectEqualStrings(ctx.events_json, plain.body);
 }
 
 test "agent-runs equity shadow endpoints serve context blobs" {

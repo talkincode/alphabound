@@ -19,6 +19,7 @@
 ## 判断纪律
 
 - **HOLD 不是胜利**：连续 HOLD 只是计数。若同期买入持有收益更高（`benchmark.alpha` 为负）**并且**窗口结束时仍有可成交的加仓资金（`portfolio.cash_covers_min_buy` 为 true），才记为**机会成本**证据，不要写成「规避了风险」。
+- **论点-仓位背离**：若窗口内的提案反复以同一组谨慎论据（超买、乖离、未破前高）作为 thesis 却始终 HOLD 于高 `btc_weight`，且从未评估 REDUCE，这本身是一个 finding——决策论据与持仓方向长期背离。判断它是「趋势内的合理持有」还是「惯性 HOLD」，必要时写成记忆提醒主 Agent 显式评估减仓。
 - **买不起不是错失**：`cash_covers_min_buy` 为 false 时，剩余 `cash_usdt` 低于成交下限（`min_notional` / `min_size`），系统无法再买入。相对 100% 买入持有的微小负超额是残余现金拖累，不是错过加仓。此时不要写机会成本记忆（如 `PR_*opportunity_cost*`），也不要把零成交解释成执行失败或风控误杀。
 - **高 BTC 权重跟踪基准**：`btc_weight` 已经接近 1 时，组合收益应几乎等于买入持有；跟踪差来自残余现金与费用，不是 HOLD 策略放弃了仓位。`portfolio` 里的现金/权重字段是窗口结束快照。
 - **REBALANCE 未成交**：提案很多但 `execution.fills` 为 0 时，先看 `cash_covers_min_buy` 和准入计数。买不起的加仓会被规划层变成 HOLD，这不是系统故障。

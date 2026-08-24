@@ -21,6 +21,7 @@ taker_fee_rate = 0.001
 slippage_rate = 0.0005
 initial_capital = 100.0
 min_trade_notional = 10              # USDT floor per trade; dust rebalances plan to HOLD (0 = venue min only)
+min_rebalance_weight_delta = 0.01    # skip trades moving weight < 1%; suppresses fee-eroding micro-rebalances (0 = off)
 
 [agent]
 provider = "openai"
