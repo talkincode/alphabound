@@ -15,6 +15,9 @@ pub const Snapshot = struct {
     entry_bid: Decimal = Decimal.zero,
     /// BTC amount BH would hold if fully converted at entry (after fee).
     bh_btc: Decimal = Decimal.zero,
+    /// Unitized capital bases for chain-linked, flow-neutral returns.
+    shadow_units: Decimal = Decimal.zero,
+    bh_units: Decimal = Decimal.zero,
     fee_rate: Decimal = Decimal.zero,
     initialized: bool = false,
 };
@@ -34,6 +37,8 @@ pub const Comparison = struct {
     bh_return: Decimal = Decimal.zero,
     /// shadow_return - bh_return (primary skill metric)
     alpha_return: Decimal = Decimal.zero,
+    shadow_units: Decimal = Decimal.zero,
+    bh_units: Decimal = Decimal.zero,
 };
 
 pub fn init(capital: Decimal, entry_bid: Decimal, fee_rate: Decimal) Snapshot {
@@ -55,9 +60,51 @@ pub fn init(capital: Decimal, entry_bid: Decimal, fee_rate: Decimal) Snapshot {
         .initial_capital = capital,
         .entry_bid = entry_bid,
         .bh_btc = btc,
+        .shadow_units = capital,
+        .bh_units = capital,
         .fee_rate = fee_rate,
         .initialized = !btc.isZero(),
     };
+}
+
+/// Apply an external quote-equivalent flow without resetting benchmark history.
+/// The added/removed BH quantity is chosen so the mark changes by the same
+/// quote amount as the live book at this bid.
+pub fn applyCapitalFlow(
+    self: Snapshot,
+    quote_flow: Decimal,
+    bid: Decimal,
+    shadow_equity_before: Decimal,
+) dec.DecimalError!Snapshot {
+    if (!self.initialized or !bid.gt(Decimal.zero)) return self;
+    const keep = try Decimal.one.sub(self.fee_rate);
+    const unit_value = try bid.mul(keep, .down);
+    if (!unit_value.gt(Decimal.zero)) return self;
+    const bh_equity_before = try self.bh_btc.mul(unit_value, .down);
+    const shadow_units_before = if (self.shadow_units.gt(Decimal.zero)) self.shadow_units else self.initial_capital;
+    const bh_units_before = if (self.bh_units.gt(Decimal.zero)) self.bh_units else self.initial_capital;
+    if (!shadow_equity_before.gt(Decimal.zero) or !bh_equity_before.gt(Decimal.zero)) return self;
+    const shadow_nav = try shadow_equity_before.div(shadow_units_before, .nearest);
+    const bh_nav = try bh_equity_before.div(bh_units_before, .nearest);
+    if (!shadow_nav.gt(Decimal.zero) or !bh_nav.gt(Decimal.zero)) return self;
+    const delta_btc = try quote_flow.div(unit_value, .nearest);
+    const shadow_unit_delta = try quote_flow.div(shadow_nav, .nearest);
+    const bh_unit_delta = try quote_flow.div(bh_nav, .nearest);
+    const next_btc = try self.bh_btc.add(delta_btc);
+    const next_capital = try self.initial_capital.add(quote_flow);
+    const next_shadow_units = try shadow_units_before.add(shadow_unit_delta);
+    const next_bh_units = try bh_units_before.add(bh_unit_delta);
+    if (!next_btc.gt(Decimal.zero) or !next_capital.gt(Decimal.zero) or
+        !next_shadow_units.gt(Decimal.zero) or !next_bh_units.gt(Decimal.zero))
+    {
+        return .{ .fee_rate = self.fee_rate };
+    }
+    var out = self;
+    out.bh_btc = next_btc;
+    out.initial_capital = next_capital;
+    out.shadow_units = next_shadow_units;
+    out.bh_units = next_bh_units;
+    return out;
 }
 
 /// True when live equity diverges from BH baseline by more than market noise —
@@ -102,6 +149,8 @@ pub fn evaluate(self: Snapshot, bid: Decimal, shadow_equity: Decimal) Comparison
             .entry_bid = self.entry_bid,
             .bh_btc = self.bh_btc,
             .baseline_capital = baseline,
+            .shadow_units = self.shadow_units,
+            .bh_units = self.bh_units,
         });
     }
     const notional = self.bh_btc.mul(bid, .down) catch Decimal.zero;
@@ -116,14 +165,16 @@ pub fn evaluate(self: Snapshot, bid: Decimal, shadow_equity: Decimal) Comparison
         .entry_bid = self.entry_bid,
         .bh_btc = self.bh_btc,
         .baseline_capital = baseline,
+        .shadow_units = self.shadow_units,
+        .bh_units = self.bh_units,
     });
 }
 
 fn withReturns(c: Comparison) Comparison {
     var out = c;
-    if (c.baseline_capital.gt(Decimal.zero)) {
-        const s_ratio = c.shadow_equity.div(c.baseline_capital, .down) catch Decimal.one;
-        const b_ratio = c.bh_equity.div(c.baseline_capital, .down) catch Decimal.one;
+    if (c.shadow_units.gt(Decimal.zero) and c.bh_units.gt(Decimal.zero)) {
+        const s_ratio = c.shadow_equity.div(c.shadow_units, .down) catch Decimal.one;
+        const b_ratio = c.bh_equity.div(c.bh_units, .down) catch Decimal.one;
         out.shadow_return = s_ratio.sub(Decimal.one) catch Decimal.zero;
         out.bh_return = b_ratio.sub(Decimal.one) catch Decimal.zero;
         out.alpha_return = out.shadow_return.sub(out.bh_return) catch Decimal.zero;
@@ -131,15 +182,15 @@ fn withReturns(c: Comparison) Comparison {
     return out;
 }
 
-/// Serialize an initialized baseline for the runtime_kv store so alpha
-/// survives daemon restarts. Compact pipe format, no allocator:
-/// "v1|capital|entry_bid|bh_btc|fee_rate".
+/// Serialize the baseline for the runtime_kv store so alpha survives daemon
+/// restarts. A zero snapshot represents a fully withdrawn account.
+/// Compact pipe format, no allocator:
+/// "v2|capital|entry_bid|bh_btc|shadow_units|bh_units|fee_rate".
 pub fn formatSnapshot(buf: []u8, s: Snapshot) error{BufferTooSmall}![]const u8 {
-    if (!s.initialized) return error.BufferTooSmall;
     return std.fmt.bufPrint(
         buf,
-        "v1|{f}|{f}|{f}|{f}",
-        .{ s.initial_capital, s.entry_bid, s.bh_btc, s.fee_rate },
+        "v2|{f}|{f}|{f}|{f}|{f}|{f}",
+        .{ s.initial_capital, s.entry_bid, s.bh_btc, s.shadow_units, s.bh_units, s.fee_rate },
     ) catch return error.BufferTooSmall;
 }
 
@@ -148,18 +199,38 @@ pub fn formatSnapshot(buf: []u8, s: Snapshot) error{BufferTooSmall}![]const u8 {
 pub fn parseSnapshot(text: []const u8) ?Snapshot {
     var it = std.mem.splitScalar(u8, text, '|');
     const ver = it.next() orelse return null;
-    if (!std.mem.eql(u8, ver, "v1")) return null;
     const cap = Decimal.parse(it.next() orelse return null) catch return null;
     const entry = Decimal.parse(it.next() orelse return null) catch return null;
     const btc = Decimal.parse(it.next() orelse return null) catch return null;
+    const shadow_units = if (std.mem.eql(u8, ver, "v2"))
+        Decimal.parse(it.next() orelse return null) catch return null
+    else if (std.mem.eql(u8, ver, "v1"))
+        cap
+    else
+        return null;
+    const bh_units = if (std.mem.eql(u8, ver, "v2"))
+        Decimal.parse(it.next() orelse return null) catch return null
+    else
+        cap;
     const fee = Decimal.parse(it.next() orelse return null) catch return null;
     if (it.next() != null) return null;
-    if (!cap.gt(Decimal.zero) or !entry.gt(Decimal.zero) or !btc.gt(Decimal.zero)) return null;
     if (fee.isNegative() or fee.gte(Decimal.one)) return null;
+    if (cap.eql(Decimal.zero) and entry.eql(Decimal.zero) and btc.eql(Decimal.zero) and
+        shadow_units.eql(Decimal.zero) and bh_units.eql(Decimal.zero))
+    {
+        return .{ .fee_rate = fee };
+    }
+    if (!cap.gt(Decimal.zero) or !entry.gt(Decimal.zero) or !btc.gt(Decimal.zero) or
+        !shadow_units.gt(Decimal.zero) or !bh_units.gt(Decimal.zero))
+    {
+        return null;
+    }
     return .{
         .initial_capital = cap,
         .entry_bid = entry,
         .bh_btc = btc,
+        .shadow_units = shadow_units,
+        .bh_units = bh_units,
         .fee_rate = fee,
         .initialized = true,
     };
@@ -168,7 +239,7 @@ pub fn parseSnapshot(text: []const u8) ?Snapshot {
 pub fn formatJson(buf: []u8, c: Comparison) error{BufferTooSmall}![]const u8 {
     return std.fmt.bufPrint(
         buf,
-        "{{\"shadow_equity\":\"{f}\",\"bh_equity\":\"{f}\",\"alpha\":\"{f}\",\"entry_bid\":\"{f}\",\"bh_btc\":\"{f}\",\"baseline_capital\":\"{f}\",\"shadow_return\":\"{f}\",\"bh_return\":\"{f}\",\"alpha_return\":\"{f}\"}}",
+        "{{\"shadow_equity\":\"{f}\",\"bh_equity\":\"{f}\",\"alpha\":\"{f}\",\"entry_bid\":\"{f}\",\"bh_btc\":\"{f}\",\"baseline_capital\":\"{f}\",\"shadow_units\":\"{f}\",\"bh_units\":\"{f}\",\"shadow_return\":\"{f}\",\"bh_return\":\"{f}\",\"alpha_return\":\"{f}\"}}",
         .{
             c.shadow_equity,
             c.bh_equity,
@@ -176,6 +247,8 @@ pub fn formatJson(buf: []u8, c: Comparison) error{BufferTooSmall}![]const u8 {
             c.entry_bid,
             c.bh_btc,
             c.baseline_capital,
+            c.shadow_units,
+            c.bh_units,
             c.shadow_return,
             c.bh_return,
             c.alpha_return,
@@ -233,6 +306,20 @@ test "needsRebase on deposit-like jump" {
     try testing.expect(!needsRebase(d("400"), d("390"))); // small mark move
 }
 
+test "capital flow changes BH equity by the same quote amount" {
+    const before = init(d("100"), d("50000"), d("0.001"));
+    const before_cmp = evaluate(before, d("50000"), d("101"));
+    const after = try applyCapitalFlow(before, d("50"), d("50000"), d("101"));
+    const after_cmp = evaluate(after, d("50000"), d("151"));
+    const bh_jump = try after_cmp.bh_equity.sub(before_cmp.bh_equity);
+    const jump_diff = try bh_jump.sub(d("50"));
+    try testing.expect(jump_diff.abs().lte(d("0.001")));
+    const alpha_diff = try after_cmp.alpha.sub(before_cmp.alpha);
+    try testing.expect(alpha_diff.abs().lte(d("0.001")));
+    const alpha_return_diff = try after_cmp.alpha_return.sub(before_cmp.alpha_return);
+    try testing.expect(alpha_return_diff.abs().lte(d("0.000001")));
+}
+
 test "rebase restores comparable alpha" {
     var s = init(d("100"), d("50000"), d("0.001"));
     // Pretend deposit to 300 while price flat-ish
@@ -254,6 +341,8 @@ test "snapshot persistence round-trip" {
     try testing.expect(back.initial_capital.eql(s.initial_capital));
     try testing.expect(back.entry_bid.eql(s.entry_bid));
     try testing.expect(back.bh_btc.eql(s.bh_btc));
+    try testing.expect(back.shadow_units.eql(s.shadow_units));
+    try testing.expect(back.bh_units.eql(s.bh_units));
     try testing.expect(back.fee_rate.eql(s.fee_rate));
 
     // Restored snapshot evaluates identically.
@@ -274,7 +363,10 @@ test "parseSnapshot fails closed on malformed input" {
     try testing.expect(parseSnapshot("v1|100|50000|0|0.001") == null); // zero btc
     try testing.expect(parseSnapshot("v1|100|50000|0.002|1") == null); // fee >= 1
     try testing.expect(parseSnapshot("v1|100|50000|0.002|-0.1") == null);
-    // Uninitialized snapshot refuses to serialize.
+    // Fully withdrawn state persists as an explicit uninitialized baseline.
     var buf: [256]u8 = undefined;
-    try testing.expectError(error.BufferTooSmall, formatSnapshot(&buf, .{}));
+    const zero_text = try formatSnapshot(&buf, .{ .fee_rate = d("0.001") });
+    const zero = parseSnapshot(zero_text) orelse return error.TestUnexpectedResult;
+    try testing.expect(!zero.initialized);
+    try testing.expect(zero.fee_rate.eql(d("0.001")));
 }

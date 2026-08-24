@@ -67,6 +67,10 @@ pub const Message = union(enum) {
         btc_available: Decimal,
         hwm_from_db: Decimal,
         clean: bool, // false = mismatch found, corrections were emitted
+        /// Set together for a detected external deposit/withdrawal. The HWM is
+        /// rescaled before revaluation so performance drawdown stays continuous.
+        flow_equity_before: Decimal = Decimal.zero,
+        flow_equity_after: Decimal = Decimal.zero,
     },
     order_ambiguity: struct { present: bool },
     risk_trigger: sm.Trigger,
@@ -125,6 +129,13 @@ pub const Engine = struct {
                 self.state.btc_total = r.btc_total;
                 self.state.btc_available = r.btc_available;
                 self.state.high_watermark = Decimal.max(self.state.high_watermark, r.hwm_from_db);
+                if (!r.flow_equity_before.eql(Decimal.zero) or !r.flow_equity_after.eql(Decimal.zero)) {
+                    self.state.high_watermark = try equity_mod.adjustHighWatermarkForFlow(
+                        self.state.high_watermark,
+                        r.flow_equity_before,
+                        r.flow_equity_after,
+                    );
+                }
                 self.state.freshness.account_last_ms = r.ts_ms;
                 self.state.reconciled = r.clean;
                 self.state.as_of_ms = r.ts_ms;
@@ -355,6 +366,70 @@ test "drawdown breach forces flattening and HWM only rises reconciled" {
     try testing.expectEqual(sm.RiskMode.flattening, e.snapshot().risk_mode);
     try testing.expect(r.boundary_hit);
     try testing.expect(e.snapshot().high_watermark.eql(hwm_at_peak)); // HWM did not fall
+}
+
+test "capital-flow reconcile preserves drawdown percentage" {
+    var e = testEngine();
+    _ = try e.apply(.{ .market_tick = .{ .ts_ms = 1000, .bid = d("100000"), .mark = d("100000") } });
+    _ = try e.apply(.{ .reconcile_result = .{
+        .ts_ms = 1100,
+        .cash_usdt = d("100"),
+        .btc_total = Decimal.zero,
+        .btc_available = Decimal.zero,
+        .hwm_from_db = Decimal.zero,
+        .clean = true,
+    } });
+    _ = try e.apply(.{ .reconcile_result = .{
+        .ts_ms = 1200,
+        .cash_usdt = d("95"),
+        .btc_total = Decimal.zero,
+        .btc_available = Decimal.zero,
+        .hwm_from_db = d("100"),
+        .clean = true,
+    } });
+    const before_dd = e.snapshot().drawdown;
+
+    _ = try e.apply(.{ .reconcile_result = .{
+        .ts_ms = 1300,
+        .cash_usdt = d("195"),
+        .btc_total = Decimal.zero,
+        .btc_available = Decimal.zero,
+        .hwm_from_db = d("100"),
+        .clean = true,
+        .flow_equity_before = d("95"),
+        .flow_equity_after = d("195"),
+    } });
+
+    const diff = try e.snapshot().drawdown.sub(before_dd);
+    try testing.expect(diff.abs().lte(d("0.00000001")));
+    try testing.expect(e.snapshot().high_watermark.gt(d("205")));
+}
+
+test "full withdrawal resets HWM instead of creating a false drawdown" {
+    var e = testEngine();
+    _ = try e.apply(.{ .market_tick = .{ .ts_ms = 1000, .bid = d("100000"), .mark = d("100000") } });
+    _ = try e.apply(.{ .reconcile_result = .{
+        .ts_ms = 1100,
+        .cash_usdt = d("100"),
+        .btc_total = Decimal.zero,
+        .btc_available = Decimal.zero,
+        .hwm_from_db = d("100"),
+        .clean = true,
+    } });
+    _ = try e.apply(.{ .reconcile_result = .{
+        .ts_ms = 1200,
+        .cash_usdt = Decimal.zero,
+        .btc_total = Decimal.zero,
+        .btc_available = Decimal.zero,
+        .hwm_from_db = d("100"),
+        .clean = true,
+        .flow_equity_before = d("100"),
+        .flow_equity_after = Decimal.zero,
+    } });
+
+    try testing.expect(e.snapshot().high_watermark.eql(Decimal.zero));
+    try testing.expect(e.snapshot().drawdown.eql(Decimal.zero));
+    try testing.expect(e.snapshot().risk_mode != .flattening);
 }
 
 test "order ambiguity blocks normal mode" {

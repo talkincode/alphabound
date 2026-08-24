@@ -85,17 +85,58 @@ fn llmErrorClass(err: ab.openai.Error) []const u8 {
 
 /// runtime_kv key for the persisted shadow buy-and-hold baseline.
 const shadow_bh_kv_key = "shadow_bh_baseline";
+const reconciled_balances_kv_key = "reconciled_balances";
+const risk_hwm_kv_key = "risk_high_watermark";
 
 /// Best-effort persist of the BH baseline (alpha survives restarts).
 /// Failures only log — the in-memory baseline keeps working either way.
 fn persistShadowBaseline(kv: *ab.storage.KvRepo, snap: ab.shadow_bench.Snapshot) void {
-    var val_buf: [256]u8 = undefined;
-    const val = ab.shadow_bench.formatSnapshot(&val_buf, snap) catch return;
     var ts_buf: [40]u8 = undefined;
     const ts = ab.clock.formatRfc3339Ms(nowMs(), &ts_buf) catch "";
-    kv.put(shadow_bh_kv_key, val, ts) catch {
+    if (!putShadowBaseline(kv, snap, ts)) {
         std.debug.print("[shadow-bh] persist failed (kv write)\n", .{});
-    };
+    }
+}
+
+fn putShadowBaseline(kv: *ab.storage.KvRepo, snap: ab.shadow_bench.Snapshot, ts: []const u8) bool {
+    var val_buf: [256]u8 = undefined;
+    const val = ab.shadow_bench.formatSnapshot(&val_buf, snap) catch return false;
+    kv.put(shadow_bh_kv_key, val, ts) catch return false;
+    return true;
+}
+
+fn loadPersistedHwm(kv: *ab.storage.KvRepo) ab.storage.DbError!?ab.decimal.Decimal {
+    var buf: [64]u8 = undefined;
+    const encoded = (try kv.getChecked(risk_hwm_kv_key, &buf)) orelse return null;
+    return ab.decimal.Decimal.parse(encoded) catch return ab.storage.DbError.StepFailed;
+}
+
+fn loadShadowBaseline(kv: *ab.storage.KvRepo) ab.storage.DbError!?ab.shadow_bench.Snapshot {
+    var buf: [256]u8 = undefined;
+    const encoded = (try kv.getChecked(shadow_bh_kv_key, &buf)) orelse return null;
+    return ab.shadow_bench.parseSnapshot(encoded) orelse return ab.storage.DbError.StepFailed;
+}
+
+fn persistHwm(kv: *ab.storage.KvRepo, hwm: ab.decimal.Decimal, ts: []const u8) bool {
+    var value_buf: [64]u8 = undefined;
+    const value = decFmt(&value_buf, hwm);
+    kv.put(risk_hwm_kv_key, value, ts) catch return false;
+    return true;
+}
+
+fn loadReconciledBalances(kv: *ab.storage.KvRepo) ab.storage.DbError!?ab.capital_flow.Balances {
+    var buf: [160]u8 = undefined;
+    const encoded = (try kv.getChecked(reconciled_balances_kv_key, &buf)) orelse return null;
+    return ab.capital_flow.parseBalances(encoded) catch return ab.storage.DbError.StepFailed;
+}
+
+fn persistReconciledBalances(kv: *ab.storage.KvRepo, balances: ab.capital_flow.Balances) bool {
+    var value_buf: [160]u8 = undefined;
+    const value = ab.capital_flow.formatBalances(&value_buf, balances) catch return false;
+    var ts_buf: [40]u8 = undefined;
+    const ts = ab.clock.formatRfc3339Ms(nowMs(), &ts_buf) catch return false;
+    kv.put(reconciled_balances_kv_key, value, ts) catch return false;
+    return true;
 }
 
 var shutdown_requested = std.atomic.Value(bool).init(false);
@@ -462,6 +503,8 @@ pub fn main(init: std.process.Init) !u8 {
     defer kv_repo.deinit();
     var intel_repo = try ab.storage.IntelRepo.init(&db);
     defer intel_repo.deinit();
+    var capital_flows_repo = try ab.storage.CapitalFlowsRepo.init(&db);
+    defer capital_flows_repo.deinit();
 
     // In-process memory index rebuilt from SQLite latest versions.
     var mem_store = ab.memory.Store.init(gpa);
@@ -476,13 +519,22 @@ pub fn main(init: std.process.Init) !u8 {
 
     // Restore HWM from durable storage (survives restarts, §5.1).
     {
-        var hwm_buf: [64]u8 = undefined;
-        if (equity_repo.latestHwm(&db, &hwm_buf)) |hwm_text| {
-            const hwm = ab.decimal.Decimal.parse(hwm_text) catch ab.decimal.Decimal.zero;
+        const persisted_hwm = loadPersistedHwm(&kv_repo) catch |err| {
+            std.debug.print("[boot] persisted HWM unreadable: {t}\n", .{err});
+            return 1;
+        };
+        if (persisted_hwm) |hwm| {
             engine.restoreHwm(hwm);
             std.debug.print("[boot] restored HWM {f}\n", .{hwm});
-        } else |_| {
-            std.debug.print("[boot] no prior HWM — fresh start\n", .{});
+        } else {
+            var hwm_buf: [64]u8 = undefined;
+            if (equity_repo.latestHwm(&db, &hwm_buf)) |hwm_text| {
+                const hwm = ab.decimal.Decimal.parse(hwm_text) catch ab.decimal.Decimal.zero;
+                engine.restoreHwm(hwm);
+                std.debug.print("[boot] restored HWM {f}\n", .{hwm});
+            } else |_| {
+                std.debug.print("[boot] no prior HWM — fresh start\n", .{});
+            }
         }
     }
 
@@ -640,15 +692,53 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("[connect] unreachable ({t}) — cannot run shadow loop\n", .{err});
         return 1;
     }
+    var startup_bid = ab.decimal.Decimal.zero;
+    var startup_bid_ts_ms: i64 = 0;
+    {
+        var startup_ticker_path_buf: [128]u8 = undefined;
+        const startup_ticker_path = std.fmt.bufPrint(
+            &startup_ticker_path_buf,
+            "/api/v5/market/ticker?instId={s}",
+            .{cfg.instrument},
+        ) catch return 1;
+        if (okx.getPublic(startup_ticker_path)) |body| {
+            defer gpa.free(body);
+            if (ab.okx_rest.parseTicker(gpa, body)) |ticker| {
+                startup_bid = ticker.bid;
+                startup_bid_ts_ms = ticker.ts_ms;
+            } else |err| {
+                std.debug.print("[connect] startup ticker parse failed: {t}\n", .{err});
+            }
+        } else |err| {
+            std.debug.print("[connect] startup ticker fetch failed: {t}\n", .{err});
+        }
+    }
+    var bh = ab.shadow_bench.Snapshot{};
+    {
+        const persisted_bh = loadShadowBaseline(&kv_repo) catch |err| {
+            std.debug.print("[boot] persisted BH baseline unreadable: {t}\n", .{err});
+            return 1;
+        };
+        if (persisted_bh) |restored| {
+            bh = restored;
+            std.debug.print(
+                "[shadow-bh] restored baseline capital={f} entry_bid={f} bh_btc={f}\n",
+                .{ bh.initial_capital, bh.entry_bid, bh.bh_btc },
+            );
+        }
+    }
 
     // ---- RECONCILING --------------------------------------------------------
     // Shadow: engine cash = initial_capital (simulated).
     // Demo/live: engine cash/BTC from private REST balance (exchange book).
     const now_boot = nowMs();
+    var boot_balance_ts_ms = now_boot;
     var boot_cash = cfg.initial_capital;
     var boot_btc = ab.decimal.Decimal.zero;
     var boot_btc_avail = ab.decimal.Decimal.zero;
     var boot_clean = true;
+    var boot_balance_loaded = false;
+    var startup_flow: ?ab.capital_flow.Flow = null;
     if (okx_env != null) {
         const probe = probePrivateBalanceRetry(gpa, &okx, io, 6);
         switch (probe) {
@@ -657,6 +747,8 @@ pub fn main(init: std.process.Init) !u8 {
                     boot_cash = b.usdt_cash;
                     boot_btc = b.btc_cash;
                     boot_btc_avail = b.btc_avail;
+                    boot_balance_ts_ms = nowMs();
+                    boot_balance_loaded = true;
                     std.debug.print(
                         "[reconcile] {t} balance applied usdt={f} avail={f} btc={f}\n",
                         .{ cfg.mode, b.usdt_cash, b.usdt_avail, b.btc_cash },
@@ -722,13 +814,65 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("[reconcile] no keys — skip private balance\n", .{});
     }
 
+    if (cfg.mode.isTrading() and boot_balance_loaded) {
+        const previous_balances = loadReconciledBalances(&kv_repo) catch |err| {
+            std.debug.print("[reconcile] stored balance checkpoint unreadable: {t}\n", .{err});
+            return 1;
+        };
+        if (previous_balances) |previous| {
+            if (startup_bid.gt(ab.decimal.Decimal.zero) and
+                startup_bid_ts_ms > 0 and
+                boot_balance_ts_ms - startup_bid_ts_ms <= engine.snapshot().freshness.market_ttl_ms)
+            {
+                startup_flow = ab.capital_flow.detect(.{
+                    .before = previous,
+                    .after = .{
+                        .cash_usdt = boot_cash,
+                        .btc_total = boot_btc,
+                    },
+                    .bid_price = startup_bid,
+                    .exit_costs = .{
+                        .fee_rate = cfg.taker_fee_rate,
+                        .slippage_rate = cfg.slippage_rate,
+                    },
+                }) catch |err| {
+                    std.debug.print("[reconcile] startup capital-flow detection failed: {t}\n", .{err});
+                    return 1;
+                };
+            } else {
+                std.debug.print("[reconcile] startup bid unavailable — refusing to advance balance checkpoint\n", .{});
+                return 1;
+            }
+        }
+    }
+    if (cfg.mode.isTrading() and boot_balance_loaded) {
+        if (!persistAccountReconcile(
+            &db,
+            &capital_flows_repo,
+            &events_repo,
+            &engine,
+            &cfg,
+            &kv_repo,
+            boot_balance_ts_ms,
+            startup_flow,
+            .{ .cash_usdt = boot_cash, .btc_total = boot_btc },
+            &bh,
+            startup_bid,
+        )) {
+            std.debug.print("[reconcile] startup account persistence failed\n", .{});
+            return 1;
+        }
+    }
+
     _ = engine.apply(.{ .reconcile_result = .{
-        .ts_ms = now_boot,
+        .ts_ms = boot_balance_ts_ms,
         .cash_usdt = boot_cash,
         .btc_total = boot_btc,
         .btc_available = boot_btc_avail,
         .hwm_from_db = engine.snapshot().high_watermark,
         .clean = boot_clean,
+        .flow_equity_before = if (startup_flow) |flow| flow.equity_before else ab.decimal.Decimal.zero,
+        .flow_equity_after = if (startup_flow) |flow| flow.equity_after else ab.decimal.Decimal.zero,
     } }) catch return 1;
     if (boot_clean) {
         logEvent(&events_repo, &engine, "RECONCILE_COMPLETED", "core", "INFO", &cfg);
@@ -747,22 +891,8 @@ pub fn main(init: std.process.Init) !u8 {
     const control_state_path = ab.admin_control.pathStateFromDb(cfg.db_path, &control_state_buf) catch "var/trading.control.state";
     writeControlState(io, control_state_path, admin_paused, .none, true);
 
-    // Shadow buy-and-hold baseline (initialized on first live bid).
-    // Restored from runtime_kv when present so alpha survives restarts;
-    // fail-closed parse → re-init from live equity as before.
-    var bh = ab.shadow_bench.Snapshot{};
-    {
-        var kv_buf: [256]u8 = undefined;
-        if (kv_repo.get(shadow_bh_kv_key, &kv_buf)) |persisted| {
-            if (ab.shadow_bench.parseSnapshot(persisted)) |restored| {
-                bh = restored;
-                std.debug.print(
-                    "[shadow-bh] restored baseline capital={f} entry_bid={f} bh_btc={f}\n",
-                    .{ bh.initial_capital, bh.entry_bid, bh.bh_btc },
-                );
-            }
-        }
-    }
+    // Shadow buy-and-hold baseline is loaded before account reconciliation so
+    // a flow and its derived HWM/BH checkpoints commit atomically.
     var last_bh_cmp = ab.shadow_bench.Comparison{
         .shadow_equity = cfg.initial_capital,
         .bh_equity = cfg.initial_capital,
@@ -856,6 +986,24 @@ pub fn main(init: std.process.Init) !u8 {
     ab.web_cache.refreshPeriodicReviewCache(&web_state, &db, &periodic_repo);
     // Cooldown between auto flatten market sells while risk_mode=FLATTENING.
     var last_flatten_exec_ms: i64 = 0;
+    var account_reconcile_ctx = AccountReconcileContext{
+        .gpa = gpa,
+        .okx = &okx,
+        .db = &db,
+        .engine = &engine,
+        .events_repo = &events_repo,
+        .capital_flows_repo = &capital_flows_repo,
+        .kv_repo = &kv_repo,
+        .bh = &bh,
+        .comparison = &last_bh_cmp,
+        .cfg = &cfg,
+        .status = &runtime_status,
+        .sched = &agent_sched,
+    };
+    const portfolio_refresher = ab.demo_runner.PortfolioRefresher{
+        .context = &account_reconcile_ctx,
+        .run_fn = refreshAccountForExecution,
+    };
 
     while (!shutdown_requested.load(.acquire)) {
         if (cli.max_ticks > 0 and tick_count >= cli.max_ticks) break;
@@ -888,7 +1036,18 @@ pub fn main(init: std.process.Init) !u8 {
                     .reconcile => {
                         std.debug.print("[admin] reconcile requested\n", .{});
                         if (okx_env != null) {
-                            runPrivateReconcile(gpa, &okx, &engine, &events_repo, &cfg, &runtime_status);
+                            const outcome = runPrivateReconcile(gpa, &okx, &db, &engine, &events_repo, &capital_flows_repo, &kv_repo, &bh, &cfg, &runtime_status);
+                            if (outcome.flow) |flow| {
+                                applyCapitalFlowEffects(
+                                    flow,
+                                    &engine,
+                                    &bh,
+                                    &last_bh_cmp,
+                                    &events_repo,
+                                    &cfg,
+                                    &agent_sched,
+                                );
+                            }
                         }
                         logEvent(&events_repo, &engine, "ADMIN_RECONCILE", "admin", "INFO", &cfg);
                     },
@@ -927,6 +1086,7 @@ pub fn main(init: std.process.Init) !u8 {
                             &fills_repo,
                             &events_repo,
                             &runtime_status,
+                            portfolio_refresher,
                             trade_instrument,
                             &last_flatten_exec_ms,
                             true,
@@ -945,6 +1105,7 @@ pub fn main(init: std.process.Init) !u8 {
                             &fills_repo,
                             &events_repo,
                             &runtime_status,
+                            portfolio_refresher,
                             trade_instrument,
                             w_s,
                         );
@@ -989,9 +1150,20 @@ pub fn main(init: std.process.Init) !u8 {
                 }
                 const snap = engine.snapshot();
                 web_state.update(snap, true);
+                if (startup_flow) |flow| {
+                    applyCapitalFlowEffects(
+                        flow,
+                        &engine,
+                        &bh,
+                        &last_bh_cmp,
+                        &events_repo,
+                        &cfg,
+                        &agent_sched,
+                    );
+                    startup_flow = null;
+                }
 
                 // BH baseline: use live equity (demo real book), not stale toml initial_capital.
-                // Rebase on deposit/withdrawal-sized jumps so alpha is not dominated by inflows.
                 if (!ticker.bid.isZero() and snap.conservative_equity.gt(ab.decimal.Decimal.zero)) {
                     const live_eq = snap.conservative_equity;
                     if (!bh.initialized) {
@@ -1004,29 +1176,8 @@ pub fn main(init: std.process.Init) !u8 {
                             logEvent(&events_repo, &engine, "SHADOW_BH_INIT", "core", "INFO", &cfg);
                             persistShadowBaseline(&kv_repo, bh);
                         }
-                    } else if (ab.shadow_bench.needsRebase(bh.initial_capital, live_eq)) {
-                        const prev_cap = bh.initial_capital;
-                        bh = ab.shadow_bench.init(live_eq, ticker.bid, cfg.taker_fee_rate);
-                        if (bh.initialized) {
-                            std.debug.print(
-                                "[shadow-bh] rebased capital {f} -> {f} entry_bid={f}\n",
-                                .{ prev_cap, bh.initial_capital, bh.entry_bid },
-                            );
-                            var rb: [192]u8 = undefined;
-                            var a_buf: [48]u8 = undefined;
-                            var b_buf: [48]u8 = undefined;
-                            const as = decFmt(&a_buf, prev_cap);
-                            const bs = decFmt(&b_buf, bh.initial_capital);
-                            const rp = std.fmt.bufPrint(
-                                &rb,
-                                "{{\"from\":\"{s}\",\"to\":\"{s}\",\"reason\":\"capital_jump\"}}",
-                                .{ as, bs },
-                            ) catch "{\"reason\":\"capital_jump\"}";
-                            logEventPayload(&events_repo, &engine, "SHADOW_BH_REBASE", "core", "INFO", &cfg, rp);
-                            persistShadowBaseline(&kv_repo, bh);
-                        }
                     }
-                } else if (!bh.initialized and !ticker.bid.isZero()) {
+                } else if (cfg.mode == .shadow and !bh.initialized and !ticker.bid.isZero()) {
                     // Fallback before first equity sample (shadow sim).
                     bh = ab.shadow_bench.init(cfg.initial_capital, ticker.bid, cfg.taker_fee_rate);
                     if (bh.initialized) {
@@ -1063,8 +1214,9 @@ pub fn main(init: std.process.Init) !u8 {
                 // 1-minute equity samples (§6.2 retention).
                 const minute = @divFloor(snap.as_of_ms, 60_000);
                 if (minute != last_sample_min) {
-                    last_sample_min = minute;
-                    writeEquitySample(&equity_repo, snap, last_bh_cmp);
+                    if (writeEquitySample(&equity_repo, &capital_flows_repo, &kv_repo, &db, snap, last_bh_cmp)) {
+                        last_sample_min = minute;
+                    }
                 }
             } else |_| {
                 _ = engine.apply(.{ .clock_tick = .{ .ts_ms = nowMs() } }) catch {};
@@ -1082,7 +1234,18 @@ pub fn main(init: std.process.Init) !u8 {
             const tnow = nowMs();
             if (last_private_ms == 0 or tnow - last_private_ms >= private_reconcile_ms) {
                 last_private_ms = tnow;
-                runPrivateReconcile(gpa, &okx, &engine, &events_repo, &cfg, &runtime_status);
+                const outcome = runPrivateReconcile(gpa, &okx, &db, &engine, &events_repo, &capital_flows_repo, &kv_repo, &bh, &cfg, &runtime_status);
+                if (outcome.flow) |flow| {
+                    applyCapitalFlowEffects(
+                        flow,
+                        &engine,
+                        &bh,
+                        &last_bh_cmp,
+                        &events_repo,
+                        &cfg,
+                        &agent_sched,
+                    );
+                }
             }
             if (envGetTruthy(env, "ALPHABOUND_PRIVATE_WS") and
                 tnow - last_private_ws_ms >= private_ws_reprobe_ms)
@@ -1103,6 +1266,7 @@ pub fn main(init: std.process.Init) !u8 {
                 &fills_repo,
                 &events_repo,
                 &runtime_status,
+                portfolio_refresher,
                 trade_instrument,
                 &last_flatten_exec_ms,
                 false,
@@ -1135,7 +1299,7 @@ pub fn main(init: std.process.Init) !u8 {
                         .{ reason_txt, ab.scheduler.hourUtc(tnow), agent_sched.params.effectiveInterval(ab.scheduler.hourUtc(tnow)) },
                     ) catch "{\"reason\":\"unknown\"}";
                     logEventPayload(&events_repo, &engine, "AGENT_TRIGGER", "agent", "INFO", &cfg, trig_payload);
-                    runAgentDecision(gpa, client, &okx, &cfg, &engine, &tool_reg, &agent_runs, &tool_calls, &llm_usage_repo, &events_repo, &orders_repo, &fills_repo, &equity_repo, &db, &mem_store, &memories_repo, &intel_repo, env, &runtime_status, trade_instrument, &agent_sched, last_bh_cmp);
+                    runAgentDecision(gpa, client, &okx, &cfg, &engine, &tool_reg, &agent_runs, &tool_calls, &llm_usage_repo, &events_repo, &orders_repo, &fills_repo, &equity_repo, &capital_flows_repo, &db, &mem_store, &memories_repo, &intel_repo, env, &runtime_status, trade_instrument, &agent_sched, portfolio_refresher, last_bh_cmp);
                     refreshWebCaches(&web_state, &db, &agent_runs, &equity_repo, &events_repo, &memories_repo, &orders_repo, &fills_repo, last_bh_cmp);
                     ab.web_cache.refreshStatisticsCache(&web_state, &db, &llm_usage_repo);
                     refreshSystemCache(&web_state, &db, &cfg, &mem_store, boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), llm_client != null, admin_paused, &runtime_status, &risk_latency);
@@ -1159,6 +1323,7 @@ pub fn main(init: std.process.Init) !u8 {
                 &events_repo,
                 &memories_repo,
                 &equity_repo,
+                &capital_flows_repo,
                 &intel_repo,
                 &mem_store,
                 &engine,
@@ -1226,6 +1391,7 @@ pub fn main(init: std.process.Init) !u8 {
                         if (llm_client) |*c| @as(?*ab.openai.Client, c) else null,
                         &db,
                         &periodic_repo,
+                        &capital_flows_repo,
                         &llm_usage_repo,
                         &events_repo,
                         &memories_repo,
@@ -1256,7 +1422,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     // ---- Graceful shutdown (§7.4) -------------------------------------------
     std.debug.print("[shutdown] draining after {d} ticks\n", .{tick_count});
-    writeEquitySample(&equity_repo, engine.snapshot(), last_bh_cmp);
+    _ = writeEquitySample(&equity_repo, &capital_flows_repo, &kv_repo, &db, engine.snapshot(), last_bh_cmp);
     refreshWebCaches(&web_state, &db, &agent_runs, &equity_repo, &events_repo, &memories_repo, &orders_repo, &fills_repo, last_bh_cmp);
     ab.web_cache.refreshStatisticsCache(&web_state, &db, &llm_usage_repo);
     logEvent(&events_repo, &engine, "SHUTDOWN_CLEAN", "core", "CRITICAL", &cfg);
@@ -1267,6 +1433,54 @@ const PrivateProbe = union(enum) {
     ok: ab.okx_rest.Balance,
     err: []const u8,
 };
+
+const PrivateReconcileOutcome = struct {
+    ok: bool = false,
+    flow: ?ab.capital_flow.Flow = null,
+};
+
+const AccountReconcileContext = struct {
+    gpa: std.mem.Allocator,
+    okx: *ab.okx_rest.Client,
+    db: *ab.storage.Db,
+    engine: *ab.state.Engine,
+    events_repo: *ab.storage.EventsRepo,
+    capital_flows_repo: *ab.storage.CapitalFlowsRepo,
+    kv_repo: *ab.storage.KvRepo,
+    bh: *ab.shadow_bench.Snapshot,
+    comparison: *ab.shadow_bench.Comparison,
+    cfg: *const ab.config.Config,
+    status: *RuntimeStatus,
+    sched: *ab.scheduler.Scheduler,
+};
+
+fn refreshAccountForExecution(raw: *anyopaque) bool {
+    const ctx: *AccountReconcileContext = @ptrCast(@alignCast(raw));
+    const outcome = runPrivateReconcile(
+        ctx.gpa,
+        ctx.okx,
+        ctx.db,
+        ctx.engine,
+        ctx.events_repo,
+        ctx.capital_flows_repo,
+        ctx.kv_repo,
+        ctx.bh,
+        ctx.cfg,
+        ctx.status,
+    );
+    if (outcome.flow) |flow| {
+        applyCapitalFlowEffects(
+            flow,
+            ctx.engine,
+            ctx.bh,
+            ctx.comparison,
+            ctx.events_repo,
+            ctx.cfg,
+            ctx.sched,
+        );
+    }
+    return outcome.ok;
+}
 
 /// Read-only signed GET /api/v5/account/balance. Never places orders.
 fn probePrivateBalance(gpa: std.mem.Allocator, client: *ab.okx_rest.Client) PrivateProbe {
@@ -1489,23 +1703,96 @@ fn runPrivateWsProbe(
 fn runPrivateReconcile(
     gpa: std.mem.Allocator,
     okx: *ab.okx_rest.Client,
+    db: *ab.storage.Db,
     engine: *ab.state.Engine,
     events_repo: *ab.storage.EventsRepo,
+    capital_flows_repo: *ab.storage.CapitalFlowsRepo,
+    kv_repo: *ab.storage.KvRepo,
+    bh: *ab.shadow_bench.Snapshot,
     cfg: *const ab.config.Config,
     st: *RuntimeStatus,
-) void {
+) PrivateReconcileOutcome {
     const probe = probePrivateBalance(gpa, okx);
     switch (probe) {
         .ok => |b| {
+            const ts_ms = nowMs();
+            var detected: ?ab.capital_flow.Flow = null;
             if (cfg.mode.isTrading()) {
+                const before = engine.snapshot();
+                const prior_balances = loadReconciledBalances(kv_repo) catch |err| {
+                    std.debug.print("[reconcile] stored balance checkpoint unreadable: {t}\n", .{err});
+                    _ = engine.apply(.{ .journal_status = .{ .ok = false } }) catch |state_err| {
+                        std.debug.print("[reconcile] journal fail-close state update failed: {t}\n", .{state_err});
+                    };
+                    return .{};
+                };
+                if (prior_balances == null and before.reconciled) {
+                    std.debug.print("[reconcile] durable balance checkpoint missing — refusing in-memory fallback\n", .{});
+                    _ = engine.apply(.{ .journal_status = .{ .ok = false } }) catch |err| {
+                        std.debug.print("[reconcile] journal fail-close state update failed: {t}\n", .{err});
+                    };
+                    return .{};
+                }
+                if (prior_balances != null and
+                    (!before.bid_price.gt(ab.decimal.Decimal.zero) or !before.freshness.marketFresh(ts_ms)))
+                {
+                    std.debug.print("[reconcile] fresh bid unavailable — refusing to advance balance checkpoint\n", .{});
+                    _ = engine.apply(.{ .journal_status = .{ .ok = false } }) catch |err| {
+                        std.debug.print("[reconcile] journal fail-close state update failed: {t}\n", .{err});
+                    };
+                    return .{};
+                }
+                if (prior_balances != null) {
+                    detected = ab.capital_flow.detect(.{
+                        .before = prior_balances.?,
+                        .after = .{ .cash_usdt = b.usdt_cash, .btc_total = b.btc_cash },
+                        .bid_price = before.bid_price,
+                        .exit_costs = .{
+                            .fee_rate = cfg.taker_fee_rate,
+                            .slippage_rate = cfg.slippage_rate,
+                        },
+                    }) catch |err| {
+                        std.debug.print("[reconcile] capital-flow detection failed: {t}\n", .{err});
+                        _ = engine.apply(.{ .journal_status = .{ .ok = false } }) catch |state_err| {
+                            std.debug.print("[reconcile] journal fail-close state update failed: {t}\n", .{state_err});
+                        };
+                        return .{};
+                    };
+                }
+                if (!persistAccountReconcile(
+                    db,
+                    capital_flows_repo,
+                    events_repo,
+                    engine,
+                    cfg,
+                    kv_repo,
+                    ts_ms,
+                    detected,
+                    .{ .cash_usdt = b.usdt_cash, .btc_total = b.btc_cash },
+                    bh,
+                    before.bid_price,
+                )) {
+                    _ = engine.apply(.{ .journal_status = .{ .ok = false } }) catch |err| {
+                        std.debug.print("[reconcile] journal fail-close state update failed: {t}\n", .{err});
+                    };
+                    return .{};
+                }
                 _ = engine.apply(.{ .reconcile_result = .{
-                    .ts_ms = nowMs(),
+                    .ts_ms = ts_ms,
                     .cash_usdt = b.usdt_cash,
                     .btc_total = b.btc_cash,
                     .btc_available = b.btc_avail,
-                    .hwm_from_db = engine.snapshot().high_watermark,
+                    .hwm_from_db = before.high_watermark,
                     .clean = true,
-                } }) catch {};
+                    .flow_equity_before = if (detected) |f| f.equity_before else ab.decimal.Decimal.zero,
+                    .flow_equity_after = if (detected) |f| f.equity_after else ab.decimal.Decimal.zero,
+                } }) catch |err| {
+                    std.debug.print("[reconcile] account state update failed: {t}\n", .{err});
+                    _ = engine.apply(.{ .journal_status = .{ .ok = false } }) catch |state_err| {
+                        std.debug.print("[reconcile] journal fail-close state update failed: {t}\n", .{state_err});
+                    };
+                    return .{};
+                };
                 std.debug.print(
                     "[reconcile] {t} balance applied usdt={f} avail={f} btc={f}\n",
                     .{ cfg.mode, b.usdt_cash, b.usdt_avail, b.btc_cash },
@@ -1527,6 +1814,7 @@ fn runPrivateReconcile(
             st.setAccount(decFmt(&u_buf, b.usdt_cash), decFmt(&b_buf, b.btc_cash));
             st.setPriv("ok", "balance");
             logEventPayload(events_repo, engine, "PRIVATE_BALANCE_OK", "exchange", "INFO", cfg, payload);
+            return .{ .ok = true, .flow = detected };
         },
         .err => |e| {
             std.debug.print("[reconcile] private balance FAILED: {s}\n", .{e});
@@ -1538,8 +1826,175 @@ fn runPrivateReconcile(
             ) catch "{\"error\":\"unknown\"}";
             st.setPriv(if (std.mem.eql(u8, e, "ip_whitelist")) "ip_whitelist" else "error", e);
             logEventPayload(events_repo, engine, "PRIVATE_BALANCE_FAILED", "exchange", "WARN", cfg, payload);
+            return .{};
         },
     }
+}
+
+fn persistAccountReconcile(
+    db: *ab.storage.Db,
+    repo: *ab.storage.CapitalFlowsRepo,
+    events_repo: *ab.storage.EventsRepo,
+    engine: *ab.state.Engine,
+    cfg: *const ab.config.Config,
+    kv_repo: *ab.storage.KvRepo,
+    ts_ms: i64,
+    flow: ?ab.capital_flow.Flow,
+    balances: ab.capital_flow.Balances,
+    bh: *ab.shadow_bench.Snapshot,
+    bid: ab.decimal.Decimal,
+) bool {
+    var ts_buf: [40]u8 = undefined;
+    const ts = ab.clock.formatRfc3339Ms(ts_ms, &ts_buf) catch {
+        std.debug.print("[reconcile] checkpoint timestamp formatting failed\n", .{});
+        return false;
+    };
+    var durable_hwm = engine.snapshot().high_watermark;
+    var durable_bh = bh.*;
+    if (flow) |capital_flow| {
+        durable_hwm = ab.risk_equity.adjustHighWatermarkForFlow(
+            durable_hwm,
+            capital_flow.equity_before,
+            capital_flow.equity_after,
+        ) catch |err| {
+            std.debug.print("[reconcile] durable HWM adjustment failed: {t}\n", .{err});
+            return false;
+        };
+        if (durable_bh.initialized and bid.gt(ab.decimal.Decimal.zero)) {
+            durable_bh = ab.shadow_bench.applyCapitalFlow(
+                durable_bh,
+                capital_flow.quote_value,
+                bid,
+                capital_flow.equity_before,
+            ) catch |err| {
+                std.debug.print("[reconcile] durable BH adjustment failed: {t}\n", .{err});
+                return false;
+            };
+        } else if (capital_flow.equity_after.gt(ab.decimal.Decimal.zero) and bid.gt(ab.decimal.Decimal.zero)) {
+            durable_bh = ab.shadow_bench.init(capital_flow.equity_after, bid, cfg.taker_fee_rate);
+            if (!durable_bh.initialized) {
+                std.debug.print("[reconcile] durable BH initialization failed\n", .{});
+                return false;
+            }
+        }
+    }
+
+    db.execAll("BEGIN IMMEDIATE") catch |err| {
+        std.debug.print("[reconcile] transaction begin failed: {t}\n", .{err});
+        return false;
+    };
+    var committed = false;
+    defer if (!committed) {
+        db.execAll("ROLLBACK") catch |err| {
+            std.debug.print("[reconcile] transaction rollback failed: {t}\n", .{err});
+        };
+    };
+
+    if (flow) |capital_flow| {
+        if (!recordCapitalFlow(repo, events_repo, engine, cfg, ts_ms, capital_flow)) return false;
+    }
+    if (!persistReconciledBalances(kv_repo, balances)) {
+        std.debug.print("[reconcile] balance checkpoint persistence failed\n", .{});
+        return false;
+    }
+    if (!persistHwm(kv_repo, durable_hwm, ts)) {
+        std.debug.print("[reconcile] HWM checkpoint persistence failed\n", .{});
+        return false;
+    }
+    if (flow != null and !putShadowBaseline(kv_repo, durable_bh, ts)) {
+        std.debug.print("[reconcile] BH checkpoint persistence failed\n", .{});
+        return false;
+    }
+    db.execAll("COMMIT") catch |err| {
+        std.debug.print("[reconcile] transaction commit failed: {t}\n", .{err});
+        return false;
+    };
+    committed = true;
+    bh.* = durable_bh;
+    return true;
+}
+
+fn recordCapitalFlow(
+    repo: *ab.storage.CapitalFlowsRepo,
+    events_repo: *ab.storage.EventsRepo,
+    engine: *ab.state.Engine,
+    cfg: *const ab.config.Config,
+    ts_ms: i64,
+    flow: ab.capital_flow.Flow,
+) bool {
+    var ts_buf: [32]u8 = undefined;
+    const ts = ab.clock.formatRfc3339Ms(ts_ms, &ts_buf) catch return false;
+    var id_buf: [96]u8 = undefined;
+    const flow_id = std.fmt.bufPrint(&id_buf, "flow_{d}_{d}", .{ ts_ms, engine.snapshot().version }) catch return false;
+    var cash_buf: [48]u8 = undefined;
+    var btc_buf: [48]u8 = undefined;
+    var quote_buf: [48]u8 = undefined;
+    var before_buf: [48]u8 = undefined;
+    var after_buf: [48]u8 = undefined;
+    const cash = decFmt(&cash_buf, flow.cash_delta);
+    const btc = decFmt(&btc_buf, flow.btc_delta);
+    const quote = decFmt(&quote_buf, flow.quote_value);
+    const equity_before = decFmt(&before_buf, flow.equity_before);
+    const equity_after = decFmt(&after_buf, flow.equity_after);
+    var payload_buf: [512]u8 = undefined;
+    const payload = std.fmt.bufPrint(
+        &payload_buf,
+        "{{\"flow_id\":\"{s}\",\"direction\":\"{s}\",\"cash_delta\":\"{s}\",\"btc_delta\":\"{s}\",\"quote_value\":\"{s}\",\"classification\":\"external_capital_not_pnl\"}}",
+        .{ flow_id, flow.direction.text(), cash, btc, quote },
+    ) catch return false;
+    if (!logEventPayloadChecked(events_repo, engine, "CAPITAL_FLOW_DETECTED", "reconcile", "INFO", cfg, payload)) {
+        return false;
+    }
+    repo.append(.{
+        .flow_id = flow_id,
+        .ts = ts,
+        .direction = flow.direction.text(),
+        .cash_delta = cash,
+        .btc_delta = btc,
+        .quote_value = quote,
+        .equity_before = equity_before,
+        .equity_after = equity_after,
+    }) catch |err| {
+        std.debug.print("[capital-flow] projection append failed: {t}\n", .{err});
+        return false;
+    };
+    std.debug.print("[capital-flow] detected direction={s} quote={s}\n", .{ flow.direction.text(), quote });
+    return true;
+}
+
+fn applyCapitalFlowEffects(
+    flow: ab.capital_flow.Flow,
+    engine: *ab.state.Engine,
+    bh: *ab.shadow_bench.Snapshot,
+    comparison: *ab.shadow_bench.Comparison,
+    events_repo: *ab.storage.EventsRepo,
+    cfg: *const ab.config.Config,
+    sched: *ab.scheduler.Scheduler,
+) void {
+    sched.noteCapitalFlow();
+
+    const snap = engine.snapshot();
+    if (!snap.bid_price.gt(ab.decimal.Decimal.zero)) return;
+    const previous_capital = if (bh.initialized)
+        bh.initial_capital.sub(flow.quote_value) catch bh.initial_capital
+    else if (flow.quote_value.isNegative())
+        flow.quote_value.abs()
+    else
+        ab.decimal.Decimal.zero;
+    if (!bh.initialized and snap.conservative_equity.gt(ab.decimal.Decimal.zero)) {
+        bh.* = ab.shadow_bench.init(snap.conservative_equity, snap.bid_price, cfg.taker_fee_rate);
+    }
+    comparison.* = ab.shadow_bench.evaluate(bh.*, snap.bid_price, snap.conservative_equity);
+
+    var payload_buf: [256]u8 = undefined;
+    var old_buf: [48]u8 = undefined;
+    var new_buf: [48]u8 = undefined;
+    const payload = std.fmt.bufPrint(
+        &payload_buf,
+        "{{\"from\":\"{s}\",\"to\":\"{s}\",\"reason\":\"external_capital_flow\"}}",
+        .{ decFmt(&old_buf, previous_capital), decFmt(&new_buf, bh.initial_capital) },
+    ) catch "{\"reason\":\"external_capital_flow\"}";
+    logEventPayload(events_repo, engine, "SHADOW_BH_REBASE", "core", "INFO", cfg, payload);
 }
 
 /// Fetch market.ticker + market.candles + market.derivatives; journal
@@ -2035,6 +2490,7 @@ fn refreshBeforeAdmission(
     okx: *ab.okx_rest.Client,
     cfg: *const ab.config.Config,
     engine: *ab.state.Engine,
+    portfolio_refresher: ab.demo_runner.PortfolioRefresher,
 ) void {
     var path_buf: [128]u8 = undefined;
     const path = std.fmt.bufPrint(&path_buf, "/api/v5/market/ticker?instId={s}", .{cfg.instrument}) catch return;
@@ -2042,14 +2498,14 @@ fn refreshBeforeAdmission(
         defer gpa.free(body);
         if (ab.okx_rest.parseTicker(gpa, body)) |ticker| {
             _ = engine.apply(.{ .market_tick = .{
-                .ts_ms = nowMs(),
+                .ts_ms = ticker.ts_ms,
                 .bid = ticker.bid,
                 .mark = ticker.last,
             } }) catch {};
         } else |_| {}
     } else |_| {}
     if (cfg.mode.isTrading()) {
-        _ = refreshDemoPortfolio(gpa, okx, engine);
+        _ = portfolio_refresher.run();
     }
 }
 
@@ -2065,6 +2521,7 @@ fn driveFlattenPosition(
     fills_repo: *ab.storage.FillsRepo,
     events_repo: *ab.storage.EventsRepo,
     st: *RuntimeStatus,
+    portfolio_refresher: ab.demo_runner.PortfolioRefresher,
     instrument: ab.planner.Instrument,
     last_exec_ms: *i64,
     force: bool,
@@ -2102,6 +2559,7 @@ fn driveFlattenPosition(
         fills_repo,
         events_repo,
         st,
+        portfolio_refresher,
         instrument,
         "0",
     );
@@ -2126,6 +2584,7 @@ fn runOperatorTargetWeight(
     fills_repo: *ab.storage.FillsRepo,
     events_repo: *ab.storage.EventsRepo,
     st: *RuntimeStatus,
+    portfolio_refresher: ab.demo_runner.PortfolioRefresher,
     instrument: ab.planner.Instrument,
     weight_s: []const u8,
 ) []const u8 {
@@ -2142,7 +2601,7 @@ fn runOperatorTargetWeight(
         return "exec_off";
     }
 
-    refreshBeforeAdmission(gpa, okx, cfg, engine);
+    refreshBeforeAdmission(gpa, okx, cfg, engine, portfolio_refresher);
     const snap = engine.snapshot();
     const admit_now = nowMs();
     const admission = shadowAdmit(snap, snap.version, target, cfg, admit_now);
@@ -2162,6 +2621,7 @@ fn runOperatorTargetWeight(
         orders_repo,
         fills_repo,
         events_repo,
+        portfolio_refresher,
         decision_id,
         admission,
         instrument,
@@ -2285,6 +2745,7 @@ fn runAgentDecision(
     orders_repo: *ab.storage.OrdersRepo,
     fills_repo: *ab.storage.FillsRepo,
     equity_repo: *ab.storage.EquityRepo,
+    capital_flows_repo: *ab.storage.CapitalFlowsRepo,
     db: *ab.storage.Db,
     mem_store: *ab.memory.Store,
     memories_repo: *ab.storage.MemoriesRepo,
@@ -2293,6 +2754,7 @@ fn runAgentDecision(
     st: *RuntimeStatus,
     instrument: ab.planner.Instrument,
     sched: *ab.scheduler.Scheduler,
+    portfolio_refresher: ab.demo_runner.PortfolioRefresher,
     bh_cmp: ab.shadow_bench.Comparison,
 ) void {
     const snap = engine.snapshot();
@@ -2341,6 +2803,11 @@ fn runAgentDecision(
     var ev_ptrs: [12][]const u8 = undefined;
     const ev_n = events_repo.listCompactForContext(db, &ev_backing, &ev_ptrs) catch 0;
     const recent_events = ev_ptrs[0..ev_n];
+
+    var flow_backing: [4096]u8 = undefined;
+    var flow_ptrs: [ab.context.MAX_CAPITAL_FLOWS][]const u8 = undefined;
+    const flow_n = capital_flows_repo.listForContext(db, &flow_backing, &flow_ptrs) catch 0;
+    const capital_flows = flow_ptrs[0..flow_n];
 
     // Self-review: own recent proposals compacted from the audit log,
     // executions (fills joined to orders), and equity marks at fixed horizons.
@@ -2403,6 +2870,7 @@ fn runAgentDecision(
     const ctx_json = ab.context.render(&ctx_buf, .{
         .snapshot = snap,
         .recent_events = recent_events,
+        .capital_flows = capital_flows,
         .memories = scored.items,
         .registry = registry,
         .tool_observations = observations,
@@ -2524,6 +2992,7 @@ fn runAgentDecision(
         const ctx_json2 = ab.context.render(&ctx_buf2, .{
             .snapshot = snap,
             .recent_events = recent_events,
+            .capital_flows = capital_flows,
             .memories = scored.items,
             .registry = registry,
             .tool_observations = all_obs[0 .. obs_n + 1],
@@ -2618,7 +3087,7 @@ fn runAgentDecision(
         .hold => "HOLD",
         .rebalance => "REBALANCE",
     };
-    refreshBeforeAdmission(gpa, okx, cfg, engine);
+    refreshBeforeAdmission(gpa, okx, cfg, engine, portfolio_refresher);
     const admit_snap = engine.snapshot();
     const admit_now = nowMs();
     const bound_version = bindProposalVersion(prop.snapshot_version, decision_start_version, admit_snap.version);
@@ -2643,6 +3112,7 @@ fn runAgentDecision(
             orders_repo,
             fills_repo,
             events_repo,
+            portfolio_refresher,
             prop.decision_id,
             admission,
             instrument,
@@ -2750,16 +3220,15 @@ fn tryDemoExecute(
     orders_repo: *ab.storage.OrdersRepo,
     fills_repo: *ab.storage.FillsRepo,
     events_repo: *ab.storage.EventsRepo,
+    portfolio_refresher: ab.demo_runner.PortfolioRefresher,
     decision_id: []const u8,
     admission: ShadowAdmission,
     instrument: ab.planner.Instrument,
     snap_in: ab.state.PortfolioState,
     order_policy: ab.proposal.OrderPolicy,
 ) []const u8 {
-    return ab.demo_runner.tryDemoExecute(gpa, okx, cfg, engine, orders_repo, fills_repo, events_repo, decision_id, admission.verdict_txt, admission.admitted_weight, instrument, snap_in, order_policy);
+    return ab.demo_runner.tryDemoExecute(gpa, okx, cfg, engine, orders_repo, fills_repo, events_repo, portfolio_refresher, decision_id, admission.verdict_txt, admission.admitted_weight, instrument, snap_in, order_policy);
 }
-
-const refreshDemoPortfolio = ab.demo_runner.refreshDemoPortfolio;
 
 /// Cancel pending trading orders (shadow: no-op count 0).
 fn adminCancelAll(
@@ -3313,6 +3782,7 @@ fn processReviewInbox(
     events_repo: *ab.storage.EventsRepo,
     memories_repo: *ab.storage.MemoriesRepo,
     equity_repo: *ab.storage.EquityRepo,
+    capital_flows_repo: *ab.storage.CapitalFlowsRepo,
     intel_repo: *ab.storage.IntelRepo,
     mem_store: *ab.memory.Store,
     engine: *ab.state.Engine,
@@ -3343,6 +3813,7 @@ fn processReviewInbox(
                 client,
                 db,
                 periodic_repo,
+                capital_flows_repo,
                 llm_usage_repo,
                 events_repo,
                 memories_repo,
@@ -3791,10 +4262,16 @@ fn periodicCountRange(
 /// written before migration 0006 — we then simply omit the benchmark instead
 /// of backfilling a guess.
 const PeriodicEdge = struct {
+    ts_buf: [32]u8 = undefined,
+    ts_len: usize = 0,
     equity: ab.decimal.Decimal = ab.decimal.Decimal.zero,
     bh_equity: ab.decimal.Decimal = ab.decimal.Decimal.zero,
     has_bh: bool = false,
     found: bool = false,
+
+    fn ts(self: *const PeriodicEdge) []const u8 {
+        return self.ts_buf[0..self.ts_len];
+    }
 };
 
 fn periodicEdge(
@@ -3804,10 +4281,10 @@ fn periodicEdge(
     comptime newest: bool,
 ) PeriodicEdge {
     const sql: [:0]const u8 = if (newest)
-        \\SELECT equity, bh_equity FROM equity_samples
+        \\SELECT ts, equity, bh_equity FROM equity_samples
         \\WHERE ts >= ?1 AND ts <= ?2 ORDER BY ts DESC LIMIT 1
     else
-        \\SELECT equity, bh_equity FROM equity_samples
+        \\SELECT ts, equity, bh_equity FROM equity_samples
         \\WHERE ts >= ?1 AND ts <= ?2 ORDER BY ts ASC LIMIT 1
     ;
     var stmt = db.prepare(sql) catch return .{};
@@ -3816,8 +4293,11 @@ fn periodicEdge(
     stmt.bindText(2, ts_to) catch return .{};
     if (!(stmt.step() catch return .{})) return .{};
     var out: PeriodicEdge = .{ .found = true };
-    out.equity = ab.decimal.Decimal.parse(stmt.columnText(0)) catch ab.decimal.Decimal.zero;
-    const bh_text = stmt.columnText(1);
+    const ts = stmt.columnText(0);
+    out.ts_len = @min(ts.len, out.ts_buf.len);
+    @memcpy(out.ts_buf[0..out.ts_len], ts[0..out.ts_len]);
+    out.equity = ab.decimal.Decimal.parse(stmt.columnText(1)) catch ab.decimal.Decimal.zero;
+    const bh_text = stmt.columnText(2);
     if (bh_text.len > 0) {
         if (ab.decimal.Decimal.parse(bh_text)) |v| {
             if (v.gt(ab.decimal.Decimal.zero)) {
@@ -3843,18 +4323,12 @@ fn periodicMaxDrawdown(db: *ab.storage.Db, ts_from: []const u8, ts_to: []const u
     return ab.decimal.Decimal.parse(stmt.columnText(0)) catch ab.decimal.Decimal.zero;
 }
 
-/// Relative change (end/start − 1); zero when the start mark is unusable.
-fn periodicReturn(start: ab.decimal.Decimal, end: ab.decimal.Decimal) ab.decimal.Decimal {
-    if (!start.gt(ab.decimal.Decimal.zero)) return ab.decimal.Decimal.zero;
-    const ratio = end.div(start, .down) catch return ab.decimal.Decimal.zero;
-    return ratio.sub(ab.decimal.Decimal.one) catch ab.decimal.Decimal.zero;
-}
-
 /// Collect the deterministic window facts. Every number comes from the ledger;
 /// the model gets no chance to invent them.
 fn collectPeriodicFacts(
     db: *ab.storage.Db,
     periodic_repo: *ab.storage.PeriodicReviewsRepo,
+    capital_flows_repo: *ab.storage.CapitalFlowsRepo,
     mem_store: *ab.memory.Store,
     engine: *ab.state.Engine,
     cfg: *const ab.config.Config,
@@ -3918,7 +4392,8 @@ fn collectPeriodicFacts(
         \\WHERE type = 'AGENT_PROPOSAL_OK' AND ts >= ?1 AND ts <= ?2
         \\  AND COALESCE(json_extract(payload_json,'$.executed'),0) = 1
     , ts_from, ts_to);
-    f.fills = periodicCountRange(db,
+    f.fills = periodicCountRange(
+        db,
         "SELECT COUNT(*) FROM fills WHERE ts >= ?1 AND ts <= ?2",
         ts_from,
         ts_to,
@@ -3928,7 +4403,16 @@ fn collectPeriodicFacts(
     const last = periodicEdge(db, ts_from, ts_to, true);
     f.equity_start = first.equity;
     f.equity_end = if (last.found) last.equity else snap.conservative_equity;
-    f.window_return = periodicReturn(f.equity_start, f.equity_end);
+    const flow_window = capital_flows_repo.summarizeWindow(
+        db,
+        if (first.found) first.ts() else ts_from,
+        if (last.found) last.ts() else ts_to,
+        f.equity_start,
+        f.equity_end,
+    ) catch ab.storage.CapitalFlowWindow{};
+    f.window_return = flow_window.adjusted_return;
+    f.capital_flow_count = flow_window.count;
+    f.net_capital_flow = flow_window.net_flow;
     f.max_drawdown = periodicMaxDrawdown(db, ts_from, ts_to);
     f.hwm = snap.high_watermark;
     f.btc_weight = ab.context.btcWeight(snap);
@@ -3954,16 +4438,25 @@ fn collectPeriodicFacts(
     // report no benchmark rather than a half-window comparison.
     if (first.has_bh and last.has_bh and first.found and last.found) {
         f.has_benchmark = true;
-        f.bh_return = periodicReturn(first.bh_equity, last.bh_equity);
+        const bh_window = capital_flows_repo.summarizeWindow(
+            db,
+            first.ts(),
+            last.ts(),
+            first.bh_equity,
+            last.bh_equity,
+        ) catch ab.storage.CapitalFlowWindow{};
+        f.bh_return = bh_window.adjusted_return;
         f.alpha_return = f.window_return.sub(f.bh_return) catch ab.decimal.Decimal.zero;
     }
 
-    f.audit_alerts = periodicCountRange(db,
+    f.audit_alerts = periodicCountRange(
+        db,
         "SELECT COUNT(*) FROM audit_reports WHERE ts >= ?1 AND ts <= ?2 AND status = 'alert'",
         ts_from,
         ts_to,
     );
-    f.audit_warns = periodicCountRange(db,
+    f.audit_warns = periodicCountRange(
+        db,
         "SELECT COUNT(*) FROM audit_reports WHERE ts >= ?1 AND ts <= ?2 AND status = 'warn'",
         ts_from,
         ts_to,
@@ -3985,6 +4478,7 @@ fn runPeriodicReview(
     client_opt: ?*ab.openai.Client,
     db: *ab.storage.Db,
     periodic_repo: *ab.storage.PeriodicReviewsRepo,
+    capital_flows_repo: *ab.storage.CapitalFlowsRepo,
     llm_usage_repo: *ab.storage.LlmUsageRepo,
     events_repo: *ab.storage.EventsRepo,
     memories_repo: *ab.storage.MemoriesRepo,
@@ -4007,7 +4501,7 @@ fn runPeriodicReview(
     const ts_from = ab.clock.formatRfc3339Ms(now_ms - window_ms, &from_buf) catch return;
     const ts_to = ab.clock.formatRfc3339Ms(now_ms, &to_buf) catch return;
 
-    const facts = collectPeriodicFacts(db, periodic_repo, mem_store, engine, cfg, cycle, ts_from, ts_to, window_ms, min_size, min_notional);
+    const facts = collectPeriodicFacts(db, periodic_repo, capital_flows_repo, mem_store, engine, cfg, cycle, ts_from, ts_to, window_ms, min_size, min_notional);
     var facts_buf: [4096]u8 = undefined;
     var fw: std.Io.Writer = .fixed(&facts_buf);
     facts.writeJson(&fw) catch {
@@ -4209,8 +4703,8 @@ fn distillPeriodicMemory(
             "\"executed\":{d},\"alpha\":\"{s}\",\"cash_covers_min_buy\":{},\"source\":\"periodic_review\"," ++
             "\"tags\":[\"periodic_review\",\"{s}\",\"reflection\"]}}",
         .{
-            cycle.text(),            facts.window_from, facts.window_to, note,
-            facts.proposals,         facts.holds,       facts.executed,  alpha_s,
+            cycle.text(),              facts.window_from, facts.window_to, note,
+            facts.proposals,           facts.holds,       facts.executed,  alpha_s,
             facts.cash_covers_min_buy, cfg.instrument,
         },
     ) catch return null;
@@ -4536,7 +5030,6 @@ fn runScheduledAudit(
     std.debug.print("[audit] {s} findings={d} window_ms={d}\n", .{ sev.text(), findings_n, window_ms });
 }
 
-
 /// Explicit human action: distill a review conversation into ONE bounded,
 /// low-confidence reflection memory (the only sanctioned channel from human
 /// review into agent context).
@@ -4742,7 +5235,6 @@ fn webThreadMain(io: std.Io, host: []const u8, port: u16, ws: *WebState) void {
     };
 }
 
-
 /// Venue authorization for trading execution: simulated keys, or explicit
 /// real-money opt-in (OKX_REAL_MONEY_OK=1). Set once during boot.
 var exec_venue_authorized: bool = false;
@@ -4807,11 +5299,14 @@ fn consumeMaintenanceMarker(
 
 fn writeEquitySample(
     repo: *ab.storage.EquityRepo,
+    capital_flows_repo: *ab.storage.CapitalFlowsRepo,
+    kv_repo: *ab.storage.KvRepo,
+    db: *ab.storage.Db,
     snap: ab.state.PortfolioState,
     bh: ab.shadow_bench.Comparison,
-) void {
+) bool {
     var ts_buf: [32]u8 = undefined;
-    const ts = ab.clock.formatRfc3339Ms(snap.as_of_ms, &ts_buf) catch return;
+    const ts = ab.clock.formatRfc3339Ms(snap.as_of_ms, &ts_buf) catch return false;
     var e_buf: [48]u8 = undefined;
     var h_buf: [48]u8 = undefined;
     var d_buf: [48]u8 = undefined;
@@ -4820,7 +5315,24 @@ fn writeEquitySample(
     var p_buf: [48]u8 = undefined;
     var q_buf: [48]u8 = undefined;
     var bh_buf: [48]u8 = undefined;
+    var flow_buf: [48]u8 = undefined;
+    var flow_moment_buf: [64]u8 = undefined;
+    const attribution = capital_flows_repo.attributionSinceLastEquitySample(db, ts) catch {
+        std.debug.print("[journal] capital-flow attribution failed\n", .{});
+        return false;
+    };
+    const flow_moment = std.fmt.bufPrint(&flow_moment_buf, "{d}", .{attribution.moment_ms}) catch return false;
     const btc_value = snap.btc_total.mul(snap.bid_price, .down) catch ab.decimal.Decimal.zero;
+    db.execAll("BEGIN IMMEDIATE") catch |err| {
+        std.debug.print("[journal] equity sample transaction begin failed: {t}\n", .{err});
+        return false;
+    };
+    var committed = false;
+    defer if (!committed) {
+        db.execAll("ROLLBACK") catch |err| {
+            std.debug.print("[journal] equity sample rollback failed: {t}\n", .{err});
+        };
+    };
     repo.append(.{
         .ts = ts,
         .interval = "1m",
@@ -4834,9 +5346,22 @@ fn writeEquitySample(
         .bid_price = decFmt(&p_buf, snap.bid_price),
         .btc_qty = decFmt(&q_buf, snap.btc_total),
         .bh_equity = decFmt(&bh_buf, bh.bh_equity),
+        .capital_flow = decFmt(&flow_buf, attribution.net_flow),
+        .capital_flow_moment = flow_moment,
     }) catch |err| {
         std.debug.print("[journal] equity sample failed: {t}\n", .{err});
+        return false;
     };
+    if (!persistHwm(kv_repo, snap.high_watermark, ts)) {
+        std.debug.print("[journal] HWM checkpoint failed\n", .{});
+        return false;
+    }
+    db.execAll("COMMIT") catch |err| {
+        std.debug.print("[journal] equity sample transaction commit failed: {t}\n", .{err});
+        return false;
+    };
+    committed = true;
+    return true;
 }
 
 fn decFmt(buf: []u8, v: ab.decimal.Decimal) []const u8 {

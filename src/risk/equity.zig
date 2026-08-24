@@ -52,6 +52,20 @@ pub fn updateHighWatermark(prev_hwm: Decimal, equity: Decimal) Decimal {
     return Decimal.max(prev_hwm, equity);
 }
 
+/// Rescale an absolute HWM when external capital changes the account size.
+/// This preserves the pre-flow drawdown percentage instead of treating a
+/// deposit as profit or a withdrawal as a loss.
+pub fn adjustHighWatermarkForFlow(
+    hwm: Decimal,
+    equity_before: Decimal,
+    equity_after: Decimal,
+) dec.DecimalError!Decimal {
+    if (!equity_after.gt(Decimal.zero)) return Decimal.zero;
+    if (!hwm.gt(Decimal.zero) or !equity_before.gt(Decimal.zero)) return equity_after;
+    const scaled = try (try hwm.mul(equity_after, .up)).div(equity_before, .up);
+    return Decimal.max(scaled, equity_after);
+}
+
 /// Drawdown as a fraction of HWM in [0, 1]; zero when HWM is not positive.
 pub fn drawdown(hwm: Decimal, equity: Decimal) dec.DecimalError!Decimal {
     if (!hwm.gt(Decimal.zero)) return Decimal.zero;
@@ -109,6 +123,19 @@ test "hwm never decreases" {
         try testing.expect(next.gte(e));
         hwm = next;
     }
+}
+
+test "capital flow rescales HWM without changing drawdown performance" {
+    const before_dd = try drawdown(d("100"), d("95"));
+    const deposit_hwm = try adjustHighWatermarkForFlow(d("100"), d("95"), d("195"));
+    const after_deposit_dd = try drawdown(deposit_hwm, d("195"));
+    const deposit_diff = try after_deposit_dd.sub(before_dd);
+    try testing.expect(deposit_diff.abs().lte(d("0.00000001")));
+
+    const withdrawal_hwm = try adjustHighWatermarkForFlow(d("100"), d("95"), d("47.5"));
+    try testing.expect(withdrawal_hwm.eql(d("50")));
+    const after_withdrawal_dd = try drawdown(withdrawal_hwm, d("47.5"));
+    try testing.expect(after_withdrawal_dd.eql(before_dd));
 }
 
 test "property: drawdown in [0,1] and consistent with budget sign" {

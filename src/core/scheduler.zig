@@ -29,6 +29,7 @@ pub const TriggerReason = enum {
     price_move,
     drawdown_step,
     risk_mode_change,
+    capital_flow,
 
     pub fn text(self: TriggerReason) []const u8 {
         return switch (self) {
@@ -39,6 +40,7 @@ pub const TriggerReason = enum {
             .price_move => "price_move",
             .drawdown_step => "drawdown_step",
             .risk_mode_change => "risk_mode_change",
+            .capital_flow => "capital_flow",
         };
     }
 };
@@ -169,6 +171,7 @@ pub const Scheduler = struct {
     /// rebalance). Drives the escalating price_move cooldown; reset by
     /// `noteOutcome(true)` when a decision actually trades.
     consecutive_noops: u32 = 0,
+    capital_flow_pending: bool = false,
 
     pub fn init(params: Params) Scheduler {
         return .{ .params = params };
@@ -190,6 +193,8 @@ pub const Scheduler = struct {
         if (elapsed < p.min_interval_ms) return .{};
 
         // Event triggers (advisory-only; risk kernel already acted on its own).
+        if (self.capital_flow_pending)
+            return .{ .fire = true, .reason = .capital_flow };
         if (risk_mode != self.last_risk_mode)
             return .{ .fire = true, .reason = .risk_mode_change };
 
@@ -233,6 +238,11 @@ pub const Scheduler = struct {
         self.last_drawdown = drawdown;
         self.last_risk_mode = risk_mode;
         self.hold_until_ms = 0;
+        self.capital_flow_pending = false;
+    }
+
+    pub fn noteCapitalFlow(self: *Scheduler) void {
+        self.capital_flow_pending = true;
     }
 
     /// Honor `review_after` on a no-op decision (HOLD, or REBALANCE that
@@ -298,6 +308,22 @@ test "parseHours accepts empty, plain, and wrap ranges" {
     try testing.expectError(error.InvalidHours, parseHours("25-3"));
     try testing.expectError(error.InvalidHours, parseHours("abc"));
     try testing.expectError(error.InvalidHours, parseHours("13"));
+}
+
+test "capital flow pulls the next decision forward after cooldown" {
+    var s = Scheduler.init(.{
+        .base_interval_ms = 60_000,
+        .min_interval_ms = 1_000,
+    });
+    s.commit(10_000, d("50000"), d("0.02"), .normal);
+    s.noteCapitalFlow();
+
+    try testing.expect(!s.evaluate(10_999, d("50000"), d("0.02"), .normal).fire);
+    const triggered = s.evaluate(11_000, d("50000"), d("0.02"), .normal);
+    try testing.expect(triggered.fire);
+    try testing.expectEqual(TriggerReason.capital_flow, triggered.reason);
+    s.commit(11_000, d("50000"), d("0.02"), .normal);
+    try testing.expect(!s.evaluate(12_000, d("50000"), d("0.02"), .normal).fire);
 }
 
 test "first run fires immediately; base interval 0 disables" {

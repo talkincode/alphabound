@@ -29,6 +29,8 @@ Or use the helper (requires `sshx` and `HOST=`):
 
 ```bash
 HOST=your-sshx-host ./scripts/deploy-remote.sh
+# Optional: ship a dedicated secrets file instead of ./secrets.env
+# HOST=your-sshx-host SECRETS_FILE=./secrets.other.env ./scripts/deploy-remote.sh
 HOST=your-sshx-host ./scripts/check-remote.sh
 # Rolling-soak acceptance: deploy restarts (logged to
 # /var/lib/alphabound/deploys.log by install) are expected; only

@@ -23,6 +23,7 @@
 - **高 BTC 权重跟踪基准**：`btc_weight` 已经接近 1 时，组合收益应几乎等于买入持有；跟踪差来自残余现金与费用，不是 HOLD 策略放弃了仓位。`portfolio` 里的现金/权重字段是窗口结束快照。
 - **REBALANCE 未成交**：提案很多但 `execution.fills` 为 0 时，先看 `cash_covers_min_buy` 和准入计数。买不起的加仓会被规划层变成 HOLD，这不是系统故障。
 - **样本量诚实**：8 小时窗口内几次决策不足以证伪一个策略假设。证据弱就把 `confidence_delta` 写小（±0.02 量级），或者干脆不动。
+- **资金流不是收益**：`portfolio.capital_flow_count` / `net_capital_flow` 是外部入出金；`portfolio.return` 已按 `return_method=modified_dietz` 剔除资金流。不要把净值台阶写成策略盈利或亏损。
 - **不要仪式性更新**：只有当这个窗口确实构成对某条记忆的正/反证据时才 UPDATE 它。
 - **不要凭空发明**：没有成交就不要写成交；`benchmark` 为 null 时不要谈超额收益。
 - 降级信息（`status`、`health.audit_alerts`、`runs_error`）属于**系统健康**，也应进入 findings —— 模型调用一直失败也是复盘结论。

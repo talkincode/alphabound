@@ -1932,7 +1932,7 @@ let rvLastMarkerSig = "";
 // --- Lightweight Charts state (lazy-init, incremental setData) ---
 let candleChart = null, candleSeries = null, volumeSeries = null, timeSeries = null;
 let equityChart = null, equitySeries = null, hwmSeries = null;
-let fngChart = null, fngLineSeries = [], fngBandSeries = [], fngMidSeries = null;
+let fngChart = null, fngLineSeries = null, fngBandSeries = [], fngMidSeries = null;
 let statsBookChart = null, statsEqSeries = null, statsBhSeries = null, statsTurnSeries = null;
 let lastCandleSig = "";
 let lastEquitySig = "";
@@ -2767,54 +2767,44 @@ function fngTone(cls) {
   return "";
 }
 
-function fngSplitByZone(line) {
-  const out = FNG_ZONES.map(() => []);
+function fngPointColor(v) {
+  return FNG_ZONES[fngZoneOf(v)].color;
+}
+
+// Single series + per-point color. Splitting by zone into 5 line series left
+// a horizontal ghost at each cut (24/44/55/75) when whitespace failed to gap.
+function fngColoredLine(line) {
+  const out = [];
   if (!line.length) return out;
 
-  function addVal(zi, t, v) {
-    const arr = out[zi];
-    const pt = { time: Math.round(t), value: v };
-    if (arr.length && arr[arr.length - 1].time === pt.time) {
-      arr[arr.length - 1] = pt;
+  function push(t, v) {
+    const time = Math.round(t);
+    const pt = { time: time, value: v, color: fngPointColor(v) };
+    if (out.length && out[out.length - 1].time === time) {
+      out[out.length - 1] = pt;
       return;
     }
-    arr.push(pt);
-  }
-  function addBreak(zi, t) {
-    const arr = out[zi];
-    if (!arr.length || arr[arr.length - 1].value == null) return;
-    let time = Math.round(t);
-    if (arr[arr.length - 1].time >= time) time = arr[arr.length - 1].time + 1;
-    arr.push({ time });
-  }
-  function lerpT(t0, v0, t1, v1, v) {
-    if (v1 === v0) return t1;
-    return t0 + (t1 - t0) * ((v - v0) / (v1 - v0));
+    if (out.length && out[out.length - 1].time > time) return;
+    out.push(pt);
   }
 
-  addVal(fngZoneOf(line[0].value), line[0].time, line[0].value);
+  push(line[0].time, line[0].value);
   for (let i = 1; i < line.length; i++) {
     let t0 = line[i - 1].time, v0 = line[i - 1].value;
     const t1 = line[i].time, v1 = line[i].value;
     let z0 = fngZoneOf(v0);
     const z1 = fngZoneOf(v1);
-    if (z0 !== z1) {
+    if (z0 !== z1 && v1 !== v0) {
       const step = z1 > z0 ? 1 : -1;
       for (let z = z0; z !== z1; z += step) {
         const cut = step > 0 ? FNG_CUTS[z] : FNG_CUTS[z - 1];
-        const tc = lerpT(t0, v0, t1, v1, cut);
-        addVal(z, tc, cut);
-        addBreak(z, tc + 1);
-        addVal(z + step, tc, cut);
+        const tc = t0 + (t1 - t0) * ((cut - v0) / (v1 - v0));
+        push(tc, cut);
         t0 = tc;
         v0 = cut;
-        z0 = z + step;
       }
     }
-    addVal(z1, t1, v1);
-    for (let z = 0; z < FNG_ZONES.length; z++) {
-      if (z !== z1) addBreak(z, t1);
-    }
+    push(t1, v1);
   }
   return out;
 }
@@ -2832,9 +2822,11 @@ function ensureFngChart() {
   fngBandSeries = FNG_ZONES.map((z) => fngChart.addBaselineSeries({
     baseValue: { type: "price", price: z.lo },
     topLineColor: "rgba(0,0,0,0)",
+    bottomLineColor: "rgba(0,0,0,0)",
+    topLineWidth: 1,
+    bottomLineWidth: 1,
     topFillColor1: z.fill,
     topFillColor2: z.fill,
-    bottomLineColor: "rgba(0,0,0,0)",
     bottomFillColor1: "rgba(0,0,0,0)",
     bottomFillColor2: "rgba(0,0,0,0)",
     lastValueVisible: false,
@@ -2843,22 +2835,23 @@ function ensureFngChart() {
     priceFormat: { type: "price", precision: 0, minMove: 1 },
     autoscaleInfoProvider: () => ({ priceRange: { minValue: 0, maxValue: 100 } }),
   }));
-  fngLineSeries = FNG_ZONES.map((z) => fngChart.addLineSeries({
-    color: z.color,
+  fngLineSeries = fngChart.addLineSeries({
+    color: FNG_ZONES[2].color,
     lineWidth: 2,
-    title: z.zh,
-    lastValueVisible: false,
+    lastValueVisible: true,
     priceLineVisible: false,
     crosshairMarkerVisible: true,
-  }));
+    priceFormat: { type: "price", precision: 0, minMove: 1 },
+    autoscaleInfoProvider: () => ({ priceRange: { minValue: 0, maxValue: 100 } }),
+  });
   fngMidSeries = fngChart.addLineSeries({
     color: "rgba(138,165,180,0.55)",
     lineWidth: 1,
     lineStyle: LightweightCharts.LineStyle.Dashed,
-    title: "中性 50",
     lastValueVisible: false,
     priceLineVisible: false,
     crosshairMarkerVisible: false,
+    priceFormat: { type: "price", precision: 0, minMove: 1 },
   });
   fngChart.applyOptions({ width: el.clientWidth || el.offsetWidth || 600 });
   bindChartResize(fngChart, el);
@@ -2893,16 +2886,18 @@ function updateFngChart(payload) {
   if (sig !== lastFngSig) {
     lastFngSig = sig;
     const t0 = line[0].time, t1 = line[line.length - 1].time;
-    const split = fngSplitByZone(line);
     const ziNow = fngZoneOf(now);
     for (let z = 0; z < FNG_ZONES.length; z++) {
       fngBandSeries[z].setData([
         { time: t0, value: FNG_ZONES[z].hi },
         { time: t1, value: FNG_ZONES[z].hi },
       ]);
-      fngLineSeries[z].applyOptions({ lastValueVisible: z === ziNow });
-      fngLineSeries[z].setData(split[z]);
     }
+    fngLineSeries.applyOptions({
+      color: FNG_ZONES[ziNow].color,
+      title: FNG_ZONES[ziNow].zh,
+    });
+    fngLineSeries.setData(fngColoredLine(line));
     fngMidSeries.setData([
       { time: t0, value: 50 },
       { time: t1, value: 50 },

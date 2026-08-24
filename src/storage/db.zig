@@ -30,6 +30,7 @@ const migration_0006: [:0]const u8 = @embedFile("migration_0006");
 const migration_0007: [:0]const u8 = @embedFile("migration_0007");
 const migration_0008: [:0]const u8 = @embedFile("migration_0008");
 const migration_0009: [:0]const u8 = @embedFile("migration_0009");
+const migration_0010: [:0]const u8 = @embedFile("migration_0010");
 const intel = @import("../intel/protocol.zig");
 
 /// Ordered list of migrations; user_version tracks the applied count.
@@ -43,6 +44,7 @@ const migrations = [_][:0]const u8{
     migration_0007,
     migration_0008,
     migration_0009,
+    migration_0010,
 };
 
 /// Expected user_version for a fully migrated database (restore drills).
@@ -786,6 +788,10 @@ pub const EquitySampleRow = struct {
     bid_price: []const u8 = "",
     btc_qty: []const u8 = "",
     bh_equity: []const u8 = "",
+    /// External quote-equivalent flow since the previous 1m sample.
+    capital_flow: []const u8 = "",
+    /// Sum of quote flow × actual flow timestamp (ms), for exact Dietz weights.
+    capital_flow_moment: []const u8 = "",
 };
 
 /// One 1m equity sample decoded for 复盘 analytics. See `listPointsAsc` for why
@@ -801,6 +807,8 @@ pub const EquityPoint = struct {
     bid_price: f64,
     btc_qty: f64,
     bh_equity: f64,
+    capital_flow: f64 = 0,
+    capital_flow_moment: f64 = 0,
     /// True only when the migration-0006 marks are usable.
     marks_ok: bool,
 };
@@ -815,8 +823,8 @@ pub const EquityRepo = struct {
     pub fn init(db: *Db) DbError!EquityRepo {
         return .{ .insert = try db.prepare(
             \\INSERT OR REPLACE INTO equity_samples
-            \\  (ts, interval, equity, hwm, drawdown, cash, btc_value, bid_price, btc_qty, bh_equity)
-            \\VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+            \\  (ts, interval, equity, hwm, drawdown, cash, btc_value, bid_price, btc_qty, bh_equity, capital_flow, capital_flow_moment)
+            \\VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
         ) };
     }
 
@@ -836,6 +844,8 @@ pub const EquityRepo = struct {
         try self.insert.bindText(8, row.bid_price);
         try self.insert.bindText(9, row.btc_qty);
         try self.insert.bindText(10, row.bh_equity);
+        try self.insert.bindText(11, row.capital_flow);
+        try self.insert.bindText(12, row.capital_flow_moment);
         _ = try self.insert.stepCritical();
     }
 
@@ -857,7 +867,7 @@ pub const EquityRepo = struct {
     pub fn listRecentJson(self: *EquityRepo, db: *Db, out: []u8, limit: i64) DbError![]const u8 {
         _ = self;
         var stmt = try db.prepare(
-            \\SELECT ts, interval, equity, hwm, drawdown, cash, btc_value, bid_price
+            \\SELECT ts, interval, equity, hwm, drawdown, cash, btc_value, bid_price, capital_flow
             \\FROM equity_samples ORDER BY ts DESC LIMIT ?1
         );
         defer stmt.finalize();
@@ -868,7 +878,7 @@ pub const EquityRepo = struct {
         while (try stmt.step()) : (i += 1) {
             if (i > 0) w.writeAll(",") catch return DbError.StepFailed;
             w.print(
-                "{{\"ts\":\"{s}\",\"interval\":\"{s}\",\"equity\":\"{s}\",\"hwm\":\"{s}\",\"drawdown\":\"{s}\",\"cash\":\"{s}\",\"btc_value\":\"{s}\",\"bid_price\":\"{s}\"}}",
+                "{{\"ts\":\"{s}\",\"interval\":\"{s}\",\"equity\":\"{s}\",\"hwm\":\"{s}\",\"drawdown\":\"{s}\",\"cash\":\"{s}\",\"btc_value\":\"{s}\",\"bid_price\":\"{s}\",\"capital_flow\":\"{s}\"}}",
                 .{
                     stmt.columnText(0),
                     stmt.columnText(1),
@@ -878,6 +888,7 @@ pub const EquityRepo = struct {
                     stmt.columnText(5),
                     stmt.columnText(6),
                     stmt.columnText(7),
+                    stmt.columnText(8),
                 },
             ) catch return DbError.StepFailed;
         }
@@ -902,7 +913,7 @@ pub const EquityRepo = struct {
         _ = self;
         if (out.len == 0) return 0;
         var stmt = try db.prepare(
-            \\SELECT ts, equity, hwm, drawdown, cash, btc_value, bid_price, btc_qty, bh_equity
+            \\SELECT ts, equity, hwm, drawdown, cash, btc_value, bid_price, btc_qty, bh_equity, capital_flow, capital_flow_moment
             \\FROM equity_samples
             \\WHERE interval = '1m' AND ts >= ?1
             \\ORDER BY ts ASC LIMIT ?2
@@ -926,6 +937,8 @@ pub const EquityRepo = struct {
                 .bid_price = bid,
                 .btc_qty = qty,
                 .bh_equity = bh,
+                .capital_flow = parseF64(stmt.columnText(9)),
+                .capital_flow_moment = parseF64(stmt.columnText(10)),
                 .marks_ok = bid > 0 and bh > 0,
             };
             n += 1;
@@ -974,7 +987,7 @@ pub const EquityRepo = struct {
     ) DbError!void {
         _ = self;
         var stmt = try db.prepare(
-            \\SELECT ts, equity, drawdown FROM equity_samples
+            \\SELECT ts, equity, drawdown, capital_flow FROM equity_samples
             \\WHERE ts >= ?1 AND ts <= ?2
             \\GROUP BY substr(ts, 1, 13)
             \\HAVING ts = MAX(ts)
@@ -991,8 +1004,8 @@ pub const EquityRepo = struct {
             const wrote = blk: {
                 if (i > 0) w.writeByte(',') catch break :blk false;
                 w.print(
-                    "{{\"ts\":\"{s}\",\"equity\":\"{s}\",\"dd\":\"{s}\"}}",
-                    .{ stmt.columnText(0), stmt.columnText(1), stmt.columnText(2) },
+                    "{{\"ts\":\"{s}\",\"equity\":\"{s}\",\"dd\":\"{s}\",\"capital_flow\":\"{s}\"}}",
+                    .{ stmt.columnText(0), stmt.columnText(1), stmt.columnText(2), stmt.columnText(3) },
                 ) catch break :blk false;
                 break :blk true;
             };
@@ -1567,12 +1580,6 @@ fn addDec(a: dec.Decimal, b: dec.Decimal) dec.Decimal {
     return a.add(b) catch a;
 }
 
-fn ratioMinusOne(start: dec.Decimal, end: dec.Decimal) ?dec.Decimal {
-    if (!start.gt(dec.Decimal.zero)) return null;
-    const ratio = end.div(start, .down) catch return null;
-    return ratio.sub(dec.Decimal.one) catch null;
-}
-
 fn writeQuotedDec(w: *std.Io.Writer, value: dec.Decimal) error{WriteFailed}!void {
     try w.writeByte('"');
     value.format(w) catch return error.WriteFailed;
@@ -1672,8 +1679,12 @@ fn writePortfolioWindow(db: *Db, w: *std.Io.Writer, since: []const u8) StatsWrit
     const start = try readPortfolioEdge(db, since, false, &start_ts_buf);
     const end = try readPortfolioEdge(db, since, true, &end_ts_buf);
     const max_dd = try maxDrawdownSince(db, since);
+    const flow_window = if (start.equity != null and end.equity != null)
+        try summarizeCapitalFlows(db, start.ts, end.ts, start.equity.?, end.equity.?)
+    else
+        CapitalFlowWindow{};
     const window_return = if (start.equity != null and end.equity != null)
-        ratioMinusOne(start.equity.?, end.equity.?)
+        flow_window.adjusted_return
     else
         null;
     const btc_weight = if (end.equity) |eq|
@@ -1684,7 +1695,7 @@ fn writePortfolioWindow(db: *Db, w: *std.Io.Writer, since: []const u8) StatsWrit
     else
         null;
     const bh_return = if (start.bh_equity != null and end.bh_equity != null)
-        ratioMinusOne(start.bh_equity.?, end.bh_equity.?)
+        (try summarizeCapitalFlows(db, start.ts, end.ts, start.bh_equity.?, end.bh_equity.?)).adjusted_return
     else
         null;
     const alpha_return = if (window_return != null and bh_return != null)
@@ -1716,6 +1727,10 @@ fn writePortfolioWindow(db: *Db, w: *std.Io.Writer, since: []const u8) StatsWrit
     try writeOptQuotedDec(w, btc_weight);
     try w.writeAll(",\"window_return\":");
     try writeOptQuotedDec(w, window_return);
+    try w.print(",\"capital_flow_count\":{d},\"net_capital_flow\":\"{f}\",\"return_method\":\"modified_dietz\"", .{
+        flow_window.count,
+        flow_window.net_flow,
+    });
     try w.writeAll(",\"max_drawdown\":");
     try writeOptQuotedDec(w, max_dd);
     try w.writeAll(",\"bh_equity_start\":");
@@ -1731,7 +1746,7 @@ fn writePortfolioWindow(db: *Db, w: *std.Io.Writer, since: []const u8) StatsWrit
 
 fn writePortfolioDaily(db: *Db, w: *std.Io.Writer, since: []const u8) StatsWriteError!void {
     var stmt = try db.prepare(
-        \\SELECT d.day, e.equity, e.cash, e.btc_value, e.drawdown, e.bh_equity
+        \\SELECT d.day, e.ts, e.equity, e.cash, e.btc_value, e.drawdown, e.bh_equity
         \\FROM (
         \\  SELECT substr(ts, 1, 10) AS day, MAX(ts) AS ts
         \\  FROM equity_samples
@@ -1746,29 +1761,42 @@ fn writePortfolioDaily(db: *Db, w: *std.Io.Writer, since: []const u8) StatsWrite
     try w.writeByte('[');
     var first = true;
     var prev_equity: ?dec.Decimal = null;
+    var prev_ts_buf: [40]u8 = undefined;
+    var prev_ts_len: usize = 0;
     while (try stmt.step()) {
         if (!first) try w.writeByte(',');
         first = false;
-        const equity = parseDec(stmt.columnText(1));
+        const equity = parseDec(stmt.columnText(2));
+        const flow_window = if (prev_equity != null and equity != null and prev_ts_len > 0)
+            try summarizeCapitalFlows(db, prev_ts_buf[0..prev_ts_len], stmt.columnText(1), prev_equity.?, equity.?)
+        else
+            CapitalFlowWindow{};
         const day_return = if (prev_equity != null and equity != null)
-            ratioMinusOne(prev_equity.?, equity.?)
+            flow_window.adjusted_return
         else
             null;
         prev_equity = equity;
+        const current_ts = stmt.columnText(1);
+        prev_ts_len = @min(current_ts.len, prev_ts_buf.len);
+        @memcpy(prev_ts_buf[0..prev_ts_len], current_ts[0..prev_ts_len]);
         try w.writeAll("{\"day\":\"");
         try writeJsonEscaped(w, stmt.columnText(0));
         try w.writeAll("\",\"equity\":");
         try writeOptQuotedDec(w, equity);
         try w.writeAll(",\"cash\":");
-        try writeOptQuotedDec(w, parseDec(stmt.columnText(2)));
-        try w.writeAll(",\"btc_value\":");
         try writeOptQuotedDec(w, parseDec(stmt.columnText(3)));
-        try w.writeAll(",\"drawdown\":");
+        try w.writeAll(",\"btc_value\":");
         try writeOptQuotedDec(w, parseDec(stmt.columnText(4)));
-        try w.writeAll(",\"bh_equity\":");
+        try w.writeAll(",\"drawdown\":");
         try writeOptQuotedDec(w, parseDec(stmt.columnText(5)));
+        try w.writeAll(",\"bh_equity\":");
+        try writeOptQuotedDec(w, parseDec(stmt.columnText(6)));
         try w.writeAll(",\"day_return\":");
         try writeOptQuotedDec(w, day_return);
+        try w.print(",\"capital_flow_count\":{d},\"net_capital_flow\":\"{f}\"", .{
+            flow_window.count,
+            flow_window.net_flow,
+        });
         try w.writeByte('}');
     }
     try w.writeByte(']');
@@ -2532,6 +2560,199 @@ pub const PeriodicReviewsRepo = struct {
     }
 };
 
+pub const CapitalFlowRow = struct {
+    flow_id: []const u8,
+    ts: []const u8,
+    direction: []const u8,
+    cash_delta: []const u8,
+    btc_delta: []const u8,
+    quote_value: []const u8,
+    equity_before: []const u8,
+    equity_after: []const u8,
+};
+
+pub const CapitalFlowWindow = struct {
+    count: i64 = 0,
+    net_flow: dec.Decimal = dec.Decimal.zero,
+    weighted_flow: dec.Decimal = dec.Decimal.zero,
+    adjusted_return: dec.Decimal = dec.Decimal.zero,
+};
+
+pub const CapitalFlowAttribution = struct {
+    net_flow: dec.Decimal = dec.Decimal.zero,
+    /// Sum of quote_value × actual flow timestamp in Unix milliseconds.
+    moment_ms: f64 = 0,
+};
+
+pub const CapitalFlowsRepo = struct {
+    insert: Stmt,
+
+    pub fn init(db: *Db) DbError!CapitalFlowsRepo {
+        return .{ .insert = try db.prepare(
+            \\INSERT INTO capital_flows
+            \\  (flow_id, ts, direction, cash_delta, btc_delta, quote_value, equity_before, equity_after)
+            \\VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+        ) };
+    }
+
+    pub fn deinit(self: *CapitalFlowsRepo) void {
+        self.insert.finalize();
+    }
+
+    pub fn append(self: *CapitalFlowsRepo, row: CapitalFlowRow) DbError!void {
+        self.insert.reset();
+        try self.insert.bindText(1, row.flow_id);
+        try self.insert.bindText(2, row.ts);
+        try self.insert.bindText(3, row.direction);
+        try self.insert.bindText(4, row.cash_delta);
+        try self.insert.bindText(5, row.btc_delta);
+        try self.insert.bindText(6, row.quote_value);
+        try self.insert.bindText(7, row.equity_before);
+        try self.insert.bindText(8, row.equity_after);
+        _ = try self.insert.stepCritical();
+    }
+
+    /// Recent first-party capital movements for decision context, oldest first.
+    pub fn listForContext(
+        self: *CapitalFlowsRepo,
+        db: *Db,
+        backing: []u8,
+        out_ptrs: [][]const u8,
+    ) DbError!usize {
+        _ = self;
+        if (out_ptrs.len == 0) return 0;
+        const cap = @min(out_ptrs.len, 16);
+        var stmt = try db.prepare(
+            \\SELECT ts, direction, cash_delta, btc_delta, quote_value
+            \\FROM capital_flows ORDER BY ts DESC LIMIT ?1
+        );
+        defer stmt.finalize();
+        try stmt.bindInt(1, @intCast(cap));
+
+        var tmp: [16][]const u8 = undefined;
+        var n: usize = 0;
+        var off: usize = 0;
+        while (try stmt.step()) {
+            if (n == cap) break;
+            var w: std.Io.Writer = .fixed(backing[off..]);
+            w.print(
+                "{{\"ts\":\"{s}\",\"direction\":\"{s}\",\"cash_delta\":\"{s}\",\"btc_delta\":\"{s}\",\"quote_value\":\"{s}\",\"classification\":\"external_capital_not_pnl\"}}",
+                .{
+                    stmt.columnText(0),
+                    stmt.columnText(1),
+                    stmt.columnText(2),
+                    stmt.columnText(3),
+                    stmt.columnText(4),
+                },
+            ) catch return DbError.StepFailed;
+            tmp[n] = w.buffered();
+            off += tmp[n].len;
+            if (off < backing.len) {
+                backing[off] = 0;
+                off += 1;
+            }
+            n += 1;
+        }
+        for (0..n) |i| out_ptrs[i] = tmp[n - 1 - i];
+        return n;
+    }
+
+    /// Durable flow attribution for the next equity sample. Recomputing from
+    /// the ledger survives a crash between reconcile and minute sampling.
+    pub fn netSinceLastEquitySample(
+        self: *CapitalFlowsRepo,
+        db: *Db,
+        ts_to: []const u8,
+    ) DbError!dec.Decimal {
+        return (try self.attributionSinceLastEquitySample(db, ts_to)).net_flow;
+    }
+
+    pub fn attributionSinceLastEquitySample(
+        self: *CapitalFlowsRepo,
+        db: *Db,
+        ts_to: []const u8,
+    ) DbError!CapitalFlowAttribution {
+        _ = self;
+        var edge = try db.prepare(
+            \\SELECT ts FROM equity_samples
+            \\WHERE interval = '1m' AND ts < ?1 ORDER BY ts DESC LIMIT 1
+        );
+        defer edge.finalize();
+        try edge.bindText(1, ts_to);
+        const has_edge = try edge.step();
+        const ts_from = if (has_edge) edge.columnText(0) else "";
+
+        var stmt = try db.prepare(
+            \\SELECT ts, quote_value FROM capital_flows
+            \\WHERE ts > ?1 AND ts <= ?2 ORDER BY ts ASC
+        );
+        defer stmt.finalize();
+        try stmt.bindText(1, ts_from);
+        try stmt.bindText(2, ts_to);
+        var out = CapitalFlowAttribution{};
+        while (try stmt.step()) {
+            const flow = dec.Decimal.parse(stmt.columnText(1)) catch continue;
+            const flow_ms = clock.parseRfc3339Ms(stmt.columnText(0)) catch continue;
+            out.net_flow = out.net_flow.add(flow) catch return DbError.StepFailed;
+            out.moment_ms += flow.toF64Lossy() * @as(f64, @floatFromInt(flow_ms));
+        }
+        return out;
+    }
+
+    /// Modified Dietz return removes external flows and weights each flow by
+    /// its remaining time in the window.
+    pub fn summarizeWindow(
+        self: *CapitalFlowsRepo,
+        db: *Db,
+        ts_from: []const u8,
+        ts_to: []const u8,
+        equity_start: dec.Decimal,
+        equity_end: dec.Decimal,
+    ) DbError!CapitalFlowWindow {
+        _ = self;
+        return summarizeCapitalFlows(db, ts_from, ts_to, equity_start, equity_end);
+    }
+};
+
+fn summarizeCapitalFlows(
+    db: *Db,
+    ts_from: []const u8,
+    ts_to: []const u8,
+    equity_start: dec.Decimal,
+    equity_end: dec.Decimal,
+) DbError!CapitalFlowWindow {
+    var out = CapitalFlowWindow{};
+    const from_ms = clock.parseRfc3339Ms(ts_from) catch return out;
+    const to_ms = clock.parseRfc3339Ms(ts_to) catch return out;
+    const span_ms = to_ms - from_ms;
+    if (span_ms <= 0) return out;
+
+    var stmt = try db.prepare(
+        \\SELECT ts, quote_value FROM capital_flows
+        \\WHERE ts > ?1 AND ts <= ?2 ORDER BY ts ASC
+    );
+    defer stmt.finalize();
+    try stmt.bindText(1, ts_from);
+    try stmt.bindText(2, ts_to);
+    while (try stmt.step()) {
+        const flow = dec.Decimal.parse(stmt.columnText(1)) catch continue;
+        const flow_ms = clock.parseRfc3339Ms(stmt.columnText(0)) catch continue;
+        const remaining_ms = @max(@as(i64, 0), to_ms - flow_ms);
+        const weight = dec.Decimal.fromInt(remaining_ms).div(dec.Decimal.fromInt(span_ms), .nearest) catch continue;
+        const weighted = flow.mul(weight, .nearest) catch continue;
+        out.net_flow = out.net_flow.add(flow) catch continue;
+        out.weighted_flow = out.weighted_flow.add(weighted) catch continue;
+        out.count += 1;
+    }
+
+    const numerator = (equity_end.sub(equity_start) catch return out).sub(out.net_flow) catch return out;
+    const denominator = equity_start.add(out.weighted_flow) catch return out;
+    if (denominator.gt(dec.Decimal.zero)) {
+        out.adjusted_return = numerator.div(denominator, .nearest) catch dec.Decimal.zero;
+    }
+    return out;
+}
+
 /// Small runtime key/value store for persisted baselines (e.g. the shadow
 /// buy-and-hold benchmark). Single writer like every other repo.
 pub const KvRepo = struct {
@@ -2563,12 +2784,16 @@ pub const KvRepo = struct {
 
     /// Copy the value for `key` into `out`; null when missing or too large.
     pub fn get(self: *KvRepo, key: []const u8, out: []u8) ?[]const u8 {
+        return self.getChecked(key, out) catch null;
+    }
+
+    pub fn getChecked(self: *KvRepo, key: []const u8, out: []u8) DbError!?[]const u8 {
         self.get_stmt.reset();
-        self.get_stmt.bindText(1, key) catch return null;
-        const has = self.get_stmt.step() catch return null;
+        try self.get_stmt.bindText(1, key);
+        const has = try self.get_stmt.step();
         if (!has) return null;
         const v = self.get_stmt.columnText(0);
-        if (v.len > out.len) return null;
+        if (v.len > out.len) return DbError.StepFailed;
         @memcpy(out[0..v.len], v);
         return out[0..v.len];
     }
@@ -2920,6 +3145,8 @@ test "LLM usage ledger aggregates priced and unmetered calls explicitly" {
     try testing.expectEqualStrings("98", portfolio.get("equity_start").?.string);
     try testing.expectEqualStrings("101", portfolio.get("equity_end").?.string);
     try testing.expect(portfolio.get("window_return").? == .string);
+    try testing.expectEqual(@as(i64, 0), portfolio.get("capital_flow_count").?.integer);
+    try testing.expectEqualStrings("modified_dietz", portfolio.get("return_method").?.string);
     try testing.expect(portfolio.get("alpha_return").? == .string);
     const trading = parsed2.value.object.get("trading").?.object.get("last_24h").?.object;
     try testing.expectEqual(@as(i64, 1), trading.get("orders").?.integer);
@@ -3556,6 +3783,72 @@ test "runtime_kv put/get round-trip and overwrite" {
     // Value larger than out buffer fails closed.
     var tiny: [4]u8 = undefined;
     try testing.expect(kv.get("shadow_bh", &tiny) == null);
+}
+
+test "capital flows persist and produce a flow-adjusted window return" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const db_path = try tmpDbPath(&tmp, &path_buf);
+
+    var db = try Db.open(db_path);
+    defer db.close();
+    var repo = try CapitalFlowsRepo.init(&db);
+    defer repo.deinit();
+    var equity = try EquityRepo.init(&db);
+    defer equity.deinit();
+    try equity.append(.{
+        .ts = "2026-08-24T00:00:00.000Z",
+        .interval = "1m",
+        .equity = "100",
+        .hwm = "100",
+        .drawdown = "0",
+        .cash = "100",
+        .btc_value = "0",
+    });
+
+    try repo.append(.{
+        .flow_id = "flow_1",
+        .ts = "2026-08-24T01:00:00.000Z",
+        .direction = "deposit",
+        .cash_delta = "50",
+        .btc_delta = "0",
+        .quote_value = "50",
+        .equity_before = "100",
+        .equity_after = "150",
+    });
+
+    const summary = try repo.summarizeWindow(
+        &db,
+        "2026-08-24T00:00:00.000Z",
+        "2026-08-24T02:00:00.000Z",
+        dec.Decimal.parse("100") catch unreachable,
+        dec.Decimal.parse("160") catch unreachable,
+    );
+    try std.testing.expectEqual(@as(i64, 1), summary.count);
+    try std.testing.expect(summary.net_flow.eql(dec.Decimal.fromInt(50)));
+    try std.testing.expect(summary.adjusted_return.eql(dec.Decimal.parse("0.08") catch unreachable));
+    const pending = try repo.netSinceLastEquitySample(&db, "2026-08-24T02:00:00.000Z");
+    try std.testing.expect(pending.eql(dec.Decimal.fromInt(50)));
+    try equity.append(.{
+        .ts = "2026-08-24T02:00:00.000Z",
+        .interval = "1m",
+        .equity = "160",
+        .hwm = "160",
+        .drawdown = "0",
+        .cash = "160",
+        .btc_value = "0",
+        .capital_flow = "50",
+    });
+    const repeated = try repo.netSinceLastEquitySample(&db, "2026-08-24T02:00:00.000Z");
+    try std.testing.expect(repeated.eql(dec.Decimal.fromInt(50)));
+
+    var backing: [512]u8 = undefined;
+    var ptrs: [4][]const u8 = undefined;
+    const n = try repo.listForContext(&db, &backing, &ptrs);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expect(std.mem.indexOf(u8, ptrs[0], "\"direction\":\"deposit\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ptrs[0], "\"quote_value\":\"50\"") != null);
 }
 
 test "periodic reviews append, list, cycle cursor and summary tail" {

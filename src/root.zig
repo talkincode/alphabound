@@ -43,6 +43,7 @@ pub const periodic_review = @import("agent/periodic_review.zig");
 pub const context = @import("agent/context.zig");
 pub const openai = @import("agent/openai.zig");
 pub const shadow_bench = @import("core/shadow_bench.zig");
+pub const capital_flow = @import("core/capital_flow.zig");
 pub const scheduler = @import("core/scheduler.zig");
 pub const admin_control = @import("admin/control.zig");
 pub const web = @import("web/server.zig");

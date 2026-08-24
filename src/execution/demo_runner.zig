@@ -21,6 +21,15 @@ const journal = @import("../observability/journal.zig");
 const Decimal = dec.Decimal;
 const logEventPayload = journal.logEventPayload;
 
+pub const PortfolioRefresher = struct {
+    context: *anyopaque,
+    run_fn: *const fn (context: *anyopaque) bool,
+
+    pub fn run(self: PortfolioRefresher) bool {
+        return self.run_fn(self.context);
+    }
+};
+
 fn nowMs() i64 {
     return clock.SystemClock.clock().wallMs();
 }
@@ -39,6 +48,7 @@ pub fn tryDemoExecute(
     orders_repo: *storage.OrdersRepo,
     fills_repo: *storage.FillsRepo,
     events_repo: *storage.EventsRepo,
+    portfolio_refresher: PortfolioRefresher,
     decision_id: []const u8,
     verdict_txt: []const u8,
     admitted_weight: Decimal,
@@ -126,7 +136,7 @@ pub fn tryDemoExecute(
             // Authoritative venue balances required before another leg.
             // If refresh fails, apply local fill once and STOP — never replan
             // on a stale zero book (that path triple-bought after API blips).
-            if (!refreshDemoPortfolio(gpa, okx, engine)) {
+            if (!portfolio_refresher.run()) {
                 applyLocalFill(engine, po.side, po.qty, mark);
                 logEventPayload(events_repo, engine, "EXEC_REFRESH_FAILED", "execution", "WARN", cfg, "{\"action\":\"stop_replan_local_fill\"}");
                 return if (std.mem.eql(u8, leg, "filled")) "filled_refresh_failed" else "partial_refresh_failed";
@@ -164,29 +174,6 @@ pub fn tryDemoExecute(
 
     if (any_fill and std.mem.eql(u8, last_note, "partial")) return "partial_max_legs";
     return last_note;
-}
-
-/// Apply private REST balances into the engine (demo only). Returns false on probe failure.
-pub fn refreshDemoPortfolio(
-    gpa: std.mem.Allocator,
-    okx: *okx_rest.Client,
-    engine: *state.Engine,
-) bool {
-    const probe = okx_rest.probeBalance(okx, gpa, nowMs());
-    switch (probe) {
-        .ok => |b| {
-            _ = engine.apply(.{ .reconcile_result = .{
-                .ts_ms = nowMs(),
-                .cash_usdt = b.usdt_cash,
-                .btc_total = b.btc_cash,
-                .btc_available = b.btc_avail,
-                .hwm_from_db = engine.snapshot().high_watermark,
-                .clean = true,
-            } }) catch {};
-            return true;
-        },
-        .err => return false,
-    }
 }
 
 /// Best-effort book update from a known fill when venue balance refresh fails.

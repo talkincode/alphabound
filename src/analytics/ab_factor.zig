@@ -113,6 +113,23 @@ fn forwardIndex(pts: []const storage.EquityPoint, i: usize, horizon_ms: i64) ?us
     return lo;
 }
 
+fn flowAdjustedReturn(pts: []const storage.EquityPoint, start: usize, end: usize) f64 {
+    if (start >= end or end >= pts.len or pts[start].equity <= 1e-9) return nan;
+    const span_ms = pts[end].ts_ms - pts[start].ts_ms;
+    if (span_ms <= 0) return nan;
+    var net_flow: f64 = 0;
+    var weighted_flow: f64 = 0;
+    for (pts[start + 1 .. end + 1]) |p| {
+        net_flow += p.capital_flow;
+        const end_ms = @as(f64, @floatFromInt(pts[end].ts_ms));
+        weighted_flow += (end_ms * p.capital_flow - p.capital_flow_moment) /
+            @as(f64, @floatFromInt(span_ms));
+    }
+    const denominator = pts[start].equity + weighted_flow;
+    if (denominator <= 1e-9) return nan;
+    return (pts[end].equity - pts[start].equity - net_flow) / denominator;
+}
+
 /// Population mean/std z-score over the finite entries of `vals[0..n]`.
 /// Degenerate series (fewer than 8 samples or ~zero variance) yield all-NaN.
 fn zscore(vals: []const f64, out: []f64) void {
@@ -210,8 +227,7 @@ pub fn compute(points_in: []const storage.EquityPoint, params: Params, out: *Ser
         // ret: rolling equity return
         out.comp[idx_ret][i] = blk: {
             const j = lookbackIndex(pts, i, ret_ms, params.gap_factor) orelse break :blk nan;
-            if (pts[j].equity <= 1e-9) break :blk nan;
-            break :blk p.equity / pts[j].equity - 1;
+            break :blk flowAdjustedReturn(pts, j, i);
         };
         // mom: BTC price momentum
         out.comp[idx_mom][i] = blk: {
@@ -290,8 +306,7 @@ pub fn computeIc(
     while (i < n) : (i += 1) {
         fwd[i] = blk: {
             const k = forwardIndex(pts, i, horizon_ms) orelse break :blk nan;
-            if (pts[i].equity <= 1e-9) break :blk nan;
-            break :blk pts[k].equity / pts[i].equity - 1;
+            break :blk flowAdjustedReturn(pts, i, k);
         };
     }
     var row = IcRow{
@@ -460,6 +475,36 @@ test "compute: components, marks gating and gap guard" {
     try testing.expect(isNum(series.comp[idx_vol][80]));
     // AB factor defined where >=3 components have finite z
     try testing.expect(isNum(series.ab[80]));
+}
+
+test "rolling return excludes external capital flow" {
+    var pts: [31]storage.EquityPoint = undefined;
+    for (0..31) |i| {
+        pts[i] = mkPoint(@intCast(i), 100, 60, 50000, 100, true);
+    }
+    pts[30].equity = 150;
+    pts[30].capital_flow = 50;
+    pts[30].capital_flow_moment = 50 * @as(f64, @floatFromInt(pts[30].ts_ms - 30_000));
+
+    var series: Series = .{};
+    compute(&pts, .{}, &series);
+    try testing.expectApproxEqAbs(@as(f64, 0), series.comp[idx_ret][30], 1e-12);
+}
+
+test "rolling return time-weights a mid-window capital flow" {
+    var pts: [31]storage.EquityPoint = undefined;
+    for (0..31) |i| {
+        pts[i] = mkPoint(@intCast(i), 100, 60, 50000, 100, true);
+    }
+    pts[15].equity = 200;
+    pts[15].capital_flow = 100;
+    pts[15].capital_flow_moment = 100 * @as(f64, @floatFromInt(pts[15].ts_ms - 30_000));
+    for (16..31) |i| pts[i].equity = 200;
+    pts[30].equity = 220;
+
+    var series: Series = .{};
+    compute(&pts, .{}, &series);
+    try testing.expectApproxEqAbs(@as(f64, 20.0 / 151.666666666667), series.comp[idx_ret][30], 1e-10);
 }
 
 test "compute: time gap voids lookback windows" {

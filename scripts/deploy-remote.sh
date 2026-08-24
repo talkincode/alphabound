@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # Deploy AlphaBound to a remote Linux x86_64 host via sshx.
 # Requires: zig 0.16, sshx, optional local secrets.env
-# Usage: HOST=my-host ./scripts/deploy-remote.sh
+# Usage:
+#   HOST=my-host ./scripts/deploy-remote.sh
+#   HOST=my-host SECRETS_FILE=./secrets.other.env ./scripts/deploy-remote.sh
+# SECRETS_FILE avoids shipping the default local secrets.env (another
+# host's live OKX keys) to a different machine.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 HOST="${HOST:?set HOST to sshx host name}"
@@ -23,7 +27,18 @@ else
   cp config/alphabound.toml "$STAGE/etc/alphabound/alphabound.toml"
 fi
 
-if [[ -f "$ROOT/secrets.env" ]]; then
+# Optional SECRETS_FILE avoids shipping the default local secrets.env
+# (which may hold another host's live OKX keys) to a different machine.
+SECRETS_FILE="${SECRETS_FILE:-}"
+if [[ -n "$SECRETS_FILE" ]]; then
+  if [[ ! -f "$SECRETS_FILE" ]]; then
+    echo "[deploy] SECRETS_FILE not found: $SECRETS_FILE" >&2
+    exit 1
+  fi
+  grep -E '^(OKX_|LLM_|OPENAI_|AZURE_|ALPHABOUND_)' "$SECRETS_FILE" > "$STAGE/etc/alphabound/secrets.env" || true
+  chmod 600 "$STAGE/etc/alphabound/secrets.env"
+  echo "[deploy] using SECRETS_FILE (not default secrets.env)"
+elif [[ -f "$ROOT/secrets.env" ]]; then
   grep -E '^(OKX_|LLM_|OPENAI_|AZURE_|ALPHABOUND_)' "$ROOT/secrets.env" > "$STAGE/etc/alphabound/secrets.env" || true
   chmod 600 "$STAGE/etc/alphabound/secrets.env"
 fi

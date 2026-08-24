@@ -17,6 +17,7 @@ const tools_mod = @import("../tools/registry.zig");
 const Decimal = dec.Decimal;
 
 pub const MAX_EVENTS = 16;
+pub const MAX_CAPITAL_FLOWS = 8;
 pub const MAX_MEMORIES = 12;
 pub const MAX_SELF_ITEMS = 8;
 pub const MAX_INTEL = 8;
@@ -25,6 +26,8 @@ pub const Input = struct {
     snapshot: state_mod.PortfolioState,
     /// Recent significant event lines (JSON), oldest first, already filtered.
     recent_events: []const []const u8 = &.{},
+    /// First-party external deposits/withdrawals, explicitly not strategy PnL.
+    capital_flows: []const []const u8 = &.{},
     /// Retrieved memories, ranked (from memory.retrieve).
     memories: []const mem_store.Scored = &.{},
     registry: *const tools_mod.Registry,
@@ -91,8 +94,8 @@ pub const ContextError = error{
 
 /// Render the full agent context as a deterministic JSON document into `buf`.
 /// The document has seven fixed top-level sections mirroring the design:
-/// current_state / recent_events / memories / tools / tool_observations /
-/// self_review / risk_rules.
+/// current_state / recent_events / capital_flows / memories / tools /
+/// tool_observations / self_review / risk_rules.
 pub fn render(buf: []u8, input: Input) ContextError![]const u8 {
     if (input.recent_events.len > MAX_EVENTS) return error.TooManyEvents;
 
@@ -122,6 +125,14 @@ fn writeContext(w: *std.Io.Writer, input: Input) !void {
     for (input.recent_events, 0..) |ev, i| {
         if (i > 0) try w.writeByte(',');
         try w.writeAll(ev); // already JSON objects from the event log
+    }
+    try w.writeAll("],");
+
+    try w.writeAll("\"capital_flows\":[");
+    const flow_n = @min(input.capital_flows.len, MAX_CAPITAL_FLOWS);
+    for (input.capital_flows[0..flow_n], 0..) |flow, i| {
+        if (i > 0) try w.writeByte(',');
+        try w.writeAll(flow);
     }
     try w.writeAll("],");
 
@@ -258,6 +269,7 @@ fn testInput(reg: *const tools_mod.Registry, mems: []const mem_store.Scored) Inp
             .unresolved_orders = false,
         },
         .recent_events = &.{ "{\"type\":\"RISK_MODE_CHANGED\"}", "{\"type\":\"ORDER_FILLED\"}" },
+        .capital_flows = &.{"{\"ts\":\"2026-08-24T12:00:00.000Z\",\"direction\":\"deposit\",\"cash_delta\":\"0\",\"btc_delta\":\"0.001\",\"quote_value\":\"49.9\",\"classification\":\"external_capital_not_pnl\"}"},
         .memories = mems,
         .registry = reg,
         .recent_proposals = &.{"{\"decision_id\":\"dec_1\",\"action\":\"HOLD\",\"target\":\"0\",\"confidence\":\"0.8\",\"executed\":false,\"exec\":\"hold\"}"},
@@ -314,6 +326,9 @@ test "render is deterministic and structurally complete" {
     const obj = parsed.value.object;
     try testing.expect(obj.get("current_state") != null);
     try testing.expect(obj.get("recent_events") != null);
+    const flows = obj.get("capital_flows").?.array;
+    try testing.expectEqual(@as(usize, 1), flows.items.len);
+    try testing.expectEqualStrings("external_capital_not_pnl", flows.items[0].object.get("classification").?.string);
     try testing.expect(obj.get("memories") != null);
     try testing.expect(obj.get("tools") != null);
     try testing.expect(obj.get("tool_observations") != null);

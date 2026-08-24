@@ -148,6 +148,8 @@ pub const Facts = struct {
     equity_start: Decimal = Decimal.zero,
     equity_end: Decimal = Decimal.zero,
     window_return: Decimal = Decimal.zero,
+    capital_flow_count: i64 = 0,
+    net_capital_flow: Decimal = Decimal.zero,
     max_drawdown: Decimal = Decimal.zero,
     hwm: Decimal = Decimal.zero,
     btc_weight: Decimal = Decimal.zero,
@@ -178,17 +180,18 @@ pub const Facts = struct {
                 "\"admission\":{{\"approved\":{d},\"reduced\":{d},\"rejected\":{d}}}," ++
                 "\"execution\":{{\"executed\":{d},\"fills\":{d}}}," ++
                 "\"portfolio\":{{\"equity_start\":\"{f}\",\"equity_end\":\"{f}\",\"return\":\"{f}\"," ++
+                "\"return_method\":\"modified_dietz\",\"capital_flow_count\":{d},\"net_capital_flow\":\"{f}\"," ++
                 "\"max_drawdown\":\"{f}\",\"hwm\":\"{f}\",\"btc_weight\":\"{f}\"," ++
                 "\"cash_usdt\":\"{f}\",\"cash_weight\":\"{f}\",\"min_size\":\"{f}\",\"min_notional\":\"{f}\"," ++
                 "\"cash_covers_min_buy\":{},\"risk_mode\":\"{s}\"}},",
             .{
-                self.cycle.text(),        self.window_from, self.window_to,   self.window_hours,
-                self.mode,                self.instrument,  self.proposals,   self.holds,
-                self.rebalances,          self.runs_invalid, self.runs_error, self.admitted,
-                self.reduced,             self.rejected,    self.executed,    self.fills,
-                self.equity_start,        self.equity_end,  self.window_return,
-                self.max_drawdown,        self.hwm,         self.btc_weight,  self.cash_usdt,
-                self.cash_weight,         self.min_size,    self.min_notional,
+                self.cycle.text(),        self.window_from,  self.window_to,     self.window_hours,
+                self.mode,                self.instrument,   self.proposals,     self.holds,
+                self.rebalances,          self.runs_invalid, self.runs_error,    self.admitted,
+                self.reduced,             self.rejected,     self.executed,      self.fills,
+                self.equity_start,        self.equity_end,   self.window_return, self.capital_flow_count,
+                self.net_capital_flow,    self.max_drawdown, self.hwm,           self.btc_weight,
+                self.cash_usdt,           self.cash_weight,  self.min_size,      self.min_notional,
                 self.cash_covers_min_buy, self.risk_mode,
             },
         );
@@ -376,6 +379,8 @@ test "facts render compact json with and without benchmark" {
         .equity_start = try Decimal.parse("100"),
         .equity_end = try Decimal.parse("101.5"),
         .window_return = try Decimal.parse("0.015"),
+        .capital_flow_count = 1,
+        .net_capital_flow = try Decimal.parse("50"),
         .max_drawdown = try Decimal.parse("0.004"),
         .btc_weight = try Decimal.parse("0.98"),
         .cash_usdt = try Decimal.parse("8.82"),
@@ -395,6 +400,8 @@ test "facts render compact json with and without benchmark" {
     try testing.expect(std.mem.indexOf(u8, out, "\"alpha\":\"-0.005\"") != null);
     try testing.expect(std.mem.indexOf(u8, out, "\"cash_usdt\":\"8.82\"") != null);
     try testing.expect(std.mem.indexOf(u8, out, "\"cash_covers_min_buy\":false") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"capital_flow_count\":1") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"net_capital_flow\":\"50\"") != null);
     // Must be valid JSON.
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out, .{});
     parsed.deinit();
