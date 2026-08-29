@@ -137,6 +137,45 @@ pub fn boundaryFloor(snap: SnapshotView, max_drawdown: Decimal, exit_reserve: De
     return try floor.add(exit_reserve);
 }
 
+/// Stress posture of the book *as it already stands* — no proposed trade.
+pub const HeldExposure = struct {
+    /// Current BTC portfolio weight in [0,1].
+    weight: Decimal,
+    /// Stress equity of the standing book under the same shock `admit` uses.
+    stress_equity: Decimal,
+    /// Boundary floor: H × (1 − maxdd) + exit_reserve.
+    floor: Decimal,
+    /// stress_equity − floor; negative means the standing book already fails
+    /// the boundary under stress, with nothing proposed.
+    headroom: Decimal,
+    breaches: bool,
+};
+
+/// Stress the weight currently held instead of the weight a proposal requests.
+///
+/// `admit` only ever stresses `proposal.target_btc_weight`, and HOLD carries
+/// weight 0 by schema. Stressing 0 shocks an empty BTC leg, so the shock term
+/// vanishes and every HOLD clears the floor by construction — the verdict says
+/// nothing about the risk actually carried. This measures that risk. It is a
+/// read-only view: it admits nothing and must not gate execution on its own.
+pub fn heldExposure(
+    snap: SnapshotView,
+    max_drawdown: Decimal,
+    p: StressParams,
+) AdmissionError!HeldExposure {
+    const floor = try boundaryFloor(snap, max_drawdown, p.exit_reserve);
+    const weight = try currentBtcWeight(snap, p);
+    const stress = try stressEquityAtWeight(snap, weight, p);
+    const headroom = try stress.sub(floor);
+    return .{
+        .weight = weight,
+        .stress_equity = stress,
+        .floor = floor,
+        .headroom = headroom,
+        .breaches = headroom.isNegative(),
+    };
+}
+
 pub fn admit(
     snap: SnapshotView,
     proposal: ProposalView,
@@ -205,7 +244,7 @@ fn rejected(reason: RejectReason, snap: SnapshotView, weight: Decimal, p: Stress
     return .{ .verdict = .{ .reject = reason }, .stress_equity = e, .floor = floor };
 }
 
-fn currentBtcWeight(snap: SnapshotView, p: StressParams) AdmissionError!Decimal {
+pub fn currentBtcWeight(snap: SnapshotView, p: StressParams) AdmissionError!Decimal {
     const pre = try equity_mod.conservativeEquity(.{
         .cash_usdt = snap.cash_usdt,
         .btc_total = snap.btc_total,
@@ -600,5 +639,93 @@ test "AC-GO3 property: tightening max_drawdown never admits a larger weight" {
             try testing.expect(admitted_loose != null);
             try testing.expect(at.lte(admitted_loose.?));
         }
+    }
+}
+
+// --- Held exposure: what a HOLD is actually carrying -------------------------
+
+/// Synthetic book shaped like the case this guards: ~90% BTC weight, mid-single-digit
+/// drawdown off the peak, still NORMAL — the posture where HOLD approves forever.
+fn heldBookSnapshot() SnapshotView {
+    var s = baseSnapshot();
+    s.cash_usdt = d("140");
+    s.btc_total = d("0.016");
+    s.liq_price = d("78000");
+    s.mark_price = d("78000");
+    s.high_watermark = d("1447");
+    return s;
+}
+
+test "HOLD admission stresses an empty leg; heldExposure stresses the real book" {
+    const snap = heldBookSnapshot();
+    const p = baseParams();
+
+    // HOLD carries target_btc_weight = 0 by schema. The shock lands on a BTC leg
+    // of size zero, so the verdict is APPROVE regardless of what is held.
+    const hold_prop = ProposalView{ .snapshot_version = snap.version, .target_btc_weight = Decimal.zero };
+    const r = try admit(snap, hold_prop, d("0.10"), p);
+    try testing.expect(r.verdict == .approve);
+
+    const held = try heldExposure(snap, d("0.10"), p);
+
+    // The book is ~90% BTC, not the 0% the admission stressed.
+    try testing.expect(held.weight.gt(d("0.88")));
+    try testing.expect(held.weight.lt(d("0.92")));
+
+    // Same floor, but the real position is materially closer to it: the 5% shock
+    // actually bites once it is applied to the weight being held.
+    try testing.expect(held.floor.eql(r.floor));
+    try testing.expect(held.stress_equity.lt(r.stress_equity));
+
+    const fake_headroom = try r.stress_equity.sub(r.floor);
+    try testing.expect(held.headroom.lt(fake_headroom));
+    // Not a rounding difference — the vacuous number overstates headroom ~4x.
+    try testing.expect(fake_headroom.gt(try held.headroom.mul(d("3"), .down)));
+}
+
+test "heldExposure flags a standing book that breaches while HOLD still approves" {
+    var snap = heldBookSnapshot();
+    // Same book, higher prior peak → floor rises above the shocked position.
+    snap.high_watermark = d("1500");
+    const p = baseParams();
+
+    const hold_prop = ProposalView{ .snapshot_version = snap.version, .target_btc_weight = Decimal.zero };
+    const r = try admit(snap, hold_prop, d("0.10"), p);
+    try testing.expect(r.verdict == .approve); // gate still says yes
+
+    const held = try heldExposure(snap, d("0.10"), p);
+    try testing.expect(held.breaches);
+    try testing.expect(held.headroom.isNegative());
+    try testing.expect(held.stress_equity.lt(held.floor));
+}
+
+test "heldExposure on a flat book matches the weight-0 stress and never breaches" {
+    var snap = baseSnapshot(); // all cash, no BTC
+    snap.high_watermark = d("100");
+    const p = baseParams();
+
+    const held = try heldExposure(snap, d("0.10"), p);
+    try testing.expect(held.weight.isZero());
+    try testing.expect(held.stress_equity.eql(try stressEquityAtWeight(snap, Decimal.zero, p)));
+    try testing.expect(!held.breaches);
+}
+
+test "property: holding BTC is never scored safer than holding none under shock" {
+    var prng = std.Random.DefaultPrng.init(0x8e1d);
+    const random = prng.random();
+    const p = baseParams();
+    for (0..2000) |_| {
+        var snap = baseSnapshot();
+        snap.cash_usdt = Decimal.fromRaw(random.intRangeAtMost(i128, 0, 500 * dec.ONE_RAW));
+        snap.btc_total = Decimal.fromRaw(random.intRangeAtMost(i128, 0, dec.ONE_RAW / 10));
+        snap.liq_price = Decimal.fromRaw(random.intRangeAtMost(i128, dec.ONE_RAW, 200_000 * dec.ONE_RAW));
+        snap.mark_price = snap.liq_price;
+        snap.high_watermark = Decimal.fromRaw(random.intRangeAtMost(i128, 0, 5000 * dec.ONE_RAW));
+
+        const held = heldExposure(snap, d("0.10"), p) catch continue;
+        const flat = stressEquityAtWeight(snap, Decimal.zero, p) catch continue;
+        // A 5% shock on the held leg costs strictly more than the 0.15% round
+        // trip to cash, so the vacuous weight-0 number can only ever flatter.
+        try testing.expect(held.stress_equity.lte(flat));
     }
 }

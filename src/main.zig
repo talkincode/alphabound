@@ -2450,14 +2450,11 @@ fn defaultStressParams(cfg: *const ab.config.Config) ab.admission.StressParams {
     };
 }
 
-fn shadowAdmit(
+fn admissionView(
     snap: ab.state.PortfolioState,
-    proposal_snapshot_version: u64,
-    target_btc_weight: ab.decimal.Decimal,
-    cfg: *const ab.config.Config,
     now_ms: i64,
-) ShadowAdmission {
-    const view = ab.admission.SnapshotView{
+) ab.admission.SnapshotView {
+    return .{
         .version = snap.version,
         .reconciled = snap.reconciled,
         .market_fresh = snap.freshness.marketFresh(now_ms),
@@ -2470,6 +2467,16 @@ fn shadowAdmit(
         .mark_price = if (snap.mark_price.gt(ab.decimal.Decimal.zero)) snap.mark_price else snap.bid_price,
         .high_watermark = snap.high_watermark,
     };
+}
+
+fn shadowAdmit(
+    snap: ab.state.PortfolioState,
+    proposal_snapshot_version: u64,
+    target_btc_weight: ab.decimal.Decimal,
+    cfg: *const ab.config.Config,
+    now_ms: i64,
+) ShadowAdmission {
+    const view = admissionView(snap, now_ms);
     const prop = ab.admission.ProposalView{
         .snapshot_version = proposal_snapshot_version,
         .target_btc_weight = target_btc_weight,
@@ -2506,6 +2513,53 @@ fn shadowAdmit(
             .floor = result.floor,
         },
     };
+}
+
+/// Record what a HOLD is actually holding.
+///
+/// The admission that precedes this stressed `target_btc_weight`, which is 0 for
+/// every HOLD by schema — a shock applied to an empty BTC leg, so the verdict is
+/// APPROVE by construction no matter how much risk sits on the book. That made a
+/// long HOLD streak at high weight indistinguishable from a flat book in the
+/// event log. Emit the stress posture of the standing position instead, and raise
+/// severity when that position would breach the boundary under shock.
+///
+/// Reporting only: this changes no execution path. HOLD stays a strict no-op.
+fn logHeldExposure(
+    events_repo: *ab.storage.EventsRepo,
+    engine: *ab.state.Engine,
+    cfg: *const ab.config.Config,
+    snap: ab.state.PortfolioState,
+    now_ms: i64,
+) void {
+    const held = ab.admission.heldExposure(
+        admissionView(snap, now_ms),
+        cfg.max_drawdown,
+        defaultStressParams(cfg),
+    ) catch {
+        logEventPayload(events_repo, engine, "EXEC_HOLD", "execution", "INFO", cfg, "{\"reason\":\"action_hold\",\"held\":\"unavailable\"}");
+        return;
+    };
+
+    var w_buf: [48]u8 = undefined;
+    var s_buf: [48]u8 = undefined;
+    var f_buf: [48]u8 = undefined;
+    var h_buf: [48]u8 = undefined;
+    var payload_buf: [320]u8 = undefined;
+    const payload = std.fmt.bufPrint(
+        &payload_buf,
+        "{{\"reason\":\"action_hold\",\"held_btc_weight\":\"{s}\",\"held_stress_equity\":\"{s}\",\"floor\":\"{s}\",\"headroom\":\"{s}\",\"breaches\":{}}}",
+        .{
+            decFmt(&w_buf, held.weight),
+            decFmt(&s_buf, held.stress_equity),
+            decFmt(&f_buf, held.floor),
+            decFmt(&h_buf, held.headroom),
+            held.breaches,
+        },
+    ) catch "{\"reason\":\"action_hold\"}";
+
+    const severity: []const u8 = if (held.breaches) "WARN" else "INFO";
+    logEventPayload(events_repo, engine, "EXEC_HOLD", "execution", severity, cfg, payload);
 }
 
 /// If the agent bound to the decision-start snapshot, rebind to the post-refresh
@@ -3149,7 +3203,7 @@ fn runAgentDecision(
     // live BTC book after balance reconcile recovered).
     if (prop.action == .hold) {
         exec_note = "hold";
-        logEventPayload(events_repo, engine, "EXEC_HOLD", "execution", "INFO", cfg, "{\"reason\":\"action_hold\"}");
+        logHeldExposure(events_repo, engine, cfg, admit_snap, admit_now);
         // Honor the model's own review_after as a regular-cadence backoff
         // (clamped; event triggers still cut through). Quiet markets stop
         // burning LLM calls re-stating the same HOLD.
