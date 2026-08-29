@@ -25,14 +25,39 @@ curl -sS http://127.0.0.1:18180/api/v1/auth/status
 
 ## MCP
 
+IDE / Copilot 用 `npx -y` **自动安装**，不必先 clone：
+
+```json
+{
+  "mcpServers": {
+    "alphabound": {
+      "command": "npx",
+      "args": ["-y", "alphabound-mcp"],
+      "env": {
+        "ALPHABOUND_API_BASE": "http://127.0.0.1:18180",
+        "ALPHABOUND_API_TOKEN": "YOUR_TOKEN"
+      }
+    }
+  }
+}
+```
+
+```bash
+npx -y alphabound-mcp install --client copilot
+# 尚未发布到 npm 时：--source github
+# 本仓库源码：node tools/alphabound-mcp/src/index.js install --source local --client copilot
+```
+
+从源码跑 stdio / HTTP：
+
 ```bash
 cd tools/alphabound-mcp
 npm install
 export ALPHABOUND_API_BASE=http://127.0.0.1:18180
-export ALPHABOUND_API_TOKEN=...   # 与 daemon 相同
-npm start                         # stdio，给 IDE
+export ALPHABOUND_API_TOKEN=YOUR_TOKEN   # 与 daemon 相同
+npx alphabound-mcp                      # stdio，给 IDE
 # 或本机 HTTP 网关：
-# ALPHABOUND_MCP_BIND=127.0.0.1 ALPHABOUND_MCP_PORT=8723 npm run http
+# npx alphabound-mcp --http
 ```
 
 工具列表见 [`tools/alphabound-mcp/README.md`](https://github.com/talkincode/alphabound/blob/main/tools/alphabound-mcp/README.md)。  

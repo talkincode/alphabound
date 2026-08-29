@@ -8,20 +8,69 @@ forwards a **pre-signed** `alphabound.intel.v1` envelope. MCP never holds
 
 Protocol: `docs/INTEL.md`.
 
+## npx (auto-install)
+
+IDE / Copilot clients spawn this package with `npx -y`. The first run downloads
+`alphabound-mcp`; later runs use the npx cache.
+
+```json
+{
+  "mcpServers": {
+    "alphabound": {
+      "command": "npx",
+      "args": ["-y", "alphabound-mcp"],
+      "env": {
+        "ALPHABOUND_API_BASE": "http://127.0.0.1:18180",
+        "ALPHABOUND_API_TOKEN": "YOUR_TOKEN"
+      }
+    }
+  }
+}
+```
+
+Write that snippet into a local client:
+
+```bash
+# detect Claude / Cursor / VS Code / Copilot CLI / Windsurf
+npx -y alphabound-mcp install
+
+# GitHub Copilot CLI (~/.copilot/mcp-config.json)
+npx -y alphabound-mcp install --client copilot
+
+# print only
+npx -y alphabound-mcp install --print --source npm
+```
+
+Until the package is on npm, use GitHub (subdirectory) or a clone:
+
+```bash
+npx -y alphabound-mcp install --source github --client copilot
+# args: ["-y", "github:talkincode/alphabound#path:tools/alphabound-mcp"]
+
+cd tools/alphabound-mcp && npm install
+node src/index.js install --source local --client copilot
+```
+
+VS Code Copilot Chat uses `"servers"` instead of `"mcpServers"`; `install --client vscode` writes that shape. Copilot CLI also gets `"type": "local"`.
+
+See `mcp.json.example`.
+
 ## Auth
 
 Set the same token as the daemon:
 
 ```bash
-export ALPHABOUND_API_BASE=http://127.0.0.1:8080
+export ALPHABOUND_API_BASE=http://127.0.0.1:18180
 export ALPHABOUND_API_TOKEN=YOUR_TOKEN
 ```
 
-The MCP client sends `Authorization: Bearer <token>` (or `X-API-Token`).
+The MCP process sends an `Authorization` Bearer header (or `X-API-Token`).
 
 ## Run (stdio — default for IDE agents)
 
 ```bash
+npx -y alphabound-mcp
+# or from a clone:
 cd tools/alphabound-mcp
 npm install
 npm start
@@ -30,6 +79,8 @@ npm start
 ## Run (remote HTTP / SSE)
 
 ```bash
+npx -y alphabound-mcp --http
+# or:
 ALPHABOUND_MCP_BIND=127.0.0.1 ALPHABOUND_MCP_PORT=8723 npm run http
 ```
 

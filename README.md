@@ -74,7 +74,7 @@ curl -sS http://127.0.0.1:18180/api/v1/state | head
 | 接真实 LLM 提案 | 配置 OpenAI 兼容端点与密钥（见手册；**勿**把密钥写进仓库） |
 | 本机控制进程 | `--control pause\|resume\|reconcile\|cancel-all\|flatten\|target-weight=W\|shutdown\|status` |
 | 保护 Dashboard API | 设 `ALPHABOUND_API_TOKEN`（见 [鉴权与 MCP](docs/DASHBOARD_AUTH_MCP.md)） |
-| 给 IDE Agent 只读盘面 | `tools/alphabound-mcp`（stdio / 本机 HTTP） |
+| 给 IDE Agent 只读盘面 | `npx -y alphabound-mcp`（stdio / `install` 写入客户端；见 [鉴权与 MCP](docs/DASHBOARD_AUTH_MCP.md)） |
 | 换数据目录 / 端口 | 复制 `config/local.toml` 或 `config/alphabound.toml` 改 `[storage]` / `[web]` |
 
 更完整的配置、CLI、部署步骤：[使用手册](https://talkincode.github.io/alphabound/)。

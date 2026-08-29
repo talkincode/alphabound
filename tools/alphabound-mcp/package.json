@@ -1,18 +1,44 @@
 {
   "name": "alphabound-mcp",
   "version": "0.1.0",
-  "private": true,
+  "private": false,
   "type": "module",
   "description": "Read-only AlphaBound analytics MCP (proxies authenticated Dashboard HTTP API)",
   "bin": {
     "alphabound-mcp": "./src/index.js"
   },
+  "files": [
+    "src",
+    "README.md",
+    "mcp.json.example"
+  ],
   "scripts": {
     "start": "node src/index.js",
-    "http": "node src/http.js"
+    "http": "node src/http.js",
+    "install-mcp": "node src/index.js install",
+    "test": "node --test test/*.test.js"
   },
   "engines": {
     "node": ">=18"
+  },
+  "license": "SEE LICENSE IN README.md",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/talkincode/alphabound.git",
+    "directory": "tools/alphabound-mcp"
+  },
+  "homepage": "https://github.com/talkincode/alphabound/tree/main/tools/alphabound-mcp",
+  "bugs": {
+    "url": "https://github.com/talkincode/alphabound/issues"
+  },
+  "keywords": [
+    "mcp",
+    "alphabound",
+    "model-context-protocol",
+    "analytics"
+  ],
+  "publishConfig": {
+    "access": "public"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1"

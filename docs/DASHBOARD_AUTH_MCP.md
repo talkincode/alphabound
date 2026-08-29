@@ -87,8 +87,30 @@ ssh -L 8080:127.0.0.1:8080 USER@HOST
 ## MCP (ideal remote path)
 
 1. Enable token on daemon (`secrets.env` → deploy).
-2. Run `tools/alphabound-mcp` with the same token + `ALPHABOUND_API_BASE`.
-3. stdio for IDE agents; `npm run http` for a small remote tool gateway (bind loopback; tunnel as needed).
+2. Point an IDE at the MCP via **npx auto-install** (same token + `ALPHABOUND_API_BASE`):
+
+```json
+{
+  "mcpServers": {
+    "alphabound": {
+      "command": "npx",
+      "args": ["-y", "alphabound-mcp"],
+      "env": {
+        "ALPHABOUND_API_BASE": "http://127.0.0.1:18180",
+        "ALPHABOUND_API_TOKEN": "YOUR_TOKEN"
+      }
+    }
+  }
+}
+```
+
+```bash
+npx -y alphabound-mcp install --client copilot
+# before npm publish:  --source github
+# from a clone:        node tools/alphabound-mcp/src/index.js install --source local --client copilot
+```
+
+3. stdio is the IDE default (`npx -y alphabound-mcp`). `npx -y alphabound-mcp --http` is a small remote tool gateway (bind loopback; tunnel as needed).
 
 Hard rule: MCP does **not** place orders, flatten, resume, or read secrets.
 Control stays on `--control` / local admin.

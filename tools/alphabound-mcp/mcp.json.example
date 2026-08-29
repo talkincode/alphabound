@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "alphabound": {
+      "command": "npx",
+      "args": ["-y", "alphabound-mcp"],
+      "env": {
+        "ALPHABOUND_API_BASE": "http://127.0.0.1:18180",
+        "ALPHABOUND_API_TOKEN": "YOUR_TOKEN"
+      }
+    }
+  }
+}

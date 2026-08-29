@@ -1,0 +1,60 @@
+name: Release MCP
+
+# Pack alphabound-mcp for npx. Optional npm publish when NPM_TOKEN is set.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-mcp-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: tools/alphabound-mcp
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: https://registry.npmjs.org
+          cache: npm
+          cache-dependency-path: tools/alphabound-mcp/package-lock.json
+
+      - name: Install, test, pack
+        run: |
+          npm ci
+          npm test
+          npm pack
+          VER=$(node -p "require('./package.json').version")
+          cp "alphabound-mcp-${VER}.tgz" alphabound-mcp.tgz
+
+      - name: Attach tarball to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            tools/alphabound-mcp/alphabound-mcp.tgz
+            tools/alphabound-mcp/alphabound-mcp-*.tgz
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+
+      - name: Publish to npm
+        working-directory: tools/alphabound-mcp
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "NPM_TOKEN not set; skip npm publish (npx can use the GitHub Release tarball or github:#path:)"
+            exit 0
+          fi
+          npm publish --access public
