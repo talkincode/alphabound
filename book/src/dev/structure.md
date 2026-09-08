@@ -27,7 +27,7 @@ alphabound/
 │   └── observability/        # redaction, latency
 ├── migrations/               # SQL
 ├── dashboard/                # 嵌入式 Overview + favicon
-├── tools/alphabound-mcp/     # Analytics MCP（只读观察 + 签名 intel ingest）
+├── tools/alphabound-mcp/     # Analytics MCP + CLI（只读观察 + 签名 intel ingest）
 ├── config/                   # alphabound.toml / local.toml / docker.toml
 ├── deploy/                   # systemd, nginx 示例, install 脚本
 ├── docs/                     # 设计分析 / 路线图 / 验收 / Gate / Auth

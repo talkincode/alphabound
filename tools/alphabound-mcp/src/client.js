@@ -1,16 +1,28 @@
-const BASE = (process.env.ALPHABOUND_API_BASE || "http://127.0.0.1:8080").replace(/\/$/, "");
-const TOKEN = process.env.ALPHABOUND_API_TOKEN || process.env.DASHBOARD_API_TOKEN || "";
+export const DEFAULT_API_BASE = "http://127.0.0.1:18180";
 
-export function apiBase() {
-  return BASE;
+/** Resolve base/token at call time so CLI/tests can use env without re-importing. */
+export function resolveConfig(overrides = {}) {
+  const base = String(overrides.base || process.env.ALPHABOUND_API_BASE || DEFAULT_API_BASE).replace(
+    /\/$/,
+    "",
+  );
+  const token =
+    overrides.token !== undefined
+      ? String(overrides.token)
+      : process.env.ALPHABOUND_API_TOKEN || process.env.DASHBOARD_API_TOKEN || "";
+  return { base, token };
 }
 
-function authHeaders(json) {
+export function apiBase(overrides) {
+  return resolveConfig(overrides).base;
+}
+
+function authHeaders(json, token) {
   const headers = { accept: "application/json" };
   if (json) headers["content-type"] = "application/json";
-  if (TOKEN) {
-    headers.authorization = `Bearer ${TOKEN}`;
-    headers["x-api-token"] = TOKEN;
+  if (token) {
+    headers.authorization = `Bearer ${token}`;
+    headers["x-api-token"] = token;
   }
   return headers;
 }
@@ -32,21 +44,62 @@ async function parseResponse(path, res) {
   return body;
 }
 
-export async function apiGet(path) {
-  const url = `${BASE}${path.startsWith("/") ? path : `/${path}`}`;
-  const res = await fetch(url, { headers: authHeaders(false), cache: "no-store" });
+function requestOpts(overrides = {}) {
+  const { base, token } = resolveConfig(overrides);
+  const fetchImpl = overrides.fetch || globalThis.fetch;
+  return { base, token, fetchImpl };
+}
+
+export async function apiGet(path, overrides = {}) {
+  const { base, token, fetchImpl } = requestOpts(overrides);
+  const url = `${base}${path.startsWith("/") ? path : `/${path}`}`;
+  const res = await fetchImpl(url, { headers: authHeaders(false, token), cache: "no-store" });
   return parseResponse(path, res);
 }
 
-export async function apiPost(path, payload) {
-  const url = `${BASE}${path.startsWith("/") ? path : `/${path}`}`;
-  const res = await fetch(url, {
+export async function apiPost(path, payload, overrides = {}) {
+  const { base, token, fetchImpl } = requestOpts(overrides);
+  const url = `${base}${path.startsWith("/") ? path : `/${path}`}`;
+  const res = await fetchImpl(url, {
     method: "POST",
-    headers: authHeaders(true),
+    headers: authHeaders(true, token),
     body: JSON.stringify(payload ?? {}),
     cache: "no-store",
   });
   return parseResponse(path, res);
+}
+
+export function findTool(name) {
+  return TOOLS.find((t) => t.name === name);
+}
+
+export function listToolsPublic() {
+  return TOOLS.map((t) => ({
+    name: t.name,
+    description: t.description,
+    path: t.path,
+    method: t.method || "GET",
+  }));
+}
+
+export async function callTool(name, args = {}, overrides = {}) {
+  const tool = findTool(name);
+  if (!tool) {
+    const err = new Error(`unknown tool: ${name}`);
+    err.code = "unknown_tool";
+    throw err;
+  }
+  const data =
+    tool.method === "POST"
+      ? await apiPost(tool.path, args || {}, overrides)
+      : await apiGet(tool.path, overrides);
+  return {
+    name: tool.name,
+    path: tool.path,
+    method: tool.method || "GET",
+    base: apiBase(overrides),
+    data,
+  };
 }
 
 /** Pre-signed alphabound.intel.v1 envelope. MCP never holds INTEL_HMAC. */

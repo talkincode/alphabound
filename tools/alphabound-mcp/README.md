@@ -66,6 +66,24 @@ export ALPHABOUND_API_TOKEN=YOUR_TOKEN
 
 The MCP process sends an `Authorization` Bearer header (or `X-API-Token`).
 
+Token is read from the environment at request time; do not put real tokens in git.
+
+## CLI (all MCP tools)
+
+Same catalog as the MCP server. Empty argv still starts stdio for IDE clients.
+
+```bash
+export ALPHABOUND_API_BASE=http://127.0.0.1:18180
+export ALPHABOUND_API_TOKEN=YOUR_TOKEN
+
+npx -y alphabound-mcp tools              # list tools (JSON)
+npx -y alphabound-mcp get_system         # any GET tool name
+npx -y alphabound-mcp call get_state
+npx -y alphabound-mcp submit_intel --file envelope.json
+```
+
+`--token` / `--base` override env. Prefer env: flags show up in `ps`. JSON goes to stdout; errors (including HTTP 401) go to stderr and exit 1. No order placement, flatten, resume, or secret readout.
+
 ## Run (stdio — default for IDE agents)
 
 ```bash
