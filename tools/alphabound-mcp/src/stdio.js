@@ -8,7 +8,7 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { TOOLS, apiGet, apiPost, apiBase } from "./client.js";
+import { TOOLS, callTool, apiBase } from "./client.js";
 
 const EMPTY_SCHEMA = { type: "object", properties: {}, additionalProperties: false };
 
@@ -35,15 +35,16 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     };
   }
   try {
-    const data =
-      tool.method === "POST"
-        ? await apiPost(tool.path, req.params.arguments || {})
-        : await apiGet(tool.path);
+    const result = await callTool(name, req.params.arguments || {});
     return {
       content: [
         {
           type: "text",
-          text: JSON.stringify({ base: apiBase(), path: tool.path, method: tool.method || "GET", data }, null, 2),
+          text: JSON.stringify(
+            { base: result.base || apiBase(), path: result.path, method: result.method, data: result.data },
+            null,
+            2,
+          ),
         },
       ],
     };

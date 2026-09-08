@@ -79,10 +79,10 @@
 
 ### 机器验收面
 
-- [ ] MCP `tools/list` 快照稳定（golden JSON）
-- [ ] 每个 tool：mock HTTP → 固定 fixture → 输出 schema 校验
+- [x] MCP `tools/list` 快照稳定（`alphabound-mcp tools` JSON catalog；`test/tools-cli.test.js`）
+- [x] 每个 tool：loopback mock HTTP + `ALPHABOUND_API_TOKEN` → CLI 调用（`test/tools-cli.test.js`）
 - [ ] 集成：对 running daemon `get_state` 与 `curl /api/v1/state` 字段一致
-- [ ] 负向：请求 `secrets` 路径 / POST control → 不存在或 405
+- [x] 负向：CLI 无 `place_order` / `flatten` / 控制面；缺 token 对需鉴权 API → 401
 - [ ] SEC3：响应扫描无 `OKX_` / `sk-` / 私钥头
 - [ ] 人工：用 Cursor/Copilot MCP 拉最近 5 条 REBALANCE thesis 成功
 

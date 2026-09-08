@@ -1,10 +1,27 @@
+import fs from "node:fs";
+import { callTool, findTool, listToolsPublic } from "./client.js";
+
 export const HELP = `alphabound-mcp — AlphaBound analytics MCP (read-only + signed intel ingest)
 
 Usage:
   alphabound-mcp                 Start stdio MCP (IDE / Copilot default)
   alphabound-mcp --http          Start loopback HTTP gateway
   alphabound-mcp install [opts]  Write MCP client config (npx -y auto-install)
+  alphabound-mcp tools           List MCP tools (JSON)
+  alphabound-mcp call <tool>     Invoke a tool; JSON on stdout
+  alphabound-mcp <tool>          Shorthand for call
   alphabound-mcp --help
+
+Auth (environment variables; preferred over flags):
+  ALPHABOUND_API_BASE     Dashboard origin (default http://127.0.0.1:18180)
+  ALPHABOUND_API_TOKEN    Same token as the daemon (or DASHBOARD_API_TOKEN)
+
+Call options:
+  --base <url>    Override ALPHABOUND_API_BASE
+  --token <str>   Override token (prefer env; do not commit / log)
+  --json <body>   POST JSON body (submit_intel)
+  --file <path>   POST JSON body from file
+  --meta          Include name/path/method/base envelope
 
 Install options:
   --client <id>   claude|claude-code|cursor|vscode|copilot|windsurf|all|detected (default: detected)
@@ -87,10 +104,99 @@ export function dispatch(argv) {
   if (args.includes("--http")) {
     return { kind: "http" };
   }
-  if (args.length) {
-    return { kind: "error", error: `unknown args: ${args.join(" ")}\n${HELP}` };
+
+  try {
+    const base = takeFlag(args, "--base");
+    const token = takeFlag(args, "--token");
+    const json = takeFlag(args, "--json");
+    const file = takeFlag(args, "--file");
+    const meta = hasFlag(args, "--meta");
+
+    if (args[0] === "tools" || args[0] === "list-tools") {
+      args.shift();
+      if (args.length) {
+        return { kind: "error", error: `unknown tools args: ${args.join(" ")}` };
+      }
+      return { kind: "tools" };
+    }
+
+    let name;
+    if (args[0] === "call") {
+      args.shift();
+      name = args.shift();
+      if (!name) {
+        return { kind: "error", error: "call requires a tool name" };
+      }
+    } else if (args[0] && findTool(args[0])) {
+      name = args.shift();
+    }
+
+    if (name) {
+      if (!findTool(name)) {
+        return { kind: "error", error: `unknown tool: ${name}` };
+      }
+      if (args.length) {
+        return { kind: "error", error: `unknown args: ${args.join(" ")}` };
+      }
+      return { kind: "call", name, base, token, json, file, meta };
+    }
+
+    if (base || token || json || file || meta) {
+      return { kind: "error", error: "tool flags require a tool name (see --help)" };
+    }
+    if (args.length) {
+      return { kind: "error", error: `unknown args: ${args.join(" ")}\n${HELP}` };
+    }
+    return { kind: "stdio" };
+  } catch (e) {
+    return { kind: "error", error: e.message };
   }
-  return { kind: "stdio" };
+}
+
+function loadPayload(action) {
+  const tool = findTool(action.name);
+  if (!tool) throw new Error(`unknown tool: ${action.name}`);
+  if (tool.method !== "POST") return {};
+  if (action.json && action.file) {
+    throw new Error("use either --json or --file, not both");
+  }
+  if (action.json) {
+    try {
+      return JSON.parse(action.json);
+    } catch {
+      throw new Error("--json is not valid JSON");
+    }
+  }
+  if (action.file) {
+    const raw = fs.readFileSync(action.file, "utf8");
+    try {
+      return JSON.parse(raw);
+    } catch {
+      throw new Error(`--file ${action.file} is not valid JSON`);
+    }
+  }
+  throw new Error(`${action.name} requires --json <body> or --file <path>`);
+}
+
+async function runCall(action, { log, err }) {
+  try {
+    const payload = loadPayload(action);
+    const overrides = {};
+    if (action.base !== undefined) overrides.base = action.base;
+    if (action.token !== undefined) overrides.token = action.token;
+    const result = await callTool(action.name, payload, overrides);
+    log(JSON.stringify(action.meta ? result : result.data, null, 2));
+    return 0;
+  } catch (e) {
+    err(
+      JSON.stringify({
+        error: e.message,
+        status: e.status || null,
+        body: e.body || null,
+      }),
+    );
+    return 1;
+  }
 }
 
 export async function runCli(argv, io = {}) {
@@ -112,6 +218,13 @@ export async function runCli(argv, io = {}) {
   if (action.kind === "http") {
     await import("./http.js");
     return undefined;
+  }
+  if (action.kind === "tools") {
+    log(JSON.stringify({ tools: listToolsPublic() }, null, 2));
+    return 0;
+  }
+  if (action.kind === "call") {
+    return runCall(action, { log, err });
   }
   await import("./stdio.js");
   return undefined;

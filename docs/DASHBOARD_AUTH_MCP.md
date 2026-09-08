@@ -111,6 +111,15 @@ npx -y alphabound-mcp install --client copilot
 ```
 
 3. stdio is the IDE default (`npx -y alphabound-mcp`). `npx -y alphabound-mcp --http` is a small remote tool gateway (bind loopback; tunnel as needed).
+4. The same binary is a CLI for every MCP tool. Token comes from `ALPHABOUND_API_TOKEN` (or `DASHBOARD_API_TOKEN`) at call time:
+
+```bash
+export ALPHABOUND_API_BASE=http://127.0.0.1:18180
+export ALPHABOUND_API_TOKEN=YOUR_TOKEN
+npx -y alphabound-mcp tools
+npx -y alphabound-mcp get_system
+npx -y alphabound-mcp submit_intel --file envelope.json
+```
 
 Hard rule: MCP does **not** place orders, flatten, resume, or read secrets.
 Control stays on `--control` / local admin.

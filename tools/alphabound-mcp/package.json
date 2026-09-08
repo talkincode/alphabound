@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": false,
   "type": "module",
-  "description": "Read-only AlphaBound analytics MCP (proxies authenticated Dashboard HTTP API)",
+  "description": "Read-only AlphaBound analytics MCP and CLI (proxies authenticated Dashboard HTTP API)",
   "bin": {
     "alphabound-mcp": "./src/index.js"
   },

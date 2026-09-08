@@ -48,7 +48,7 @@ npx -y alphabound-mcp install --client copilot
 # 本仓库源码：node tools/alphabound-mcp/src/index.js install --source local --client copilot
 ```
 
-从源码跑 stdio / HTTP：
+从源码跑 stdio / HTTP / CLI（token 走环境变量）：
 
 ```bash
 cd tools/alphabound-mcp
@@ -56,6 +56,8 @@ npm install
 export ALPHABOUND_API_BASE=http://127.0.0.1:18180
 export ALPHABOUND_API_TOKEN=YOUR_TOKEN   # 与 daemon 相同
 npx alphabound-mcp                      # stdio，给 IDE
+npx alphabound-mcp tools                # 列出全部 MCP 工具
+npx alphabound-mcp get_system           # CLI 调用同一工具面
 # 或本机 HTTP 网关：
 # npx alphabound-mcp --http
 ```

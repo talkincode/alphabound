@@ -11,12 +11,11 @@
  * Full MCP Streamable HTTP can be layered later; this is the operational remote surface.
  */
 import http from "node:http";
-import { TOOLS, apiGet, apiPost, apiBase } from "./client.js";
+import { TOOLS, callTool, apiBase, resolveConfig } from "./client.js";
 
 const BIND = process.env.ALPHABOUND_MCP_BIND || "127.0.0.1";
 const PORT = Number(process.env.ALPHABOUND_MCP_PORT || "8723");
 const REQUIRE = process.env.ALPHABOUND_MCP_REQUIRE_TOKEN === "1";
-const TOKEN = process.env.ALPHABOUND_API_TOKEN || process.env.DASHBOARD_API_TOKEN || "";
 
 function readAuth(req) {
   const h = req.headers["authorization"] || "";
@@ -72,7 +71,8 @@ const server = http.createServer(async (req, res) => {
     }
     if (REQUIRE) {
       const presented = readAuth(req);
-      if (!TOKEN || presented !== TOKEN) return send(res, 401, { error: "unauthorized" });
+      const token = resolveConfig().token;
+      if (!token || presented !== token) return send(res, 401, { error: "unauthorized" });
     }
     if (req.method === "GET" && url.pathname === "/tools") {
       return send(res, 200, {
@@ -88,13 +88,14 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && m) {
       const tool = TOOLS.find((t) => t.name === m[1]);
       if (!tool) return send(res, 404, { error: "unknown_tool" });
-      if (tool.method === "POST") {
-        const payload = await readJson(req);
-        const data = await apiPost(tool.path, payload);
-        return send(res, 200, { name: tool.name, path: tool.path, method: "POST", data });
-      }
-      const data = await apiGet(tool.path);
-      return send(res, 200, { name: tool.name, path: tool.path, method: "GET", data });
+      const payload = tool.method === "POST" ? await readJson(req) : {};
+      const result = await callTool(tool.name, payload);
+      return send(res, 200, {
+        name: result.name,
+        path: result.path,
+        method: result.method,
+        data: result.data,
+      });
     }
     return send(res, 404, { error: "not_found" });
   } catch (e) {
