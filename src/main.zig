@@ -1210,10 +1210,7 @@ pub fn main(init: std.process.Init) !u8 {
                     );
                 }
 
-                if (res.mode_changed) {
-                    std.debug.print("[risk] mode {t} -> {t}\n", .{ prev_mode, snap.risk_mode });
-                    logEvent(&events_repo, &engine, "RISK_MODE_CHANGED", "risk-kernel", "CRITICAL", &cfg);
-                }
+                noteRiskModeChange(&events_repo, &engine, &cfg, prev_mode, res.mode_changed);
 
                 // 1-minute equity samples (§6.2 retention).
                 const minute = @divFloor(snap.as_of_ms, 60_000);
@@ -1808,7 +1805,7 @@ fn runPrivateReconcile(
                     };
                     return .{};
                 }
-                _ = engine.apply(.{ .reconcile_result = .{
+                const applied = engine.apply(.{ .reconcile_result = .{
                     .ts_ms = ts_ms,
                     .cash_usdt = b.usdt_cash,
                     .btc_total = b.btc_cash,
@@ -1824,6 +1821,7 @@ fn runPrivateReconcile(
                     };
                     return .{};
                 };
+                noteRiskModeChange(events_repo, engine, cfg, before.risk_mode, applied.mode_changed);
                 std.debug.print(
                     "[reconcile] {t} balance applied usdt={f} avail={f} btc={f}\n",
                     .{ cfg.mode, b.usdt_cash, b.usdt_avail, b.btc_cash },
@@ -5006,7 +5004,10 @@ fn runScheduledAudit(
         .now_ms = now,
         .window_ms = window_ms,
         .agent_enabled = agent_live,
-        .zombie_threshold_ms = 3 * @as(i64, @intCast(@max(cfg.decision_interval_ms, cfg.decision_interval_quiet_ms))),
+        .zombie_threshold_ms = ab.auditor.zombieThresholdMs(
+            @intCast(@max(cfg.decision_interval_ms, cfg.decision_interval_quiet_ms)),
+            @intCast(cfg.review_backoff_max_ms),
+        ),
     };
 
     // --- llm ---
@@ -5359,6 +5360,24 @@ fn execLabel(mode: ab.config.Mode) []const u8 {
 const logEvent = ab.journal.logEvent;
 const logEventPayload = ab.journal.logEventPayload;
 const logEventPayloadChecked = ab.journal.logEventPayloadChecked;
+
+fn noteRiskModeChange(
+    events_repo: *ab.storage.EventsRepo,
+    engine: *ab.state.Engine,
+    cfg: *const ab.config.Config,
+    prev: ab.risk_state.RiskMode,
+    changed: bool,
+) void {
+    if (!changed) return;
+    const now_mode = engine.snapshot().risk_mode;
+    var buf: [128]u8 = undefined;
+    const payload = std.fmt.bufPrint(&buf, "{{\"from\":\"{s}\",\"to\":\"{s}\"}}", .{
+        prev.jsonName(),
+        now_mode.jsonName(),
+    }) catch "{\"from\":\"unknown\",\"to\":\"unknown\"}";
+    std.debug.print("[risk] mode {s} -> {s}\n", .{ prev.jsonName(), now_mode.jsonName() });
+    logEventPayload(events_repo, engine, "RISK_MODE_CHANGED", "risk-kernel", now_mode.journalSeverity(), cfg, payload);
+}
 
 fn consumeMaintenanceMarker(
     io: std.Io,

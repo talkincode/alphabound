@@ -82,7 +82,7 @@ pub const Message = union(enum) {
 };
 
 pub const ApplyResult = struct {
-    /// Risk mode changed during this message (worth a critical event).
+    /// Risk mode changed during this message (journal from/to + destination severity).
     mode_changed: bool = false,
     /// Drawdown boundary reached during this message.
     boundary_hit: bool = false,
