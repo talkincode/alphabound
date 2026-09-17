@@ -94,6 +94,12 @@ pub const Config = struct {
     // memories; they never reach the order path.
     review_short_interval_ms: u32 = 28_800_000, // 8h 小周期
     review_long_interval_ms: u32 = 604_800_000, // 7d 大周期
+    /// LLM call budget for one periodic-review pass. Deliberately independent
+    /// of `decision_timeout_ms`: the review prompt (window facts + memory
+    /// digest + prior short-review tail) is batched and routinely larger than
+    /// a single decision prompt, so tightening the per-decision budget must
+    /// not silently cap — and starve — this call too (see `runPeriodicReview`).
+    review_timeout_ms: u32 = 180_000,
     /// When true, after a valid proposal run a second LLM reflection call
     /// (structured memory_ops). Fail-closed → deterministic fallback.
     agent_llm_reflection: bool = true,
@@ -329,6 +335,12 @@ fn applyKey(a: std.mem.Allocator, cfg: *Config, section: []const u8, key: []cons
         } else if (std.mem.eql(u8, key, "long_interval_ms")) {
             cfg.review_long_interval_ms = parseInt(u32, val) catch return error.InvalidValue;
             if (cfg.review_long_interval_ms != 0 and cfg.review_long_interval_ms < 3_600_000) return error.InvalidValue;
+        } else if (std.mem.eql(u8, key, "timeout_ms")) {
+            cfg.review_timeout_ms = parseInt(u32, val) catch return error.InvalidValue;
+            // Floor guards against a misconfiguration reintroducing the
+            // starve-the-review bug this field exists to prevent; no 0-off
+            // escape hatch (unlike the interval knobs above).
+            if (cfg.review_timeout_ms < 30_000) return error.InvalidValue;
         } else return error.UnknownKey;
     } else {
         return error.UnknownSection;
@@ -453,6 +465,30 @@ test "[review] section parses, validates floors and stays optional" {
     try testing.expectError(error.UnknownKey, parse(testing.allocator,
         \\[review]
         \\cadence = 1
+    ));
+}
+
+test "review_timeout_ms is independent of decision_timeout_ms and floors at 30s" {
+    // Default stays generous even when unset.
+    var defaults = try parse(testing.allocator, "");
+    defer defaults.deinit();
+    try testing.expectEqual(@as(u32, 180_000), defaults.review_timeout_ms);
+
+    // A tight decision_timeout_ms (the exact appendix B example that
+    // previously capped periodic review via @min()) must not shrink it.
+    var cfg = try parse(testing.allocator,
+        \\[agent]
+        \\decision_timeout_ms = 30000
+        \\[review]
+        \\timeout_ms = 200000
+    );
+    defer cfg.deinit();
+    try testing.expectEqual(@as(u32, 30_000), cfg.decision_timeout_ms);
+    try testing.expectEqual(@as(u32, 200_000), cfg.review_timeout_ms);
+
+    try testing.expectError(error.InvalidValue, parse(testing.allocator,
+        \\[review]
+        \\timeout_ms = 29999
     ));
 }
 

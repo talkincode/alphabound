@@ -4346,10 +4346,26 @@ fn executeReviewTools(
 // risk state. Its only channel into future decisions is the low-confidence
 // memory it distills, which the agent may retrieve and weigh on its own.
 
-const periodic_review_timeout_ms: u32 = 90_000;
 /// Reports are journaled even when the model is unavailable, so the 复盘记录
 /// page still shows the deterministic facts for every closed window.
 const periodic_review_degraded_note = "本窗口未生成模型复盘（未配置 LLM 或调用/解析失败），仅记录确定性事实。";
+/// Distinct from the generic note above: this path never attempted a call at
+/// all (no LLM client), so it must not be reported as an "调用/解析失败".
+const periodic_review_not_configured_note = "本窗口未生成模型复盘：未检测到已配置的 LLM（provider/key 缺失或 agent 已禁用），仅记录确定性事实。";
+
+/// `cfg.review_timeout_ms` widened for large prompts: the review batches
+/// window facts + memory digest + (for the long cycle) a short-review tail
+/// into one call, so it is routinely bigger than a single decision prompt.
+/// Adds up to +50% of the base budget, capped, rather than scaling
+/// unbounded — a single busy window must not be able to block the loop
+/// indefinitely.
+fn periodicReviewTimeoutMs(base_ms: u32, prompt_len: usize) u32 {
+    const threshold: usize = 4096;
+    if (prompt_len <= threshold) return base_ms;
+    const extra_cap: u32 = base_ms / 2;
+    const extra: u32 = @intCast(@min(@as(usize, extra_cap), prompt_len - threshold));
+    return base_ms + extra;
+}
 
 fn periodicCountRange(
     db: *ab.storage.Db,
@@ -4627,6 +4643,7 @@ fn runPeriodicReview(
     // --- model pass (optional; degraded path keeps the facts) ---------------
     var status: []const u8 = "degraded";
     var summary: []const u8 = periodic_review_degraded_note;
+    var summary_buf: [200]u8 = undefined;
     var model_name: []const u8 = "";
     var ops_applied: usize = 0;
     var memory_id: []const u8 = "";
@@ -4675,7 +4692,10 @@ fn runPeriodicReview(
         };
 
         const saved_timeout = client.timeout_ms;
-        client.timeout_ms = @min(periodic_review_timeout_ms, cfg.decision_timeout_ms);
+        // Independent of cfg.decision_timeout_ms — see periodicReviewTimeoutMs
+        // doc comment above; a tight per-decision budget must not starve this
+        // larger, batched call.
+        client.timeout_ms = periodicReviewTimeoutMs(cfg.review_timeout_ms, user_msg.len);
         defer client.timeout_ms = saved_timeout;
 
         if (meteredChat(
@@ -4710,15 +4730,59 @@ fn runPeriodicReview(
                 } else |err| {
                     std.debug.print("[periodic] document rejected ({t}); memory untouched\n", .{err});
                     st.setLlm("invalid", "periodic_review");
+                    summary = std.fmt.bufPrint(
+                        &summary_buf,
+                        "本窗口模型复盘返回内容未通过校验（{t}），仅记录确定性事实。",
+                        .{err},
+                    ) catch periodic_review_degraded_note;
+                    persistLlmUsage(llm_usage_repo, .{
+                        .ts_ms = nowMs(),
+                        .call_kind = "periodic_review",
+                        .run_id = review_id,
+                        .model = client.model,
+                        .outcome = .failed,
+                        .error_class = "invalid_document",
+                    });
                 }
             } else {
                 std.debug.print("[periodic] no JSON object in model reply\n", .{});
                 st.setLlm("invalid", "periodic_review");
+                summary = "本窗口模型复盘返回内容未通过校验（no_json_object），仅记录确定性事实。";
+                persistLlmUsage(llm_usage_repo, .{
+                    .ts_ms = nowMs(),
+                    .call_kind = "periodic_review",
+                    .run_id = review_id,
+                    .model = client.model,
+                    .outcome = .failed,
+                    .error_class = "no_json_object",
+                });
             }
         } else |err| {
             std.debug.print("[periodic] LLM failed ({t})\n", .{err});
             st.setLlm("error", "periodic_review");
+            // meteredChat already appended the llm_usage failure row above
+            // (call_kind=periodic_review, error_class=llmErrorClass(err)); this
+            // only shapes the human-facing summary so it stops reading
+            // identically to the "no LLM configured" path below.
+            summary = std.fmt.bufPrint(
+                &summary_buf,
+                "本窗口模型复盘调用失败（{s}），仅记录确定性事实。",
+                .{llmErrorClass(err)},
+            ) catch periodic_review_degraded_note;
         }
+    } else {
+        // No LLM client at all (not configured / agent disabled) — distinct
+        // from a call that was attempted and failed, both for the human
+        // summary and for the llm_usage breakdown by call_kind=periodic_review.
+        summary = periodic_review_not_configured_note;
+        persistLlmUsage(llm_usage_repo, .{
+            .ts_ms = nowMs(),
+            .call_kind = "periodic_review",
+            .run_id = review_id,
+            .model = "",
+            .outcome = .failed,
+            .error_class = "not_configured",
+        });
     }
 
     persistPeriodicReport(periodic_repo, events_repo, engine, cfg, st, .{
@@ -5549,6 +5613,36 @@ fn jsonStringArrayLimited(buf: []u8, items: []const []const u8, max_items: usize
 
 test "version string sane" {
     try std.testing.expect(version_string.len >= 5);
+}
+
+test "periodicReviewTimeoutMs stays at the base for small prompts" {
+    try std.testing.expectEqual(@as(u32, 180_000), periodicReviewTimeoutMs(180_000, 0));
+    try std.testing.expectEqual(@as(u32, 180_000), periodicReviewTimeoutMs(180_000, 4096));
+}
+
+test "periodicReviewTimeoutMs widens for large prompts but caps at +50%" {
+    // A prompt just over the threshold gets a proportionally small bump.
+    const small_bump = periodicReviewTimeoutMs(180_000, 4096 + 1000);
+    try std.testing.expectEqual(@as(u32, 181_000), small_bump);
+
+    // Realistic ceiling: the review's user_buf is 16KB, so extra stays well
+    // under the +50% safety cap here.
+    const near_buffer_ceiling = periodicReviewTimeoutMs(180_000, 16 * 1024);
+    try std.testing.expectEqual(@as(u32, 192_288), near_buffer_ceiling);
+
+    // The +50% cap itself still holds for any pathologically large input.
+    const pathological = periodicReviewTimeoutMs(180_000, 10 * 1024 * 1024);
+    try std.testing.expectEqual(@as(u32, 270_000), pathological);
+}
+
+test "periodicReviewTimeoutMs never shrinks below the configured base regardless of decision_timeout_ms" {
+    // This is the exact regression this fix targets: a tight
+    // decision_timeout_ms (e.g. 30s) must never cap the review timeout.
+    const tight_decision_timeout_ms: u32 = 30_000;
+    const review_base_ms: u32 = 180_000;
+    const effective = periodicReviewTimeoutMs(review_base_ms, 12_000);
+    try std.testing.expect(effective > tight_decision_timeout_ms);
+    try std.testing.expectEqual(review_base_ms, @min(effective, review_base_ms));
 }
 
 test "jsonStringArrayLimited escapes and caps" {
