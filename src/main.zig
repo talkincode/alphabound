@@ -2622,7 +2622,7 @@ fn drainModeTransitions(
     logEventPayload(events_repo, engine, "RISK_MODE_CHANGED", "risk-kernel", severity, cfg, payload);
 }
 
-fn riskModeUpper(m: ab.state_machine.RiskMode) []const u8 {
+fn riskModeUpper(m: ab.risk_state.RiskMode) []const u8 {
     return switch (m) {
         .normal => "NORMAL",
         .exit_only => "EXIT_ONLY",
