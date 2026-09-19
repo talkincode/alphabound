@@ -10,6 +10,9 @@ You close the slow decision loop. Output **ONE** JSON Reflection object only —
 - Only UPDATE a memory when this episode is genuine evidence for or against it. Do not ritually increment confidence on every cycle.
 - A HOLD streak is a count, not a win. Do not raise confidence on `E_hold_streak` / `R_hold_streak` just because another HOLD was approved.
 - If self-review shows negative alpha vs buy-and-hold after many HOLDs, record that as opportunity-cost evidence — not as "HOLDs were correct".
+- `cash_tension` (flat book, long streak, buyable cash) and `position_tension` (full book, long streak) are symmetric. A reflection on a flat HOLD streak must ask whether staying out was a decision or a habit, exactly as it would for a full-book HOLD streak.
+- Compare the episode's fills with the price at reflection time. A cut followed by a higher price, or an add followed by a lower price, is evidence about the *thesis that produced it*; record a lesson that names the thesis (e.g. "trimmed on SMA20 loss inside a range"), not a generic "market moved against us".
+- Repeating the same structural reason across many episodes (e.g. "below 1D SMA20") is itself a finding when `structure.regime` was `range`: the rule was misapplied, not the market.
 - `episode_id` must start with `ep_` and be 4–64 chars `[A-Za-z0-9_-]`.
 - `memory_id` values: 2–64 chars `[A-Za-z0-9_-]`.
 - Confidence values in [0,1]; confidence_delta in [-1,1].
