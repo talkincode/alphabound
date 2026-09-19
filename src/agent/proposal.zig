@@ -50,6 +50,8 @@ pub const Proposal = struct {
     review_after: ?[]const u8,
     /// Required on HOLD when `position_tension` is true: did you weigh a cut?
     reduce_eval: ?ReduceEval = null,
+    /// Required on HOLD when `cash_tension` is true: did you weigh an add?
+    add_eval: ?AddEval = null,
 
     arena: std.heap.ArenaAllocator,
 
@@ -73,6 +75,15 @@ pub const ReduceEval = struct {
     reason: []const u8,
 };
 
+pub const AddVerdict = enum { stay, add };
+
+/// Explicit ADD check, mirror of `ReduceEval`. HOLD + `add` is a schema
+/// conflict (must REBALANCE to a higher weight).
+pub const AddEval = struct {
+    verdict: AddVerdict,
+    reason: []const u8,
+};
+
 pub const ValidationError = error{
     MalformedJson,
     MissingField,
@@ -89,6 +100,9 @@ pub const ValidationError = error{
     ReduceEvalInvalid,
     ReduceEvalRequired,
     ReduceEvalConflict,
+    AddEvalInvalid,
+    AddEvalRequired,
+    AddEvalConflict,
     OutOfMemory,
 };
 
@@ -175,6 +189,22 @@ pub fn parse(gpa: std.mem.Allocator, raw: []const u8) ValidationError!Proposal {
         reduce_eval = .{ .verdict = verdict, .reason = try dupString(a, reason) };
     }
 
+    var add_eval: ?AddEval = null;
+    if (obj.get("add_eval")) |av| {
+        if (av != .object) return error.WrongType;
+        const verdict_s = try getString(av.object, "verdict");
+        const verdict: AddVerdict = if (std.mem.eql(u8, verdict_s, "stay"))
+            .stay
+        else if (std.mem.eql(u8, verdict_s, "add"))
+            .add
+        else
+            return error.AddEvalInvalid;
+        const reason = try getString(av.object, "reason");
+        if (reason.len < 8) return error.AddEvalInvalid;
+        if (action == .hold and verdict == .add) return error.AddEvalConflict;
+        add_eval = .{ .verdict = verdict, .reason = try dupString(a, reason) };
+    }
+
     return .{
         .decision_id = decision_id,
         .snapshot_version = snapshot_version,
@@ -186,6 +216,7 @@ pub fn parse(gpa: std.mem.Allocator, raw: []const u8) ValidationError!Proposal {
         .invalid_if = invalid_if,
         .review_after = review_after,
         .reduce_eval = reduce_eval,
+        .add_eval = add_eval,
         .arena = arena,
     };
 }
@@ -194,6 +225,12 @@ pub fn parse(gpa: std.mem.Allocator, raw: []const u8) ValidationError!Proposal {
 pub fn enforceReduceEval(p: *const Proposal, tension: bool) ValidationError!void {
     if (!tension or p.action != .hold) return;
     if (p.reduce_eval == null) return error.ReduceEvalRequired;
+}
+
+/// Flat book plus a long no-op streak with buyable cash: the model must weigh an add.
+pub fn enforceAddEval(p: *const Proposal, cash_tension: bool) ValidationError!void {
+    if (!cash_tension or p.action != .hold) return;
+    if (p.add_eval == null) return error.AddEvalRequired;
 }
 
 fn getString(obj: std.json.ObjectMap, key: []const u8) ValidationError![]const u8 {
@@ -423,4 +460,47 @@ test "reduce_eval keep is accepted; cut on HOLD is a conflict" {
     defer bare.deinit();
     try enforceReduceEval(&bare, false);
     try testing.expectError(error.ReduceEvalRequired, enforceReduceEval(&bare, true));
+}
+
+test "add_eval stay is accepted; add on HOLD is a conflict; required under cash_tension" {
+    const gpa = testing.allocator;
+    var stay = try parse(gpa,
+        \\{"decision_id":"dec_flat_1","snapshot_version":7,"action":"HOLD","confidence":0.5,
+        \\ "thesis":["range regime, mid-band"],"invalid_if":["4H close > range high"],
+        \\ "add_eval":{"verdict":"stay","reason":"range regime, price mid-band, no edge"}}
+    );
+    defer stay.deinit();
+    try testing.expect(stay.add_eval != null);
+    try testing.expectEqual(AddVerdict.stay, stay.add_eval.?.verdict);
+    try enforceAddEval(&stay, true);
+
+    try testing.expectError(error.AddEvalConflict, parse(gpa,
+        \\{"decision_id":"dec_flat_2","snapshot_version":7,"action":"HOLD","confidence":0.5,
+        \\ "thesis":["x"],"invalid_if":["y"],
+        \\ "add_eval":{"verdict":"add","reason":"should have rebalanced"}}
+    ));
+    try testing.expectError(error.AddEvalInvalid, parse(gpa,
+        \\{"decision_id":"dec_flat_3","snapshot_version":7,"action":"HOLD","confidence":0.5,
+        \\ "thesis":["x"],"invalid_if":["y"],
+        \\ "add_eval":{"verdict":"stay","reason":"short"}}
+    ));
+
+    var bare = try parse(gpa,
+        \\{"decision_id":"dec_flat_4","snapshot_version":7,"action":"HOLD","confidence":0.5,
+        \\ "thesis":["x"],"invalid_if":["y"]}
+    );
+    defer bare.deinit();
+    try enforceAddEval(&bare, false);
+    try testing.expectError(error.AddEvalRequired, enforceAddEval(&bare, true));
+
+    // REBALANCE with add verdict is fine.
+    var reb = try parse(gpa,
+        \\{"decision_id":"dec_flat_5","snapshot_version":7,"action":"REBALANCE",
+        \\ "target":{"type":"portfolio_weight","btc":0.4},"confidence":0.6,
+        \\ "order_policy":{"type":"LIMIT_OR_MARKET","urgency":0.3,"max_wait_ms":60000},
+        \\ "thesis":["x"],"invalid_if":["y"],
+        \\ "add_eval":{"verdict":"add","reason":"range low, 4H RSI 32, cash idle 9 cycles"}}
+    );
+    defer reb.deinit();
+    try enforceAddEval(&reb, true);
 }

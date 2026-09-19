@@ -73,6 +73,18 @@ pub fn positionTension(weight: Decimal, hold_streak: u32) bool {
     return weight.gte(threshold);
 }
 
+/// Mirror of `positionTension`: a (near-)flat book, a long no-op streak, and
+/// cash that can still form a legal buy. Without this the only hard
+/// self-check pointed one way — the model was forced to justify *holding* a
+/// full position but never forced to justify *staying out* while it could
+/// buy (25 consecutive flat HOLDs through a +6% move in production).
+pub fn cashTension(weight: Decimal, hold_streak: u32, cash_covers_min_buy: bool) bool {
+    if (hold_streak < TENSION_HOLD_STREAK) return false;
+    if (!cash_covers_min_buy) return false;
+    const threshold = Decimal.parse("0.15") catch return false;
+    return weight.lte(threshold);
+}
+
 /// BTC notional / conservative equity. Zero when equity is missing or non-positive.
 pub fn btcWeight(s: state_mod.PortfolioState) Decimal {
     if (!s.conservative_equity.gt(Decimal.zero)) return Decimal.zero;
@@ -248,7 +260,9 @@ fn writeReviewFacts(w: *std.Io.Writer, input: Input) !void {
     } else {
         try w.writeAll("\"shadow_return\":null,\"bh_return\":null,\"alpha_return\":null,");
     }
-    try w.print("\"position_tension\":{}", .{positionTension(btcWeight(input.snapshot), f.hold_streak)});
+    const covers = cashCoversMinBuy(input.snapshot.cash_usdt, quotePrice(input.snapshot), input.min_size, input.min_notional);
+    try w.print("\"position_tension\":{},", .{positionTension(btcWeight(input.snapshot), f.hold_streak)});
+    try w.print("\"cash_tension\":{}", .{cashTension(btcWeight(input.snapshot), f.hold_streak, covers)});
 }
 
 fn riskModeText(mode: sm.RiskMode) []const u8 {
@@ -519,4 +533,15 @@ test "position_tension is true only at high weight and a long HOLD streak" {
     defer parsed.deinit();
     const facts = parsed.value.object.get("self_review").?.object.get("facts").?.object;
     try testing.expect(facts.get("position_tension").?.bool);
+}
+
+test "cashTension mirrors positionTension for a flat, buyable book" {
+    const flat = Decimal.zero;
+    const low = Decimal.parse("0.12") catch unreachable;
+    const mid = Decimal.parse("0.40") catch unreachable;
+    try std.testing.expect(cashTension(flat, 4, true));
+    try std.testing.expect(cashTension(low, 9, true));
+    try std.testing.expect(!cashTension(flat, 3, true)); // streak too short
+    try std.testing.expect(!cashTension(flat, 9, false)); // cannot buy anyway
+    try std.testing.expect(!cashTension(mid, 9, true)); // not flat
 }

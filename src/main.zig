@@ -2972,9 +2972,12 @@ fn runAgentDecision(
     const intel_rows = intel_ptrs[0..intel_n];
 
     var review_facts = ab.context.ReviewFacts{};
-    if (mem_store.find("E_hold_streak")) |hm| {
-        review_facts.hold_streak = hm.evidence_count;
-    }
+    // Consecutive no-ops since the last executed rebalance (audit log). The
+    // memory counter is a lifetime total and only a fallback.
+    review_facts.hold_streak = events_repo.noopStreakSinceLastExecution(db) catch blk: {
+        if (mem_store.find("E_hold_streak")) |hm| break :blk hm.evidence_count;
+        break :blk 0;
+    };
     if (fill_n > 0) {
         if (compactJsonTsMs(recent_fills[0])) |fts| {
             const age = nowMs() - fts;
@@ -3022,8 +3025,17 @@ fn runAgentDecision(
     );
 
     const tension = ab.context.positionTension(ab.context.btcWeight(snap), review_facts.hold_streak);
+    const cash_tension = ab.context.cashTension(
+        ab.context.btcWeight(snap),
+        review_facts.hold_streak,
+        ab.context.cashCoversMinBuy(snap.cash_usdt, ab.context.quotePrice(snap), instrument.min_size, instrument.min_notional),
+    );
     const user_msg_prefix: []const u8 = if (tension)
         \\Respond with ONE JSON Decision Proposal only. position_tension=true: HOLD requires reduce_eval {verdict:keep|cut, reason>=8 chars}; cut must be action REBALANCE.
+        \\Context:
+        \\
+    else if (cash_tension)
+        \\Respond with ONE JSON Decision Proposal only. cash_tension=true: HOLD requires add_eval {verdict:stay|add, reason>=8 chars}; add must be action REBALANCE to a higher weight.
         \\Context:
         \\
     else
@@ -3206,6 +3218,18 @@ fn runAgentDecision(
         return;
     };
     defer prop.deinit();
+    ab.proposal.enforceAddEval(&prop, cash_tension) catch |err| {
+        std.debug.print("[agent] proposal invalid ({t}) → HOLD\n", .{err});
+        completeRun(runs, run_id, "invalid_proposal", out_digest, input_digest, nowMs());
+        var inva_buf: [360]u8 = undefined;
+        const inva_payload = std.fmt.bufPrint(
+            &inva_buf,
+            "{{\"run_id\":\"{s}\",\"output_digest\":\"{s}\",\"reason\":\"{t}\",\"degraded\":\"HOLD\"}}",
+            .{ run_id, out_digest, err },
+        ) catch "{\"degraded\":\"HOLD\"}";
+        logEventPayload(events_repo, engine, "AGENT_INVALID_PROPOSAL", "agent", "WARN", cfg, inva_payload);
+        return;
+    };
     ab.proposal.enforceReduceEval(&prop, tension) catch |err| {
         std.debug.print("[agent] proposal invalid ({t}) → HOLD\n", .{err});
         completeRun(runs, run_id, "invalid_proposal", out_digest, input_digest, nowMs());
