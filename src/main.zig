@@ -2601,6 +2601,24 @@ fn refreshBeforeAdmission(
     }
 }
 
+/// `{"verdict":"...","reason":"..."}` with the reason UTF-8-safely capped.
+fn evalJson(buf: []u8, verdict: []const u8, reason: []const u8) []const u8 {
+    var esc: [2 * 200 + 8]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&esc);
+    for (utf8SafePrefix(reason, 200)) |c| {
+        switch (c) {
+            '"' => w.writeAll("\\\"") catch break,
+            '\\' => w.writeAll("\\\\") catch break,
+            '\n', '\r', '\t' => w.writeByte(' ') catch break,
+            else => {
+                if (c < 0x20) continue;
+                w.writeByte(c) catch break;
+            },
+        }
+    }
+    return std.fmt.bufPrint(buf, "{{\"verdict\":\"{s}\",\"reason\":\"{s}\"}}", .{ verdict, w.buffered() }) catch "null";
+}
+
 /// True for execution notes that denote at least one confirmed fill
 /// (`filled`, `partial`, `filled_book_lag`, `partial_then_hold`, ...).
 fn executionNoteMeansFill(note: []const u8) bool {
@@ -3422,14 +3440,25 @@ fn runAgentDecision(
     const review_s: []const u8 = if (prop.review_after) |ra| blk: {
         break :blk jsonEscapeInto(&review_buf, ra);
     } else "";
+    // Audit the symmetric self-checks alongside the decision they justify.
+    var reduce_eval_buf: [320]u8 = undefined;
+    var add_eval_buf: [320]u8 = undefined;
+    const reduce_eval_json: []const u8 = if (prop.reduce_eval) |re|
+        evalJson(&reduce_eval_buf, @tagName(re.verdict), re.reason)
+    else
+        "null";
+    const add_eval_json: []const u8 = if (prop.add_eval) |ae|
+        evalJson(&add_eval_buf, @tagName(ae.verdict), ae.reason)
+    else
+        "null";
     // Positive list: only notes that mean "the venue book moved" count as
     // executed. A deny-list marked rejected / limit_timeout / unknown_* legs as
     // executed, which now also resets the no-op streak in the audit log.
     const executed = executionNoteMeansFill(exec_note);
     const ok_payload = std.fmt.bufPrint(
         &ok_buf,
-        "{{\"run_id\":\"{s}\",\"decision_id\":\"{s}\",\"action\":\"{s}\",\"target_btc_weight\":\"{s}\",\"confidence\":\"{s}\",\"snapshot_version\":{d},\"output_digest\":\"{s}\",\"tools\":{d},\"executed\":{},\"exec\":\"{s}\",\"thesis\":{s},\"invalid_if\":{s},\"review_after\":\"{s}\",\"admission\":{{\"verdict\":\"{s}\",\"reason\":\"{s}\",\"admitted_weight\":\"{s}\",\"stress_equity\":\"{s}\",\"floor\":\"{s}\"}},\"usage\":{{\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d}}}}}",
-        .{ run_id, prop.decision_id, action_txt, weight_s, conf_s, prop.snapshot_version, out_digest, tools_used, executed, exec_note, thesis_json, invalid_json, review_s, admission.verdict_txt, admission.reason_txt, admitted_s, stress_s, floor_s, usage.prompt_tokens, usage.completion_tokens, usage.total_tokens },
+        "{{\"run_id\":\"{s}\",\"decision_id\":\"{s}\",\"action\":\"{s}\",\"target_btc_weight\":\"{s}\",\"confidence\":\"{s}\",\"snapshot_version\":{d},\"output_digest\":\"{s}\",\"tools\":{d},\"executed\":{},\"exec\":\"{s}\",\"thesis\":{s},\"invalid_if\":{s},\"review_after\":\"{s}\",\"reduce_eval\":{s},\"add_eval\":{s},\"admission\":{{\"verdict\":\"{s}\",\"reason\":\"{s}\",\"admitted_weight\":\"{s}\",\"stress_equity\":\"{s}\",\"floor\":\"{s}\"}},\"usage\":{{\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d}}}}}",
+        .{ run_id, prop.decision_id, action_txt, weight_s, conf_s, prop.snapshot_version, out_digest, tools_used, executed, exec_note, thesis_json, invalid_json, review_s, reduce_eval_json, add_eval_json, admission.verdict_txt, admission.reason_txt, admitted_s, stress_s, floor_s, usage.prompt_tokens, usage.completion_tokens, usage.total_tokens },
     ) catch "{\"executed\":false}";
     {
         var dbuf: [160]u8 = undefined;
