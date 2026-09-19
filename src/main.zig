@@ -2122,7 +2122,7 @@ fn collectMarketTools(
                 fetch_err = true;
             }
         }
-        var struct_buf: [768]u8 = undefined;
+        var struct_buf: [1280]u8 = undefined;
         const structure = if (daily_n > 0)
             ab.indicators.formatHtfStructure(
                 &struct_buf,
@@ -3274,22 +3274,24 @@ fn runAgentDecision(
         applyShadowReflection(gpa, mem_store, memories_repo, events_repo, engine, cfg, run_id, prop.decision_id, action_txt, prop.target_btc_weight, prop.confidence);
     }
 
-    var ok_buf: [4096]u8 = undefined;
+    var ok_buf: [8192]u8 = undefined;
     var w_buf: [48]u8 = undefined;
     var c_buf: [48]u8 = undefined;
     var aw_buf: [48]u8 = undefined;
     var se_buf: [48]u8 = undefined;
     var fl_buf: [48]u8 = undefined;
-    var thesis_buf: [1536]u8 = undefined;
-    var invalid_buf: [1024]u8 = undefined;
+    var thesis_buf: [3072]u8 = undefined;
+    var invalid_buf: [2048]u8 = undefined;
     var review_buf: [48]u8 = undefined;
     const weight_s = decFmt(&w_buf, prop.target_btc_weight);
     const conf_s = decFmt(&c_buf, prop.confidence);
     const admitted_s = decFmt(&aw_buf, admission.admitted_weight);
     const stress_s = decFmt(&se_buf, admission.stress_equity);
     const floor_s = decFmt(&fl_buf, admission.floor);
-    const thesis_json = jsonStringArrayLimited(&thesis_buf, prop.thesis, 6, 180);
-    const invalid_json = jsonStringArrayLimited(&invalid_buf, prop.invalid_if, 6, 120);
+    // 400/240 bytes keep the full sentence the model actually wrote (the old
+    // 180/120 cut most theses mid-clause); the array cap bounds the payload.
+    const thesis_json = jsonStringArrayLimited(&thesis_buf, prop.thesis, 6, 400);
+    const invalid_json = jsonStringArrayLimited(&invalid_buf, prop.invalid_if, 6, 240);
     const review_s: []const u8 = if (prop.review_after) |ra| blk: {
         break :blk jsonEscapeInto(&review_buf, ra);
     } else "";
@@ -5499,6 +5501,33 @@ fn jsonEscapeInto(buf: []u8, s: []const u8) []const u8 {
 }
 
 /// JSON array of strings, truncated for event payload size.
+/// Longest prefix of `s` that is at most `max_len` bytes and does not end in
+/// the middle of a UTF-8 sequence. Byte-slicing `s[0..max_len]` used to cut
+/// multi-byte characters (e.g. "—") in half; the broken bytes then landed in
+/// event payloads and broke every downstream JSON consumer (periodic review
+/// prompts were rejected by the LLM API with "invalid unicode code point").
+pub fn utf8SafePrefix(s: []const u8, max_len: usize) []const u8 {
+    if (s.len <= max_len) return s;
+    var end = max_len;
+    // Back off over continuation bytes (10xxxxxx) to the start of the sequence
+    // that straddles the cut, then drop that sequence.
+    while (end > 0 and (s[end] & 0xC0) == 0x80) end -= 1;
+    return s[0..end];
+}
+
+test "utf8SafePrefix never splits a multi-byte character" {
+    const s = "ab—cd"; // "—" is 3 bytes (E2 80 94)
+    try std.testing.expectEqualStrings("ab—cd", utf8SafePrefix(s, 10));
+    try std.testing.expectEqualStrings("ab—cd", utf8SafePrefix(s, 7));
+    try std.testing.expectEqualStrings("ab—c", utf8SafePrefix(s, 6));
+    try std.testing.expectEqualStrings("ab—", utf8SafePrefix(s, 5));
+    try std.testing.expectEqualStrings("ab", utf8SafePrefix(s, 4));
+    try std.testing.expectEqualStrings("ab", utf8SafePrefix(s, 3));
+    try std.testing.expectEqualStrings("ab", utf8SafePrefix(s, 2));
+    try std.testing.expectEqualStrings("", utf8SafePrefix(s, 0));
+    for (0..s.len + 1) |n| try std.testing.expect(std.unicode.utf8ValidateSlice(utf8SafePrefix(s, n)));
+}
+
 fn jsonStringArrayLimited(buf: []u8, items: []const []const u8, max_items: usize, max_item_len: usize) []const u8 {
     var w: std.Io.Writer = .fixed(buf);
     w.writeAll("[") catch return "[]";
@@ -5508,7 +5537,7 @@ fn jsonStringArrayLimited(buf: []u8, items: []const []const u8, max_items: usize
         if (i > 0) w.writeAll(",") catch break;
         w.writeAll("\"") catch break;
         const raw = items[i];
-        const slice = if (raw.len > max_item_len) raw[0..max_item_len] else raw;
+        const slice = utf8SafePrefix(raw, max_item_len);
         for (slice) |c| {
             switch (c) {
                 '"' => w.writeAll("\\\"") catch break,

@@ -290,23 +290,60 @@ fn writeChatBody(w: *std.Io.Writer, model: []const u8, system: []const u8, user:
     w.writeAll("\"}]}") catch return error.OutOfMemory;
 }
 
+/// JSON-escape `s` and repair invalid UTF-8 on the way out. Request bodies
+/// must be valid UTF-8 or the provider rejects the whole call (HTTP 400
+/// "invalid unicode code point"); one bad byte in a quoted event line used
+/// to take down every periodic review. Invalid sequences become U+FFFD.
 fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
-    for (s) |c| {
-        switch (c) {
-            '"' => try w.writeAll("\\\""),
-            '\\' => try w.writeAll("\\\\"),
-            '\n' => try w.writeAll("\\n"),
-            '\r' => try w.writeAll("\\r"),
-            '\t' => try w.writeAll("\\t"),
-            else => {
-                if (c < 0x20) {
-                    try w.print("\\u{x:0>4}", .{c});
-                } else {
-                    try w.writeByte(c);
-                }
-            },
+    var i: usize = 0;
+    while (i < s.len) {
+        const c = s[i];
+        if (c < 0x80) {
+            switch (c) {
+                '"' => try w.writeAll("\\\""),
+                '\\' => try w.writeAll("\\\\"),
+                '\n' => try w.writeAll("\\n"),
+                '\r' => try w.writeAll("\\r"),
+                '\t' => try w.writeAll("\\t"),
+                else => {
+                    if (c < 0x20) {
+                        try w.print("\\u{x:0>4}", .{c});
+                    } else {
+                        try w.writeByte(c);
+                    }
+                },
+            }
+            i += 1;
+            continue;
         }
+        const seq_len = std.unicode.utf8ByteSequenceLength(c) catch {
+            try w.writeAll("\xEF\xBF\xBD");
+            i += 1;
+            continue;
+        };
+        if (i + seq_len > s.len or !std.unicode.utf8ValidateSlice(s[i .. i + seq_len])) {
+            try w.writeAll("\xEF\xBF\xBD");
+            i += 1;
+            continue;
+        }
+        try w.writeAll(s[i .. i + seq_len]);
+        i += seq_len;
     }
+}
+
+test "writeJsonString repairs truncated UTF-8 instead of forwarding it" {
+    var buf: [128]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    // "a—" with the em dash cut to two bytes, then a quote.
+    try writeJsonString(&w, "a\xE2\x80\"z");
+    const out = w.buffered();
+    try std.testing.expect(std.unicode.utf8ValidateSlice(out));
+    try std.testing.expect(std.mem.indexOf(u8, out, "\xEF\xBF\xBD") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\\\"z") != null);
+
+    var w2: std.Io.Writer = .fixed(&buf);
+    try writeJsonString(&w2, "ok — 中文");
+    try std.testing.expectEqualStrings("ok — 中文", w2.buffered());
 }
 
 /// Map provider error JSON to a short stable token (no secrets).
