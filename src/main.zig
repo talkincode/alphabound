@@ -1306,7 +1306,7 @@ pub fn main(init: std.process.Init) !u8 {
                         .{ reason_txt, ab.scheduler.hourUtc(tnow), agent_sched.params.effectiveInterval(ab.scheduler.hourUtc(tnow)) },
                     ) catch "{\"reason\":\"unknown\"}";
                     logEventPayload(&events_repo, &engine, "AGENT_TRIGGER", "agent", "INFO", &cfg, trig_payload);
-                    runAgentDecision(gpa, client, &okx, &cfg, &engine, &tool_reg, &agent_runs, &tool_calls, &llm_usage_repo, &events_repo, &orders_repo, &fills_repo, &equity_repo, &capital_flows_repo, &db, &mem_store, &memories_repo, &intel_repo, env, &runtime_status, trade_instrument, &agent_sched, portfolio_refresher, last_bh_cmp);
+                    runAgentDecision(gpa, client, &okx, &cfg, &engine, &tool_reg, &agent_runs, &tool_calls, &llm_usage_repo, &events_repo, &orders_repo, &fills_repo, &equity_repo, &capital_flows_repo, &db, &mem_store, &memories_repo, &intel_repo, env, &runtime_status, trade_instrument, &agent_sched, portfolio_refresher, last_bh_cmp, reason_txt);
                     refreshWebCaches(&web_state, &db, &agent_runs, &equity_repo, &events_repo, &memories_repo, &orders_repo, &fills_repo, last_bh_cmp);
                     ab.web_cache.refreshStatisticsCache(&web_state, &db, &llm_usage_repo);
                     refreshSystemCache(&web_state, &db, &cfg, &mem_store, boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), llm_client != null, admin_paused, &runtime_status, &risk_latency);
@@ -2600,6 +2600,10 @@ fn refreshBeforeAdmission(
     }
 }
 
+/// A first-run REBALANCE is deferred when the previous decision is younger
+/// than this (deploy/restart churn); a genuinely long outage still acts.
+const restart_guard_window_ms: i64 = 2 * 3_600_000;
+
 /// Journal risk-mode transitions recorded by the engine since the last drain.
 /// Emitted as one `RISK_MODE_CHANGED` per drain with the causing message and
 /// the number of folded bounces, so a stale-account flap between reconciles
@@ -2880,6 +2884,7 @@ fn runAgentDecision(
     sched: *ab.scheduler.Scheduler,
     portfolio_refresher: ab.demo_runner.PortfolioRefresher,
     bh_cmp: ab.shadow_bench.Comparison,
+    trigger_reason: []const u8,
 ) void {
     const snap = engine.snapshot();
     const decision_start_version = snap.version;
@@ -2942,6 +2947,18 @@ fn runAgentDecision(
     var prop_ptrs: [6][]const u8 = undefined;
     const prop_n = compactProposalLines(gpa, prop_rows[0..prop_raw_n], &prop_backing, &prop_ptrs);
     const recent_proposals = prop_ptrs[0..prop_n];
+
+    // Restart guard: the first decision after a (re)start sees a bare context
+    // — no scheduler state, no in-loop history — and in production twice
+    // produced an immediate trim right after a deploy. If the previous
+    // decision is recent, the first run may only HOLD; anything else waits
+    // for the next regular cycle with full context.
+    const restart_guard = blk: {
+        if (!std.mem.eql(u8, trigger_reason, "first_run")) break :blk false;
+        if (prop_raw_n == 0) break :blk false;
+        const last_ts = ab.clock.parseRfc3339Ms(prop_rows[prop_raw_n - 1].ts) catch break :blk false;
+        break :blk nowMs() - last_ts < restart_guard_window_ms;
+    };
 
     var fill_backing: [2048]u8 = undefined;
     var fill_ptrs: [6][]const u8 = undefined;
@@ -3269,6 +3286,10 @@ fn runAgentDecision(
         // (clamped; event triggers still cut through). Quiet markets stop
         // burning LLM calls re-stating the same HOLD.
         applyReviewAfterBackoff(sched, admit_now, prop.review_after, "hold");
+    } else if (restart_guard) {
+        exec_note = "restart_guard";
+        logEventPayload(events_repo, engine, "EXEC_HOLD", "execution", "WARN", cfg, "{\"reason\":\"restart_guard\",\"detail\":\"first decision after restart with a recent prior decision; rebalance deferred to next cycle\"}");
+        std.debug.print("[agent] restart guard: REBALANCE deferred (first_run, prior decision <{d}m ago)\n", .{@divTrunc(restart_guard_window_ms, 60_000)});
     } else if (ab.okx_trade.executionAllowed(cfg.mode.isTrading(), exec_venue_authorized)) {
         exec_note = tryDemoExecute(
             gpa,
@@ -3298,6 +3319,7 @@ fn runAgentDecision(
     // Execution errors and shadow-mode approvals count as real intent → reset.
     const noop_outcome = prop.action == .hold or
         std.mem.eql(u8, exec_note, "plan_hold") or
+        std.mem.eql(u8, exec_note, "restart_guard") or
         std.mem.eql(u8, exec_note, "skipped_reject");
     sched.noteOutcome(!noop_outcome);
     std.debug.print(
@@ -3367,6 +3389,7 @@ fn runAgentDecision(
         !std.mem.eql(u8, exec_note, "hold") and
         !std.mem.eql(u8, exec_note, "skipped_reject") and
         !std.mem.eql(u8, exec_note, "plan_hold") and
+        !std.mem.eql(u8, exec_note, "restart_guard") and
         !std.mem.eql(u8, exec_note, "plan_error");
     const ok_payload = std.fmt.bufPrint(
         &ok_buf,
