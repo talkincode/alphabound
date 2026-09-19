@@ -1135,18 +1135,11 @@ pub fn main(init: std.process.Init) !u8 {
         if (okx.getPublic(ticker_path)) |body| {
             defer gpa.free(body);
             if (ab.okx_rest.parseTicker(gpa, body)) |ticker| {
-                const prev_mode = engine.snapshot().risk_mode;
-                const lat_t0 = ab.clock.SystemClock.clock().monotonicNs();
-                const res = engine.apply(.{ .market_tick = .{
-                    .ts_ms = ticker.ts_ms,
-                    .bid = ticker.bid,
-                    .mark = ticker.last,
-                } }) catch continue;
-                const lat_us = (ab.clock.SystemClock.clock().monotonicNs() -| lat_t0) / 1000;
-                risk_latency.record(@intCast(@min(lat_us, std.math.maxInt(u32))));
                 // Shadow uses a simulated book: keep account freshness aligned with
                 // market ticks so the risk mode does not spuriously enter EXIT_ONLY
-                // after account_ttl without private WS updates.
+                // after account_ttl without private WS updates. Applied *before*
+                // the market tick so the tick's health check sees a fresh
+                // account and the mode does not round-trip through EXIT_ONLY.
                 if (cfg.mode == .shadow) {
                     const s0 = engine.snapshot();
                     _ = engine.apply(.{ .account_update = .{
@@ -1156,6 +1149,14 @@ pub fn main(init: std.process.Init) !u8 {
                         .btc_available = s0.btc_available,
                     } }) catch {};
                 }
+                const lat_t0 = ab.clock.SystemClock.clock().monotonicNs();
+                _ = engine.apply(.{ .market_tick = .{
+                    .ts_ms = ticker.ts_ms,
+                    .bid = ticker.bid,
+                    .mark = ticker.last,
+                } }) catch continue;
+                const lat_us = (ab.clock.SystemClock.clock().monotonicNs() -| lat_t0) / 1000;
+                risk_latency.record(@intCast(@min(lat_us, std.math.maxInt(u32))));
                 const snap = engine.snapshot();
                 web_state.update(snap, true);
                 if (startup_flow) |flow| {
@@ -1214,8 +1215,6 @@ pub fn main(init: std.process.Init) !u8 {
                     );
                 }
 
-                _ = res;
-                _ = prev_mode;
 
                 // 1-minute equity samples (§6.2 retention).
                 const minute = @divFloor(snap.as_of_ms, 60_000);
@@ -2654,6 +2653,12 @@ fn drainModeTransitions(
         engine.pending_transition = t;
     };
     std.debug.print("[risk] mode {t} -> {t} cause={s} bounces={d}\n", .{ t.from, t.to, t.cause, t.bounces });
+    // A round trip that resolved before anyone could observe it (same mode
+    // in and out within one drain window) is logged but not journaled.
+    if (t.from == t.to) {
+        drain_persisted = true;
+        return;
+    }
     var buf: [192]u8 = undefined;
     const payload = std.fmt.bufPrint(
         &buf,
