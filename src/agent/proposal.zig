@@ -233,6 +233,19 @@ pub fn enforceAddEval(p: *const Proposal, cash_tension: bool) ValidationError!vo
     if (p.add_eval == null) return error.AddEvalRequired;
 }
 
+/// `add_eval.add` must accompany a REBALANCE *above* the current weight and
+/// `reduce_eval.cut` one *below* it — otherwise the verdict contradicts the
+/// proposed trade and the proposal is rejected (degrades to HOLD).
+pub fn enforceEvalDirection(p: *const Proposal, current_weight: Decimal) ValidationError!void {
+    if (p.action != .rebalance) return;
+    if (p.add_eval) |ae| {
+        if (ae.verdict == .add and !p.target_btc_weight.gt(current_weight)) return error.AddEvalConflict;
+    }
+    if (p.reduce_eval) |re| {
+        if (re.verdict == .cut and !p.target_btc_weight.lt(current_weight)) return error.ReduceEvalConflict;
+    }
+}
+
 fn getString(obj: std.json.ObjectMap, key: []const u8) ValidationError![]const u8 {
     const v = obj.get(key) orelse return error.MissingField;
     if (v != .string) return error.WrongType;
@@ -503,4 +516,18 @@ test "add_eval stay is accepted; add on HOLD is a conflict; required under cash_
     );
     defer reb.deinit();
     try enforceAddEval(&reb, true);
+    // add to 0.4 from 0.1 is upward → ok; from 0.5 it contradicts the verdict.
+    try enforceEvalDirection(&reb, Decimal.parse("0.1") catch unreachable);
+    try testing.expectError(error.AddEvalConflict, enforceEvalDirection(&reb, Decimal.parse("0.5") catch unreachable));
+
+    var cut = try parse(gpa,
+        \\{"decision_id":"dec_cut_1","snapshot_version":7,"action":"REBALANCE",
+        \\ "target":{"type":"portfolio_weight","btc":0.6},"confidence":0.6,
+        \\ "order_policy":{"type":"LIMIT_OR_MARKET","urgency":0.3,"max_wait_ms":60000},
+        \\ "thesis":["x"],"invalid_if":["y"],
+        \\ "reduce_eval":{"verdict":"cut","reason":"overbought at range top, trim"}}
+    );
+    defer cut.deinit();
+    try enforceEvalDirection(&cut, Decimal.parse("0.9") catch unreachable);
+    try testing.expectError(error.ReduceEvalConflict, enforceEvalDirection(&cut, Decimal.parse("0.6") catch unreachable));
 }

@@ -1429,6 +1429,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     // ---- Graceful shutdown (§7.4) -------------------------------------------
     std.debug.print("[shutdown] draining after {d} ticks\n", .{tick_count});
+    drainModeTransitions(&events_repo, &engine, &cfg);
     _ = writeEquitySample(&equity_repo, &capital_flows_repo, &kv_repo, &db, engine.snapshot(), last_bh_cmp);
     refreshWebCaches(&web_state, &db, &agent_runs, &equity_repo, &events_repo, &memories_repo, &orders_repo, &fills_repo, last_bh_cmp);
     ab.web_cache.refreshStatisticsCache(&web_state, &db, &llm_usage_repo);
@@ -2600,6 +2601,21 @@ fn refreshBeforeAdmission(
     }
 }
 
+/// True for execution notes that denote at least one confirmed fill
+/// (`filled`, `partial`, `filled_book_lag`, `partial_then_hold`, ...).
+fn executionNoteMeansFill(note: []const u8) bool {
+    return std.mem.startsWith(u8, note, "filled") or std.mem.startsWith(u8, note, "partial");
+}
+
+test "executionNoteMeansFill is a positive list" {
+    try std.testing.expect(executionNoteMeansFill("filled"));
+    try std.testing.expect(executionNoteMeansFill("partial_then_hold"));
+    try std.testing.expect(executionNoteMeansFill("filled_book_lag"));
+    for ([_][]const u8{ "hold", "plan_hold", "skipped_reject", "restart_guard", "plan_error", "not_executed", "limit_timeout", "rejected", "unknown_http", "canceled" }) |n| {
+        try std.testing.expect(!executionNoteMeansFill(n));
+    }
+}
+
 /// A first-run REBALANCE is deferred when the previous decision is younger
 /// than this (deploy/restart churn); a genuinely long outage still acts.
 const restart_guard_window_ms: i64 = 2 * 3_600_000;
@@ -2615,6 +2631,10 @@ fn drainModeTransitions(
     cfg: *const ab.config.Config,
 ) void {
     const t = engine.takeModeTransition() orelse return;
+    // Put the record back if journaling fails so a later drain retries it.
+    defer if (!drain_persisted) {
+        engine.pending_transition = t;
+    };
     std.debug.print("[risk] mode {t} -> {t} cause={s} bounces={d}\n", .{ t.from, t.to, t.cause, t.bounces });
     var buf: [192]u8 = undefined;
     const payload = std.fmt.bufPrint(
@@ -2625,8 +2645,9 @@ fn drainModeTransitions(
     // Entering a restrictive mode is critical; recovering (or a folded bounce
     // back to the same mode) is informational.
     const severity: []const u8 = if (t.to == .normal) "INFO" else "CRITICAL";
-    logEventPayload(events_repo, engine, "RISK_MODE_CHANGED", "risk-kernel", severity, cfg, payload);
+    drain_persisted = logEventPayloadChecked(events_repo, engine, "RISK_MODE_CHANGED", "risk-kernel", severity, cfg, payload);
 }
+threadlocal var drain_persisted: bool = true;
 
 fn riskModeUpper(m: ab.risk_state.RiskMode) []const u8 {
     return switch (m) {
@@ -3237,6 +3258,18 @@ fn runAgentDecision(
         return;
     };
     defer prop.deinit();
+    ab.proposal.enforceEvalDirection(&prop, ab.context.btcWeight(snap)) catch |err| {
+        std.debug.print("[agent] proposal invalid ({t}) → HOLD\n", .{err});
+        completeRun(runs, run_id, "invalid_proposal", out_digest, input_digest, nowMs());
+        var invd_buf: [360]u8 = undefined;
+        const invd_payload = std.fmt.bufPrint(
+            &invd_buf,
+            "{{\"run_id\":\"{s}\",\"output_digest\":\"{s}\",\"reason\":\"{t}\",\"degraded\":\"HOLD\"}}",
+            .{ run_id, out_digest, err },
+        ) catch "{\"degraded\":\"HOLD\"}";
+        logEventPayload(events_repo, engine, "AGENT_INVALID_PROPOSAL", "agent", "WARN", cfg, invd_payload);
+        return;
+    };
     ab.proposal.enforceAddEval(&prop, cash_tension) catch |err| {
         std.debug.print("[agent] proposal invalid ({t}) → HOLD\n", .{err});
         completeRun(runs, run_id, "invalid_proposal", out_digest, input_digest, nowMs());
@@ -3364,14 +3397,18 @@ fn runAgentDecision(
         applyShadowReflection(gpa, mem_store, memories_repo, events_repo, engine, cfg, run_id, prop.decision_id, action_txt, prop.target_btc_weight, prop.confidence);
     }
 
-    var ok_buf: [8192]u8 = undefined;
+    // Worst case: 6 items × 400 (thesis) / 240 (invalid_if) bytes, every byte
+    // escaped to two → 4.8 KiB / 2.9 KiB plus brackets; ok_buf holds both plus
+    // ~1 KiB of fixed fields. Undersized buffers make jsonStringArrayLimited
+    // return "[]" and silently drop the whole list.
+    var ok_buf: [12288]u8 = undefined;
     var w_buf: [48]u8 = undefined;
     var c_buf: [48]u8 = undefined;
     var aw_buf: [48]u8 = undefined;
     var se_buf: [48]u8 = undefined;
     var fl_buf: [48]u8 = undefined;
-    var thesis_buf: [3072]u8 = undefined;
-    var invalid_buf: [2048]u8 = undefined;
+    var thesis_buf: [5120]u8 = undefined;
+    var invalid_buf: [3072]u8 = undefined;
     var review_buf: [48]u8 = undefined;
     const weight_s = decFmt(&w_buf, prop.target_btc_weight);
     const conf_s = decFmt(&c_buf, prop.confidence);
@@ -3385,12 +3422,10 @@ fn runAgentDecision(
     const review_s: []const u8 = if (prop.review_after) |ra| blk: {
         break :blk jsonEscapeInto(&review_buf, ra);
     } else "";
-    const executed = !std.mem.eql(u8, exec_note, "not_executed") and
-        !std.mem.eql(u8, exec_note, "hold") and
-        !std.mem.eql(u8, exec_note, "skipped_reject") and
-        !std.mem.eql(u8, exec_note, "plan_hold") and
-        !std.mem.eql(u8, exec_note, "restart_guard") and
-        !std.mem.eql(u8, exec_note, "plan_error");
+    // Positive list: only notes that mean "the venue book moved" count as
+    // executed. A deny-list marked rejected / limit_timeout / unknown_* legs as
+    // executed, which now also resets the no-op streak in the audit log.
+    const executed = executionNoteMeansFill(exec_note);
     const ok_payload = std.fmt.bufPrint(
         &ok_buf,
         "{{\"run_id\":\"{s}\",\"decision_id\":\"{s}\",\"action\":\"{s}\",\"target_btc_weight\":\"{s}\",\"confidence\":\"{s}\",\"snapshot_version\":{d},\"output_digest\":\"{s}\",\"tools\":{d},\"executed\":{},\"exec\":\"{s}\",\"thesis\":{s},\"invalid_if\":{s},\"review_after\":\"{s}\",\"admission\":{{\"verdict\":\"{s}\",\"reason\":\"{s}\",\"admitted_weight\":\"{s}\",\"stress_equity\":\"{s}\",\"floor\":\"{s}\"}},\"usage\":{{\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d}}}}}",
