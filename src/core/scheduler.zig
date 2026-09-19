@@ -27,6 +27,7 @@ pub const TriggerReason = enum {
     interval_active,
     interval_quiet,
     price_move,
+    price_drift,
     drawdown_step,
     risk_mode_change,
     capital_flow,
@@ -38,6 +39,7 @@ pub const TriggerReason = enum {
             .interval_active => "interval_active",
             .interval_quiet => "interval_quiet",
             .price_move => "price_move",
+            .price_drift => "price_drift",
             .drawdown_step => "drawdown_step",
             .risk_mode_change => "risk_mode_change",
             .capital_flow => "capital_flow",
@@ -138,6 +140,13 @@ pub const Params = struct {
     price_move: Decimal = Decimal.zero,
     /// Early trigger when drawdown − last_drawdown ≥ this fraction; 0 disables.
     drawdown_step: Decimal = Decimal.zero,
+    /// Early trigger when |bid − anchor_bid| / anchor_bid ≥ this fraction,
+    /// where the anchor is the price at the last decision that traded (or the
+    /// last drift fire). Unlike `price_move`, which re-anchors on *every*
+    /// decision and is dampened by the no-op backoff, drift accumulates across
+    /// HOLDs: a slow grind of +0.4%/h still wakes the agent once it adds up.
+    /// 0 disables.
+    price_drift: Decimal = Decimal.zero,
     /// Upper bound for honoring a HOLD proposal's `review_after` as a regular-
     /// cadence backoff; 0 disables the backoff entirely (legacy behavior).
     /// Event triggers (price_move / drawdown_step / risk_mode_change) always
@@ -172,6 +181,10 @@ pub const Scheduler = struct {
     /// `noteOutcome(true)` when a decision actually trades.
     consecutive_noops: u32 = 0,
     capital_flow_pending: bool = false,
+    /// Reference price for `price_drift`; set on the first fire, on every
+    /// decision that trades, and when a drift trigger fires.
+    anchor_bid: Decimal = Decimal.zero,
+    drift_fired: bool = false,
 
     pub fn init(params: Params) Scheduler {
         return .{ .params = params };
@@ -213,6 +226,17 @@ pub const Scheduler = struct {
                 return .{ .fire = true, .reason = .price_move };
         }
 
+        // Cumulative drift since the last trade — bypasses the no-op backoff
+        // (min_interval still applies via the elapsed check above).
+        if (!p.price_drift.isZero() and !p.price_drift.isNegative() and
+            self.anchor_bid.gt(Decimal.zero) and bid.gt(Decimal.zero))
+        {
+            const diff = bid.sub(self.anchor_bid) catch Decimal.zero;
+            const rel = diff.abs().div(self.anchor_bid, .down) catch Decimal.zero;
+            if (rel.gte(p.price_drift))
+                return .{ .fire = true, .reason = .price_drift };
+        }
+
         // Session-aware regular cadence, deferrable by a HOLD review_after backoff.
         const hour = hourUtc(now_ms);
         if (now_ms < self.hold_until_ms) return .{};
@@ -239,6 +263,17 @@ pub const Scheduler = struct {
         self.last_risk_mode = risk_mode;
         self.hold_until_ms = 0;
         self.capital_flow_pending = false;
+        // First decision, or a drift trigger that just fired: re-anchor so the
+        // next drift needs another full move from here.
+        if (!self.anchor_bid.gt(Decimal.zero) or self.drift_fired) {
+            self.anchor_bid = bid;
+            self.drift_fired = false;
+        }
+    }
+
+    /// Mark that the verdict about to be committed was a drift trigger.
+    pub fn noteReason(self: *Scheduler, reason: TriggerReason) void {
+        self.drift_fired = reason == .price_drift;
     }
 
     pub fn noteCapitalFlow(self: *Scheduler) void {
@@ -266,6 +301,7 @@ pub const Scheduler = struct {
     pub fn noteOutcome(self: *Scheduler, produced_order: bool) void {
         if (produced_order) {
             self.consecutive_noops = 0;
+            self.anchor_bid = self.last_bid;
         } else {
             self.consecutive_noops +|= 1;
         }
@@ -289,6 +325,11 @@ const testing = std.testing;
 
 fn d(s: []const u8) Decimal {
     return Decimal.parse(s) catch unreachable;
+}
+
+fn parseF(buf: []u8, v: f64) Decimal {
+    const txt = std.fmt.bufPrint(buf, "{d:.6}", .{v}) catch unreachable;
+    return Decimal.parse(txt) catch unreachable;
 }
 
 test "parseHours accepts empty, plain, and wrap ranges" {
@@ -551,4 +592,66 @@ test "no-op escalation saturates at cap and disabled cap keeps legacy behavior" 
     const lv = legacy.evaluate(180_000, d("101"), Decimal.zero, .normal);
     try testing.expect(lv.fire);
     try testing.expectEqual(TriggerReason.price_move, lv.reason);
+}
+
+test "price_drift accumulates across HOLDs and bypasses the no-op backoff" {
+    var s = Scheduler.init(.{
+        .base_interval_ms = 900_000,
+        .min_interval_ms = 180_000,
+        .price_move = d("0.005"),
+        .price_drift = d("0.02"),
+        .noop_backoff_cap_ms = 3_600_000,
+        .review_backoff_max_ms = 4 * 3_600_000,
+    });
+    var t: i64 = 0;
+    try testing.expect(s.evaluate(t, d("100"), d("0"), .normal).fire);
+    s.noteReason(.first_run);
+    s.commit(t, d("100"), d("0"), .normal);
+    s.noteOutcome(false);
+    // Every hour the agent HOLDs at a price +0.4% above the previous decision:
+    // price_move (0.5%, re-anchored per decision) never fires. Drift measures
+    // from the anchor (100) and must fire once the cumulative move is >= 2%.
+    var i: usize = 0;
+    while (i < 10) : (i += 1) {
+        t += 3_600_000;
+        const px_f = 100.0 * std.math.pow(f64, 1.004, @as(f64, @floatFromInt(i + 1)));
+        var pb: [32]u8 = undefined;
+        const px = parseF(&pb, px_f);
+        const v = s.evaluate(t, px, d("0"), .normal);
+        if (px_f >= 102.0) {
+            try testing.expect(v.fire);
+            try testing.expectEqual(TriggerReason.price_drift, v.reason);
+            s.noteReason(v.reason);
+            s.commit(t, px, d("0"), .normal);
+            s.noteOutcome(false);
+            // Re-anchored at px: the same price does not fire drift again.
+            t += 180_001;
+            const again = s.evaluate(t, px, d("0"), .normal);
+            try testing.expect(!again.fire or again.reason != .price_drift);
+            return;
+        }
+        try testing.expect(v.reason != .price_drift);
+        // Simulate the regular-cadence HOLD decision at this price.
+        s.commit(t, px, d("0"), .normal);
+        s.noteOutcome(false);
+        _ = s.deferAfterHold(t, 8 * 3_600_000);
+    }
+    return error.TestExpectedDriftFire;
+}
+
+test "a traded decision re-anchors price_drift at its price" {
+    var s = Scheduler.init(.{ .base_interval_ms = 900_000, .min_interval_ms = 1, .price_drift = d("0.02") });
+    try testing.expect(s.evaluate(0, d("100"), d("0"), .normal).fire);
+    s.commit(0, d("100"), d("0"), .normal);
+    s.noteOutcome(false);
+    // +3% → drift fires.
+    const v = s.evaluate(10, d("103"), d("0"), .normal);
+    try testing.expect(v.fire and v.reason == .price_drift);
+    s.noteReason(v.reason);
+    s.commit(10, d("103"), d("0"), .normal);
+    s.noteOutcome(true); // it traded: anchor = 103
+    try testing.expect(!s.evaluate(20, d("104"), d("0"), .normal).fire or
+        s.evaluate(20, d("104"), d("0"), .normal).reason != .price_drift);
+    const v2 = s.evaluate(30, d("106"), d("0"), .normal);
+    try testing.expect(v2.fire and v2.reason == .price_drift);
 }

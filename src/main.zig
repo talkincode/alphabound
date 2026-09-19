@@ -950,6 +950,7 @@ pub fn main(init: std.process.Init) !u8 {
         .min_interval_ms = @as(i64, cfg.decision_min_interval_ms),
         .active_hours = ab.scheduler.parseHours(cfg.active_hours_utc) catch .{},
         .price_move = cfg.event_price_move,
+        .price_drift = cfg.event_price_drift,
         .drawdown_step = cfg.event_drawdown_step,
         .review_backoff_max_ms = @as(i64, cfg.review_backoff_max_ms),
         .noop_backoff_cap_ms = @as(i64, cfg.event_noop_backoff_max_ms),
@@ -1293,6 +1294,7 @@ pub fn main(init: std.process.Init) !u8 {
                 const verdict = agent_sched.evaluate(tnow, snap_now.bid_price, snap_now.drawdown, snap_now.risk_mode);
                 const due_once = cli.agent_once and !agent_done_once and tick_count >= 1;
                 if (verdict.fire or due_once) {
+                    agent_sched.noteReason(verdict.reason);
                     agent_sched.commit(tnow, snap_now.bid_price, snap_now.drawdown, snap_now.risk_mode);
                     agent_done_once = true;
                     const reason_txt = if (verdict.fire) verdict.reason.text() else "manual_once";
@@ -3307,7 +3309,14 @@ fn runAgentDecision(
     // Reflection: prefer LLM structured memory_ops; fail-closed → deterministic.
     // HOLD cycles skip the second LLM call unless explicitly enabled — quiet
     // markets should not burn tokens re-reflecting on identical no-ops.
-    const reflect_this_action = cfg.agent_llm_reflection_on_hold or prop.action != .hold;
+    // A HOLD under tension, or every Nth consecutive no-op, still gets the LLM
+    // reflection: the deterministic fallback only counts the streak, and a
+    // streak that is never examined is how 25 identical flat HOLDs happen.
+    const streak_after = review_facts.hold_streak + 1;
+    const periodic_hold_reflect = cfg.agent_llm_reflection_hold_every > 0 and
+        streak_after % cfg.agent_llm_reflection_hold_every == 0;
+    const reflect_this_action = cfg.agent_llm_reflection_on_hold or prop.action != .hold or
+        tension or cash_tension or periodic_hold_reflect;
     const want_llm_reflect = cfg.agent_llm_reflection and reflect_this_action and llmReflectionWanted(env);
     var reflected = false;
     if (want_llm_reflect) {
