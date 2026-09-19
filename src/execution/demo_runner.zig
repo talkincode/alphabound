@@ -60,30 +60,15 @@ pub fn tryDemoExecute(
         return "skipped_reject";
     }
 
-    // LIMIT_ONLY → every leg is a limit; LIMIT_OR_MARKET → the opening leg is a
-    // passive limit (saves taker fees on a 15-minute-cadence strategy) and
-    // falls back to market when it times out; MARKET_ONLY → market.
-    // LIMIT_OR_MARKET used to be silently executed as market, so the model's
-    // order_policy had no effect and every fill paid taker.
+    // LIMIT_ONLY → limit legs; LIMIT_OR_MARKET → market (demo default, fast fill).
+    const prefer_limit = order_policy.type == .limit_only;
     const max_legs = okx_trade.max_replan_legs;
     var seq: u16 = 0;
     var last_note: []const u8 = "plan_hold";
     var snap = snap_in;
     var any_fill = false;
-    var limit_fallback_used = false;
 
     while (seq < max_legs) : (seq += 1) {
-        const prefer_limit = switch (order_policy.type) {
-            .limit_only => true,
-            .market_only => false,
-            .limit_or_market => !limit_fallback_used,
-        };
-        // Bound the blocking wait for the fallback path: the main loop is
-        // single-threaded and stalls ticks while a limit order is polled.
-        const max_wait_ms: u32 = if (order_policy.type == .limit_or_market)
-            @min(order_policy.max_wait_ms, limit_or_market_max_wait_ms)
-        else
-            order_policy.max_wait_ms;
         const mark = if (snap.mark_price.gt(Decimal.zero)) snap.mark_price else snap.bid_price;
         const equity = if (snap.conservative_equity.gt(Decimal.zero))
             snap.conservative_equity
@@ -145,23 +130,9 @@ pub fn tryDemoExecute(
             instrument,
             prefer_limit,
             order_policy.urgency,
-            max_wait_ms,
+            order_policy.max_wait_ms,
         );
         last_note = leg;
-
-        // Passive limit did not fill in time: retry the same delta at market.
-        if (order_policy.type == .limit_or_market and prefer_limit and
-            std.mem.eql(u8, leg, "limit_timeout"))
-        {
-            limit_fallback_used = true;
-            logEventPayload(events_repo, engine, "EXEC_LIMIT_FALLBACK", "execution", "INFO", cfg, "{\"reason\":\"limit_timeout\",\"next\":\"market\"}");
-            if (!okx_trade.canPlaceAnotherLeg(seq)) break;
-            continue;
-        }
-        // Partial fill on the passive leg: finish the residual at market.
-        if (order_policy.type == .limit_or_market and prefer_limit and std.mem.eql(u8, leg, "partial")) {
-            limit_fallback_used = true;
-        }
 
         if (okx_trade.wantsResidualPlan(leg)) {
             any_fill = true;
@@ -207,9 +178,6 @@ pub fn tryDemoExecute(
     if (any_fill and std.mem.eql(u8, last_note, "partial")) return "partial_max_legs";
     return last_note;
 }
-
-/// Upper bound on the passive-limit wait before LIMIT_OR_MARKET falls back.
-pub const limit_or_market_max_wait_ms: u32 = 45_000;
 
 /// Best-effort book update from a known fill when venue balance refresh fails.
 /// Used only to keep the engine off a false zero book — not a substitute for reconcile.
