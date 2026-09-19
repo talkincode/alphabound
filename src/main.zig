@@ -1011,6 +1011,9 @@ pub fn main(init: std.process.Init) !u8 {
 
     while (!shutdown_requested.load(.acquire)) {
         if (cli.max_ticks > 0 and tick_count >= cli.max_ticks) break;
+        // Journal any risk-mode transition from the previous iteration, whatever
+        // engine message caused it (single emission point).
+        drainModeTransitions(&events_repo, &engine, &cfg);
 
         // One-shot admin commands from local control file.
         {
@@ -1210,10 +1213,8 @@ pub fn main(init: std.process.Init) !u8 {
                     );
                 }
 
-                if (res.mode_changed) {
-                    std.debug.print("[risk] mode {t} -> {t}\n", .{ prev_mode, snap.risk_mode });
-                    logEvent(&events_repo, &engine, "RISK_MODE_CHANGED", "risk-kernel", "CRITICAL", &cfg);
-                }
+                _ = res;
+                _ = prev_mode;
 
                 // 1-minute equity samples (§6.2 retention).
                 const minute = @divFloor(snap.as_of_ms, 60_000);
@@ -2597,6 +2598,39 @@ fn refreshBeforeAdmission(
     }
 }
 
+/// Journal risk-mode transitions recorded by the engine since the last drain.
+/// Emitted as one `RISK_MODE_CHANGED` per drain with the causing message and
+/// the number of folded bounces, so a stale-account flap between reconciles
+/// is visible as `{from:NORMAL,to:NORMAL,cause:clock_tick,bounces:1}`
+/// instead of an orphan EXIT_ONLY→NORMAL.
+fn drainModeTransitions(
+    events_repo: *ab.storage.EventsRepo,
+    engine: *ab.state.Engine,
+    cfg: *const ab.config.Config,
+) void {
+    const t = engine.takeModeTransition() orelse return;
+    std.debug.print("[risk] mode {t} -> {t} cause={s} bounces={d}\n", .{ t.from, t.to, t.cause, t.bounces });
+    var buf: [192]u8 = undefined;
+    const payload = std.fmt.bufPrint(
+        &buf,
+        "{{\"from\":\"{s}\",\"to\":\"{s}\",\"cause\":\"{s}\",\"bounces\":{d},\"at_ms\":{d}}}",
+        .{ riskModeUpper(t.from), riskModeUpper(t.to), t.cause, t.bounces, t.ts_ms },
+    ) catch "{}";
+    // Entering a restrictive mode is critical; recovering (or a folded bounce
+    // back to the same mode) is informational.
+    const severity: []const u8 = if (t.to == .normal) "INFO" else "CRITICAL";
+    logEventPayload(events_repo, engine, "RISK_MODE_CHANGED", "risk-kernel", severity, cfg, payload);
+}
+
+fn riskModeUpper(m: ab.state_machine.RiskMode) []const u8 {
+    return switch (m) {
+        .normal => "NORMAL",
+        .exit_only => "EXIT_ONLY",
+        .flattening => "FLATTENING",
+        .halted => "HALTED",
+    };
+}
+
 /// Operator path probe: same admission + trading execution stack as agent REBALANCE.
 /// Used to unblock Gate3 order-path verification without waiting on LLM HOLD bias.
 /// While risk_mode=FLATTENING: market-sell toward weight 0; when dust, emit flatten_complete → HALTED.
@@ -3193,6 +3227,7 @@ fn runAgentDecision(
         .rebalance => "REBALANCE",
     };
     refreshBeforeAdmission(gpa, okx, cfg, engine, portfolio_refresher);
+    drainModeTransitions(events_repo, engine, cfg);
     const admit_snap = engine.snapshot();
     const admit_now = nowMs();
     const bound_version = bindProposalVersion(prop.snapshot_version, decision_start_version, admit_snap.version);

@@ -88,10 +88,35 @@ pub const ApplyResult = struct {
     boundary_hit: bool = false,
 };
 
+/// A risk-mode change recorded by `Engine.apply`, drained by the owner and
+/// journaled as one `RISK_MODE_CHANGED` event. Every `apply` path (market
+/// tick, clock tick, reconcile, order ambiguity, disk/journal status) used to
+/// be able to flip the mode silently; only the market-tick caller emitted an
+/// event, so the journal showed dozens of EXIT_ONLY→NORMAL "changes" with no
+/// matching entry. Recording here makes the transition itself the source of
+/// truth regardless of which message caused it.
+pub const ModeTransition = struct {
+    from: sm.RiskMode,
+    to: sm.RiskMode,
+    /// Message tag that caused the first transition (e.g. "clock_tick").
+    cause: []const u8,
+    ts_ms: i64,
+    /// Additional transitions folded into this record before it was drained.
+    bounces: u32 = 0,
+};
+
 pub const Engine = struct {
     state: PortfolioState = .{},
     exit_costs: equity_mod.ExitCostParams,
     max_drawdown: Decimal,
+    pending_transition: ?ModeTransition = null,
+
+    /// Return and clear the pending transition record, if any.
+    pub fn takeModeTransition(self: *Engine) ?ModeTransition {
+        const t = self.pending_transition;
+        self.pending_transition = null;
+        return t;
+    }
 
     pub fn init(exit_costs: equity_mod.ExitCostParams, max_drawdown: Decimal) Engine {
         return .{ .exit_costs = exit_costs, .max_drawdown = max_drawdown };
@@ -164,6 +189,19 @@ pub const Engine = struct {
 
         self.state.version += 1;
         result.mode_changed = self.state.risk_mode != prev_mode;
+        if (result.mode_changed) {
+            if (self.pending_transition) |*t| {
+                t.to = self.state.risk_mode;
+                t.bounces += 1;
+            } else {
+                self.pending_transition = .{
+                    .from = prev_mode,
+                    .to = self.state.risk_mode,
+                    .cause = @tagName(std.meta.activeTag(msg)),
+                    .ts_ms = self.state.as_of_ms,
+                };
+            }
+        }
         result.boundary_hit = self.state.drawdown.gte(self.max_drawdown) and
             self.state.high_watermark.gt(Decimal.zero);
         return result;
@@ -472,4 +510,31 @@ test "replay determinism: same messages, same final state" {
     try testing.expect(s1.high_watermark.eql(s2.high_watermark));
     try testing.expect(s1.drawdown.eql(s2.drawdown));
     try testing.expectEqual(s1.risk_mode, s2.risk_mode);
+}
+
+test "engine records silent mode transitions with their cause" {
+    var e = Engine.init(.{ .fee_rate = Decimal.zero, .slippage_rate = Decimal.zero }, Decimal.parse("0.10") catch unreachable);
+    e.state.reconciled = true;
+    e.state.disk_ok = true;
+    e.state.journal_ok = true;
+    const t0: i64 = 1_000_000;
+    _ = try e.apply(.{ .account_update = .{ .ts_ms = t0, .cash_usdt = Decimal.parse("100") catch unreachable, .btc_total = Decimal.zero, .btc_available = Decimal.zero } });
+    _ = try e.apply(.{ .market_tick = .{ .ts_ms = t0, .bid = Decimal.parse("100") catch unreachable, .mark = Decimal.parse("100") catch unreachable } });
+    try std.testing.expectEqual(sm.RiskMode.normal, e.state.risk_mode);
+    _ = e.takeModeTransition(); // discard boot-time transitions, if any
+
+    // Account goes stale on a clock tick: mode flips to EXIT_ONLY silently.
+    _ = try e.apply(.{ .clock_tick = .{ .ts_ms = t0 + 60_000 } });
+    try std.testing.expectEqual(sm.RiskMode.exit_only, e.state.risk_mode);
+    // Fresh account + market: back to NORMAL before anyone drained.
+    _ = try e.apply(.{ .account_update = .{ .ts_ms = t0 + 61_000, .cash_usdt = Decimal.parse("100") catch unreachable, .btc_total = Decimal.zero, .btc_available = Decimal.zero } });
+    _ = try e.apply(.{ .market_tick = .{ .ts_ms = t0 + 61_000, .bid = Decimal.parse("100") catch unreachable, .mark = Decimal.parse("100") catch unreachable } });
+    try std.testing.expectEqual(sm.RiskMode.normal, e.state.risk_mode);
+
+    const t = e.takeModeTransition() orelse return error.TestExpectedTransition;
+    try std.testing.expectEqual(sm.RiskMode.normal, t.from);
+    try std.testing.expectEqual(sm.RiskMode.normal, t.to);
+    try std.testing.expectEqualStrings("clock_tick", t.cause);
+    try std.testing.expectEqual(@as(u32, 1), t.bounces);
+    try std.testing.expect(e.takeModeTransition() == null);
 }
