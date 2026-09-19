@@ -26,7 +26,7 @@ before on a smaller scale.
 | 4 | Event `thesis` strings were byte-sliced at 180 bytes, cutting UTF-8 characters in half. The periodic review embedded those bytes in its prompt; the provider rejected the request (HTTP 400 "invalid unicode code point"). **Every periodic review failed for ~2.5 weeks**, so the loop meant to notice "same mistake repeated" was dark. | `src/main.zig`, `src/agent/openai.zig` |
 | 5 | HOLD reflection was deterministic and wrote the identical lesson hundreds of times; the strategy memory layer held zero active entries. | `src/main.zig` |
 | 6 | `price_move` re-anchored on every decision and its cooldown doubled per no-op; a slow grind never woke the agent while `review_after` deferred the regular cadence up to 4h. | `src/core/scheduler.zig` |
-| 7 | `LIMIT_OR_MARKET` executed as a plain market order; every fill paid taker. | `src/execution/demo_runner.zig` |
+| 7 | `LIMIT_OR_MARKET` executes as a plain market order (documented; left as is — see below). | `src/execution/demo_runner.zig` |
 | 8 | Only the market-tick path journaled `RISK_MODE_CHANGED`; other engine messages flipped the mode silently, leaving orphan EXIT_ONLY→NORMAL events at decision time. | `src/core/state.zig`, `src/main.zig` |
 | 9 | Twice, the first decision after a restart (`first_run`, bare context) produced an immediate trim. | `src/main.zig` |
 
@@ -56,8 +56,13 @@ before on a smaller scale.
 - **Scheduler.** `price_drift` (default 2%) measures from the last traded
   price, accumulates across HOLDs and bypasses the no-op backoff. Recommended
   `event_noop_backoff_max_ms` lowered to 30 min.
-- **Execution.** `LIMIT_OR_MARKET` posts a passive limit (≤ 45 s) and falls
-  back to market on timeout.
+- **Execution — deliberately unchanged.** `LIMIT_OR_MARKET` still executes as
+  market. A passive-limit-first variant was written and reverted in review:
+  the single-threaded limit wait has no ticker refresh, so venue reconcile is
+  refused after `market_ttl_ms` and partial fills fall back to a synthetic
+  full-quantity local fill; cancel confirmation is also weak. Fixing that is
+  an execution-layer task (follow-up), and taker fees were never a material
+  part of the underperformance.
 - **Observability.** The engine records every mode transition (from, to,
   cause, folded bounces); `main` journals it from one place.
 - **Restart guard.** A `first_run` REBALANCE is deferred (`exec=restart_guard`)
