@@ -62,9 +62,40 @@ fn barsPerYear(bar: []const u8) f64 {
     return 365.0; // 1D
 }
 
+/// Regime classification thresholds (deterministic, documented facts).
+/// A frame is `trend_up`/`trend_down` when SMA20 has moved by more than
+/// `slope_pct` over the last `SLOPE_LOOKBACK` bars *and* price sits on the
+/// trend side of SMA20; otherwise it is `range`. Thresholds scale with the
+/// bar: a daily SMA20 drifting 1% over 5 days is noise, 3% is a trend.
+pub const SLOPE_LOOKBACK: usize = 5;
+pub const TREND_SLOPE_PCT_1D: f64 = 2.0;
+pub const TREND_SLOPE_PCT_4H: f64 = 1.0;
+
+pub const Regime = enum {
+    range,
+    trend_up,
+    trend_down,
+
+    pub fn text(self: Regime) []const u8 {
+        return switch (self) {
+            .range => "range",
+            .trend_up => "trend_up",
+            .trend_down => "trend_down",
+        };
+    }
+};
+
+/// Pure regime rule shared by structure rendering and tests.
+pub fn classifyRegime(close: f64, sma_now: f64, sma_slope_pct: f64, slope_threshold_pct: f64) Regime {
+    if (sma_slope_pct >= slope_threshold_pct and close >= sma_now) return .trend_up;
+    if (sma_slope_pct <= -slope_threshold_pct and close <= sma_now) return .trend_down;
+    return .range;
+}
+
 /// Compact HTF structure from venue candles (newest-first, as OKX returns).
-/// Facts only: SMA/range/RSI plus whether the forming bar broke the prior
-/// completed-window high. Never prescribes a trade.
+/// Facts only: SMA/range/RSI, SMA slope, range width, ATR, a deterministic
+/// regime label, plus whether the forming bar broke the prior completed-window
+/// high or low. Never prescribes a trade.
 pub fn formatHtfStructure(
     buf: []u8,
     daily_newest_first: []const Candle,
@@ -72,14 +103,20 @@ pub fn formatHtfStructure(
 ) error{BufferTooSmall}![]const u8 {
     var w: std.Io.Writer = .fixed(buf);
     w.writeAll("{\"1D\":") catch return error.BufferTooSmall;
-    writeBarStructure(&w, daily_newest_first, 20, 14) catch return error.BufferTooSmall;
+    writeBarStructure(&w, daily_newest_first, 20, 14, TREND_SLOPE_PCT_1D) catch return error.BufferTooSmall;
     w.writeAll(",\"4H\":") catch return error.BufferTooSmall;
-    writeBarStructure(&w, h4_newest_first, 20, 14) catch return error.BufferTooSmall;
+    writeBarStructure(&w, h4_newest_first, 20, 14, TREND_SLOPE_PCT_4H) catch return error.BufferTooSmall;
     w.writeByte('}') catch return error.BufferTooSmall;
     return w.buffered();
 }
 
-fn writeBarStructure(w: *std.Io.Writer, newest_first: []const Candle, range_period: usize, rsi_period: usize) !void {
+fn writeBarStructure(
+    w: *std.Io.Writer,
+    newest_first: []const Candle,
+    range_period: usize,
+    rsi_period: usize,
+    slope_threshold_pct: f64,
+) !void {
     if (newest_first.len < 2) {
         try w.writeAll("null");
         return;
@@ -106,10 +143,27 @@ fn writeBarStructure(w: *std.Io.Writer, newest_first: []const Candle, range_peri
         sma /= @as(f64, @floatFromInt(range_period));
         const width = hi - lo;
         const pos = if (width > 0) (close - lo) / width else 0.5;
+        const width_pct = if (close > 0) width / close * 100.0 else 0.0;
         try w.print(
-            ",\"sma{d}\":{d:.1},\"range{d}_high\":{d:.1},\"range{d}_low\":{d:.1},\"range{d}_pos\":{d:.2}",
-            .{ range_period, sma, range_period, hi, range_period, lo, range_period, pos },
+            ",\"sma{d}\":{d:.1},\"range{d}_high\":{d:.1},\"range{d}_low\":{d:.1},\"range{d}_pos\":{d:.2},\"range{d}_width_pct\":{d:.2}",
+            .{ range_period, sma, range_period, hi, range_period, lo, range_period, pos, range_period, width_pct },
         );
+
+        // SMA slope over SLOPE_LOOKBACK bars → regime label. Needs
+        // range_period + SLOPE_LOOKBACK bars; otherwise the label is omitted
+        // (never fabricated).
+        if (n >= range_period + SLOPE_LOOKBACK) {
+            const prev_window = cs[n - range_period - SLOPE_LOOKBACK .. n - SLOPE_LOOKBACK];
+            var sma_prev: f64 = 0;
+            for (prev_window) |c| sma_prev += c.close.toF64Lossy();
+            sma_prev /= @as(f64, @floatFromInt(range_period));
+            const slope_pct = if (sma_prev > 0) (sma - sma_prev) / sma_prev * 100.0 else 0.0;
+            const regime = classifyRegime(close, sma, slope_pct, slope_threshold_pct);
+            try w.print(
+                ",\"sma{d}_slope_pct\":{d:.2},\"regime\":\"{s}\"",
+                .{ range_period, slope_pct, regime.text() },
+            );
+        }
     }
 
     if (n >= 2) {
@@ -117,15 +171,28 @@ fn writeBarStructure(w: *std.Io.Writer, newest_first: []const Candle, range_peri
         const take = @min(completed.len, range_period);
         const prior = completed[completed.len - take ..];
         var prior_hi: f64 = -std.math.inf(f64);
-        for (prior) |c| prior_hi = @max(prior_hi, c.high.toF64Lossy());
+        var prior_lo: f64 = std.math.inf(f64);
+        for (prior) |c| {
+            prior_hi = @max(prior_hi, c.high.toF64Lossy());
+            prior_lo = @min(prior_lo, c.low.toF64Lossy());
+        }
         const broke = last.high.toF64Lossy() > prior_hi or close > prior_hi;
-        try w.print(",\"prior_completed_high\":{d:.1},\"broke_prior_high\":{}", .{ prior_hi, broke });
+        const broke_low = last.low.toF64Lossy() < prior_lo or close < prior_lo;
+        try w.print(
+            ",\"prior_completed_high\":{d:.1},\"broke_prior_high\":{},\"prior_completed_low\":{d:.1},\"broke_prior_low\":{}",
+            .{ prior_hi, broke, prior_lo, broke_low },
+        );
     }
 
     if (n >= rsi_period * 3) {
         var closes_buf: [64]f64 = undefined;
         for (cs, 0..) |c, i| closes_buf[i] = c.close.toF64Lossy();
         try w.print(",\"rsi{d}\":{d:.1}", .{ rsi_period, rsi(closes_buf[0..n], rsi_period) });
+    }
+    if (n > rsi_period) {
+        const a = atr(cs, rsi_period);
+        const atr_pct = if (close > 0) a / close * 100.0 else 0.0;
+        try w.print(",\"atr{d}_pct\":{d:.2}", .{ rsi_period, atr_pct });
     }
     try w.writeByte('}');
 }
@@ -528,4 +595,41 @@ test "formatHtfStructure flags a daily breakout vs prior completed high" {
     try testing.expect(std.mem.indexOf(u8, s, "\"1D\":{") != null);
     try testing.expect(std.mem.indexOf(u8, s, "\"4H\":{") != null);
     try testing.expect(std.mem.indexOf(u8, s, "\"sma20\":") != null);
+}
+
+test "structure labels a flat SMA as range and a rising SMA as trend_up" {
+    var flat: [30]Candle = undefined;
+    for (0..30) |i| flat[i] = mkCandle(70000, 70100, 69900, 70000);
+    var buf: [1024]u8 = undefined;
+    const s_flat = try formatHtfStructure(&buf, &flat, &flat);
+    try testing.expect(std.mem.indexOf(u8, s_flat, "\"regime\":\"range\"") != null);
+    try testing.expect(std.mem.indexOf(u8, s_flat, "\"range20_width_pct\":") != null);
+    try testing.expect(std.mem.indexOf(u8, s_flat, "\"atr14_pct\":") != null);
+    try testing.expect(std.mem.indexOf(u8, s_flat, "\"broke_prior_low\":false") != null);
+
+    var up: [30]Candle = undefined;
+    for (0..30) |i| {
+        const px = 60000.0 * std.math.pow(f64, 1.01, @as(f64, @floatFromInt(i)));
+        up[29 - i] = mkCandle(px, px * 1.002, px * 0.998, px);
+    }
+    var buf2: [1024]u8 = undefined;
+    const s_up = try formatHtfStructure(&buf2, &up, &up);
+    try testing.expect(std.mem.indexOf(u8, s_up, "\"regime\":\"trend_up\"") != null);
+
+    var down: [30]Candle = undefined;
+    for (0..30) |i| {
+        const px = 90000.0 * std.math.pow(f64, 0.99, @as(f64, @floatFromInt(i)));
+        down[29 - i] = mkCandle(px, px * 1.002, px * 0.998, px);
+    }
+    var buf3: [1024]u8 = undefined;
+    const s_down = try formatHtfStructure(&buf3, &down, &down);
+    try testing.expect(std.mem.indexOf(u8, s_down, "\"regime\":\"trend_down\"") != null);
+    try testing.expect(std.mem.indexOf(u8, s_down, "\"broke_prior_low\":true") != null);
+}
+
+test "classifyRegime requires both slope and side of SMA" {
+    try testing.expectEqual(Regime.trend_up, classifyRegime(100, 95, 3.0, 2.0));
+    try testing.expectEqual(Regime.range, classifyRegime(90, 95, 3.0, 2.0));
+    try testing.expectEqual(Regime.trend_down, classifyRegime(90, 95, -3.0, 2.0));
+    try testing.expectEqual(Regime.range, classifyRegime(100, 95, 1.0, 2.0));
 }

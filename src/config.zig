@@ -73,6 +73,10 @@ pub const Config = struct {
     event_price_move: Decimal = Decimal.parse("0.005") catch unreachable,
     /// Early decision when drawdown deepens by ≥ this fraction; 0 off.
     event_drawdown_step: Decimal = Decimal.parse("0.01") catch unreachable,
+    /// Early decision when the price has drifted ≥ this fraction from the
+    /// last *traded* price (cumulative across HOLDs, not dampened by the
+    /// no-op backoff). Catches slow grinds that never trip price_move. 0 off.
+    event_price_drift: Decimal = Decimal.parse("0.02") catch unreachable,
     /// Cap for honoring a HOLD proposal's `review_after` as a regular-cadence
     /// backoff (ms); 0 disables (legacy fixed cadence). Event triggers
     /// (price_move / drawdown_step / risk_mode_change) always cut through.
@@ -100,6 +104,10 @@ pub const Config = struct {
     /// When false (default), HOLD proposals use the deterministic reflection
     /// only — skipping the second LLM call on quiet cycles.
     agent_llm_reflection_on_hold: bool = false,
+    /// Even with `llm_reflection_on_hold=false`, run the LLM reflection on
+    /// every Nth consecutive no-op and whenever position/cash tension is set,
+    /// so a long HOLD streak is examined instead of merely counted. 0 = never.
+    agent_llm_reflection_hold_every: u32 = 6,
     // [storage]
     db_path: []const u8 = "trading.db",
     wal: bool = true,
@@ -286,6 +294,10 @@ fn applyKey(a: std.mem.Allocator, cfg: *Config, section: []const u8, key: []cons
             cfg.event_drawdown_step = Decimal.parse(val) catch return error.InvalidValue;
             if (cfg.event_drawdown_step.isNegative() or
                 cfg.event_drawdown_step.gte(Decimal.fromInt(1))) return error.InvalidValue;
+        } else if (std.mem.eql(u8, key, "event_price_drift")) {
+            cfg.event_price_drift = Decimal.parse(val) catch return error.InvalidValue;
+            if (cfg.event_price_drift.isNegative() or
+                cfg.event_price_drift.gte(Decimal.fromInt(1))) return error.InvalidValue;
         } else if (std.mem.eql(u8, key, "review_backoff_max_ms")) {
             cfg.review_backoff_max_ms = parseInt(u32, val) catch return error.InvalidValue;
         } else if (std.mem.eql(u8, key, "event_noop_backoff_max_ms")) {
@@ -298,6 +310,8 @@ fn applyKey(a: std.mem.Allocator, cfg: *Config, section: []const u8, key: []cons
             cfg.agent_llm_reflection = try parseBool(val);
         } else if (std.mem.eql(u8, key, "llm_reflection_on_hold")) {
             cfg.agent_llm_reflection_on_hold = try parseBool(val);
+        } else if (std.mem.eql(u8, key, "llm_reflection_hold_every")) {
+            cfg.agent_llm_reflection_hold_every = parseInt(u32, val) catch return error.InvalidValue;
         } else return error.UnknownKey;
     } else if (std.mem.eql(u8, section, "storage")) {
         if (std.mem.eql(u8, key, "path")) {

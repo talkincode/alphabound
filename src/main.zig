@@ -950,6 +950,7 @@ pub fn main(init: std.process.Init) !u8 {
         .min_interval_ms = @as(i64, cfg.decision_min_interval_ms),
         .active_hours = ab.scheduler.parseHours(cfg.active_hours_utc) catch .{},
         .price_move = cfg.event_price_move,
+        .price_drift = cfg.event_price_drift,
         .drawdown_step = cfg.event_drawdown_step,
         .review_backoff_max_ms = @as(i64, cfg.review_backoff_max_ms),
         .noop_backoff_cap_ms = @as(i64, cfg.event_noop_backoff_max_ms),
@@ -1011,6 +1012,9 @@ pub fn main(init: std.process.Init) !u8 {
 
     while (!shutdown_requested.load(.acquire)) {
         if (cli.max_ticks > 0 and tick_count >= cli.max_ticks) break;
+        // Journal any risk-mode transition from the previous iteration, whatever
+        // engine message caused it (single emission point).
+        drainModeTransitions(&events_repo, &engine, &cfg);
 
         // One-shot admin commands from local control file.
         {
@@ -1131,18 +1135,11 @@ pub fn main(init: std.process.Init) !u8 {
         if (okx.getPublic(ticker_path)) |body| {
             defer gpa.free(body);
             if (ab.okx_rest.parseTicker(gpa, body)) |ticker| {
-                const prev_mode = engine.snapshot().risk_mode;
-                const lat_t0 = ab.clock.SystemClock.clock().monotonicNs();
-                const res = engine.apply(.{ .market_tick = .{
-                    .ts_ms = ticker.ts_ms,
-                    .bid = ticker.bid,
-                    .mark = ticker.last,
-                } }) catch continue;
-                const lat_us = (ab.clock.SystemClock.clock().monotonicNs() -| lat_t0) / 1000;
-                risk_latency.record(@intCast(@min(lat_us, std.math.maxInt(u32))));
                 // Shadow uses a simulated book: keep account freshness aligned with
                 // market ticks so the risk mode does not spuriously enter EXIT_ONLY
-                // after account_ttl without private WS updates.
+                // after account_ttl without private WS updates. Applied *before*
+                // the market tick so the tick's health check sees a fresh
+                // account and the mode does not round-trip through EXIT_ONLY.
                 if (cfg.mode == .shadow) {
                     const s0 = engine.snapshot();
                     _ = engine.apply(.{ .account_update = .{
@@ -1152,6 +1149,14 @@ pub fn main(init: std.process.Init) !u8 {
                         .btc_available = s0.btc_available,
                     } }) catch {};
                 }
+                const lat_t0 = ab.clock.SystemClock.clock().monotonicNs();
+                _ = engine.apply(.{ .market_tick = .{
+                    .ts_ms = ticker.ts_ms,
+                    .bid = ticker.bid,
+                    .mark = ticker.last,
+                } }) catch continue;
+                const lat_us = (ab.clock.SystemClock.clock().monotonicNs() -| lat_t0) / 1000;
+                risk_latency.record(@intCast(@min(lat_us, std.math.maxInt(u32))));
                 const snap = engine.snapshot();
                 web_state.update(snap, true);
                 if (startup_flow) |flow| {
@@ -1209,8 +1214,6 @@ pub fn main(init: std.process.Init) !u8 {
                         .{ tick_count, ticker.bid, snap.conservative_equity, last_bh_cmp.bh_equity, last_bh_cmp.alpha, snap.drawdown, snap.risk_mode },
                     );
                 }
-
-                noteRiskModeChange(&events_repo, &engine, &cfg, prev_mode, res.mode_changed);
 
                 // 1-minute equity samples (§6.2 retention).
                 const minute = @divFloor(snap.as_of_ms, 60_000);
@@ -1289,6 +1292,7 @@ pub fn main(init: std.process.Init) !u8 {
                 const verdict = agent_sched.evaluate(tnow, snap_now.bid_price, snap_now.drawdown, snap_now.risk_mode);
                 const due_once = cli.agent_once and !agent_done_once and tick_count >= 1;
                 if (verdict.fire or due_once) {
+                    agent_sched.noteReason(verdict.reason);
                     agent_sched.commit(tnow, snap_now.bid_price, snap_now.drawdown, snap_now.risk_mode);
                     agent_done_once = true;
                     const reason_txt = if (verdict.fire) verdict.reason.text() else "manual_once";
@@ -1300,7 +1304,7 @@ pub fn main(init: std.process.Init) !u8 {
                         .{ reason_txt, ab.scheduler.hourUtc(tnow), agent_sched.params.effectiveInterval(ab.scheduler.hourUtc(tnow)) },
                     ) catch "{\"reason\":\"unknown\"}";
                     logEventPayload(&events_repo, &engine, "AGENT_TRIGGER", "agent", "INFO", &cfg, trig_payload);
-                    runAgentDecision(gpa, client, &okx, &cfg, &engine, &tool_reg, &agent_runs, &tool_calls, &llm_usage_repo, &events_repo, &orders_repo, &fills_repo, &equity_repo, &capital_flows_repo, &db, &mem_store, &memories_repo, &intel_repo, env, &runtime_status, trade_instrument, &agent_sched, portfolio_refresher, last_bh_cmp);
+                    runAgentDecision(gpa, client, &okx, &cfg, &engine, &tool_reg, &agent_runs, &tool_calls, &llm_usage_repo, &events_repo, &orders_repo, &fills_repo, &equity_repo, &capital_flows_repo, &db, &mem_store, &memories_repo, &intel_repo, env, &runtime_status, trade_instrument, &agent_sched, portfolio_refresher, last_bh_cmp, reason_txt);
                     refreshWebCaches(&web_state, &db, &agent_runs, &equity_repo, &events_repo, &memories_repo, &orders_repo, &fills_repo, last_bh_cmp);
                     ab.web_cache.refreshStatisticsCache(&web_state, &db, &llm_usage_repo);
                     refreshSystemCache(&web_state, &db, &cfg, &mem_store, boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), llm_client != null, admin_paused, &runtime_status, &risk_latency);
@@ -1423,6 +1427,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     // ---- Graceful shutdown (§7.4) -------------------------------------------
     std.debug.print("[shutdown] draining after {d} ticks\n", .{tick_count});
+    drainModeTransitions(&events_repo, &engine, &cfg);
     _ = writeEquitySample(&equity_repo, &capital_flows_repo, &kv_repo, &db, engine.snapshot(), last_bh_cmp);
     refreshWebCaches(&web_state, &db, &agent_runs, &equity_repo, &events_repo, &memories_repo, &orders_repo, &fills_repo, last_bh_cmp);
     ab.web_cache.refreshStatisticsCache(&web_state, &db, &llm_usage_repo);
@@ -1821,7 +1826,7 @@ fn runPrivateReconcile(
                     };
                     return .{};
                 };
-                noteRiskModeChange(events_repo, engine, cfg, before.risk_mode, applied.mode_changed);
+                _ = applied; // mode transitions are journaled by drainModeTransitions
                 std.debug.print(
                     "[reconcile] {t} balance applied usdt={f} avail={f} btc={f}\n",
                     .{ cfg.mode, b.usdt_cash, b.usdt_avail, b.btc_cash },
@@ -2120,7 +2125,7 @@ fn collectMarketTools(
                 fetch_err = true;
             }
         }
-        var struct_buf: [768]u8 = undefined;
+        var struct_buf: [1280]u8 = undefined;
         const structure = if (daily_n > 0)
             ab.indicators.formatHtfStructure(
                 &struct_buf,
@@ -2595,6 +2600,77 @@ fn refreshBeforeAdmission(
     }
 }
 
+/// `{"verdict":"...","reason":"..."}` with the reason UTF-8-safely capped.
+fn evalJson(buf: []u8, verdict: []const u8, reason: []const u8) []const u8 {
+    var esc: [2 * 200 + 8]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&esc);
+    for (utf8SafePrefix(reason, 200)) |c| {
+        switch (c) {
+            '"' => w.writeAll("\\\"") catch break,
+            '\\' => w.writeAll("\\\\") catch break,
+            '\n', '\r', '\t' => w.writeByte(' ') catch break,
+            else => {
+                if (c < 0x20) continue;
+                w.writeByte(c) catch break;
+            },
+        }
+    }
+    return std.fmt.bufPrint(buf, "{{\"verdict\":\"{s}\",\"reason\":\"{s}\"}}", .{ verdict, w.buffered() }) catch "null";
+}
+
+/// True for execution notes that denote at least one confirmed fill
+/// (`filled`, `partial`, `filled_book_lag`, `partial_then_hold`, ...).
+fn executionNoteMeansFill(note: []const u8) bool {
+    return std.mem.startsWith(u8, note, "filled") or std.mem.startsWith(u8, note, "partial");
+}
+
+test "executionNoteMeansFill is a positive list" {
+    try std.testing.expect(executionNoteMeansFill("filled"));
+    try std.testing.expect(executionNoteMeansFill("partial_then_hold"));
+    try std.testing.expect(executionNoteMeansFill("filled_book_lag"));
+    for ([_][]const u8{ "hold", "plan_hold", "skipped_reject", "restart_guard", "plan_error", "not_executed", "limit_timeout", "rejected", "unknown_http", "canceled" }) |n| {
+        try std.testing.expect(!executionNoteMeansFill(n));
+    }
+}
+
+/// A first-run REBALANCE is deferred when the previous decision is younger
+/// than this (deploy/restart churn); a genuinely long outage still acts.
+const restart_guard_window_ms: i64 = 2 * 3_600_000;
+
+/// Journal risk-mode transitions recorded by the engine since the last drain.
+/// Emitted as one `RISK_MODE_CHANGED` per drain with the causing message and
+/// the number of folded bounces, so a stale-account flap between reconciles
+/// is visible as `{from:NORMAL,to:NORMAL,cause:clock_tick,bounces:1}`
+/// instead of an orphan EXIT_ONLY→NORMAL.
+fn drainModeTransitions(
+    events_repo: *ab.storage.EventsRepo,
+    engine: *ab.state.Engine,
+    cfg: *const ab.config.Config,
+) void {
+    const t = engine.takeModeTransition() orelse return;
+    // Put the record back if journaling fails so a later drain retries it.
+    defer if (!drain_persisted) {
+        engine.pending_transition = t;
+    };
+    std.debug.print("[risk] mode {t} -> {t} cause={s} bounces={d}\n", .{ t.from, t.to, t.cause, t.bounces });
+    // A round trip that resolved before anyone could observe it (same mode
+    // in and out within one drain window) is logged but not journaled.
+    if (t.from == t.to) {
+        drain_persisted = true;
+        return;
+    }
+    var buf: [192]u8 = undefined;
+    const payload = std.fmt.bufPrint(
+        &buf,
+        "{{\"from\":\"{s}\",\"to\":\"{s}\",\"cause\":\"{s}\",\"bounces\":{d},\"at_ms\":{d}}}",
+        .{ t.from.jsonName(), t.to.jsonName(), t.cause, t.bounces, t.ts_ms },
+    ) catch "{}";
+    const severity: []const u8 = t.to.journalSeverity();
+    drain_persisted = logEventPayloadChecked(events_repo, engine, "RISK_MODE_CHANGED", "risk-kernel", severity, cfg, payload);
+}
+threadlocal var drain_persisted: bool = true;
+
+
 /// Operator path probe: same admission + trading execution stack as agent REBALANCE.
 /// Used to unblock Gate3 order-path verification without waiting on LLM HOLD bias.
 /// While risk_mode=FLATTENING: market-sell toward weight 0; when dust, emit flatten_complete → HALTED.
@@ -2842,6 +2918,7 @@ fn runAgentDecision(
     sched: *ab.scheduler.Scheduler,
     portfolio_refresher: ab.demo_runner.PortfolioRefresher,
     bh_cmp: ab.shadow_bench.Comparison,
+    trigger_reason: []const u8,
 ) void {
     const snap = engine.snapshot();
     const decision_start_version = snap.version;
@@ -2905,6 +2982,18 @@ fn runAgentDecision(
     const prop_n = compactProposalLines(gpa, prop_rows[0..prop_raw_n], &prop_backing, &prop_ptrs);
     const recent_proposals = prop_ptrs[0..prop_n];
 
+    // Restart guard: the first decision after a (re)start sees a bare context
+    // — no scheduler state, no in-loop history — and in production twice
+    // produced an immediate trim right after a deploy. If the previous
+    // decision is recent, the first run may only HOLD; anything else waits
+    // for the next regular cycle with full context.
+    const restart_guard = blk: {
+        if (!std.mem.eql(u8, trigger_reason, "first_run")) break :blk false;
+        if (prop_raw_n == 0) break :blk false;
+        const last_ts = ab.clock.parseRfc3339Ms(prop_rows[prop_raw_n - 1].ts) catch break :blk false;
+        break :blk nowMs() - last_ts < restart_guard_window_ms;
+    };
+
     var fill_backing: [2048]u8 = undefined;
     var fill_ptrs: [6][]const u8 = undefined;
     const fill_n = fills_repo.listCompactForContext(db, &fill_backing, &fill_ptrs) catch 0;
@@ -2936,9 +3025,12 @@ fn runAgentDecision(
     const intel_rows = intel_ptrs[0..intel_n];
 
     var review_facts = ab.context.ReviewFacts{};
-    if (mem_store.find("E_hold_streak")) |hm| {
-        review_facts.hold_streak = hm.evidence_count;
-    }
+    // Consecutive no-ops since the last executed rebalance (audit log). The
+    // memory counter is a lifetime total and only a fallback.
+    review_facts.hold_streak = events_repo.noopStreakSinceLastExecution(db) catch blk: {
+        if (mem_store.find("E_hold_streak")) |hm| break :blk hm.evidence_count;
+        break :blk 0;
+    };
     if (fill_n > 0) {
         if (compactJsonTsMs(recent_fills[0])) |fts| {
             const age = nowMs() - fts;
@@ -2986,8 +3078,17 @@ fn runAgentDecision(
     );
 
     const tension = ab.context.positionTension(ab.context.btcWeight(snap), review_facts.hold_streak);
+    const cash_tension = ab.context.cashTension(
+        ab.context.btcWeight(snap),
+        review_facts.hold_streak,
+        ab.context.cashCoversMinBuy(snap.cash_usdt, ab.context.quotePrice(snap), instrument.min_size, instrument.min_notional),
+    );
     const user_msg_prefix: []const u8 = if (tension)
         \\Respond with ONE JSON Decision Proposal only. position_tension=true: HOLD requires reduce_eval {verdict:keep|cut, reason>=8 chars}; cut must be action REBALANCE.
+        \\Context:
+        \\
+    else if (cash_tension)
+        \\Respond with ONE JSON Decision Proposal only. cash_tension=true: HOLD requires add_eval {verdict:stay|add, reason>=8 chars}; add must be action REBALANCE to a higher weight.
         \\Context:
         \\
     else
@@ -3170,6 +3271,30 @@ fn runAgentDecision(
         return;
     };
     defer prop.deinit();
+    ab.proposal.enforceEvalDirection(&prop, ab.context.btcWeight(snap)) catch |err| {
+        std.debug.print("[agent] proposal invalid ({t}) → HOLD\n", .{err});
+        completeRun(runs, run_id, "invalid_proposal", out_digest, input_digest, nowMs());
+        var invd_buf: [360]u8 = undefined;
+        const invd_payload = std.fmt.bufPrint(
+            &invd_buf,
+            "{{\"run_id\":\"{s}\",\"output_digest\":\"{s}\",\"reason\":\"{t}\",\"degraded\":\"HOLD\"}}",
+            .{ run_id, out_digest, err },
+        ) catch "{\"degraded\":\"HOLD\"}";
+        logEventPayload(events_repo, engine, "AGENT_INVALID_PROPOSAL", "agent", "WARN", cfg, invd_payload);
+        return;
+    };
+    ab.proposal.enforceAddEval(&prop, cash_tension) catch |err| {
+        std.debug.print("[agent] proposal invalid ({t}) → HOLD\n", .{err});
+        completeRun(runs, run_id, "invalid_proposal", out_digest, input_digest, nowMs());
+        var inva_buf: [360]u8 = undefined;
+        const inva_payload = std.fmt.bufPrint(
+            &inva_buf,
+            "{{\"run_id\":\"{s}\",\"output_digest\":\"{s}\",\"reason\":\"{t}\",\"degraded\":\"HOLD\"}}",
+            .{ run_id, out_digest, err },
+        ) catch "{\"degraded\":\"HOLD\"}";
+        logEventPayload(events_repo, engine, "AGENT_INVALID_PROPOSAL", "agent", "WARN", cfg, inva_payload);
+        return;
+    };
     ab.proposal.enforceReduceEval(&prop, tension) catch |err| {
         std.debug.print("[agent] proposal invalid ({t}) → HOLD\n", .{err});
         completeRun(runs, run_id, "invalid_proposal", out_digest, input_digest, nowMs());
@@ -3191,6 +3316,7 @@ fn runAgentDecision(
         .rebalance => "REBALANCE",
     };
     refreshBeforeAdmission(gpa, okx, cfg, engine, portfolio_refresher);
+    drainModeTransitions(events_repo, engine, cfg);
     const admit_snap = engine.snapshot();
     const admit_now = nowMs();
     const bound_version = bindProposalVersion(prop.snapshot_version, decision_start_version, admit_snap.version);
@@ -3206,6 +3332,10 @@ fn runAgentDecision(
         // (clamped; event triggers still cut through). Quiet markets stop
         // burning LLM calls re-stating the same HOLD.
         applyReviewAfterBackoff(sched, admit_now, prop.review_after, "hold");
+    } else if (restart_guard) {
+        exec_note = "restart_guard";
+        logEventPayload(events_repo, engine, "EXEC_HOLD", "execution", "WARN", cfg, "{\"reason\":\"restart_guard\",\"detail\":\"first decision after restart with a recent prior decision; rebalance deferred to next cycle\"}");
+        std.debug.print("[agent] restart guard: REBALANCE deferred (first_run, prior decision <{d}m ago)\n", .{@divTrunc(restart_guard_window_ms, 60_000)});
     } else if (ab.okx_trade.executionAllowed(cfg.mode.isTrading(), exec_venue_authorized)) {
         exec_note = tryDemoExecute(
             gpa,
@@ -3235,6 +3365,7 @@ fn runAgentDecision(
     // Execution errors and shadow-mode approvals count as real intent → reset.
     const noop_outcome = prop.action == .hold or
         std.mem.eql(u8, exec_note, "plan_hold") or
+        std.mem.eql(u8, exec_note, "restart_guard") or
         std.mem.eql(u8, exec_note, "skipped_reject");
     sched.noteOutcome(!noop_outcome);
     std.debug.print(
@@ -3246,7 +3377,14 @@ fn runAgentDecision(
     // Reflection: prefer LLM structured memory_ops; fail-closed → deterministic.
     // HOLD cycles skip the second LLM call unless explicitly enabled — quiet
     // markets should not burn tokens re-reflecting on identical no-ops.
-    const reflect_this_action = cfg.agent_llm_reflection_on_hold or prop.action != .hold;
+    // A HOLD under tension, or every Nth consecutive no-op, still gets the LLM
+    // reflection: the deterministic fallback only counts the streak, and a
+    // streak that is never examined is how 25 identical flat HOLDs happen.
+    const streak_after = review_facts.hold_streak + 1;
+    const periodic_hold_reflect = cfg.agent_llm_reflection_hold_every > 0 and
+        streak_after % cfg.agent_llm_reflection_hold_every == 0;
+    const reflect_this_action = cfg.agent_llm_reflection_on_hold or prop.action != .hold or
+        tension or cash_tension or periodic_hold_reflect;
     const want_llm_reflect = cfg.agent_llm_reflection and reflect_this_action and llmReflectionWanted(env);
     var reflected = false;
     if (want_llm_reflect) {
@@ -3272,34 +3410,50 @@ fn runAgentDecision(
         applyShadowReflection(gpa, mem_store, memories_repo, events_repo, engine, cfg, run_id, prop.decision_id, action_txt, prop.target_btc_weight, prop.confidence);
     }
 
-    var ok_buf: [4096]u8 = undefined;
+    // Worst case: 6 items × 400 (thesis) / 240 (invalid_if) bytes, every byte
+    // escaped to two → 4.8 KiB / 2.9 KiB plus brackets; ok_buf holds both plus
+    // ~1 KiB of fixed fields. Undersized buffers make jsonStringArrayLimited
+    // return "[]" and silently drop the whole list.
+    var ok_buf: [12288]u8 = undefined;
     var w_buf: [48]u8 = undefined;
     var c_buf: [48]u8 = undefined;
     var aw_buf: [48]u8 = undefined;
     var se_buf: [48]u8 = undefined;
     var fl_buf: [48]u8 = undefined;
-    var thesis_buf: [1536]u8 = undefined;
-    var invalid_buf: [1024]u8 = undefined;
+    var thesis_buf: [5120]u8 = undefined;
+    var invalid_buf: [3072]u8 = undefined;
     var review_buf: [48]u8 = undefined;
     const weight_s = decFmt(&w_buf, prop.target_btc_weight);
     const conf_s = decFmt(&c_buf, prop.confidence);
     const admitted_s = decFmt(&aw_buf, admission.admitted_weight);
     const stress_s = decFmt(&se_buf, admission.stress_equity);
     const floor_s = decFmt(&fl_buf, admission.floor);
-    const thesis_json = jsonStringArrayLimited(&thesis_buf, prop.thesis, 6, 180);
-    const invalid_json = jsonStringArrayLimited(&invalid_buf, prop.invalid_if, 6, 120);
+    // 400/240 bytes keep the full sentence the model actually wrote (the old
+    // 180/120 cut most theses mid-clause); the array cap bounds the payload.
+    const thesis_json = jsonStringArrayLimited(&thesis_buf, prop.thesis, 6, 400);
+    const invalid_json = jsonStringArrayLimited(&invalid_buf, prop.invalid_if, 6, 240);
     const review_s: []const u8 = if (prop.review_after) |ra| blk: {
         break :blk jsonEscapeInto(&review_buf, ra);
     } else "";
-    const executed = !std.mem.eql(u8, exec_note, "not_executed") and
-        !std.mem.eql(u8, exec_note, "hold") and
-        !std.mem.eql(u8, exec_note, "skipped_reject") and
-        !std.mem.eql(u8, exec_note, "plan_hold") and
-        !std.mem.eql(u8, exec_note, "plan_error");
+    // Audit the symmetric self-checks alongside the decision they justify.
+    var reduce_eval_buf: [320]u8 = undefined;
+    var add_eval_buf: [320]u8 = undefined;
+    const reduce_eval_json: []const u8 = if (prop.reduce_eval) |re|
+        evalJson(&reduce_eval_buf, @tagName(re.verdict), re.reason)
+    else
+        "null";
+    const add_eval_json: []const u8 = if (prop.add_eval) |ae|
+        evalJson(&add_eval_buf, @tagName(ae.verdict), ae.reason)
+    else
+        "null";
+    // Positive list: only notes that mean "the venue book moved" count as
+    // executed. A deny-list marked rejected / limit_timeout / unknown_* legs as
+    // executed, which now also resets the no-op streak in the audit log.
+    const executed = executionNoteMeansFill(exec_note);
     const ok_payload = std.fmt.bufPrint(
         &ok_buf,
-        "{{\"run_id\":\"{s}\",\"decision_id\":\"{s}\",\"action\":\"{s}\",\"target_btc_weight\":\"{s}\",\"confidence\":\"{s}\",\"snapshot_version\":{d},\"output_digest\":\"{s}\",\"tools\":{d},\"executed\":{},\"exec\":\"{s}\",\"thesis\":{s},\"invalid_if\":{s},\"review_after\":\"{s}\",\"admission\":{{\"verdict\":\"{s}\",\"reason\":\"{s}\",\"admitted_weight\":\"{s}\",\"stress_equity\":\"{s}\",\"floor\":\"{s}\"}},\"usage\":{{\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d}}}}}",
-        .{ run_id, prop.decision_id, action_txt, weight_s, conf_s, prop.snapshot_version, out_digest, tools_used, executed, exec_note, thesis_json, invalid_json, review_s, admission.verdict_txt, admission.reason_txt, admitted_s, stress_s, floor_s, usage.prompt_tokens, usage.completion_tokens, usage.total_tokens },
+        "{{\"run_id\":\"{s}\",\"decision_id\":\"{s}\",\"action\":\"{s}\",\"target_btc_weight\":\"{s}\",\"confidence\":\"{s}\",\"snapshot_version\":{d},\"output_digest\":\"{s}\",\"tools\":{d},\"executed\":{},\"exec\":\"{s}\",\"thesis\":{s},\"invalid_if\":{s},\"review_after\":\"{s}\",\"reduce_eval\":{s},\"add_eval\":{s},\"admission\":{{\"verdict\":\"{s}\",\"reason\":\"{s}\",\"admitted_weight\":\"{s}\",\"stress_equity\":\"{s}\",\"floor\":\"{s}\"}},\"usage\":{{\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d}}}}}",
+        .{ run_id, prop.decision_id, action_txt, weight_s, conf_s, prop.snapshot_version, out_digest, tools_used, executed, exec_note, thesis_json, invalid_json, review_s, reduce_eval_json, add_eval_json, admission.verdict_txt, admission.reason_txt, admitted_s, stress_s, floor_s, usage.prompt_tokens, usage.completion_tokens, usage.total_tokens },
     ) catch "{\"executed\":false}";
     {
         var dbuf: [160]u8 = undefined;
@@ -5361,23 +5515,6 @@ const logEvent = ab.journal.logEvent;
 const logEventPayload = ab.journal.logEventPayload;
 const logEventPayloadChecked = ab.journal.logEventPayloadChecked;
 
-fn noteRiskModeChange(
-    events_repo: *ab.storage.EventsRepo,
-    engine: *ab.state.Engine,
-    cfg: *const ab.config.Config,
-    prev: ab.risk_state.RiskMode,
-    changed: bool,
-) void {
-    if (!changed) return;
-    const now_mode = engine.snapshot().risk_mode;
-    var buf: [128]u8 = undefined;
-    const payload = std.fmt.bufPrint(&buf, "{{\"from\":\"{s}\",\"to\":\"{s}\"}}", .{
-        prev.jsonName(),
-        now_mode.jsonName(),
-    }) catch "{\"from\":\"unknown\",\"to\":\"unknown\"}";
-    std.debug.print("[risk] mode {s} -> {s}\n", .{ prev.jsonName(), now_mode.jsonName() });
-    logEventPayload(events_repo, engine, "RISK_MODE_CHANGED", "risk-kernel", now_mode.journalSeverity(), cfg, payload);
-}
 
 fn consumeMaintenanceMarker(
     io: std.Io,
@@ -5518,6 +5655,33 @@ fn jsonEscapeInto(buf: []u8, s: []const u8) []const u8 {
 }
 
 /// JSON array of strings, truncated for event payload size.
+/// Longest prefix of `s` that is at most `max_len` bytes and does not end in
+/// the middle of a UTF-8 sequence. Byte-slicing `s[0..max_len]` used to cut
+/// multi-byte characters (e.g. "—") in half; the broken bytes then landed in
+/// event payloads and broke every downstream JSON consumer (periodic review
+/// prompts were rejected by the LLM API with "invalid unicode code point").
+pub fn utf8SafePrefix(s: []const u8, max_len: usize) []const u8 {
+    if (s.len <= max_len) return s;
+    var end = max_len;
+    // Back off over continuation bytes (10xxxxxx) to the start of the sequence
+    // that straddles the cut, then drop that sequence.
+    while (end > 0 and (s[end] & 0xC0) == 0x80) end -= 1;
+    return s[0..end];
+}
+
+test "utf8SafePrefix never splits a multi-byte character" {
+    const s = "ab—cd"; // "—" is 3 bytes (E2 80 94)
+    try std.testing.expectEqualStrings("ab—cd", utf8SafePrefix(s, 10));
+    try std.testing.expectEqualStrings("ab—cd", utf8SafePrefix(s, 7));
+    try std.testing.expectEqualStrings("ab—c", utf8SafePrefix(s, 6));
+    try std.testing.expectEqualStrings("ab—", utf8SafePrefix(s, 5));
+    try std.testing.expectEqualStrings("ab", utf8SafePrefix(s, 4));
+    try std.testing.expectEqualStrings("ab", utf8SafePrefix(s, 3));
+    try std.testing.expectEqualStrings("ab", utf8SafePrefix(s, 2));
+    try std.testing.expectEqualStrings("", utf8SafePrefix(s, 0));
+    for (0..s.len + 1) |n| try std.testing.expect(std.unicode.utf8ValidateSlice(utf8SafePrefix(s, n)));
+}
+
 fn jsonStringArrayLimited(buf: []u8, items: []const []const u8, max_items: usize, max_item_len: usize) []const u8 {
     var w: std.Io.Writer = .fixed(buf);
     w.writeAll("[") catch return "[]";
@@ -5527,7 +5691,7 @@ fn jsonStringArrayLimited(buf: []u8, items: []const []const u8, max_items: usize
         if (i > 0) w.writeAll(",") catch break;
         w.writeAll("\"") catch break;
         const raw = items[i];
-        const slice = if (raw.len > max_item_len) raw[0..max_item_len] else raw;
+        const slice = utf8SafePrefix(raw, max_item_len);
         for (slice) |c| {
             switch (c) {
                 '"' => w.writeAll("\\\"") catch break,

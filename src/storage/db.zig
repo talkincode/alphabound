@@ -349,6 +349,27 @@ pub const EventsRepo = struct {
 
     /// Compact proposal lines inside [ts_from, ts_to] (oldest first) for the
     /// review tool round: ts/action/weight/conf/admission verdict only.
+    /// Consecutive no-op decisions since the last proposal that actually
+    /// executed. `E_hold_streak.evidence_count` only ever grew (rebalances
+    /// never reset it), so the "consecutive HOLD" fact the prompt reasons
+    /// about was a lifetime counter. Derived from the audit log instead.
+    pub fn noopStreakSinceLastExecution(self: *EventsRepo, db: *Db) DbError!u32 {
+        _ = self;
+        var stmt = try db.prepare(
+            \\SELECT count(*) FROM events
+            \\WHERE type = 'AGENT_PROPOSAL_OK'
+            \\  AND seq > COALESCE((
+            \\    SELECT max(seq) FROM events
+            \\    WHERE type = 'AGENT_PROPOSAL_OK'
+            \\      AND json_extract(payload_json, '$.executed') = 1
+            \\  ), 0)
+        );
+        defer stmt.finalize();
+        if (!(try stmt.step())) return 0;
+        const n = stmt.columnInt(0);
+        return if (n < 0) 0 else @intCast(@min(n, std.math.maxInt(u32)));
+    }
+
     pub fn writeProposalsWindowCompact(
         self: *EventsRepo,
         db: *Db,
