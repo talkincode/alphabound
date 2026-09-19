@@ -23,6 +23,16 @@ pub const RiskMode = enum {
             .halted => "HALTED",
         };
     }
+
+    /// Journal severity for a transition *into* this mode. Recovery to
+    /// NORMAL is informational; EXIT_ONLY is a warn; flatten/halt stay critical.
+    pub fn journalSeverity(self: RiskMode) []const u8 {
+        return switch (self) {
+            .normal => "INFO",
+            .exit_only => "WARN",
+            .flattening, .halted => "CRITICAL",
+        };
+    }
 };
 
 pub const Trigger = enum {
@@ -91,6 +101,13 @@ pub fn allowsRiskReduction(mode: RiskMode) bool {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "journal severity follows destination mode" {
+    try testing.expectEqualStrings("INFO", RiskMode.normal.journalSeverity());
+    try testing.expectEqualStrings("WARN", RiskMode.exit_only.journalSeverity());
+    try testing.expectEqualStrings("CRITICAL", RiskMode.flattening.journalSeverity());
+    try testing.expectEqualStrings("CRITICAL", RiskMode.halted.journalSeverity());
+}
 
 test "halted is sticky without operator reset" {
     inline for ([_]Trigger{ .conditions_ok, .degraded, .exit_trigger, .fatal, .flatten_complete }) |t| {

@@ -48,7 +48,7 @@ pub const Input = struct {
     consecutive_failures: i64 = 0,
     /// ms since last AGENT_PROPOSAL_OK; -1 = none on record.
     last_proposal_age_ms: i64 = -1,
-    /// Zombie when last_proposal_age exceeds this (3× slowest cadence).
+    /// Zombie when last_proposal_age exceeds this (see `zombieThresholdMs`).
     zombie_threshold_ms: i64,
     // --- tools ---
     tool_calls_total: i64 = 0,
@@ -78,6 +78,19 @@ pub const Input = struct {
 };
 
 const W = std.Io.Writer;
+
+/// Silence that is still explained by the slow-loop scheduler is not a zombie.
+///
+/// HOLD `review_after` can stretch the regular cadence up to
+/// `review_backoff_max_ms`. A 3×-cadence threshold below that cap false-alerts
+/// every time the agent honors a long HOLD. The extra cadence is so a due
+/// decision can actually fire after backoff expires.
+pub fn zombieThresholdMs(cadence_ms: i64, review_backoff_max_ms: i64) i64 {
+    const cadence: i64 = @max(cadence_ms, 0);
+    const triple = 3 * cadence;
+    if (review_backoff_max_ms <= 0) return triple;
+    return @max(triple, review_backoff_max_ms + cadence);
+}
 
 fn finding(w: *W, first: *bool, check: []const u8, sev: Severity, comptime fmt: []const u8, args: anytype) W.Error!Severity {
     if (!first.*) try w.writeByte(',');
@@ -273,6 +286,23 @@ test "data invariant breaks are alerts; chain gaps are warns" {
     try testing.expect(std.mem.indexOf(u8, s2, "flow.admissions") != null);
     try testing.expect(std.mem.indexOf(u8, s2, "flow.reflections") != null);
     try testing.expect(std.mem.indexOf(u8, s2, "flow.trigger_outcomes") != null);
+}
+
+test "zombie threshold covers HOLD review backoff" {
+    try testing.expectEqual(@as(i64, 3 * 3_600_000), zombieThresholdMs(3_600_000, 0));
+    try testing.expectEqual(@as(i64, 5 * 3_600_000), zombieThresholdMs(3_600_000, 4 * 3_600_000));
+    var in = healthyInput();
+    in.zombie_threshold_ms = zombieThresholdMs(3_600_000, 4 * 3_600_000);
+    in.last_proposal_age_ms = 225 * 60_000; // production false-alert: 3.75h < 5h
+    var buf: [8192]u8 = undefined;
+    var w: W = .fixed(&buf);
+    try testing.expectEqual(Severity.ok, try writeFindings(&w, in));
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "llm.zombie") == null);
+
+    in.last_proposal_age_ms = 6 * 3_600_000;
+    var w2: W = .fixed(&buf);
+    try testing.expectEqual(Severity.alert, try writeFindings(&w2, in));
+    try testing.expect(std.mem.indexOf(u8, w2.buffered(), "llm.zombie") != null);
 }
 
 test "risk mode and stale samples surface as warns; disabled agent skips zombie" {

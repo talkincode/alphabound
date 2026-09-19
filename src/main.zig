@@ -1215,7 +1215,6 @@ pub fn main(init: std.process.Init) !u8 {
                     );
                 }
 
-
                 // 1-minute equity samples (§6.2 retention).
                 const minute = @divFloor(snap.as_of_ms, 60_000);
                 if (minute != last_sample_min) {
@@ -1811,7 +1810,7 @@ fn runPrivateReconcile(
                     };
                     return .{};
                 }
-                _ = engine.apply(.{ .reconcile_result = .{
+                const applied = engine.apply(.{ .reconcile_result = .{
                     .ts_ms = ts_ms,
                     .cash_usdt = b.usdt_cash,
                     .btc_total = b.btc_cash,
@@ -1827,6 +1826,7 @@ fn runPrivateReconcile(
                     };
                     return .{};
                 };
+                _ = applied; // mode transitions are journaled by drainModeTransitions
                 std.debug.print(
                     "[reconcile] {t} balance applied usdt={f} avail={f} btc={f}\n",
                     .{ cfg.mode, b.usdt_cash, b.usdt_avail, b.btc_cash },
@@ -2663,23 +2663,13 @@ fn drainModeTransitions(
     const payload = std.fmt.bufPrint(
         &buf,
         "{{\"from\":\"{s}\",\"to\":\"{s}\",\"cause\":\"{s}\",\"bounces\":{d},\"at_ms\":{d}}}",
-        .{ riskModeUpper(t.from), riskModeUpper(t.to), t.cause, t.bounces, t.ts_ms },
+        .{ t.from.jsonName(), t.to.jsonName(), t.cause, t.bounces, t.ts_ms },
     ) catch "{}";
-    // Entering a restrictive mode is critical; recovering (or a folded bounce
-    // back to the same mode) is informational.
-    const severity: []const u8 = if (t.to == .normal) "INFO" else "CRITICAL";
+    const severity: []const u8 = t.to.journalSeverity();
     drain_persisted = logEventPayloadChecked(events_repo, engine, "RISK_MODE_CHANGED", "risk-kernel", severity, cfg, payload);
 }
 threadlocal var drain_persisted: bool = true;
 
-fn riskModeUpper(m: ab.risk_state.RiskMode) []const u8 {
-    return switch (m) {
-        .normal => "NORMAL",
-        .exit_only => "EXIT_ONLY",
-        .flattening => "FLATTENING",
-        .halted => "HALTED",
-    };
-}
 
 /// Operator path probe: same admission + trading execution stack as agent REBALANCE.
 /// Used to unblock Gate3 order-path verification without waiting on LLM HOLD bias.
@@ -5168,7 +5158,10 @@ fn runScheduledAudit(
         .now_ms = now,
         .window_ms = window_ms,
         .agent_enabled = agent_live,
-        .zombie_threshold_ms = 3 * @as(i64, @intCast(@max(cfg.decision_interval_ms, cfg.decision_interval_quiet_ms))),
+        .zombie_threshold_ms = ab.auditor.zombieThresholdMs(
+            @intCast(@max(cfg.decision_interval_ms, cfg.decision_interval_quiet_ms)),
+            @intCast(cfg.review_backoff_max_ms),
+        ),
     };
 
     // --- llm ---
@@ -5521,6 +5514,7 @@ fn execLabel(mode: ab.config.Mode) []const u8 {
 const logEvent = ab.journal.logEvent;
 const logEventPayload = ab.journal.logEventPayload;
 const logEventPayloadChecked = ab.journal.logEventPayloadChecked;
+
 
 fn consumeMaintenanceMarker(
     io: std.Io,

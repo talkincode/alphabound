@@ -91,9 +91,14 @@ pub const Client = struct {
         // Wall-clock budget guards against half-open TLS hangs that never surface as
         // an error from std.http (observed in production after idle gateway drops).
         return self.chatBudgeted(url, body) catch |err| {
-            // Retry only quick transport failures. Timeouts already consumed the full budget.
-            if (err != error.HttpFailed) return err;
-            std.debug.print("[llm] transport_failed; reset_http_retry\n", .{});
+            // Retry transport flakes and empty-content (thinking models / gateway
+            // blanks). Timeouts already consumed the full budget.
+            if (err != error.HttpFailed and err != error.EmptyContent) return err;
+            if (err == error.EmptyContent) {
+                std.debug.print("[llm] empty_content; reset_http_retry\n", .{});
+            } else {
+                std.debug.print("[llm] transport_failed; reset_http_retry\n", .{});
+            }
             self.resetHttp();
             return self.chatBudgeted(url, body);
         };
@@ -216,6 +221,7 @@ pub const Client = struct {
             } else if (err == error.MalformedResponse) {
                 std.debug.print("[llm] malformed_response status={d} bytes={d}\n", .{ status_code, owned.len });
             }
+            logBodySnippet(status_code, owned);
             return err;
         };
         return parsed;
@@ -279,10 +285,24 @@ fn detectAuthStyle(base_url: []const u8) AuthStyle {
     return .bearer;
 }
 
+fn modelWantsThinkingOff(model: []const u8) bool {
+    // DeepSeek V4 / R1-class default thinking=on: tokens land in
+    // reasoning_content and `content` is often empty; some gateways also 400
+    // when temperature is set while thinking is enabled.
+    if (std.ascii.indexOfIgnoreCase(model, "deepseek-v4") != null) return true;
+    if (std.ascii.indexOfIgnoreCase(model, "deepseek-r1") != null) return true;
+    if (std.ascii.indexOfIgnoreCase(model, "reasoner") != null) return true;
+    return false;
+}
+
 fn writeChatBody(w: *std.Io.Writer, model: []const u8, system: []const u8, user: []const u8) Error!void {
     w.writeAll("{\"model\":\"") catch return error.OutOfMemory;
     writeJsonString(w, model) catch return error.OutOfMemory;
-    w.writeAll("\",\"temperature\":0.2,\"messages\":[") catch return error.OutOfMemory;
+    if (modelWantsThinkingOff(model)) {
+        w.writeAll("\",\"temperature\":0.2,\"thinking\":{\"type\":\"disabled\"},\"messages\":[") catch return error.OutOfMemory;
+    } else {
+        w.writeAll("\",\"temperature\":0.2,\"messages\":[") catch return error.OutOfMemory;
+    }
     w.writeAll("{\"role\":\"system\",\"content\":\"") catch return error.OutOfMemory;
     writeJsonString(w, system) catch return error.OutOfMemory;
     w.writeAll("\"},{\"role\":\"user\",\"content\":\"") catch return error.OutOfMemory;
@@ -384,13 +404,9 @@ pub fn parseChatResult(gpa: std.mem.Allocator, body: []const u8) Error!ChatResul
     if (first != .object) return error.MalformedResponse;
     const msg_v = first.object.get("message") orelse return error.MalformedResponse;
     if (msg_v != .object) return error.MalformedResponse;
-    const content_v = msg_v.object.get("content") orelse return error.EmptyContent;
-    const content = switch (content_v) {
-        .string => |s| s,
-        .null => return error.EmptyContent,
-        else => return error.MalformedResponse,
-    };
-    if (content.len == 0) return error.EmptyContent;
+    const content = collectAssistantText(gpa, msg_v) catch |err| return err;
+    defer if (content.owned) gpa.free(content.text);
+    if (content.text.len == 0) return error.EmptyContent;
 
     var usage: Usage = .{};
     if (obj.get("usage")) |uv| {
@@ -419,8 +435,64 @@ pub fn parseChatResult(gpa: std.mem.Allocator, body: []const u8) Error!ChatResul
         }
     }
 
-    const owned = gpa.dupe(u8, content) catch return error.OutOfMemory;
+    const owned = gpa.dupe(u8, content.text) catch return error.OutOfMemory;
     return .{ .content = owned, .usage = usage };
+}
+
+const AssistantText = struct {
+    text: []const u8,
+    owned: bool = false,
+};
+
+/// OpenAI string content, or the concatenated `text` parts of a content array.
+/// Empty / missing / null → EmptyContent. Reasoning-only replies are empty:
+/// structured JSON tasks must send `thinking.type=disabled` instead of mining CoT.
+fn collectAssistantText(gpa: std.mem.Allocator, msg_v: std.json.Value) Error!AssistantText {
+    if (msg_v != .object) return error.MalformedResponse;
+    const msg = msg_v.object;
+    const content_v = msg.get("content") orelse return error.EmptyContent;
+    switch (content_v) {
+        .string => |s| return .{ .text = s },
+        .null => return error.EmptyContent,
+        .array => |arr| {
+            var aw = std.Io.Writer.Allocating.init(gpa);
+            defer aw.deinit();
+            for (arr.items) |item| {
+                switch (item) {
+                    .string => |s| aw.writer.writeAll(s) catch return error.OutOfMemory,
+                    .object => |o| {
+                        if (o.get("text")) |t| {
+                            if (t == .string) aw.writer.writeAll(t.string) catch return error.OutOfMemory;
+                        } else if (o.get("content")) |c| {
+                            if (c == .string) aw.writer.writeAll(c.string) catch return error.OutOfMemory;
+                        }
+                    },
+                    else => {},
+                }
+            }
+            const slice = aw.writer.buffered();
+            if (slice.len == 0) return error.EmptyContent;
+            const owned = gpa.dupe(u8, slice) catch return error.OutOfMemory;
+            return .{ .text = owned, .owned = true };
+        },
+        else => return error.MalformedResponse,
+    }
+}
+
+fn logBodySnippet(status: u16, body: []const u8) void {
+    var buf: [96]u8 = undefined;
+    var n: usize = 0;
+    for (body) |c| {
+        if (n >= buf.len) break;
+        if (c >= 0x20 and c < 0x7f) {
+            buf[n] = c;
+            n += 1;
+        } else if (c == '\n' or c == '\t' or c == '\r') {
+            buf[n] = ' ';
+            n += 1;
+        }
+    }
+    std.debug.print("[llm] body_snippet status={d} bytes={d} text={s}\n", .{ status, body.len, buf[0..n] });
 }
 
 fn jsonU64(v: ?std.json.Value) u64 {
@@ -513,6 +585,39 @@ test "extractJsonObject nested braces in strings" {
     const raw = "{\"a\":{\"b\":1},\"c\":\"x{y}\"}";
     const j = extractJsonObject(raw).?;
     try testing.expectEqualStrings(raw, j);
+}
+
+test "v4 flash chat body disables thinking" {
+    var buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeChatBody(&w, "deepseek-v4-flash", "sys", "hi");
+    const s = w.buffered();
+    try testing.expect(std.mem.indexOf(u8, s, "\"thinking\":{\"type\":\"disabled\"}") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "\"temperature\":0.2") != null);
+}
+
+test "non-reasoner chat body has no thinking field" {
+    var buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeChatBody(&w, "gpt-4o-mini", "sys", "hi");
+    const s = w.buffered();
+    try testing.expect(std.mem.indexOf(u8, s, "thinking") == null);
+}
+
+test "parseAssistantContent concatenates content array" {
+    const body =
+        \\{"choices":[{"message":{"role":"assistant","content":[{"type":"text","text":"{\"action\":"},{"type":"text","text":"\"HOLD\"}"}]}}]}
+    ;
+    const c = try parseAssistantContent(testing.allocator, body);
+    defer testing.allocator.free(c);
+    try testing.expectEqualStrings("{\"action\":\"HOLD\"}", c);
+}
+
+test "parseAssistantContent empty content is EmptyContent" {
+    const body =
+        \\{"choices":[{"message":{"role":"assistant","content":"","reasoning_content":"thoughts"}}]}
+    ;
+    try testing.expectError(error.EmptyContent, parseAssistantContent(testing.allocator, body));
 }
 
 test "parses usage tokens" {
