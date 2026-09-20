@@ -35,6 +35,10 @@ event_price_move = 0.005            # 距上次决策价格偏离 ≥0.5% 提前
 event_drawdown_step = 0.01          # 回撤加深 ≥1% 提前触发
 event_price_drift = 0.02            # 相对上次成交价累计偏离 ≥2% 触发(跨多次 HOLD 累计,不受空转退避影响;0 = 关闭)
 event_noop_backoff_max_ms = 1800000 # 连续空转决策后对 price_move 触发指数退避,上限 30 分钟 (0 = 关闭)
+volatility_enter = 0.01            # 约15分钟振幅 ≥1% 进入高波动档；0关闭，旧配置省略时默认关闭
+volatility_exit = 0.006            # 振幅 ≤0.6% 持续 exit_hold 后恢复原调度
+volatility_interval_ms = 180000    # 高波动每3分钟复查，仍受 decision_min_interval_ms 约束
+volatility_exit_hold_ms = 900000   # 退出需持续15分钟；行情中断>90秒重新预热
 llm_reflection_on_hold = false      # HOLD 提案默认用确定性反思,省一次 LLM 调用
 llm_reflection_hold_every = 6       # 但每第 N 次连续空转、以及 position/cash tension 成立时仍做 LLM 反思 (0 = 从不)
 prompt_dir = "/etc/alphabound/prompts"
