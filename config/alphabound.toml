@@ -47,6 +47,7 @@ prompt_dir = "/etc/alphabound/prompts"
 # 定期复盘（分析用，永不触碰交易路径）：结论只沉淀为低置信度记忆。
 short_interval_ms = 28800000   # 小周期 8 小时（小时级；常用 4h=14400000）；0 = 关闭
 long_interval_ms = 604800000   # 大周期 7 天；0 = 关闭
+# timeout_ms = 180000           # 复盘 LLM 超时，独立于 decision_timeout_ms（不被其封顶）；最小 30000
 
 [storage]
 path = "/var/lib/alphabound/trading.db"

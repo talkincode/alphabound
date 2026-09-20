@@ -53,6 +53,15 @@ llm_reflection_hold_every = 6        # ... except every 6th consecutive no-op an
 path = "/var/lib/alphabound/trading.db"
 wal = true
 
+# Periodic review (analysis-only; never touches orders/risk). 0 disables a
+# cycle. timeout_ms is deliberately independent of agent.decision_timeout_ms
+# above — the review prompt is batched and larger than a single decision, so
+# a tight per-decision budget must not silently cap this call too.
+[review]
+short_interval_ms = 28800000  # 8h
+long_interval_ms = 604800000  # 7d
+timeout_ms = 180000           # min 30000
+
 # Auth: set ALPHABOUND_API_TOKEN in secrets.env (not in this file).
 # Intel ingest: ALPHABOUND_INTEL_HMAC in secrets.env (empty = ingest off).
 # Optional WebAuthn: ALPHABOUND_WEBAUTHN_RP_ID / ALPHABOUND_WEBAUTHN_ORIGIN.

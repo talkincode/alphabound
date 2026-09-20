@@ -36,6 +36,7 @@ llm_reflection = true
 # 定期复盘：本机开发把小周期调短便于观察；生产用 8h / 7d 默认值。
 short_interval_ms = 28800000   # 小周期 8 小时（小时级；4h=14400000，最小 600000）；0 = 关闭
 long_interval_ms = 604800000   # 大周期 7 天（最小 3600000）；0 = 关闭
+# timeout_ms = 180000           # 复盘 LLM 超时，独立于 decision_timeout_ms，不受其封顶（最小 30000）
 
 [storage]
 path = "var/trading.db"
