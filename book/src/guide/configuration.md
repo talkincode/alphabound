@@ -106,6 +106,10 @@ long_interval_ms = 604800000   # 定期复盘·大周期 7d（最小 3600000；0
 | `active_hours_utc` | string | `""` | UTC 活跃时段 `"start-end"`（end 不含，可跨 0 点如 `"22-4"`）；空 = 全天基础间隔 |
 | `event_price_move` | decimal | `0.005` | 距上次决策价格偏离 ≥ 该比例提前触发；0 关闭 |
 | `event_drawdown_step` | decimal | `0.01` | 回撤较上次决策加深 ≥ 该比例提前触发；0 关闭 |
+| `volatility_enter` | decimal | `0` | 约 15 分钟 `(最高−最低)/最低` ≥ 该比例进入高波动档，放宽 HOLD 等待；0 关闭 |
+| `volatility_exit` | decimal | `0.006` | 振幅 ≤ 该比例且持续 `volatility_exit_hold_ms` 才退出高波动档 |
+| `volatility_interval_ms` | u32 | `180000` | 高波动档的复查间隔；仍受 `decision_min_interval_ms` 约束 |
+| `volatility_exit_hold_ms` | u32 | `900000` | 退出高波动档所需的连续低振幅时长 |
 | `prompt_dir` | path | `prompts` | Prompt 目录 |
 | `enabled` | bool | `true` | false 时永不调 LLM |
 | `llm_reflection` | bool | `true` | 有效提案后跑 LLM 结构化反思；失败回退确定性 |
@@ -114,7 +118,10 @@ long_interval_ms = 604800000   # 定期复盘·大周期 7d（最小 3600000；0
 慢环调度是多因素的：活跃/静默时段各有基础节奏，价格突变、回撤加深、
 风险模式切换会提前触发一次决策，且所有触发都受 `decision_min_interval_ms`
 冷却下限约束。HOLD 以及因低于最小下单额而 `plan_hold` 的 REBALANCE 会按提案的
-`review_after` 推迟常规节奏（价格/回撤/风险模式事件仍可穿透）。风险内核不受此影响——它始终在快环独立执行。
+`review_after` 推迟常规节奏（价格/回撤/风险模式/高波动事件仍可穿透）。
+事件触发的复查不会取消已生效的 `review_after`：只有新的可解析 `review_after`、
+实际成交，或一次未产出建议的失败（LLM 失败／提案无效）才会改变它。
+风险内核不受此影响——它始终在快环独立执行。
 每次触发在事件流记录 `AGENT_TRIGGER`（含 reason），便于审计调用频率。
 
 ### `[storage]`

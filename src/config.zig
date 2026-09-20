@@ -77,6 +77,12 @@ pub const Config = struct {
     /// last *traded* price (cumulative across HOLDs, not dampened by the
     /// no-op backoff). Catches slow grinds that never trip price_move. 0 off.
     event_price_drift: Decimal = Decimal.parse("0.02") catch unreachable,
+    /// Opt-in: rolling 15m price range that enters frequent advisory review.
+    /// Zero preserves legacy scheduling when upgrading an existing config.
+    volatility_enter: Decimal = Decimal.zero,
+    volatility_exit: Decimal = Decimal.parse("0.006") catch unreachable,
+    volatility_interval_ms: u32 = 180_000,
+    volatility_exit_hold_ms: u32 = 900_000,
     /// Cap for honoring a HOLD proposal's `review_after` as a regular-cadence
     /// backoff (ms); 0 disables (legacy fixed cadence). Event triggers
     /// (price_move / drawdown_step / risk_mode_change) always cut through.
@@ -189,6 +195,9 @@ pub fn parse(gpa: std.mem.Allocator, text: []const u8) ConfigError!Config {
         const val = std.mem.trim(u8, line[eq + 1 ..], " \t");
         try applyKey(a, &cfg, section, key, val);
     }
+    // Cross-field validation belongs after parsing: key order is immaterial.
+    if (!cfg.volatility_enter.isZero() and
+        !cfg.volatility_exit.lt(cfg.volatility_enter)) return error.InvalidValue;
     cfg.arena = arena; // final arena state, after all allocations
     return cfg;
 }
@@ -298,6 +307,22 @@ fn applyKey(a: std.mem.Allocator, cfg: *Config, section: []const u8, key: []cons
             cfg.event_price_drift = Decimal.parse(val) catch return error.InvalidValue;
             if (cfg.event_price_drift.isNegative() or
                 cfg.event_price_drift.gte(Decimal.fromInt(1))) return error.InvalidValue;
+        } else if (std.mem.eql(u8, key, "volatility_enter")) {
+            cfg.volatility_enter = Decimal.parse(val) catch return error.InvalidValue;
+            if (cfg.volatility_enter.isNegative() or
+                cfg.volatility_enter.gte(Decimal.fromInt(1))) return error.InvalidValue;
+        } else if (std.mem.eql(u8, key, "volatility_exit")) {
+            cfg.volatility_exit = Decimal.parse(val) catch return error.InvalidValue;
+            if (cfg.volatility_exit.isNegative() or
+                cfg.volatility_exit.gte(Decimal.fromInt(1))) return error.InvalidValue;
+        } else if (std.mem.eql(u8, key, "volatility_interval_ms")) {
+            cfg.volatility_interval_ms = parseInt(u32, val) catch return error.InvalidValue;
+            if (cfg.volatility_interval_ms < 180_000 or
+                cfg.volatility_interval_ms > 3_600_000) return error.InvalidValue;
+        } else if (std.mem.eql(u8, key, "volatility_exit_hold_ms")) {
+            cfg.volatility_exit_hold_ms = parseInt(u32, val) catch return error.InvalidValue;
+            if (cfg.volatility_exit_hold_ms < 60_000 or
+                cfg.volatility_exit_hold_ms > 3_600_000) return error.InvalidValue;
         } else if (std.mem.eql(u8, key, "review_backoff_max_ms")) {
             cfg.review_backoff_max_ms = parseInt(u32, val) catch return error.InvalidValue;
         } else if (std.mem.eql(u8, key, "event_noop_backoff_max_ms")) {
@@ -555,4 +580,39 @@ test "multi-factor schedule keys parse with validation" {
         \\[agent]
         \\event_drawdown_step = -0.01
     ));
+}
+
+test "volatility scheduling is opt-in and validates hysteresis independent of key order" {
+    var defaults = try parse(testing.allocator, "");
+    defer defaults.deinit();
+    try testing.expect(defaults.volatility_enter.isZero());
+    try testing.expectEqual(@as(u32, 180_000), defaults.volatility_interval_ms);
+
+    var cfg = try parse(testing.allocator,
+        \\[agent]
+        \\volatility_exit = 0.006
+        \\volatility_interval_ms = 180000
+        \\volatility_exit_hold_ms = 900000
+        \\volatility_enter = 0.01
+    );
+    defer cfg.deinit();
+    try testing.expect(cfg.volatility_enter.eql(try Decimal.parse("0.01")));
+    try testing.expect(cfg.volatility_exit.eql(try Decimal.parse("0.006")));
+    try testing.expectEqual(@as(u32, 900_000), cfg.volatility_exit_hold_ms);
+
+    const invalid = [_][]const u8{
+        "[agent]\nvolatility_enter = -0.01",
+        "[agent]\nvolatility_enter = 1",
+        "[agent]\nvolatility_exit = -0.01",
+        "[agent]\nvolatility_exit = 1",
+        "[agent]\nvolatility_enter = 0.005",
+        "[agent]\nvolatility_enter = 0.01\nvolatility_exit = 0.01",
+        "[agent]\nvolatility_exit = 0.02\nvolatility_enter = 0.01",
+        "[agent]\nvolatility_interval_ms = 0",
+        "[agent]\nvolatility_interval_ms = 179999",
+        "[agent]\nvolatility_interval_ms = 3600001",
+        "[agent]\nvolatility_exit_hold_ms = 59999",
+        "[agent]\nvolatility_exit_hold_ms = 3600001",
+    };
+    for (invalid) |text| try testing.expectError(error.InvalidValue, parse(testing.allocator, text));
 }

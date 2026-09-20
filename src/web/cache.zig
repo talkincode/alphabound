@@ -19,6 +19,7 @@ const review = @import("review.zig");
 const intel_inbox = @import("../intel/inbox.zig");
 const analytics = @import("../analytics/ab_factor.zig");
 const external = @import("../tools/external.zig");
+const scheduler = @import("../core/scheduler.zig");
 
 fn nowMs() i64 {
     return clock.SystemClock.clock().wallMs();
@@ -380,6 +381,8 @@ pub const WebState = struct {
 
 /// Live connectivity/status snapshot for Dashboard「状态」页.
 pub const RuntimeStatus = struct {
+    volatility: scheduler.VolatilityStatus = .{},
+    volatility_as_of_ms: i64 = 0,
     okx_public: []const u8 = "unknown",
     okx_public_ms: i64 = 0,
     okx_public_detail: []const u8 = "",
@@ -813,6 +816,47 @@ pub const ExecFlags = struct {
     real_money: bool = false,
 };
 
+fn writeVolatility(w: *std.Io.Writer, cfg: *const config.Config, st: *const RuntimeStatus) !void {
+    try w.print(
+        "{{\"enabled\":{},\"ready\":{},\"active\":{},\"range\":\"{f}\",\"as_of_ms\":{d},\"window_ms\":{d},\"max_gap_ms\":{d},\"enter\":\"{f}\",\"exit\":\"{f}\",\"interval_ms\":{d},\"exit_hold_ms\":{d}}}",
+        .{
+            !cfg.volatility_enter.isZero(),
+            st.volatility.ready,
+            st.volatility.active,
+            st.volatility.range,
+            st.volatility_as_of_ms,
+            scheduler.volatility_window_ms,
+            scheduler.volatility_max_gap_ms,
+            cfg.volatility_enter,
+            cfg.volatility_exit,
+            @max(cfg.decision_min_interval_ms, cfg.volatility_interval_ms),
+            cfg.volatility_exit_hold_ms,
+        },
+    );
+}
+
+test "system volatility JSON exposes effective cadence and observed state" {
+    var cfg = try config.parse(std.testing.allocator,
+        \\[agent]
+        \\volatility_enter = 0.01
+        \\decision_min_interval_ms = 240000
+    );
+    defer cfg.deinit();
+    var st: RuntimeStatus = .{};
+    st.volatility = .{ .ready = true, .active = true, .range = cfg.volatility_enter };
+    st.volatility_as_of_ms = 1234;
+    var buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeVolatility(&w, &cfg, &st);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, w.buffered(), .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try std.testing.expect(obj.get("enabled").?.bool);
+    try std.testing.expect(obj.get("active").?.bool);
+    try std.testing.expectEqual(@as(i64, 240_000), obj.get("interval_ms").?.integer);
+    try std.testing.expectEqualStrings("0.01", obj.get("range").?.string);
+}
+
 pub fn refreshSystemCache(
     ws: *WebState,
     db: *storage.Db,
@@ -897,6 +941,9 @@ pub fn refreshSystemCache(
             cfg.event_noop_backoff_max_ms,
         },
     ) catch return;
+    w.writeAll("\"volatility\":") catch return;
+    writeVolatility(&w, cfg, st) catch return;
+    w.writeByte(',') catch return;
     w.print(
         "\"status\":{{\"okx_public\":\"{s}\",\"okx_public_ms\":{d},\"okx_public_detail\":\"{s}\",\"okx_private\":\"{s}\",\"okx_private_ms\":{d},\"okx_private_detail\":\"{s}\",\"llm\":\"{s}\",\"llm_ms\":{d},\"llm_detail\":\"{s}\",\"last_bid\":\"{s}\",",
         .{

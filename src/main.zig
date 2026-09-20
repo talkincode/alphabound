@@ -954,6 +954,10 @@ pub fn main(init: std.process.Init) !u8 {
         .drawdown_step = cfg.event_drawdown_step,
         .review_backoff_max_ms = @as(i64, cfg.review_backoff_max_ms),
         .noop_backoff_cap_ms = @as(i64, cfg.event_noop_backoff_max_ms),
+        .volatility_enter = cfg.volatility_enter,
+        .volatility_exit = cfg.volatility_exit,
+        .volatility_interval_ms = cfg.volatility_interval_ms,
+        .volatility_exit_hold_ms = cfg.volatility_exit_hold_ms,
     });
     var ticker_path_buf: [128]u8 = undefined;
     const ticker_path = std.fmt.bufPrint(&ticker_path_buf, "/api/v5/market/ticker?instId={s}", .{cfg.instrument}) catch return 1;
@@ -1158,6 +1162,9 @@ pub fn main(init: std.process.Init) !u8 {
                 const lat_us = (ab.clock.SystemClock.clock().monotonicNs() -| lat_t0) / 1000;
                 risk_latency.record(@intCast(@min(lat_us, std.math.maxInt(u32))));
                 const snap = engine.snapshot();
+                // Observe exchange timestamps, not repeated stale snapshots.
+                // Collection continues while paused/HALTED; decisions stay gated.
+                observeSchedulerPrice(&agent_sched, nowMs(), ticker.ts_ms, ticker.bid, snap.freshness.market_ttl_ms);
                 web_state.update(snap, true);
                 if (startup_flow) |flow| {
                     applyCapitalFlowEffects(
@@ -1280,28 +1287,32 @@ pub fn main(init: std.process.Init) !u8 {
 
         // Publish connectivity status before slow agent work so Dashboard stays fresh
         // even while an LLM call blocks the loop for tens of seconds.
+        runtime_status.volatility_as_of_ms = nowMs();
+        runtime_status.volatility = schedulerVolatilityStatus(&agent_sched, engine.snapshot(), runtime_status.volatility_as_of_ms);
         refreshSystemCache(&web_state, &db, &cfg, &mem_store, boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), llm_client != null, admin_paused, &runtime_status, &risk_latency);
 
         // Slow agent loop: proposals always risk-admitted; trading modes may execute.
         // Paused: keep risk/market/reconcile; skip agent decisions.
         // While FLATTENING/HALTED, skip agent so it cannot fight the exit path.
-        if (!admin_paused and engine.snapshot().risk_mode != .flattening and engine.snapshot().risk_mode != .halted) {
+        if (advisoryDecisionAllowed(admin_paused, engine.snapshot().risk_mode)) {
             if (llm_client) |*client| {
                 const tnow = nowMs();
                 const snap_now = engine.snapshot();
-                const verdict = agent_sched.evaluate(tnow, snap_now.bid_price, snap_now.drawdown, snap_now.risk_mode);
+                const verdict = evaluateAgentSchedule(&agent_sched, snap_now, tnow);
                 const due_once = cli.agent_once and !agent_done_once and tick_count >= 1;
                 if (verdict.fire or due_once) {
+                    const elapsed_ms = if (agent_sched.fired_once) tnow - agent_sched.last_fire_ms else 0;
                     agent_sched.noteReason(verdict.reason);
                     agent_sched.commit(tnow, snap_now.bid_price, snap_now.drawdown, snap_now.risk_mode);
                     agent_done_once = true;
                     const reason_txt = if (verdict.fire) verdict.reason.text() else "manual_once";
                     std.debug.print("[agent] trigger reason={s}\n", .{reason_txt});
-                    var trig_buf: [192]u8 = undefined;
+                    var trig_buf: [768]u8 = undefined;
+                    const vol = schedulerVolatilityStatus(&agent_sched, snap_now, tnow);
                     const trig_payload = std.fmt.bufPrint(
                         &trig_buf,
-                        "{{\"reason\":\"{s}\",\"hour_utc\":{d},\"interval_ms\":{d}}}",
-                        .{ reason_txt, ab.scheduler.hourUtc(tnow), agent_sched.params.effectiveInterval(ab.scheduler.hourUtc(tnow)) },
+                        "{{\"reason\":\"{s}\",\"hour_utc\":{d},\"interval_ms\":{d},\"elapsed_ms\":{d},\"volatility\":{{\"ready\":{},\"active\":{},\"range\":\"{f}\",\"interval_ms\":{d}}}}}",
+                        .{ reason_txt, ab.scheduler.hourUtc(tnow), agent_sched.params.effectiveInterval(ab.scheduler.hourUtc(tnow)), elapsed_ms, vol.ready, vol.active, vol.range, @max(agent_sched.params.min_interval_ms, agent_sched.params.volatility_interval_ms) },
                     ) catch "{\"reason\":\"unknown\"}";
                     logEventPayload(&events_repo, &engine, "AGENT_TRIGGER", "agent", "INFO", &cfg, trig_payload);
                     runAgentDecision(gpa, client, &okx, &cfg, &engine, &tool_reg, &agent_runs, &tool_calls, &llm_usage_repo, &events_repo, &orders_repo, &fills_repo, &equity_repo, &capital_flows_repo, &db, &mem_store, &memories_repo, &intel_repo, env, &runtime_status, trade_instrument, &agent_sched, portfolio_refresher, last_bh_cmp, reason_txt);
@@ -2618,6 +2629,65 @@ fn evalJson(buf: []u8, verdict: []const u8, reason: []const u8) []const u8 {
     return std.fmt.bufPrint(buf, "{{\"verdict\":\"{s}\",\"reason\":\"{s}\"}}", .{ verdict, w.buffered() }) catch "null";
 }
 
+/// A polled quote is not a new observation merely because we fetched it again.
+/// Keep the exchange clock and reject stale/future input before warmup advances.
+fn observeSchedulerPrice(sched: *ab.scheduler.Scheduler, now: i64, tick_ms: i64, bid: ab.decimal.Decimal, max_age_ms: i64) void {
+    if (tick_ms <= 0 or tick_ms > now or now - tick_ms > max_age_ms) return;
+    sched.observePrice(tick_ms, bid);
+}
+
+fn advisoryDecisionAllowed(paused: bool, mode: ab.risk_state.RiskMode) bool {
+    return !paused and mode != .flattening and mode != .halted;
+}
+
+fn schedulerVolatilityStatus(sched: *const ab.scheduler.Scheduler, snap: ab.state.PortfolioState, now: i64) ab.scheduler.VolatilityStatus {
+    if (snap.freshness.market_last_ms > now or !snap.freshness.marketFresh(now)) return .{};
+    return sched.volatilityStatus(now);
+}
+
+fn evaluateAgentSchedule(sched: *const ab.scheduler.Scheduler, snap: ab.state.PortfolioState, now: i64) ab.scheduler.Verdict {
+    const verdict = sched.evaluate(now, snap.bid_price, snap.drawdown, snap.risk_mode);
+    // The rolling window tolerates sampling gaps, but a new frequent review
+    // must also satisfy the engine's stricter current-quote freshness check.
+    if (verdict.reason == .volatility and !schedulerVolatilityStatus(sched, snap, now).active) return .{};
+    return verdict;
+}
+
+test "volatility integration rejects stale/future quotes and respects advisory gates" {
+    const D = ab.decimal.Decimal;
+    const base: i64 = 60_000;
+    var sched = ab.scheduler.Scheduler.init(.{
+        .volatility_enter = try D.parse("0.01"),
+        .min_interval_ms = 180_000,
+        .review_backoff_max_ms = 14_400_000,
+    });
+    var snap: ab.state.PortfolioState = .{ .risk_mode = .normal, .bid_price = D.fromInt(100) };
+    for (0..16) |i| {
+        const t = base + @as(i64, @intCast(i)) * 60_000;
+        observeSchedulerPrice(&sched, t, t - 10_001, D.fromInt(100), 10_000);
+        observeSchedulerPrice(&sched, t, t + 1, D.fromInt(102), 10_000);
+    }
+    try std.testing.expect(!sched.volatilityStatus(base + 900_000).ready);
+    for (0..16) |i| {
+        const t = base + @as(i64, @intCast(i)) * 60_000;
+        observeSchedulerPrice(&sched, t, t, D.fromInt(if (i == 15) 102 else 100), 10_000);
+    }
+    const now = base + 900_000;
+    snap.freshness.market_last_ms = now;
+    sched.commit(now - 180_000, snap.bid_price, snap.drawdown, snap.risk_mode);
+    _ = sched.deferAfterHold(now - 180_000, 14_400_000);
+    try std.testing.expectEqual(ab.scheduler.TriggerReason.volatility, evaluateAgentSchedule(&sched, snap, now).reason);
+    // Window still internally fresh (<90s), but the current market quote is not.
+    try std.testing.expect(!evaluateAgentSchedule(&sched, snap, now + 10_001).fire);
+    snap.freshness.market_last_ms = now + 1;
+    try std.testing.expect(!evaluateAgentSchedule(&sched, snap, now).fire);
+    try std.testing.expect(advisoryDecisionAllowed(false, .normal));
+    try std.testing.expect(advisoryDecisionAllowed(false, .exit_only));
+    try std.testing.expect(!advisoryDecisionAllowed(true, .normal));
+    try std.testing.expect(!advisoryDecisionAllowed(false, .flattening));
+    try std.testing.expect(!advisoryDecisionAllowed(false, .halted));
+}
+
 /// True for execution notes that denote at least one confirmed fill
 /// (`filled`, `partial`, `filled_book_lag`, `partial_then_hold`, ...).
 fn executionNoteMeansFill(note: []const u8) bool {
@@ -2669,7 +2739,6 @@ fn drainModeTransitions(
     drain_persisted = logEventPayloadChecked(events_repo, engine, "RISK_MODE_CHANGED", "risk-kernel", severity, cfg, payload);
 }
 threadlocal var drain_persisted: bool = true;
-
 
 /// Operator path probe: same admission + trading execution stack as agent REBALANCE.
 /// Used to unblock Gate3 order-path verification without waiting on LLM HOLD bias.
@@ -3065,6 +3134,7 @@ fn runAgentDecision(
     }) catch {
         std.debug.print("[agent] context render failed\n", .{});
         completeRun(runs, run_id, "error_context", "", "", nowMs());
+        sched.noteAgentFailure();
         return;
     };
 
@@ -3098,6 +3168,7 @@ fn runAgentDecision(
     var user_buf: [88 * 1024]u8 = undefined;
     const user_msg = std.fmt.bufPrint(&user_buf, "{s}{s}", .{ user_msg_prefix, ctx_json }) catch {
         completeRun(runs, run_id, "error_buffer", "", input_digest, nowMs());
+        sched.noteAgentFailure();
         return;
     };
 
@@ -3129,6 +3200,7 @@ fn runAgentDecision(
             .{ run_id, client.model, tag },
         ) catch "{\"degraded\":\"HOLD\"}";
         logEventPayload(events_repo, engine, "AGENT_LLM_FAILED", "agent", "WARN", cfg, fail_payload);
+        sched.noteAgentFailure();
         return;
     };
     defer gpa.free(chat_res.content);
@@ -3235,6 +3307,7 @@ fn runAgentDecision(
                 .{ run_id, client.model, tag },
             ) catch "{\"degraded\":\"HOLD\"}";
             logEventPayload(events_repo, engine, "AGENT_LLM_FAILED", "agent", "WARN", cfg, fail_payload);
+            sched.noteAgentFailure();
             return;
         };
         raw2 = chat2.content;
@@ -3254,6 +3327,7 @@ fn runAgentDecision(
                 .{ run_id, out_digest },
             ) catch "{\"degraded\":\"HOLD\"}";
             logEventPayload(events_repo, engine, "AGENT_INVALID_OUTPUT", "agent", "WARN", cfg, inv_payload);
+            sched.noteAgentFailure();
             return;
         };
     }
@@ -3268,6 +3342,7 @@ fn runAgentDecision(
             .{ run_id, out_digest, err },
         ) catch "{\"degraded\":\"HOLD\"}";
         logEventPayload(events_repo, engine, "AGENT_INVALID_PROPOSAL", "agent", "WARN", cfg, invp_payload);
+        sched.noteAgentFailure();
         return;
     };
     defer prop.deinit();
@@ -3281,6 +3356,7 @@ fn runAgentDecision(
             .{ run_id, out_digest, err },
         ) catch "{\"degraded\":\"HOLD\"}";
         logEventPayload(events_repo, engine, "AGENT_INVALID_PROPOSAL", "agent", "WARN", cfg, invd_payload);
+        sched.noteAgentFailure();
         return;
     };
     ab.proposal.enforceAddEval(&prop, cash_tension) catch |err| {
@@ -3293,6 +3369,7 @@ fn runAgentDecision(
             .{ run_id, out_digest, err },
         ) catch "{\"degraded\":\"HOLD\"}";
         logEventPayload(events_repo, engine, "AGENT_INVALID_PROPOSAL", "agent", "WARN", cfg, inva_payload);
+        sched.noteAgentFailure();
         return;
     };
     ab.proposal.enforceReduceEval(&prop, tension) catch |err| {
@@ -3305,6 +3382,7 @@ fn runAgentDecision(
             .{ run_id, out_digest, err },
         ) catch "{\"degraded\":\"HOLD\"}";
         logEventPayload(events_repo, engine, "AGENT_INVALID_PROPOSAL", "agent", "WARN", cfg, invr_payload);
+        sched.noteAgentFailure();
         return;
     };
 
@@ -5514,7 +5592,6 @@ fn execLabel(mode: ab.config.Mode) []const u8 {
 const logEvent = ab.journal.logEvent;
 const logEventPayload = ab.journal.logEventPayload;
 const logEventPayloadChecked = ab.journal.logEventPayloadChecked;
-
 
 fn consumeMaintenanceMarker(
     io: std.Io,

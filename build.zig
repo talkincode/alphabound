@@ -128,4 +128,19 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+
+    const replay = b.addExecutable(.{
+        .name = "scheduler-replay",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/scheduler_replay.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const replay_run = b.addRunArtifact(replay);
+    if (b.args) |args| replay_run.addArgs(args);
+    b.step("replay-scheduler", "Replay public market CSV against fixed-policy schedulers").dependOn(&replay_run.step);
+    const replay_tests = b.addTest(.{ .root_module = replay.root_module });
+    const replay_test_run = b.addRunArtifact(replay_tests);
+    test_step.dependOn(&replay_test_run.step);
 }

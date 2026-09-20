@@ -31,6 +31,7 @@ pub const TriggerReason = enum {
     drawdown_step,
     risk_mode_change,
     capital_flow,
+    volatility,
 
     pub fn text(self: TriggerReason) []const u8 {
         return switch (self) {
@@ -43,6 +44,7 @@ pub const TriggerReason = enum {
             .drawdown_step => "drawdown_step",
             .risk_mode_change => "risk_mode_change",
             .capital_flow => "capital_flow",
+            .volatility => "volatility",
         };
     }
 };
@@ -159,11 +161,30 @@ pub const Params = struct {
     /// risk_mode_change keep the base cooldown, and the risk kernel is
     /// independent of this advisory loop entirely.
     noop_backoff_cap_ms: i64 = 0,
+    volatility_enter: Decimal = Decimal.zero,
+    volatility_exit: Decimal = Decimal.fromRaw(600_000),
+    volatility_interval_ms: i64 = 180_000,
+    volatility_exit_hold_ms: i64 = 900_000,
 
     pub fn effectiveInterval(self: Params, hour: u8) i64 {
         if (self.active_hours.contains(hour)) return self.base_interval_ms;
         return if (self.quiet_interval_ms > 0) self.quiet_interval_ms else self.base_interval_ms;
     }
+};
+
+pub const volatility_window_ms: i64 = 900_000;
+pub const volatility_max_gap_ms: i64 = 90_000;
+
+pub const VolatilityStatus = struct {
+    ready: bool = false,
+    active: bool = false,
+    range: Decimal = Decimal.zero,
+};
+
+const PriceBucket = struct {
+    minute: i64 = -1,
+    low: Decimal = Decimal.zero,
+    high: Decimal = Decimal.zero,
 };
 
 pub const Scheduler = struct {
@@ -185,9 +206,95 @@ pub const Scheduler = struct {
     /// decision that trades, and when a drift trigger fires.
     anchor_bid: Decimal = Decimal.zero,
     drift_fired: bool = false,
+    // Sixteen minute buckets retain every tick's extrema, never just a sampled
+    // closing price. Inclusive left bucket rounds the 15m window outward by
+    // 0..59,999ms; an extreme at exactly now-15m is included. Fixed storage and
+    // O(16) work per tick regardless of tick rate.
+    price_buckets: [16]PriceBucket = [_]PriceBucket{.{}} ** 16,
+    price_start_ms: ?i64 = null,
+    price_last_ms: ?i64 = null,
+    volatility_state: VolatilityStatus = .{},
+    volatility_exit_since_ms: ?i64 = null,
 
     pub fn init(params: Params) Scheduler {
         return .{ .params = params };
+    }
+
+    fn resetPrices(self: *Scheduler) void {
+        self.price_buckets = [_]PriceBucket{.{}} ** 16;
+        self.price_start_ms = null;
+        self.price_last_ms = null;
+        self.volatility_state = .{};
+        self.volatility_exit_since_ms = null;
+    }
+
+    /// Only call for a received fresh market tick, including while paused.
+    /// Positive timestamps/prices are required; equal timestamps retain extrema.
+    /// Backward/invalid input clears history and is discarded. A gap >90s
+    /// clears history and starts a new 15m warmup with this tick.
+    pub fn observePrice(self: *Scheduler, now_ms: i64, bid: Decimal) void {
+        if (!self.params.volatility_enter.gt(Decimal.zero)) return;
+        if (now_ms <= 0 or !bid.gt(Decimal.zero)) {
+            self.resetPrices();
+            return;
+        }
+        if (self.price_last_ms) |last| {
+            if (now_ms < last) {
+                self.resetPrices();
+                return;
+            }
+            if (now_ms - last > volatility_max_gap_ms) self.resetPrices();
+        }
+        if (self.price_start_ms == null) self.price_start_ms = now_ms;
+        self.price_last_ms = now_ms;
+        const minute = @divFloor(now_ms, 60_000);
+        const bucket = &self.price_buckets[@intCast(@mod(minute, 16))];
+        if (bucket.minute != minute) {
+            bucket.* = .{ .minute = minute, .low = bid, .high = bid };
+        } else {
+            if (bid.lt(bucket.low)) bucket.low = bid;
+            if (bid.gt(bucket.high)) bucket.high = bid;
+        }
+        if (now_ms - self.price_start_ms.? < volatility_window_ms) return;
+        var low = bid;
+        var high = bid;
+        for (self.price_buckets) |b| {
+            if (b.minute < minute - @divExact(volatility_window_ms, 60_000) or b.minute > minute) continue;
+            if (b.low.lt(low)) low = b.low;
+            if (b.high.gt(high)) high = b.high;
+        }
+        const spread = high.sub(low) catch {
+            self.resetPrices();
+            return;
+        };
+        const range = spread.div(low, .down) catch {
+            self.resetPrices();
+            return;
+        };
+        self.volatility_state.ready = true;
+        self.volatility_state.range = range;
+        if (!self.volatility_state.active) {
+            if (range.gte(self.params.volatility_enter)) self.volatility_state.active = true;
+            self.volatility_exit_since_ms = null;
+        } else if (range.lte(self.params.volatility_exit)) {
+            if (self.volatility_exit_since_ms == null) self.volatility_exit_since_ms = now_ms;
+            if (now_ms - self.volatility_exit_since_ms.? >= self.params.volatility_exit_hold_ms) {
+                self.volatility_state.active = false;
+                self.volatility_exit_since_ms = null;
+            }
+        } else {
+            self.volatility_exit_since_ms = null;
+        }
+    }
+
+    /// Last observed window, not synthetic sampling. Read-only: transitions
+    /// happen on ticks. At >90s without a tick (or backward time), returns an
+    /// empty status, including zero range; the next tick must warm up again.
+    pub fn volatilityStatus(self: *const Scheduler, now_ms: i64) VolatilityStatus {
+        if (!self.params.volatility_enter.gt(Decimal.zero)) return .{};
+        const last = self.price_last_ms orelse return .{};
+        if (now_ms < last or now_ms - last > volatility_max_gap_ms) return .{};
+        return self.volatility_state;
     }
 
     /// Pure check — does not mutate state. Call `commit` after actually firing.
@@ -216,6 +323,9 @@ pub const Scheduler = struct {
             if (!dd_delta.isNegative() and dd_delta.gte(p.drawdown_step))
                 return .{ .fire = true, .reason = .drawdown_step };
         }
+
+        if (self.volatilityStatus(now_ms).active and elapsed >= @max(p.min_interval_ms, p.volatility_interval_ms))
+            return .{ .fire = true, .reason = .volatility };
 
         if (!p.price_move.isZero() and !p.price_move.isNegative() and
             self.last_bid.gt(Decimal.zero) and bid.gt(Decimal.zero))
@@ -249,6 +359,13 @@ pub const Scheduler = struct {
     }
 
     /// Record that a decision fired now with the given market observations.
+    ///
+    /// A standing `review_after` deadline survives this: an intervening
+    /// event-triggered review (price move, drift, volatility, risk mode) is a
+    /// new look at the market, not the model withdrawing its own cadence.
+    /// Only a newer `deferAfterHold` replaces the deadline; `noteOutcome(true)`
+    /// clears it once a decision actually trades, and `noteAgentFailure` clears
+    /// it when a decision never produced an advisory value at all.
     pub fn commit(
         self: *Scheduler,
         now_ms: i64,
@@ -261,7 +378,6 @@ pub const Scheduler = struct {
         self.last_bid = bid;
         self.last_drawdown = drawdown;
         self.last_risk_mode = risk_mode;
-        self.hold_until_ms = 0;
         self.capital_flow_pending = false;
         // First decision, or a drift trigger that just fired: re-anchor so the
         // next drift needs another full move from here.
@@ -297,14 +413,25 @@ pub const Scheduler = struct {
 
     /// Record whether the fired decision actually produced an order.
     /// Consecutive no-ops (HOLD, plan-held rebalance) escalate the
-    /// price_move cooldown; any real order resets it.
+    /// price_move cooldown; any real order resets it and voids the standing
+    /// review deadline, because an executed trade changes the situation the
+    /// model asked to be left alone about.
     pub fn noteOutcome(self: *Scheduler, produced_order: bool) void {
         if (produced_order) {
             self.consecutive_noops = 0;
             self.anchor_bid = self.last_bid;
+            self.hold_until_ms = 0;
         } else {
             self.consecutive_noops +|= 1;
         }
+    }
+
+    /// A decision that never reached an advisory value (LLM error, invalid or
+    /// truncated proposal): drop the standing review deadline so the loop
+    /// retries on the regular cadence instead of waiting it out. Market and
+    /// risk events cut through regardless.
+    pub fn noteAgentFailure(self: *Scheduler) void {
+        self.hold_until_ms = 0;
     }
 
     /// Effective cooldown floor for the price_move trigger: doubles per
@@ -325,6 +452,149 @@ const testing = std.testing;
 
 fn d(s: []const u8) Decimal {
     return Decimal.parse(s) catch unreachable;
+}
+
+fn warmVolatility(s: *Scheduler) void {
+    for (0..16) |i| s.observePrice(1 + @as(i64, @intCast(i)) * 60_000, d("100"));
+}
+
+test "volatility warmup quiet disabled and bidirectional round trip extrema" {
+    var off = Scheduler.init(.{});
+    warmVolatility(&off);
+    off.observePrice(900_002, d("200"));
+    try testing.expect(!off.volatilityStatus(900_002).ready);
+    for ([_][]const u8{ "101", "99" }) |burst| {
+        var s = Scheduler.init(.{ .volatility_enter = d("0.01") });
+        s.observePrice(1, d("100"));
+        for (1..15) |i| s.observePrice(1 + @as(i64, @intCast(i)) * 60_000, d("100"));
+        try testing.expect(!s.volatilityStatus(840_001).ready);
+        s.observePrice(900_000, d("100"));
+        try testing.expect(!s.volatilityStatus(900_000).ready);
+        s.observePrice(900_001, d("100"));
+        try testing.expect(s.volatilityStatus(900_001).ready);
+        try testing.expect(!s.volatilityStatus(900_001).active);
+        s.observePrice(900_002, d(burst));
+        s.observePrice(900_002, d("100"));
+        try testing.expect(s.volatilityStatus(900_002).active);
+        try testing.expect(s.volatilityStatus(900_002).range.gte(d("0.01")));
+    }
+}
+
+test "volatility repeats despite HOLD and noops but respects cooldown and precedence" {
+    var s = Scheduler.init(.{
+        .volatility_enter = d("0.01"),
+        .base_interval_ms = 3_600_000,
+        .review_backoff_max_ms = 7_200_000,
+        .noop_backoff_cap_ms = 7_200_000,
+        .price_move = d("0.001"),
+        .drawdown_step = d("0.01"),
+    });
+    warmVolatility(&s);
+    s.commit(900_001, d("100"), Decimal.zero, .normal);
+    for (1..13) |i| {
+        const now = 900_001 + @as(i64, @intCast(i)) * 60_000;
+        s.noteOutcome(false);
+        _ = s.deferAfterHold(now, 7_200_000);
+        s.observePrice(now, d("101"));
+        const noops = s.consecutive_noops;
+        const hold = s.hold_until_ms;
+        const verdict = s.evaluate(now, d("101"), Decimal.zero, .normal);
+        try testing.expectEqual(@mod(i, 3) == 0, verdict.fire);
+        try testing.expectEqual(noops, s.consecutive_noops);
+        try testing.expectEqual(hold, s.hold_until_ms);
+        if (verdict.fire) {
+            try testing.expectEqual(TriggerReason.volatility, verdict.reason);
+            s.commit(now, d("101"), Decimal.zero, .normal);
+        }
+    }
+    const now: i64 = 1_620_001;
+    s.last_fire_ms = now - 180_000;
+    try testing.expectEqual(TriggerReason.drawdown_step, s.evaluate(now, d("101"), d("0.01"), .normal).reason);
+    try testing.expectEqual(TriggerReason.risk_mode_change, s.evaluate(now, d("101"), d("0.01"), .halted).reason);
+    s.noteCapitalFlow();
+    try testing.expectEqual(TriggerReason.capital_flow, s.evaluate(now, d("101"), d("0.01"), .halted).reason);
+    s.params.min_interval_ms = 180_001;
+    try testing.expect(!s.evaluate(now, d("101"), d("0.01"), .halted).fire);
+    s.params.base_interval_ms = 0;
+    try testing.expect(!s.evaluate(now + 1, d("101"), Decimal.zero, .normal).fire);
+}
+
+test "volatility uses the larger global floor and toggles preserve deferrals" {
+    var s = Scheduler.init(.{
+        .volatility_enter = d("0.01"),
+        .min_interval_ms = 240_000,
+        .base_interval_ms = 3_600_000,
+        .volatility_exit_hold_ms = 0,
+    });
+    warmVolatility(&s);
+    s.commit(900_001, d("100"), Decimal.zero, .normal);
+    s.hold_until_ms = 9_000_000;
+    s.consecutive_noops = 10;
+    for (16..20) |i| s.observePrice(1 + @as(i64, @intCast(i)) * 60_000, d("101"));
+    try testing.expect(!s.evaluate(1_140_000, d("101"), Decimal.zero, .normal).fire);
+    try testing.expectEqual(TriggerReason.volatility, s.evaluate(1_140_001, d("101"), Decimal.zero, .normal).reason);
+    for (20..36) |i| s.observePrice(1 + @as(i64, @intCast(i)) * 60_000, d("101"));
+    try testing.expect(!s.volatilityStatus(2_100_001).active);
+    try testing.expectEqual(@as(i64, 9_000_000), s.hold_until_ms);
+    try testing.expectEqual(@as(u32, 10), s.consecutive_noops);
+    try testing.expect(!s.evaluate(2_100_001, d("101"), Decimal.zero, .normal).fire);
+}
+
+test "volatility stale gaps invalid data and restart require new coverage" {
+    var s = Scheduler.init(.{ .volatility_enter = d("0.01") });
+    warmVolatility(&s);
+    s.observePrice(900_002, d("101"));
+    try testing.expect(s.volatilityStatus(990_002).active);
+    try testing.expect(!s.volatilityStatus(990_003).ready);
+    try testing.expect(!s.volatilityStatus(900_001).active);
+    s.observePrice(990_003, d("101"));
+    try testing.expect(!s.volatilityStatus(990_003).ready);
+    try testing.expectEqual(@as(?i64, 990_003), s.price_start_ms);
+    const bad = [_]struct { time: i64, price: Decimal }{
+        .{ .time = 0, .price = d("100") },
+        .{ .time = -1, .price = d("100") },
+        .{ .time = 900_000, .price = d("100") },
+        .{ .time = 900_003, .price = Decimal.zero },
+        .{ .time = 900_003, .price = d("-1") },
+    };
+    for (bad) |b| {
+        s = Scheduler.init(.{ .volatility_enter = d("0.01") });
+        warmVolatility(&s);
+        s.observePrice(900_002, d("101"));
+        s.observePrice(b.time, b.price);
+        try testing.expect(!s.volatilityStatus(900_003).active);
+        try testing.expect(s.price_last_ms == null);
+    }
+    s = Scheduler.init(.{ .volatility_enter = d("0.01") });
+    try testing.expect(!s.volatilityStatus(900_003).ready);
+    for (0..11) |i| s.observePrice(1 + @as(i64, @intCast(i)) * 90_000, d("100"));
+    try testing.expect(s.volatilityStatus(900_001).ready);
+}
+
+test "volatility bucket boundaries bounded tick storage and continuous exit hysteresis" {
+    var s = Scheduler.init(.{ .volatility_enter = d("0.01"), .volatility_exit_hold_ms = 120_000 });
+    warmVolatility(&s);
+    // Arbitrarily many ticks in one bucket retain an intra-bucket round trip.
+    for (0..10_000) |_| s.observePrice(900_002, d("101"));
+    s.observePrice(900_002, d("100"));
+    try testing.expectEqual(@as(usize, 16), s.price_buckets.len);
+    for (16..31) |i| s.observePrice(1 + @as(i64, @intCast(i)) * 60_000, d("100"));
+    try testing.expect(s.volatilityStatus(1_800_001).range.gte(d("0.01")));
+    s.observePrice(1_859_999, d("100"));
+    try testing.expect(s.volatilityStatus(1_859_999).range.gte(d("0.01")));
+    s.observePrice(1_860_000, d("100"));
+    try testing.expect(s.volatilityStatus(1_860_000).range.isZero());
+    try testing.expect(s.volatilityStatus(1_860_000).active);
+    s.observePrice(1_920_000, d("100.7")); // between thresholds cancels exit
+    try testing.expect(s.volatility_exit_since_ms == null);
+    for (33..49) |i| s.observePrice(@as(i64, @intCast(i)) * 60_000, d("100"));
+    try testing.expectEqual(@as(?i64, 2_880_000), s.volatility_exit_since_ms);
+    s.observePrice(2_940_000, d("100.6")); // exactly exit threshold qualifies
+    s.observePrice(2_999_999, d("100"));
+    try testing.expect(s.volatilityStatus(2_999_999).active);
+    s.observePrice(3_000_000, d("100"));
+    try testing.expect(!s.volatilityStatus(3_000_000).active);
+    try testing.expect(s.volatilityStatus(3_000_000).ready);
 }
 
 fn parseF(buf: []u8, v: f64) Decimal {
@@ -500,9 +770,52 @@ test "hold backoff defers regular cadence but not event triggers" {
     try testing.expect(v2.fire);
     try testing.expectEqual(TriggerReason.interval_active, v2.reason);
 
-    // commit clears the backoff.
+    // An intervening event-triggered review keeps the standing deadline...
     _ = s.deferAfterHold(0, 3_600_000);
     s.commit(10, d("64000"), Decimal.zero, .normal);
+    try testing.expectEqual(@as(i64, 3_600_000), s.hold_until_ms);
+    try testing.expect(!s.evaluate(900_000, d("64000"), Decimal.zero, .normal).fire);
+    // ...a newer advisory value replaces it...
+    _ = s.deferAfterHold(900_000, parseIsoDurationMs("PT2H").?);
+    try testing.expectEqual(@as(i64, 900_000 + 7_200_000), s.hold_until_ms);
+    // ...and a decision that actually trades clears it.
+    s.noteOutcome(true);
+    try testing.expectEqual(@as(i64, 0), s.hold_until_ms);
+}
+
+test "an intervening volatility review keeps the standing HOLD deadline" {
+    var s = Scheduler.init(.{
+        .base_interval_ms = 900_000,
+        .min_interval_ms = 180_000,
+        .volatility_enter = d("0.01"),
+        .review_backoff_max_ms = 4 * 3_600_000,
+    });
+    warmVolatility(&s);
+    s.commit(900_001, d("100"), Decimal.zero, .normal);
+    s.noteOutcome(false);
+    // The HOLD asked for four hours of quiet.
+    _ = s.deferAfterHold(900_001, 14_400_000);
+    try testing.expectEqual(@as(i64, 900_001 + 14_400_000), s.hold_until_ms);
+
+    // High volatility pulls a review forward after three minutes.
+    for (16..19) |i| s.observePrice(1 + @as(i64, @intCast(i)) * 60_000, d("101"));
+    const now: i64 = 1_140_001;
+    try testing.expectEqual(TriggerReason.volatility, s.evaluate(now, d("101"), Decimal.zero, .normal).reason);
+    s.noteReason(.volatility);
+    s.commit(now, d("101"), Decimal.zero, .normal);
+    s.noteOutcome(false);
+    // The review produced no new advisory value: the model's own cadence stands.
+    try testing.expectEqual(@as(i64, 900_001 + 14_400_000), s.hold_until_ms);
+
+    // A decision that never reached an advisory value drops it, so the loop
+    // retries on the regular cadence instead of waiting out the deadline.
+    s.noteAgentFailure();
+    try testing.expectEqual(@as(i64, 0), s.hold_until_ms);
+    try testing.expectEqual(TriggerReason.interval_active, s.evaluate(now + 900_000, d("101"), Decimal.zero, .normal).reason);
+
+    // A real order clears it as well.
+    _ = s.deferAfterHold(now, 3_600_000);
+    s.noteOutcome(true);
     try testing.expectEqual(@as(i64, 0), s.hold_until_ms);
 }
 
