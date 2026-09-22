@@ -48,9 +48,10 @@ pub const Proposal = struct {
     invalid_if: [][]const u8,
     /// ISO-8601 duration for scheduled review, e.g. "PT4H" (kept as text).
     review_after: ?[]const u8,
-    /// Required on HOLD when `position_tension` is true: did you weigh a cut?
+    /// Required on HOLD when `reduce_eval_required` is true: why keep BTC?
     reduce_eval: ?ReduceEval = null,
-    /// Required on HOLD when `cash_tension` is true: did you weigh an add?
+    /// Required on HOLD when `add_eval_required` is true: why keep cash?
+    /// Both evaluations can be required on the same HOLD.
     add_eval: ?AddEval = null,
 
     arena: std.heap.ArenaAllocator,
@@ -221,15 +222,17 @@ pub fn parse(gpa: std.mem.Allocator, raw: []const u8) ValidationError!Proposal {
     };
 }
 
-/// High BTC weight plus a long HOLD streak: the model must weigh a cut.
-pub fn enforceReduceEval(p: *const Proposal, tension: bool) ValidationError!void {
-    if (!tension or p.action != .hold) return;
+/// Sell capacity requires review on every HOLD, not a cut. The parser already
+/// validates a reasoned keep verdict; absence rejects the proposal fail-closed.
+pub fn enforceReduceEval(p: *const Proposal, required: bool) ValidationError!void {
+    if (!required or p.action != .hold) return;
     if (p.reduce_eval == null) return error.ReduceEvalRequired;
 }
 
-/// Flat book plus a long no-op streak with buyable cash: the model must weigh an add.
-pub fn enforceAddEval(p: *const Proposal, cash_tension: bool) ValidationError!void {
-    if (!cash_tension or p.action != .hold) return;
+/// Buy capacity requires review on every HOLD, not an add. Independent of the
+/// reduce requirement: a mixed book must justify both staying and keeping.
+pub fn enforceAddEval(p: *const Proposal, required: bool) ValidationError!void {
+    if (!required or p.action != .hold) return;
     if (p.add_eval == null) return error.AddEvalRequired;
 }
 
@@ -475,7 +478,7 @@ test "reduce_eval keep is accepted; cut on HOLD is a conflict" {
     try testing.expectError(error.ReduceEvalRequired, enforceReduceEval(&bare, true));
 }
 
-test "add_eval stay is accepted; add on HOLD is a conflict; required under cash_tension" {
+test "add_eval stay is accepted; add on HOLD is a conflict; required with buy capacity" {
     const gpa = testing.allocator;
     var stay = try parse(gpa,
         \\{"decision_id":"dec_flat_1","snapshot_version":7,"action":"HOLD","confidence":0.5,
@@ -530,4 +533,55 @@ test "add_eval stay is accepted; add on HOLD is a conflict; required under cash_
     defer cut.deinit();
     try enforceEvalDirection(&cut, Decimal.parse("0.9") catch unreachable);
     try testing.expectError(error.ReduceEvalConflict, enforceEvalDirection(&cut, Decimal.parse("0.6") catch unreachable));
+}
+
+test "mixed allocation HOLD requires both reviews but stay and keep never force orders" {
+    const context = @import("context.zig");
+    const required = context.exposureReviewRequirements(.{
+        .cash_usdt = Decimal.fromInt(78),
+        .btc_total = try Decimal.parse("0.00022"),
+        .btc_available = try Decimal.parse("0.00022"),
+        .conservative_equity = Decimal.fromInt(100),
+        .bid_price = Decimal.fromInt(100000),
+        .mark_price = Decimal.fromInt(100000),
+        .risk_mode = .normal,
+        .reconciled = true,
+    }, try Decimal.parse("0.00001"), Decimal.fromInt(10), Decimal.fromRaw(1));
+    try testing.expect(required.add_eval_required and required.reduce_eval_required);
+
+    var p = try parse(testing.allocator,
+        \\{"decision_id":"dec_mixed","snapshot_version":1,"action":"HOLD","confidence":0.5,
+        \\ "thesis":["Current exposure balances trend and uncertainty"],"invalid_if":["Trend breaks"],
+        \\ "add_eval":{"verdict":"stay","reason":"Cash can buy, but evidence does not justify more exposure"},
+        \\ "reduce_eval":{"verdict":"keep","reason":"Available BTC can sell, but the trend remains intact"}}
+    );
+    defer p.deinit();
+    try enforceAddEval(&p, required.add_eval_required);
+    try enforceReduceEval(&p, required.reduce_eval_required);
+    try enforceEvalDirection(&p, try Decimal.parse("0.22"));
+    try testing.expectEqual(Action.hold, p.action);
+    try testing.expect(p.target_btc_weight.isZero());
+    try testing.expectEqual(AddVerdict.stay, p.add_eval.?.verdict);
+    try testing.expectEqual(ReduceVerdict.keep, p.reduce_eval.?.verdict);
+
+    // Satisfying either side alone does not bypass the other requirement.
+    const add_eval = p.add_eval;
+    p.add_eval = null;
+    try enforceReduceEval(&p, required.reduce_eval_required);
+    try testing.expectError(error.AddEvalRequired, enforceAddEval(&p, required.add_eval_required));
+    p.add_eval = add_eval;
+    p.reduce_eval = null;
+    try enforceAddEval(&p, required.add_eval_required);
+    try testing.expectError(error.ReduceEvalRequired, enforceReduceEval(&p, required.reduce_eval_required));
+    p.add_eval = null;
+    try testing.expectError(error.AddEvalRequired, enforceAddEval(&p, required.add_eval_required));
+    try testing.expectError(error.ReduceEvalRequired, enforceReduceEval(&p, required.reduce_eval_required));
+    try testing.expectEqual(Action.hold, p.action);
+
+    // An actual REBALANCE still uses normal target/direction/risk validation,
+    // not the HOLD counterfactual requirement.
+    var reb = try parse(testing.allocator, valid_json);
+    defer reb.deinit();
+    try enforceAddEval(&reb, required.add_eval_required);
+    try enforceReduceEval(&reb, required.reduce_eval_required);
 }

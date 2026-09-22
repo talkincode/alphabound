@@ -156,6 +156,7 @@ Dashboard 默认 `127.0.0.1`。对外暴露前务必设置 `ALPHABOUND_API_TOKEN
 | 验收勾选（FR/NFR/故障） | [docs/ACCEPTANCE_MATRIX.md](docs/ACCEPTANCE_MATRIX.md) |
 | Dashboard 鉴权 / MCP | [docs/DASHBOARD_AUTH_MCP.md](docs/DASHBOARD_AUTH_MCP.md) · [tools/alphabound-mcp](tools/alphabound-mcp/README.md) |
 | 设计取舍与风险点 | [docs/DESIGN_ANALYSIS.md](docs/DESIGN_ANALYSIS.md) |
+| 决策证据隔离与旧记忆处理 | [决策证据策略](docs/DECISION_EVIDENCE_POLICY.md) |
 | 通用部署 | [deploy/README.md](deploy/README.md)（真实主机写本机 `DEPLOY.local.md`，勿提交） |
 | 给 Agent / 协作者的硬约束 | [AGENTS.md](AGENTS.md) |
 | 安全基线 | [SECURITY.md](SECURITY.md) |

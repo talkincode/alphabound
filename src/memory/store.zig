@@ -13,6 +13,46 @@ const std = @import("std");
 const dec = @import("../core/decimal.zig");
 const Decimal = dec.Decimal;
 
+/// Bump to start a clean decision-memory epoch without rewriting DB history.
+pub const CURRENT_POLICY_EPOCH: u32 = 1;
+pub const MAX_DECISION_AGE_MS: i64 = 48 * 60 * 60 * 1000;
+
+/// Opt-in decision context, supplied by trusted runtime configuration, never
+/// parsed from an agent operation. Active memories remain provisional context,
+/// not validated alpha. A caller may tighten, but cannot extend, the age bound.
+pub const DecisionScope = struct {
+    policy_epoch: u32 = CURRENT_POLICY_EPOCH,
+    mode: @import("../config.zig").Mode,
+    max_age_ms: i64 = MAX_DECISION_AGE_MS,
+    /// Trusted, persisted start of the current policy/mode evidence cohort.
+    /// Returning to an earlier trading mode must not revive its earlier notes.
+    /// Inclusive and nonnegative; a boundary after now fails closed.
+    not_before_ms: i64 = 0,
+};
+
+const Provenance = struct {
+    policy_epoch: u32,
+    mode: @import("../config.zig").Mode,
+    content_ms: i64,
+};
+
+/// Only applyOpWithScope writes this envelope. Agent-supplied JSON is nested
+/// under content and cannot select/override the outer provenance. No migration
+/// is needed: the existing append-only content_json column persists it.
+const DecisionEnvelope = struct {
+    _decision_scope: Provenance,
+    content: std.json.Value,
+};
+
+const ParsedEnvelope = struct {
+    allocation: std.json.Parsed(std.json.Value),
+    value: DecisionEnvelope,
+
+    fn deinit(self: ParsedEnvelope) void {
+        self.allocation.deinit();
+    }
+};
+
 pub const Kind = enum {
     working,
     episodic,
@@ -111,6 +151,10 @@ pub const StoreError = error{
     StoreFull,
     SelfMerge,
     OutOfMemory,
+    InvalidDecisionScope,
+    InvalidContent,
+    ScopeMismatch,
+    ContentReplacementRequired,
 };
 
 pub const MAX_MEMORIES = 1024;
@@ -154,9 +198,114 @@ pub const Store = struct {
         try self.items.append(self.gpa, try self.own(m));
     }
 
-    /// Apply one structured memory operation. Returns the new latest version
-    /// of every touched memory so the caller can persist rows + events.
+    /// Generic writes never acquire decision provenance, even when their
+    /// content imitates an envelope. A generic UPDATE also revokes any existing
+    /// stamp; use applyOpWithScope for all decision-memory writers.
     pub fn applyOp(self: *Store, op: Op, now_ms: i64, out: *std.ArrayList(Memory)) StoreError!void {
+        var clean = op;
+        switch (op) {
+            .create => |c| {
+                const content = try withoutProvenance(self.gpa, c.content_json);
+                defer if (content) |s| self.gpa.free(s);
+                clean.create.content_json = content orelse c.content_json;
+                return self.applyRawOp(clean, now_ms, out);
+            },
+            .update => |u| {
+                const m = self.find(u.memory_id) orelse return error.UnknownId;
+                const original = u.content_json orelse m.content_json;
+                const content = try withoutProvenance(self.gpa, original);
+                defer if (content) |s| self.gpa.free(s);
+                clean.update.content_json = content orelse u.content_json;
+                return self.applyRawOp(clean, now_ms, out);
+            },
+            else => return self.applyRawOp(clean, now_ms, out),
+        }
+    }
+
+    /// Append-only scoped operations; persist each returned version as usual.
+    /// CREATE and explicit full-content UPDATE stamp an envelope. Equivalent
+    /// same-scope replacement content retains its original content age, even if
+    /// already expired. Replacement UPDATE inherits neither status nor
+    /// confidence/evidence from the prior
+    /// version (including legacy or another mode). Callers must build replacement
+    /// content from current inputs, not copy historical narratives into it.
+    /// Partial UPDATE / MERGE require usable same-scope content, cannot promote
+    /// unverified content, and preserve content age. Repetition is not evidence:
+    /// confidence/evidence deltas never increase authority in this path.
+    pub fn applyOpWithScope(self: *Store, op: Op, now_ms: i64, scope: DecisionScope, out: *std.ArrayList(Memory)) StoreError!void {
+        if (!validScope(scope, now_ms)) return error.InvalidDecisionScope;
+        // Reserve before mutating so a failed append cannot hide a new version.
+        try out.ensureUnusedCapacity(self.gpa, 2);
+        switch (op) {
+            .create => |c| {
+                if (self.find(c.memory_id) != null) return error.DuplicateId;
+                const content = try stampContent(self.gpa, c.content_json, scope, now_ms, null);
+                defer self.gpa.free(content);
+                if (self.items.items.len >= MAX_MEMORIES) _ = try self.evictDecisionIneligible(scope, now_ms);
+                try self.applyRawOp(.{ .create = .{
+                    .memory_id = c.memory_id,
+                    .kind = c.kind,
+                    .status = c.status,
+                    .confidence = Decimal.zero,
+                    .content_json = content,
+                } }, now_ms, out);
+            },
+            .update => |u| {
+                const m = self.find(u.memory_id) orelse return error.UnknownId;
+                if (u.content_json) |replacement| {
+                    const content = try stampContent(self.gpa, replacement, scope, now_ms, m.*);
+                    defer self.gpa.free(content);
+                    // Allocate before changing the indexed version.
+                    const owned = try self.ownStr(content);
+                    m.version += 1;
+                    m.content_json = owned;
+                    m.status = u.new_status orelse .unverified;
+                    m.confidence = Decimal.zero;
+                    m.evidence_count = 0;
+                    m.created_ms = now_ms;
+                    out.appendAssumeCapacity(m.*);
+                } else {
+                    try requireScope(self.gpa, m.*, scope);
+                    if (!try isDecisionEligible(self.gpa, m.*, scope, now_ms)) return error.ContentReplacementRequired;
+                    m.version += 1;
+                    if (u.new_status) |status| m.status = status;
+                    m.confidence = Decimal.zero;
+                    m.evidence_count = 0;
+                    m.created_ms = now_ms;
+                    out.appendAssumeCapacity(m.*);
+                }
+            },
+            .invalidate => |i| {
+                const m = self.find(i.memory_id) orelse return error.UnknownId;
+                try requireScope(self.gpa, m.*, scope);
+                try self.applyRawOp(op, now_ms, out);
+            },
+            .merge => |merge| {
+                if (std.mem.eql(u8, merge.from_id, merge.into_id)) return error.SelfMerge;
+                const from = self.find(merge.from_id) orelse return error.UnknownId;
+                const into = self.find(merge.into_id) orelse return error.UnknownId;
+                try requireScope(self.gpa, from.*, scope);
+                try requireScope(self.gpa, into.*, scope);
+                if (!try isDecisionEligible(self.gpa, from.*, scope, now_ms) or
+                    !try isDecisionEligible(self.gpa, into.*, scope, now_ms)) return error.ContentReplacementRequired;
+                // A merge retires a duplicate, not independent confirmation. It
+                // does not copy content, boost confidence, or renew content age.
+                from.version += 1;
+                from.status = .merged;
+                from.created_ms = now_ms;
+                into.version += 1;
+                into.confidence = Decimal.zero;
+                into.evidence_count = 0;
+                into.created_ms = now_ms;
+                out.appendAssumeCapacity(from.*);
+                out.appendAssumeCapacity(into.*);
+            },
+        }
+    }
+
+    /// Apply one generic structured operation without changing its semantics.
+    /// Kept private so untrusted content cannot stamp decision provenance.
+    fn applyRawOp(self: *Store, op: Op, now_ms: i64, out: *std.ArrayList(Memory)) StoreError!void {
         switch (op) {
             .create => |c| {
                 if (self.find(c.memory_id) != null) return error.DuplicateId;
@@ -205,6 +354,27 @@ pub const Store = struct {
                 try out.append(self.gpa, into.*);
             },
         }
+    }
+
+    /// Prefer quarantined content over any usable decision memory when a
+    /// scoped CREATE needs room. Protected names do not protect legacy priors.
+    /// This changes only the bounded index, never the durable version history.
+    fn evictDecisionIneligible(self: *Store, scope: DecisionScope, now_ms: i64) StoreError!bool {
+        var best: ?usize = null;
+        for (self.items.items, 0..) |m, index| {
+            if (try isDecisionEligible(self.gpa, m, scope, now_ms)) continue;
+            if (best) |b| {
+                const prior = self.items.items[b];
+                if (m.created_ms < prior.created_ms or
+                    (m.created_ms == prior.created_ms and std.mem.lessThan(u8, m.memory_id, prior.memory_id)))
+                    best = index;
+            } else best = index;
+        }
+        if (best) |index| {
+            _ = self.items.orderedRemove(index);
+            return true;
+        }
+        return false;
     }
 
     /// Deterministic eviction when the index is at MAX_MEMORIES: drop the
@@ -320,6 +490,143 @@ fn evictableEpisodic(id: []const u8, m: Memory) bool {
     return m.kind == .episodic;
 }
 
+fn validScope(scope: DecisionScope, now_ms: i64) bool {
+    return scope.policy_epoch > 0 and scope.max_age_ms > 0 and scope.max_age_ms <= MAX_DECISION_AGE_MS and
+        scope.not_before_ms >= 0 and scope.not_before_ms <= now_ms;
+}
+
+fn parseEnvelope(gpa: std.mem.Allocator, content: []const u8) StoreError!?ParsedEnvelope {
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, content, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    var keep = false;
+    defer if (!keep) parsed.deinit();
+    const root = parsed.value;
+    if (root != .object or root.object.count() != 2) return null;
+    const provenance = root.object.get("_decision_scope") orelse return null;
+    const payload = root.object.get("content") orelse return null;
+    if (provenance != .object or provenance.object.count() != 3 or payload != .object) return null;
+    const epoch = provenance.object.get("policy_epoch") orelse return null;
+    const mode = provenance.object.get("mode") orelse return null;
+    const timestamp = provenance.object.get("content_ms") orelse return null;
+    // Typed JSON parsing accepts numeric strings; provenance deliberately does
+    // not. Only the exact schema produced by stampContent is admissible.
+    if (epoch != .integer or epoch.integer <= 0 or epoch.integer > std.math.maxInt(u32) or
+        timestamp != .integer or mode != .string) return null;
+    const parsed_mode = std.meta.stringToEnum(@import("../config.zig").Mode, mode.string) orelse return null;
+    keep = true;
+    return .{ .allocation = parsed, .value = .{
+        ._decision_scope = .{ .policy_epoch = @intCast(epoch.integer), .mode = parsed_mode, .content_ms = timestamp.integer },
+        .content = payload,
+    } };
+}
+
+fn sameScope(provenance: Provenance, scope: DecisionScope) bool {
+    return provenance.policy_epoch == scope.policy_epoch and provenance.mode == scope.mode;
+}
+
+fn requireScope(gpa: std.mem.Allocator, m: Memory, scope: DecisionScope) StoreError!void {
+    const parsed = (try parseEnvelope(gpa, m.content_json)) orelse return error.ScopeMismatch;
+    defer parsed.deinit();
+    if (!sameScope(parsed.value._decision_scope, scope)) return error.ScopeMismatch;
+}
+
+fn eligibleEnvelope(m: Memory, envelope: DecisionEnvelope, scope: DecisionScope, now_ms: i64) bool {
+    if (!validScope(scope, now_ms) or m.status != .active) return false;
+    const provenance = envelope._decision_scope;
+    if (!sameScope(provenance, scope)) return false;
+    // Inspect original content time, never the latest UPDATE/MERGE timestamp.
+    // Negative/future timestamps fail closed rather than appearing age zero.
+    if (provenance.content_ms < scope.not_before_ms or provenance.content_ms > now_ms or
+        m.created_ms < provenance.content_ms or m.created_ms > now_ms) return false;
+    return now_ms - provenance.content_ms <= scope.max_age_ms;
+}
+
+/// Shared eligibility predicate for boot filtering and direct lookup surfaces.
+/// load() is for trusted persisted rows; untrusted input must use an op writer.
+pub fn isDecisionEligible(gpa: std.mem.Allocator, m: Memory, scope: DecisionScope, now_ms: i64) StoreError!bool {
+    const parsed = (try parseEnvelope(gpa, m.content_json)) orelse return false;
+    defer parsed.deinit();
+    return eligibleEnvelope(m, parsed.value, scope, now_ms);
+}
+
+/// Structural JSON equality: whitespace, object key order, and equivalent
+/// string escapes are immaterial; array order and value types remain semantic.
+fn equivalentContent(a: std.json.Value, b: std.json.Value) bool {
+    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+    return switch (a) {
+        .null => true,
+        .bool => |value| value == b.bool,
+        .integer => |value| value == b.integer,
+        .float => |value| value == b.float,
+        .number_string => |value| std.mem.eql(u8, value, b.number_string),
+        .string => |value| std.mem.eql(u8, value, b.string),
+        .array => |array| blk: {
+            if (array.items.len != b.array.items.len) break :blk false;
+            for (array.items, b.array.items) |left, right| {
+                if (!equivalentContent(left, right)) break :blk false;
+            }
+            break :blk true;
+        },
+        .object => |object| blk: {
+            if (object.count() != b.object.count()) break :blk false;
+            for (object.keys(), object.values()) |key, value| {
+                if (!equivalentContent(value, b.object.get(key) orelse break :blk false)) break :blk false;
+            }
+            break :blk true;
+        },
+    };
+}
+
+fn stampContent(gpa: std.mem.Allocator, content: []const u8, scope: DecisionScope, now_ms: i64, previous: ?Memory) StoreError![]u8 {
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, content, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidContent,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidContent;
+    var content_ms = now_ms;
+    if (previous) |m| {
+        if (try parseEnvelope(gpa, m.content_json)) |prior| {
+            defer prior.deinit();
+            if (sameScope(prior.value._decision_scope, scope) and equivalentContent(prior.value.content, parsed.value))
+                content_ms = prior.value._decision_scope.content_ms;
+        }
+    }
+    return std.json.Stringify.valueAlloc(gpa, DecisionEnvelope{
+        ._decision_scope = .{ .policy_epoch = scope.policy_epoch, .mode = scope.mode, .content_ms = content_ms },
+        .content = parsed.value,
+    }, .{}) catch return error.OutOfMemory;
+}
+
+/// Remove the reserved outer stamp on generic ingestion, including escaped
+/// JSON keys. A substring test here would allow a forged provenance bypass.
+fn withoutProvenance(gpa: std.mem.Allocator, content: []const u8) StoreError!?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, gpa, content, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object or !parsed.value.object.swapRemove("_decision_scope")) return null;
+    return std.json.Stringify.valueAlloc(gpa, parsed.value, .{}) catch return error.OutOfMemory;
+}
+
+/// Only top-level content.tags string-array members are tags. Text in lessons,
+/// nested objects, or partial identifiers is not a match. Invalid tag arrays
+/// fail closed; duplicate query tags are counted once by the caller.
+fn exactTagMatch(content: std.json.Value, tag: []const u8) bool {
+    if (content != .object) return false;
+    const tags = content.object.get("tags") orelse return false;
+    if (tags != .array) return false;
+    var found = false;
+    for (tags.array.items) |item| {
+        if (item != .string) return false;
+        if (std.mem.eql(u8, item.string, tag)) found = true;
+    }
+    return found;
+}
+
 // ---------------------------------------------------------------------------
 // Retrieval scoring (§4.5): relevance ⊕ recency ⊕ evidence strength.
 // Pure and deterministic; tag relevance is exact-match set overlap so the
@@ -334,6 +641,10 @@ pub const Query = struct {
     /// Only these kinds are eligible (empty = all).
     kinds: []const Kind = &.{},
     limit: usize = 8,
+    /// Strict isolation for decision/review context. Null preserves generic
+    /// historical retrieval. Scoped queries ignore the callback matcher and use
+    /// exact JSON tags; with tags supplied, at least one must match.
+    decision_scope: ?DecisionScope = null,
 };
 
 pub const Scored = struct {
@@ -350,6 +661,12 @@ pub fn retrieve(store: *const Store, gpa: std.mem.Allocator, q: Query, matchTags
 
     for (store.items.items) |m| {
         if (m.status == .invalidated or m.status == .merged) continue;
+        var parsed: ?ParsedEnvelope = null;
+        defer if (parsed) |p| p.deinit();
+        if (q.decision_scope) |scope| {
+            parsed = (try parseEnvelope(gpa, m.content_json)) orelse continue;
+            if (!eligibleEnvelope(m, parsed.?.value, scope, q.now_ms)) continue;
+        }
         if (q.kinds.len > 0) {
             var ok = false;
             for (q.kinds) |k| {
@@ -362,33 +679,52 @@ pub fn retrieve(store: *const Store, gpa: std.mem.Allocator, q: Query, matchTags
         }
 
         var tag_hits: i64 = 0;
-        for (q.tags) |t| {
-            if (matchTags(m.content_json, t)) tag_hits += 1;
+        for (q.tags, 0..) |t, index| {
+            if (parsed) |p| {
+                var duplicate = false;
+                for (q.tags[0..index]) |prior| {
+                    if (std.mem.eql(u8, prior, t)) duplicate = true;
+                }
+                if (!duplicate and exactTagMatch(p.value.content, t)) tag_hits += 1;
+            } else if (matchTags(m.content_json, t)) tag_hits += 1;
         }
+        if (parsed != null and q.tags.len > 0 and tag_hits == 0) continue;
 
+        // A decision view carries content time, not the last repetition time,
+        // and never presents model confidence / repetition as corroboration.
+        var view = m;
+        if (parsed) |p| {
+            view.created_ms = p.value._decision_scope.content_ms;
+            view.confidence = Decimal.zero;
+            view.evidence_count = 0;
+        }
         // recency in [0,1000]: 1000 at age 0, halved every half_life.
-        const age: i64 = @max(0, q.now_ms - m.created_ms);
+        const age: i64 = @max(0, q.now_ms -| view.created_ms);
         var recency: i64 = 1000;
         var remaining = age;
-        while (remaining >= q.half_life_ms and recency > 0) : (remaining -= q.half_life_ms) {
+        const half_life_ms = @max(1, q.half_life_ms);
+        while (remaining >= half_life_ms and recency > 0) : (remaining -= half_life_ms) {
             recency = @divTrunc(recency, 2);
         }
 
         // evidence strength saturates at 10.
-        const evidence: i64 = @min(10, @as(i64, m.evidence_count));
+        const evidence: i64 = @min(10, @as(i64, view.evidence_count));
 
         // confidence in [0,1000] fixed-point.
-        const conf: i64 = @intCast(@divTrunc(m.confidence.raw * 1000, dec.ONE_RAW));
+        const conf: i64 = @intCast(@divTrunc(clamp01(view.confidence).raw * 1000, dec.ONE_RAW));
 
         var score = tag_hits * 4000 + recency + evidence * 200 + conf;
-        // Per-run / dated-window copies must not crowd rolling reviews.
-        if (isEphemeralId(m.memory_id)) score -= 8000;
-        try out.append(gpa, .{ .memory = m, .score = score });
+        // Generic history favors rolling reviews. Decision context must not
+        // give an old repeated narrative authority merely because of its ID.
+        if (q.decision_scope == null and isEphemeralId(m.memory_id)) score -= 8000;
+        try out.append(gpa, .{ .memory = view, .score = score });
     }
 
-    std.mem.sort(Scored, out.items, {}, struct {
-        fn lessThan(_: void, a: Scored, b: Scored) bool {
+    std.mem.sort(Scored, out.items, q.decision_scope != null, struct {
+        fn lessThan(scoped: bool, a: Scored, b: Scored) bool {
             if (a.score != b.score) return a.score > b.score;
+            if (scoped and a.memory.created_ms != b.memory.created_ms)
+                return a.memory.created_ms > b.memory.created_ms;
             // stable, deterministic tiebreak on id
             return std.mem.lessThan(u8, a.memory.memory_id, b.memory.memory_id);
         }
@@ -407,6 +743,10 @@ pub fn substringTagMatch(content_json: []const u8, tag: []const u8) bool {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test {
+    _ = @import("decision_policy_tests.zig");
+}
 
 fn d(s: []const u8) Decimal {
     return Decimal.parse(s) catch unreachable;

@@ -128,6 +128,8 @@ pub const Facts = struct {
     window_from: []const u8 = "",
     window_to: []const u8 = "",
     window_hours: i64 = 0,
+    evidence_cohort_start_ms: i64 = 0,
+    window_clipped: bool = false,
     mode: []const u8 = "shadow",
     instrument: []const u8 = "",
 
@@ -195,6 +197,7 @@ pub const Facts = struct {
                 self.cash_covers_min_buy, self.risk_mode,
             },
         );
+        try w.print("\"evidence_cohort_start_ms\":{d},\"window_clipped\":{},", .{ self.evidence_cohort_start_ms, self.window_clipped });
         if (self.has_benchmark) {
             try w.print(
                 "\"benchmark\":{{\"buy_and_hold_return\":\"{f}\",\"alpha\":\"{f}\"}},",

@@ -13,6 +13,7 @@
 
 const std = @import("std");
 const okx_rest = @import("../exchange/okx/rest.zig");
+const market = @import("market.zig");
 
 pub const Candle = okx_rest.Candle;
 
@@ -64,38 +65,40 @@ fn barsPerYear(bar: []const u8) f64 {
 
 /// Regime classification thresholds (deterministic, documented facts).
 /// A frame is `trend_up`/`trend_down` when SMA20 has moved by more than
-/// `slope_pct` over the last `SLOPE_LOOKBACK` bars *and* price sits on the
-/// trend side of SMA20; otherwise it is `range`. Thresholds scale with the
-/// bar: a daily SMA20 drifting 1% over 5 days is noise, 3% is a trend.
+/// `slope_pct` over the last `SLOPE_LOOKBACK` completed bars *and* the last
+/// completed close sits on the trend side of SMA20. Failure to establish a
+/// trend is `unconfirmed`, NOT evidence of a range. Thresholds are unchanged;
+/// independent breakout facts expose moves before a lagging SMA confirms.
 pub const SLOPE_LOOKBACK: usize = 5;
 pub const TREND_SLOPE_PCT_1D: f64 = 2.0;
 pub const TREND_SLOPE_PCT_4H: f64 = 1.0;
 
 pub const Regime = enum {
-    range,
+    unconfirmed,
     trend_up,
     trend_down,
 
     pub fn text(self: Regime) []const u8 {
-        return switch (self) {
-            .range => "range",
-            .trend_up => "trend_up",
-            .trend_down => "trend_down",
-        };
+        return @tagName(self);
     }
 };
 
 /// Pure regime rule shared by structure rendering and tests.
 pub fn classifyRegime(close: f64, sma_now: f64, sma_slope_pct: f64, slope_threshold_pct: f64) Regime {
+    if (!std.math.isFinite(close) or !std.math.isFinite(sma_now) or
+        !std.math.isFinite(sma_slope_pct) or !std.math.isFinite(slope_threshold_pct) or
+        close <= 0 or sma_now <= 0 or slope_threshold_pct <= 0) return .unconfirmed;
     if (sma_slope_pct >= slope_threshold_pct and close >= sma_now) return .trend_up;
     if (sma_slope_pct <= -slope_threshold_pct and close <= sma_now) return .trend_down;
-    return .range;
+    return .unconfirmed;
 }
 
 /// Compact HTF structure from venue candles (newest-first, as OKX returns).
-/// Facts only: SMA/range/RSI, SMA slope, range width, ATR, a deterministic
-/// regime label, plus whether the forming bar broke the prior completed-window
-/// high or low. Never prescribes a trade.
+/// SMA/range/RSI/slope/ATR use confirmed completed bars only. Breakout facts
+/// separately test the latest completed and forming bar against their own
+/// PRECEDING full completed windows. A tested candle never moves its target.
+/// `broke_prior_*` compatibility fields mean wick excursion, not close
+/// confirmation; explicit close/wick-only fields disambiguate. Facts only.
 pub fn formatHtfStructure(
     buf: []u8,
     daily_newest_first: []const Candle,
@@ -110,6 +113,50 @@ pub fn formatHtfStructure(
     return w.buffered();
 }
 
+/// A full-window breakout comparison. `wick_only_*` means an excursion
+/// beyond the boundary with price back inside, NOT a prediction of reversal.
+pub const Breakout = struct {
+    prior_high: f64,
+    prior_low: f64,
+    broke_high: bool,
+    broke_low: bool,
+    close_above: bool,
+    close_below: bool,
+    wick_only_high: bool,
+    wick_only_low: bool,
+};
+
+pub fn breakoutAgainst(c: Candle, prior_completed: []const Candle, period: usize) ?Breakout {
+    if (period == 0 or prior_completed.len < period) return null;
+    var hi: f64 = -std.math.inf(f64);
+    var lo: f64 = std.math.inf(f64);
+    for (prior_completed[0..period]) |prior| {
+        if (market.candleConfirmed(prior) != true) return null;
+        hi = @max(hi, prior.high.toF64Lossy());
+        lo = @min(lo, prior.low.toF64Lossy());
+    }
+    const close = c.close.toF64Lossy();
+    const broke_high = c.high.toF64Lossy() > hi;
+    const broke_low = c.low.toF64Lossy() < lo;
+    return .{
+        .prior_high = hi,
+        .prior_low = lo,
+        .broke_high = broke_high,
+        .broke_low = broke_low,
+        .close_above = close > hi,
+        .close_below = close < lo,
+        .wick_only_high = broke_high and close <= hi,
+        .wick_only_low = broke_low and close >= lo,
+    };
+}
+
+fn writeBreakoutFields(w: *std.Io.Writer, b: Breakout, period: usize) !void {
+    try w.print(
+        "\"prior_completed_n\":{d},\"prior_completed_high\":{d:.1},\"prior_completed_low\":{d:.1},\"broke_prior_high\":{},\"broke_prior_low\":{},\"close_above_prior_high\":{},\"close_below_prior_low\":{},\"wick_only_high\":{},\"wick_only_low\":{}",
+        .{ period, b.prior_high, b.prior_low, b.broke_high, b.broke_low, b.close_above, b.close_below, b.wick_only_high, b.wick_only_low },
+    );
+}
+
 fn writeBarStructure(
     w: *std.Io.Writer,
     newest_first: []const Candle,
@@ -117,19 +164,55 @@ fn writeBarStructure(
     rsi_period: usize,
     slope_threshold_pct: f64,
 ) !void {
-    if (newest_first.len < 2) {
+    if (newest_first.len == 0) {
         try w.writeAll("null");
         return;
     }
-    var oldest: [64]Candle = undefined;
-    const n = @min(newest_first.len, oldest.len);
-    for (0..n) |i| oldest[i] = newest_first[n - 1 - i];
-    const cs = oldest[0..n];
     const last = newest_first[0];
-    const close = last.close.toF64Lossy();
+    const confirmed = market.candleConfirmed(last);
+    const basis: []const u8 = if (confirmed) |yes| (if (yes) "completed" else "forming") else "unknown";
+    const start: usize = if (confirmed == true) 0 else 1;
+    var end = start;
+    // Never jump over an unknown/unconfirmed historical row to synthesize a
+    // continuous completed window. Admission separately checks timestamps.
+    while (end < newest_first.len and end - start < 64 and market.candleConfirmed(newest_first[end]) == true) : (end += 1) {}
+    const completed = newest_first[start..end];
+    const n = completed.len;
+    var oldest: [64]Candle = undefined;
+    for (0..n) |i| oldest[i] = completed[n - 1 - i];
+    const cs = oldest[0..n];
+    try w.print("{{\"n\":{d},\"close\":{d:.1},\"latest_basis\":\"{s}\",\"indicator_basis\":\"completed\",\"completed_n\":{d}", .{ newest_first.len, last.close.toF64Lossy(), basis, n });
 
-    try w.print("{{\"n\":{d},\"close\":{d:.1}", .{ n, close });
+    // Top-level compatibility breakout fields always describe the newest
+    // candle, with its basis explicit. Never use a partial lookback as 20 bars.
+    const latest_prior = if (confirmed == true) completed[1..] else completed;
+    if (confirmed != null) {
+        if (breakoutAgainst(last, latest_prior, range_period)) |b| {
+            try w.writeByte(',');
+            try writeBreakoutFields(w, b, range_period);
+        }
+    }
+    try w.writeAll(",\"latest_completed_breakout\":");
+    if (n > range_period) {
+        const b = breakoutAgainst(completed[0], completed[1..], range_period).?;
+        try w.print("{{\"ts_ms\":{d},\"close\":{d:.1},", .{ completed[0].ts_ms, completed[0].close.toF64Lossy() });
+        try writeBreakoutFields(w, b, range_period);
+        try w.writeByte('}');
+    } else try w.writeAll("null");
+    try w.writeAll(",\"forming_breakout\":");
+    if (confirmed == false and n >= range_period) {
+        const b = breakoutAgainst(last, completed, range_period).?;
+        try w.print("{{\"ts_ms\":{d},\"close\":{d:.1},", .{ last.ts_ms, last.close.toF64Lossy() });
+        try writeBreakoutFields(w, b, range_period);
+        try w.writeByte('}');
+    } else try w.writeAll("null");
 
+    if (n == 0) {
+        try w.writeByte('}');
+        return;
+    }
+    const close = completed[0].close.toF64Lossy();
+    try w.print(",\"completed_close\":{d:.1}", .{close});
     if (n >= range_period) {
         const window = cs[n - range_period ..];
         var sma: f64 = 0;
@@ -148,10 +231,6 @@ fn writeBarStructure(
             ",\"sma{d}\":{d:.1},\"range{d}_high\":{d:.1},\"range{d}_low\":{d:.1},\"range{d}_pos\":{d:.2},\"range{d}_width_pct\":{d:.2}",
             .{ range_period, sma, range_period, hi, range_period, lo, range_period, pos, range_period, width_pct },
         );
-
-        // SMA slope over SLOPE_LOOKBACK bars → regime label. Needs
-        // range_period + SLOPE_LOOKBACK bars; otherwise the label is omitted
-        // (never fabricated).
         if (n >= range_period + SLOPE_LOOKBACK) {
             const prev_window = cs[n - range_period - SLOPE_LOOKBACK .. n - SLOPE_LOOKBACK];
             var sma_prev: f64 = 0;
@@ -165,25 +244,6 @@ fn writeBarStructure(
             );
         }
     }
-
-    if (n >= 2) {
-        const completed = cs[0 .. n - 1];
-        const take = @min(completed.len, range_period);
-        const prior = completed[completed.len - take ..];
-        var prior_hi: f64 = -std.math.inf(f64);
-        var prior_lo: f64 = std.math.inf(f64);
-        for (prior) |c| {
-            prior_hi = @max(prior_hi, c.high.toF64Lossy());
-            prior_lo = @min(prior_lo, c.low.toF64Lossy());
-        }
-        const broke = last.high.toF64Lossy() > prior_hi or close > prior_hi;
-        const broke_low = last.low.toF64Lossy() < prior_lo or close < prior_lo;
-        try w.print(
-            ",\"prior_completed_high\":{d:.1},\"broke_prior_high\":{},\"prior_completed_low\":{d:.1},\"broke_prior_low\":{}",
-            .{ prior_hi, broke, prior_lo, broke_low },
-        );
-    }
-
     if (n >= rsi_period * 3) {
         var closes_buf: [64]f64 = undefined;
         for (cs, 0..) |c, i| closes_buf[i] = c.close.toF64Lossy();
@@ -273,8 +333,9 @@ pub fn candlesNeeded(req: Request) usize {
 
 pub const ComputeError = error{InsufficientData};
 
-/// Compute one indicator over candles ordered OLDEST-FIRST; write a compact
-/// JSON object (no trailing separator) into `w`.
+/// Compute one indicator over candles ordered OLDEST-FIRST. Unlike stable
+/// HTF structure, on-demand values may include the live bar; their basis is
+/// explicit. Unknown confirmation/history holes cannot produce a value.
 pub fn compute(w: *std.Io.Writer, req: Request, candles: []const Candle) (ComputeError || std.Io.Writer.Error)!void {
     const n = candles.len;
     if (n < candlesNeeded(req) or n < 2) return error.InsufficientData;
@@ -284,31 +345,35 @@ pub fn compute(w: *std.Io.Writer, req: Request, candles: []const Candle) (Comput
     for (candles, 0..) |c, i| closes_buf[i] = c.close.toF64Lossy();
     const closes = closes_buf[0..n];
     const last_close = closes[n - 1];
+    for (candles, 0..) |c, i| {
+        const confirmed = market.candleConfirmed(c) orelse return error.InsufficientData;
+        if (!confirmed and i != n - 1) return error.InsufficientData;
+    }
+    try head(w, req);
+    try w.print("\"basis\":\"{s}\",\"latest_ts_ms\":{d},", .{
+        if (market.candleConfirmed(candles[n - 1]) == true) @as([]const u8, "completed") else "includes_forming",
+        candles[n - 1].ts_ms,
+    });
 
     switch (req.kind) {
         .sma => {
             const v = mean(closes[n - req.period ..]);
-            try head(w, req);
             try w.print("\"value\":{d:.2},\"close\":{d:.2}}}", .{ v, last_close });
         },
         .ema => {
             const v = ema(closes, req.period);
-            try head(w, req);
             try w.print("\"value\":{d:.2},\"close\":{d:.2}}}", .{ v, last_close });
         },
         .rsi => {
             const v = rsi(closes, req.period);
-            try head(w, req);
             try w.print("\"value\":{d:.1}}}", .{v});
         },
         .atr => {
             const v = atr(candles, req.period);
-            try head(w, req);
             try w.print("\"value\":{d:.2},\"pct_of_close\":{d:.3}}}", .{ v, 100.0 * v / last_close });
         },
         .vol => {
             const v = realizedVol(closes, req.period, barsPerYear(req.bar));
-            try head(w, req);
             try w.print("\"annualized_pct\":{d:.1}}}", .{v * 100.0});
         },
         .bollinger => {
@@ -319,7 +384,6 @@ pub fn compute(w: *std.Io.Writer, req: Request, candles: []const Candle) (Comput
             const lower = mid - 2.0 * sd;
             const width = upper - lower;
             const pos = if (width > 0) (last_close - lower) / width else 0.5;
-            try head(w, req);
             try w.print(
                 "\"mid\":{d:.2},\"upper\":{d:.2},\"lower\":{d:.2},\"pos\":{d:.2},\"width_pct\":{d:.2}}}",
                 .{ mid, upper, lower, pos, 100.0 * width / mid },
@@ -334,8 +398,10 @@ pub fn compute(w: *std.Io.Writer, req: Request, candles: []const Candle) (Comput
             }
             const width = hi - lo;
             const pos = if (width > 0) (last_close - lo) / width else 0.5;
-            try head(w, req);
-            try w.print("\"high\":{d:.2},\"low\":{d:.2},\"pos\":{d:.2}}}", .{ hi, lo, pos });
+            try w.print("\"high\":{d:.2},\"low\":{d:.2},\"pos\":{d:.2},\"window_includes_latest\":true,", .{ hi, lo, pos });
+            const b = breakoutAgainst(candles[n - 1], candles[n - req.period - 1 .. n - 1], req.period).?;
+            try writeBreakoutFields(w, b, req.period);
+            try w.writeByte('}');
         },
     }
 }
@@ -450,6 +516,7 @@ fn mkCandle(o: f64, h: f64, l: f64, c: f64) Candle {
         .low = parseF(&buf, l),
         .close = parseF(&buf, c),
         .vol = Decimal.zero,
+        .confirmed = true,
     };
 }
 
@@ -582,6 +649,7 @@ test "formatHtfStructure flags a daily breakout vs prior completed high" {
     }
     // Forming bar breaks the prior 20-completed high (~64220+50).
     daily[0] = mkCandle(65000, 70000, 64800, 68680);
+    daily[0].confirmed = false;
 
     var h4: [24]Candle = undefined;
     for (0..24) |i| {
@@ -589,7 +657,7 @@ test "formatHtfStructure flags a daily breakout vs prior completed high" {
         h4[i] = mkCandle(px, px + 20, px - 20, px);
     }
 
-    var buf: [768]u8 = undefined;
+    var buf: [4096]u8 = undefined;
     const s = try formatHtfStructure(&buf, &daily, &h4);
     try testing.expect(std.mem.indexOf(u8, s, "\"broke_prior_high\":true") != null);
     try testing.expect(std.mem.indexOf(u8, s, "\"1D\":{") != null);
@@ -597,12 +665,12 @@ test "formatHtfStructure flags a daily breakout vs prior completed high" {
     try testing.expect(std.mem.indexOf(u8, s, "\"sma20\":") != null);
 }
 
-test "structure labels a flat SMA as range and a rising SMA as trend_up" {
+test "structure labels a flat SMA as unconfirmed and a rising SMA as trend_up" {
     var flat: [30]Candle = undefined;
     for (0..30) |i| flat[i] = mkCandle(70000, 70100, 69900, 70000);
-    var buf: [1024]u8 = undefined;
+    var buf: [4096]u8 = undefined;
     const s_flat = try formatHtfStructure(&buf, &flat, &flat);
-    try testing.expect(std.mem.indexOf(u8, s_flat, "\"regime\":\"range\"") != null);
+    try testing.expect(std.mem.indexOf(u8, s_flat, "\"regime\":\"unconfirmed\"") != null);
     try testing.expect(std.mem.indexOf(u8, s_flat, "\"range20_width_pct\":") != null);
     try testing.expect(std.mem.indexOf(u8, s_flat, "\"atr14_pct\":") != null);
     try testing.expect(std.mem.indexOf(u8, s_flat, "\"broke_prior_low\":false") != null);
@@ -612,7 +680,7 @@ test "structure labels a flat SMA as range and a rising SMA as trend_up" {
         const px = 60000.0 * std.math.pow(f64, 1.01, @as(f64, @floatFromInt(i)));
         up[29 - i] = mkCandle(px, px * 1.002, px * 0.998, px);
     }
-    var buf2: [1024]u8 = undefined;
+    var buf2: [4096]u8 = undefined;
     const s_up = try formatHtfStructure(&buf2, &up, &up);
     try testing.expect(std.mem.indexOf(u8, s_up, "\"regime\":\"trend_up\"") != null);
 
@@ -621,7 +689,7 @@ test "structure labels a flat SMA as range and a rising SMA as trend_up" {
         const px = 90000.0 * std.math.pow(f64, 0.99, @as(f64, @floatFromInt(i)));
         down[29 - i] = mkCandle(px, px * 1.002, px * 0.998, px);
     }
-    var buf3: [1024]u8 = undefined;
+    var buf3: [4096]u8 = undefined;
     const s_down = try formatHtfStructure(&buf3, &down, &down);
     try testing.expect(std.mem.indexOf(u8, s_down, "\"regime\":\"trend_down\"") != null);
     try testing.expect(std.mem.indexOf(u8, s_down, "\"broke_prior_low\":true") != null);
@@ -629,7 +697,127 @@ test "structure labels a flat SMA as range and a rising SMA as trend_up" {
 
 test "classifyRegime requires both slope and side of SMA" {
     try testing.expectEqual(Regime.trend_up, classifyRegime(100, 95, 3.0, 2.0));
-    try testing.expectEqual(Regime.range, classifyRegime(90, 95, 3.0, 2.0));
+    try testing.expectEqual(Regime.unconfirmed, classifyRegime(90, 95, 3.0, 2.0));
     try testing.expectEqual(Regime.trend_down, classifyRegime(90, 95, -3.0, 2.0));
-    try testing.expectEqual(Regime.range, classifyRegime(100, 95, 1.0, 2.0));
+    try testing.expectEqual(Regime.unconfirmed, classifyRegime(100, 95, 1.0, 2.0));
+}
+
+test "fresh completed breakout remains visible while SMA trend is unconfirmed" {
+    for ([_]bool{ true, false }) |up| {
+        var candles: [32]Candle = undefined;
+        for (&candles) |*c| c.* = mkCandle(100, 101, 99, 100);
+        candles[1] = if (up) mkCandle(100, 103, 99, 102) else mkCandle(100, 101, 97, 98);
+        candles[0] = if (up) mkCandle(102, 110, 101, 104) else mkCandle(98, 99, 90, 96);
+        candles[0].confirmed = false;
+        var buf: [4096]u8 = undefined;
+        const text = try formatHtfStructure(&buf, &candles, &.{});
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, text, .{});
+        defer parsed.deinit();
+        const daily = parsed.value.object.get("1D").?.object;
+        try testing.expectEqualStrings("unconfirmed", daily.get("regime").?.string);
+        try testing.expectEqualStrings("completed", daily.get("indicator_basis").?.string);
+        try testing.expectEqualStrings("forming", daily.get("latest_basis").?.string);
+        // Forming extreme is excluded from SMA/range and the completed
+        // breakout target. Each candle compares to a fixed preceding window.
+        const completed = daily.get("latest_completed_breakout").?.object;
+        const forming = daily.get("forming_breakout").?.object;
+        const bound = if (up) "prior_completed_high" else "prior_completed_low";
+        try testing.expectApproxEqAbs(if (up) @as(f64, 101) else 99, completed.get(bound).?.float, 0.01);
+        try testing.expectApproxEqAbs(if (up) @as(f64, 103) else 97, forming.get(bound).?.float, 0.01);
+        try testing.expect(completed.get(if (up) "close_above_prior_high" else "close_below_prior_low").?.bool);
+        try testing.expect(forming.get(if (up) "close_above_prior_high" else "close_below_prior_low").?.bool);
+        try testing.expect(!completed.get(if (up) "wick_only_high" else "wick_only_low").?.bool);
+        try testing.expectApproxEqAbs(if (up) @as(f64, 103) else 97, daily.get(if (up) "range20_high" else "range20_low").?.float, 0.01);
+    }
+}
+
+test "wick excursion is not close confirmation and uses strict symmetric boundaries" {
+    var prior: [20]Candle = undefined;
+    for (&prior) |*c| c.* = mkCandle(100, 101, 99, 100);
+    const both = breakoutAgainst(mkCandle(100, 105, 95, 100), &prior, 20).?;
+    try testing.expect(both.broke_high and both.broke_low);
+    try testing.expect(both.wick_only_high and both.wick_only_low);
+    try testing.expect(!both.close_above and !both.close_below);
+    const equal = breakoutAgainst(mkCandle(100, 101, 99, 101), &prior, 20).?;
+    try testing.expect(!equal.broke_high and !equal.close_above);
+    try testing.expect(!equal.broke_low and !equal.close_below);
+    try testing.expect(breakoutAgainst(prior[0], prior[0..19], 20) == null);
+    prior[5].confirmed = false;
+    try testing.expect(breakoutAgainst(prior[0], &prior, 20) == null);
+}
+
+test "forming wick cannot rewrite completed indicators or become a confirmed breakout" {
+    var candles: [46]Candle = undefined;
+    for (&candles) |*c| c.* = mkCandle(100, 101, 99, 100);
+    candles[0] = mkCandle(100, 150, 50, 100);
+    candles[0].confirmed = false;
+    var buf: [4096]u8 = undefined;
+    const text = try formatHtfStructure(&buf, &candles, &.{});
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, text, .{});
+    defer parsed.deinit();
+    const daily = parsed.value.object.get("1D").?.object;
+    try testing.expectApproxEqAbs(@as(f64, 100), daily.get("sma20").?.float, 0.01);
+    try testing.expectApproxEqAbs(@as(f64, 101), daily.get("range20_high").?.float, 0.01);
+    try testing.expectApproxEqAbs(@as(f64, 99), daily.get("range20_low").?.float, 0.01);
+    try testing.expectEqualStrings("unconfirmed", daily.get("regime").?.string);
+    const b = daily.get("forming_breakout").?.object;
+    try testing.expect(b.get("wick_only_high").?.bool and b.get("wick_only_low").?.bool);
+    try testing.expect(!b.get("close_above_prior_high").?.bool and !b.get("close_below_prior_low").?.bool);
+    const completed = daily.get("latest_completed_breakout").?.object;
+    try testing.expect(!completed.get("broke_prior_high").?.bool and !completed.get("broke_prior_low").?.bool);
+}
+
+test "empty short and unknown confirmation series never fabricate structure" {
+    var buf: [4096]u8 = undefined;
+    try testing.expectEqualStrings("{\"1D\":null,\"4H\":null}", try formatHtfStructure(&buf, &.{}, &.{}));
+    var candles = [_]Candle{mkCandle(100, 101, 99, 100)} ** 20;
+    for ([_]usize{ 1, 19, 20 }) |count| {
+        const text = try formatHtfStructure(&buf, candles[0..count], &.{});
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, text, .{});
+        defer parsed.deinit();
+        const daily = parsed.value.object.get("1D").?.object;
+        try testing.expect(daily.get("regime") == null);
+        try testing.expect(daily.get("broke_prior_high") == null);
+        try testing.expect(daily.get("latest_completed_breakout").? == .null);
+        try testing.expect(daily.get("forming_breakout").? == .null);
+    }
+    for (&candles) |*c| c.confirmed = null;
+    const text = try formatHtfStructure(&buf, &candles, &.{});
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, text, .{});
+    defer parsed.deinit();
+    const daily = parsed.value.object.get("1D").?.object;
+    try testing.expectEqualStrings("unknown", daily.get("latest_basis").?.string);
+    try testing.expectEqual(@as(i64, 0), daily.get("completed_n").?.integer);
+    try testing.expect(daily.get("sma20") == null);
+    try testing.expect(daily.get("broke_prior_high") == null);
+}
+
+test "invalid regime inputs cannot manufacture trend evidence" {
+    try testing.expectEqual(Regime.unconfirmed, classifyRegime(100, 100, 0, 0));
+    try testing.expectEqual(Regime.unconfirmed, classifyRegime(100, 100, std.math.nan(f64), 2));
+    try testing.expectEqual(Regime.unconfirmed, classifyRegime(100, 100, std.math.inf(f64), 2));
+    try testing.expectEqual(Regime.unconfirmed, classifyRegime(0, 0, 3, 2));
+}
+
+test "on-demand range distinguishes current-inclusive range from prior breakout target" {
+    var candles = [_]Candle{mkCandle(100, 101, 99, 100)} ** 21; // oldest-first
+    candles[20] = mkCandle(100, 110, 98, 104);
+    candles[20].confirmed = false;
+    var buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try compute(&w, .{ .kind = .range, .bar = "1H", .period = 20 }, &candles);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, w.buffered(), .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try testing.expectEqualStrings("includes_forming", root.get("basis").?.string);
+    try testing.expect(root.get("window_includes_latest").?.bool);
+    try testing.expectApproxEqAbs(@as(f64, 110), root.get("high").?.float, 0.01);
+    try testing.expectApproxEqAbs(@as(f64, 101), root.get("prior_completed_high").?.float, 0.01);
+    try testing.expect(root.get("close_above_prior_high").?.bool);
+    try testing.expect(!root.get("wick_only_high").?.bool);
+    try testing.expect(root.get("wick_only_low").?.bool);
+    candles[1].confirmed = null;
+    w = .fixed(&buf);
+    try testing.expectError(error.InsufficientData, compute(&w, .{ .kind = .range, .bar = "1H", .period = 20 }, &candles));
+    try testing.expectEqual(@as(usize, 0), w.buffered().len);
 }
