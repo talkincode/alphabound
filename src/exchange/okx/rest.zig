@@ -120,6 +120,9 @@ pub const Candle = struct {
     low: Decimal,
     close: Decimal,
     vol: Decimal,
+    /// Venue confirmation, not inferred from array position. Legacy six-column
+    /// rows remain parseable but cannot prove a completed bar.
+    confirmed: ?bool = null,
 };
 
 /// Parse candles envelope into `out`; returns count written (newest-first as OKX).
@@ -159,8 +162,16 @@ pub fn parseCandles(gpa: std.mem.Allocator, body: []const u8, out: []Candle) Err
             .string => |s| s,
             else => return Error.MalformedResponse,
         };
+        const confirmed: ?bool = if (row.items.len > 8) blk: {
+            if (row.items[8] != .string) return Error.MalformedResponse;
+            const flag = row.items[8].string;
+            if (std.mem.eql(u8, flag, "1")) break :blk true;
+            if (std.mem.eql(u8, flag, "0")) break :blk false;
+            return Error.MalformedResponse;
+        } else null;
         out[n] = .{
             .ts_ms = std.fmt.parseInt(i64, ts_s, 10) catch return Error.MalformedResponse,
+            .confirmed = confirmed,
             .open = Decimal.parse(o_s) catch return Error.MalformedResponse,
             .high = Decimal.parse(h_s) catch return Error.MalformedResponse,
             .low = Decimal.parse(l_s) catch return Error.MalformedResponse,
@@ -757,6 +768,19 @@ test "parse candles array rows" {
     try testing.expectEqual(@as(i64, 1700000000000), out[0].ts_ms);
     try testing.expect(out[0].close.eql(d("105")));
     try testing.expect(out[1].open.eql(d("98")));
+    try testing.expectEqual(@as(?bool, true), out[0].confirmed);
+}
+
+test "candle confirmation distinguishes forming unknown and malformed" {
+    var out: [2]Candle = undefined;
+    _ = try parseCandles(testing.allocator,
+        \\{"code":"0","data":[["1000","100","110","90","105","1","0","0","0"],["500","100","110","90","105","1"]]}
+    , &out);
+    try testing.expectEqual(@as(?bool, false), out[0].confirmed);
+    try testing.expectEqual(@as(?bool, null), out[1].confirmed);
+    try testing.expectError(Error.MalformedResponse, parseCandles(testing.allocator,
+        \\{"code":"0","data":[["1000","100","110","90","105","1","0","0","yes"]]}
+    , &out));
 }
 
 test "parse funding rate snapshot (venue precision beyond SCALE)" {

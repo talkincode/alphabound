@@ -354,17 +354,22 @@ pub const EventsRepo = struct {
     /// never reset it), so the "consecutive HOLD" fact the prompt reasons
     /// about was a lifetime counter. Derived from the audit log instead.
     pub fn noopStreakSinceLastExecution(self: *EventsRepo, db: *Db) DbError!u32 {
+        return self.noopStreakSince(db, "");
+    }
+
+    pub fn noopStreakSince(self: *EventsRepo, db: *Db, since_ts: []const u8) DbError!u32 {
         _ = self;
         var stmt = try db.prepare(
             \\SELECT count(*) FROM events
-            \\WHERE type = 'AGENT_PROPOSAL_OK'
+            \\WHERE type = 'AGENT_PROPOSAL_OK' AND ts >= ?1
             \\  AND seq > COALESCE((
             \\    SELECT max(seq) FROM events
-            \\    WHERE type = 'AGENT_PROPOSAL_OK'
+            \\    WHERE type = 'AGENT_PROPOSAL_OK' AND ts >= ?1
             \\      AND json_extract(payload_json, '$.executed') = 1
             \\  ), 0)
         );
         defer stmt.finalize();
+        try stmt.bindText(1, since_ts);
         if (!(try stmt.step())) return 0;
         const n = stmt.columnInt(0);
         return if (n < 0) 0 else @intCast(@min(n, std.math.maxInt(u32)));
@@ -2104,17 +2109,45 @@ pub const MemoryRow = struct {
 
 pub const MemoriesRepo = struct {
     insert: Stmt,
+    insert_next: Stmt,
 
     pub fn init(db: *Db) DbError!MemoriesRepo {
-        return .{ .insert = try db.prepare(
+        var insert = try db.prepare(
             \\INSERT INTO memories (memory_id, version, kind, status, confidence,
             \\  evidence_count, content_json, created_ts)
             \\VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+        );
+        errdefer insert.finalize();
+        return .{ .insert = insert, .insert_next = try db.prepare(
+            \\INSERT INTO memories (memory_id, version, kind, status, confidence,
+            \\  evidence_count, content_json, created_ts)
+            \\VALUES (?1,(SELECT COALESCE(MAX(version),0)+1 FROM memories WHERE memory_id=?1),?2,?3,?4,?5,?6,?7)
+            \\RETURNING version
         ) };
     }
 
     pub fn deinit(self: *MemoriesRepo) void {
         self.insert.finalize();
+        self.insert_next.finalize();
+    }
+
+    /// The bounded index may evict an ID and later recreate it. Allocate its
+    /// version from durable history, never reset it to 1 or overwrite a row.
+    /// Caller must synchronize the returned version back to the live index.
+    pub fn appendNext(self: *MemoriesRepo, row: MemoryRow) DbError!i64 {
+        self.insert_next.reset();
+        defer self.insert_next.reset();
+        try self.insert_next.bindText(1, row.memory_id);
+        try self.insert_next.bindText(2, row.kind);
+        try self.insert_next.bindText(3, row.status);
+        try self.insert_next.bindFloat(4, row.confidence);
+        try self.insert_next.bindInt(5, row.evidence_count);
+        try self.insert_next.bindText(6, row.content_json);
+        try self.insert_next.bindText(7, row.created_ts);
+        if (!try self.insert_next.stepCritical()) return DbError.StepFailed;
+        const version = self.insert_next.columnInt(0);
+        _ = try self.insert_next.stepCritical();
+        return version;
     }
 
     pub fn append(self: *MemoriesRepo, row: MemoryRow) DbError!void {
@@ -3589,6 +3622,30 @@ test "fills idempotent, equity samples, agent runs and tool calls" {
     try testing.expect(std.mem.indexOf(u8, mem_json, "\"memory_id\":\"m1\"") != null);
     try testing.expect(std.mem.indexOf(u8, mem_json, "\"version\":2") != null);
     try testing.expect(std.mem.indexOf(u8, mem_json, "\"version\":1") == null);
+}
+
+test "memory recreated after index eviction continues durable versions" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const path = try tmpDbPath(&tmp, &buf);
+    var db = try Db.open(path);
+    defer db.close();
+    var repo = try MemoriesRepo.init(&db);
+    defer repo.deinit();
+    const row = MemoryRow{
+        .memory_id = "PR_short",
+        .version = 1,
+        .kind = "reflection",
+        .content_json = "{\"summary\":\"synthetic observation\"}",
+        .created_ts = "2026-01-01T00:00:00.000Z",
+    };
+    try repo.append(row);
+    // A fresh index would attempt v1 again. Audit history remains append-only.
+    try testing.expectEqual(@as(i64, 2), try repo.appendNext(row));
+    try testing.expectEqual(@as(i64, 3), try repo.appendNext(row));
+    try testing.expectEqual(@as(i64, 3), try db.queryInt("SELECT COUNT(*) FROM memories"));
+    try testing.expectEqual(@as(i64, 1), try db.queryInt("SELECT COUNT(*) FROM memories WHERE version=1"));
 }
 
 test "events compact context order and sqlite backup" {

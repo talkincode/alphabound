@@ -238,7 +238,7 @@ test "AC-SEC7 injected instruction text survives only as inert data" {
     var rec = tools.AuditRecord{
         .tool = "market.ticker",
         .source = "okx",
-        .status = "ok",
+        .status = tools.ResultStatus.ok.text(),
         .as_of_ms = 1_700_000_000_000,
         .latency_ms = 5,
         .cost_usd = Decimal.zero,

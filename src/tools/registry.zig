@@ -71,7 +71,9 @@ pub const ToolSpec = struct {
 pub const ToolResult = struct {
     status: ResultStatus,
     source: []const u8,
-    /// Milliseconds since epoch when the underlying data was produced.
+    /// Source sample time, or the oldest admitted fetch time for a composite
+    /// whose adapter separately validates each source's cadence/progression.
+    /// Candle bar-open times are NOT snapshot production times.
     as_of_ms: i64,
     confidence: ?Decimal = null,
     latency_ms: u32 = 0,
@@ -118,14 +120,18 @@ pub const Registry = struct {
     }
 };
 
-/// Admission-time staleness check: a result that arrived OK but whose data is
-/// older than the tool's freshness contract is downgraded to STALE. The risk
-/// kernel treats STALE evidence as missing (fail-closed), never as zero.
+/// Pure recency check for an actual sample/fetch timestamp, NOT a bar-open
+/// timestamp. Unknown/future timestamps and invalid budgets fail closed.
+pub fn timestampFresh(ts_ms: i64, now_ms: i64, max_age_ms: i64) bool {
+    if (ts_ms <= 0 or now_ms < ts_ms or max_age_ms < 0) return false;
+    return now_ms - ts_ms <= max_age_ms;
+}
+
+/// Admission staleness is local to this observation, not proof that the
+/// current account/ticker (or the root risk evidence) is stale.
 pub fn effectiveStatus(spec: *const ToolSpec, result: ToolResult, now_ms: i64) ResultStatus {
     if (result.status != .ok) return result.status;
-    if (result.as_of_ms <= 0) return .stale; // unknown provenance = stale
-    const age = now_ms - result.as_of_ms;
-    if (age > spec.max_age_ms) return .stale;
+    if (!timestampFresh(result.as_of_ms, now_ms, spec.max_age_ms)) return .stale;
     return .ok;
 }
 
@@ -137,7 +143,8 @@ pub const AuditRecord = struct {
     as_of_ms: i64,
     latency_ms: u32,
     cost_usd: Decimal,
-    /// SHA-256 of data_json — proves what the agent saw without trusting it.
+    /// SHA-256 of the received payload; inadmissible payloads remain digested
+    /// for audit but are suppressed from the agent observation.
     result_digest: [64]u8,
 };
 
@@ -266,4 +273,20 @@ test "auditRecord digests untrusted payload and reports effective status" {
         .data_json = "{\"c\":[9]}",
     }, now);
     try testing.expect(!std.mem.eql(u8, &rec.result_digest, &rec3.result_digest));
+}
+
+test "recency rejects future and unknown timestamps without overflow" {
+    const now: i64 = 1_000_000;
+    try testing.expect(timestampFresh(now - 60_000, now, 60_000));
+    try testing.expect(!timestampFresh(now - 60_001, now, 60_000));
+    try testing.expect(!timestampFresh(now + 1, now, 60_000));
+    try testing.expect(!timestampFresh(0, now, 60_000));
+    try testing.expect(!timestampFresh(std.math.minInt(i64), now, 60_000));
+    try testing.expect(!timestampFresh(std.math.maxInt(i64), now, 60_000));
+    try testing.expect(!timestampFresh(now, now, -1));
+    try testing.expectEqual(ResultStatus.stale, effectiveStatus(&testSpec(), .{
+        .status = .ok,
+        .source = "test",
+        .as_of_ms = now + 1,
+    }, now));
 }

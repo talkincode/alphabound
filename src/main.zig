@@ -88,6 +88,55 @@ const shadow_bh_kv_key = "shadow_bh_baseline";
 const reconciled_balances_kv_key = "reconciled_balances";
 const risk_hwm_kv_key = "risk_high_watermark";
 
+/// Decision-only cohort: audit history is never deleted. A mode/policy change
+/// starts a new evidence window so demo ledger outcomes cannot become live notes.
+var decision_evidence_start_ms: i64 = 0;
+
+fn ensureDecisionCohort(gpa: std.mem.Allocator, kv: *ab.storage.KvRepo, mode: ab.config.Mode, instrument: []const u8, now_ms: i64) !i64 {
+    const key = "decision_evidence_cohort";
+    var buf: [512]u8 = undefined;
+    if (try kv.getChecked(key, &buf)) |saved| {
+        const parsed = std.json.parseFromSlice(std.json.Value, gpa, saved, .{}) catch null;
+        if (parsed) |p| {
+            defer p.deinit();
+            if (p.value == .object) {
+                const epoch = p.value.object.get("epoch");
+                const saved_mode = jsonStr(p.value.object, "mode");
+                const saved_instrument = jsonStr(p.value.object, "instrument");
+                const start = p.value.object.get("since_ms");
+                if (epoch != null and epoch.? == .integer and epoch.?.integer == ab.memory.CURRENT_POLICY_EPOCH and
+                    saved_mode != null and std.mem.eql(u8, saved_mode.?, @tagName(mode)) and
+                    saved_instrument != null and std.mem.eql(u8, saved_instrument.?, instrument) and
+                    start != null and start.? == .integer and start.?.integer > 0 and start.?.integer <= now_ms)
+                    return start.?.integer;
+            }
+        }
+    }
+    var ts_buf: [32]u8 = undefined;
+    const ts = try ab.clock.formatRfc3339Ms(now_ms, &ts_buf);
+    var writer: std.Io.Writer = .fixed(&buf);
+    try std.json.Stringify.value(.{ .epoch = ab.memory.CURRENT_POLICY_EPOCH, .mode = mode, .instrument = instrument, .since_ms = now_ms }, .{}, &writer);
+    const value = writer.buffered();
+    try kv.put(key, value, ts); // fail boot if this isolation boundary is not durable
+    return now_ms;
+}
+
+fn evidenceTimestampUsable(ts: []const u8, since_ms: i64, now_ms: i64) bool {
+    const at = ab.clock.parseRfc3339Ms(ts) catch return false;
+    return at >= since_ms and at <= now_ms;
+}
+
+fn filterEvidenceLines(lines: [][]const u8, since_ms: i64, now_ms: i64) usize {
+    var n: usize = 0;
+    for (lines) |line| {
+        const at = compactJsonTsMs(line) orelse continue;
+        if (at < since_ms or at > now_ms) continue;
+        lines[n] = line;
+        n += 1;
+    }
+    return n;
+}
+
 /// Best-effort persist of the BH baseline (alpha survives restarts).
 /// Failures only log — the in-memory baseline keeps working either way.
 fn persistShadowBaseline(kv: *ab.storage.KvRepo, snap: ab.shadow_bench.Snapshot) void {
@@ -501,6 +550,7 @@ pub fn main(init: std.process.Init) !u8 {
     defer periodic_repo.deinit();
     var kv_repo = try ab.storage.KvRepo.init(&db);
     defer kv_repo.deinit();
+    decision_evidence_start_ms = try ensureDecisionCohort(gpa, &kv_repo, decisionMode(cfg.mode, exec_real_money), cfg.instrument, nowMs());
     var intel_repo = try ab.storage.IntelRepo.init(&db);
     defer intel_repo.deinit();
     var capital_flows_repo = try ab.storage.CapitalFlowsRepo.init(&db);
@@ -1546,7 +1596,7 @@ fn registerDefaultTools(reg: *ab.tools.Registry) !void {
         .domain = .market,
         .source = "okx",
         .max_age_ms = 120_000,
-        .schema_note = "compact OHLCV frames newest-first (layout ts/o/h/l/c/vol): 1D×45 4H×42 1H×48 30m×48 15m×48 + structure{1D,4H} sma/range/prior_high/broke",
+        .schema_note = "fresh validated OHLCV frames (bar-open timestamp, confirmation, fetched_at_ms); coverage/missing_frames; completed-bar structure plus separate forming-bar facts",
     });
     try reg.register(.{
         .name = "market.derivatives",
@@ -2054,7 +2104,7 @@ fn collectMarketTools(
     registry: *const ab.tools.Registry,
     run_id: []const u8,
     tools_repo: *ab.storage.ToolCallsRepo,
-    obs_bufs: *[5][20480]u8,
+    obs_bufs: *[5][32768]u8,
     obs_out: *[5][]const u8,
 ) usize {
     var n: usize = 0;
@@ -2096,7 +2146,8 @@ fn collectMarketTools(
         if (n >= obs_out.len) return n;
         const frame_specs = [_]struct { bar: []const u8, limit: usize }{
             .{ .bar = "1D", .limit = 45 },
-            .{ .bar = "4H", .limit = 42 },
+            // RSI14 needs 42 completed bars; leave room for the forming bar.
+            .{ .bar = "4H", .limit = 45 },
             .{ .bar = "1H", .limit = 48 },
             .{ .bar = "30m", .limit = 48 },
             .{ .bar = "15m", .limit = 48 },
@@ -2105,7 +2156,7 @@ fn collectMarketTools(
         var frames: [5]ab.market_tools.CandleFrame = undefined;
         var frames_n: usize = 0;
         var as_of: i64 = 0;
-        var data_buf: [24576]u8 = undefined;
+        var data_buf: [32768]u8 = undefined;
         var result: ab.tools.ToolResult = undefined;
         const t_start = nowMs();
         var fetch_err = false;
@@ -2121,13 +2172,23 @@ fn collectMarketTools(
             if (okx.getPublic(path)) |body| {
                 defer gpa.free(body);
                 if (ab.okx_rest.parseCandles(gpa, body, frame_candles[fi][0..fs.limit])) |count| {
-                    if (count > 0) {
-                        frames[frames_n] = .{ .bar = fs.bar, .candles = frame_candles[fi][0..count] };
+                    const fetched_at = nowMs();
+                    const frame = ab.market_tools.CandleFrame{
+                        .bar = fs.bar,
+                        .candles = frame_candles[fi][0..count],
+                        .fetched_at_ms = fetched_at,
+                    };
+                    // Bar timestamps are opening times, not fetch times. A fresh
+                    // 4H/1D bar is valid throughout its interval; frozen/malformed
+                    // frames must not be rescued by a fresh 15m frame.
+                    if (ab.market_tools.candleFrameUsable(frame, fetched_at, nowMs(), spec.max_age_ms)) {
+                        frames[frames_n] = frame;
                         frames_n += 1;
                         if (std.mem.eql(u8, fs.bar, "1D")) daily_n = count;
                         if (std.mem.eql(u8, fs.bar, "4H")) h4_n = count;
-                        // Newest bar across frames drives observation freshness.
-                        if (frame_candles[fi][0].ts_ms > as_of) as_of = frame_candles[fi][0].ts_ms;
+                        if (as_of == 0 or fetched_at < as_of) as_of = fetched_at;
+                    } else {
+                        fetch_err = true;
                     }
                 } else |_| {
                     fetch_err = true;
@@ -2136,8 +2197,24 @@ fn collectMarketTools(
                 fetch_err = true;
             }
         }
-        var struct_buf: [1280]u8 = undefined;
-        const structure = if (daily_n > 0)
+        // Collection can cross a candle boundary or exceed the fetch budget.
+        // Recheck every admitted frame at the common render instant.
+        const collected_at = nowMs();
+        var valid_frames: usize = 0;
+        daily_n = 0;
+        h4_n = 0;
+        as_of = 0;
+        for (frames[0..frames_n]) |frame| {
+            if (!ab.market_tools.candleFrameUsable(frame, frame.fetched_at_ms, collected_at, spec.max_age_ms)) continue;
+            frames[valid_frames] = frame;
+            valid_frames += 1;
+            if (std.mem.eql(u8, frame.bar, "1D")) daily_n = frame.candles.len;
+            if (std.mem.eql(u8, frame.bar, "4H")) h4_n = frame.candles.len;
+            if (as_of == 0 or frame.fetched_at_ms < as_of) as_of = frame.fetched_at_ms;
+        }
+        frames_n = valid_frames;
+        var struct_buf: [4096]u8 = undefined;
+        const structure = if (daily_n > 0 or h4_n > 0)
             ab.indicators.formatHtfStructure(
                 &struct_buf,
                 frame_candles[0][0..daily_n],
@@ -2147,7 +2224,7 @@ fn collectMarketTools(
             null;
         const latency: u32 = @intCast(@max(@as(i64, 0), nowMs() - t_start));
         if (frames_n > 0) {
-            if (ab.market_tools.formatCandleFramesCompact(&data_buf, cfg.instrument, frames[0..frames_n], structure)) |data| {
+            if (ab.market_tools.formatCandleFramesCompactCoverage(&data_buf, cfg.instrument, frames[0..frames_n], structure, &.{ "1D", "4H", "1H", "30m", "15m" })) |data| {
                 result = ab.market_tools.okResult("okx", as_of, latency, data);
             } else |_| {
                 result = ab.market_tools.errResult("okx", nowMs(), latency, "buffer");
@@ -2196,6 +2273,9 @@ fn collectMarketTools(
                     if (okx.getPublic(oi_path)) |oi_body| {
                         defer gpa.free(oi_body);
                         oi = ab.okx_rest.parseOpenInterest(gpa, oi_body) catch null;
+                        if (oi) |v| {
+                            if (!ab.tools.timestampFresh(v.ts_ms, nowMs(), spec.max_age_ms)) oi = null;
+                        }
                     } else |_| {}
                 } else |_| {}
                 var ls_path_buf: [160]u8 = undefined;
@@ -2204,10 +2284,24 @@ fn collectMarketTools(
                         defer gpa.free(ls_body);
                         var ls_rows: [25]ab.okx_rest.LongShortRatio = undefined;
                         if (ab.okx_rest.parseLongShortRatioSeries(gpa, ls_body, &ls_rows)) |ls_n| {
-                            // Rows are newest-first hourly samples.
-                            if (ls_n > 0) extras.long_short_ratio = ls_rows[0].ratio;
-                            if (ls_n > 4) extras.long_short_ratio_4h_ago = ls_rows[4].ratio;
-                            if (ls_n > 24) extras.long_short_ratio_24h_ago = ls_rows[24].ratio;
+                            // Hourly buckets have their own cadence. Compare by
+                            // timestamps, never assume index 4/24 means 4h/24h.
+                            if (ls_n > 0 and ab.tools.timestampFresh(ls_rows[0].ts_ms, nowMs(), 3_600_000 + 120_000)) {
+                                const latest = ls_rows[0];
+                                extras.long_short_ratio = latest.ratio;
+                                extras.long_short_ratio_ts_ms = latest.ts_ms;
+                                for (ls_rows[1..ls_n]) |row| {
+                                    if (row.ts_ms <= 0 or row.ts_ms > latest.ts_ms) continue;
+                                    if (latest.ts_ms - row.ts_ms == 4 * 3_600_000) {
+                                        extras.long_short_ratio_4h_ago = row.ratio;
+                                        extras.long_short_ratio_4h_ago_ts_ms = row.ts_ms;
+                                    }
+                                    if (latest.ts_ms - row.ts_ms == 24 * 3_600_000) {
+                                        extras.long_short_ratio_24h_ago = row.ratio;
+                                        extras.long_short_ratio_24h_ago_ts_ms = row.ts_ms;
+                                    }
+                                }
+                            }
                         } else |_| {}
                     } else |_| {}
                 } else |_| {}
@@ -2220,45 +2314,53 @@ fn collectMarketTools(
                         fh_n = ab.okx_rest.parseFundingHistory(gpa, fh_body, &fh_rows) catch 0;
                     } else |_| {}
                 } else |_| {}
-                extras.funding_history = fh_rows[0..fh_n];
+                var valid_funding: usize = 0;
+                const history_now = nowMs();
+                for (fh_rows[0..fh_n]) |row| {
+                    if (row.funding_time_ms <= 0 or row.funding_time_ms > history_now) continue;
+                    fh_rows[valid_funding] = row;
+                    valid_funding += 1;
+                }
+                extras.funding_history = fh_rows[0..valid_funding];
                 var tv_path_buf: [180]u8 = undefined;
                 if (std.fmt.bufPrint(&tv_path_buf, "/api/v5/rubik/stat/taker-volume?ccy={s}&instType=CONTRACTS&period=1H", .{base_ccy})) |tv_path| {
                     if (okx.getPublic(tv_path)) |tv_body| {
                         defer gpa.free(tv_body);
                         if (ab.okx_rest.parseTakerVolume(gpa, tv_body)) |tv| {
-                            extras.taker_buy_vol = tv.buy_vol;
-                            extras.taker_sell_vol = tv.sell_vol;
+                            if (ab.tools.timestampFresh(tv.ts_ms, nowMs(), 3_600_000 + 120_000)) {
+                                extras.taker_buy_vol = tv.buy_vol;
+                                extras.taker_sell_vol = tv.sell_vol;
+                                extras.taker_ts_ms = tv.ts_ms;
+                            }
                         } else |_| {}
                     } else |_| {}
                 } else |_| {}
                 var mk_path_buf: [128]u8 = undefined;
-                var mark_px: ?ab.decimal.Decimal = null;
                 if (std.fmt.bufPrint(&mk_path_buf, "/api/v5/public/mark-price?instId={s}", .{swap_inst})) |mk_path| {
                     if (okx.getPublic(mk_path)) |mk_body| {
                         defer gpa.free(mk_body);
                         if (ab.okx_rest.parseMarkPrice(gpa, mk_body)) |mk| {
-                            mark_px = mk.mark_px;
-                            extras.mark_px = mk.mark_px;
+                            if (ab.tools.timestampFresh(mk.ts_ms, nowMs(), spec.max_age_ms)) {
+                                extras.mark_px = mk.mark_px;
+                                extras.mark_ts_ms = mk.ts_ms;
+                            }
                         } else |_| {}
                     } else |_| {}
                 } else |_| {}
                 var ix_path_buf: [128]u8 = undefined;
-                var index_px: ?ab.decimal.Decimal = null;
                 // Spot index ticker uses the configured spot instrument id.
                 if (std.fmt.bufPrint(&ix_path_buf, "/api/v5/market/index-tickers?instId={s}", .{cfg.instrument})) |ix_path| {
                     if (okx.getPublic(ix_path)) |ix_body| {
                         defer gpa.free(ix_body);
                         if (ab.okx_rest.parseIndexTicker(gpa, ix_body)) |ix| {
-                            index_px = ix.index_px;
-                            extras.index_px = ix.index_px;
+                            if (ab.tools.timestampFresh(ix.ts_ms, nowMs(), spec.max_age_ms)) {
+                                extras.index_px = ix.index_px;
+                                extras.index_ts_ms = ix.ts_ms;
+                            }
                         } else |_| {}
                     } else |_| {}
                 } else |_| {}
-                if (mark_px) |m| {
-                    if (index_px) |ix| {
-                        extras.basis_bps = ab.okx_rest.basisBps(m, ix);
-                    }
-                }
+                ab.market_tools.discardStalePositioning(&oi, &extras, nowMs(), spec.max_age_ms);
                 const latency: u32 = @intCast(@max(@as(i64, 0), nowMs() - t_start));
                 if (ab.market_tools.formatDerivativesData(&data_buf, swap_inst, fr, oi, extras)) |data| {
                     result = ab.market_tools.okResult("okx", fr.ts_ms, latency, data);
@@ -2390,6 +2492,7 @@ fn computeIndicatorObservation(
 
     var done = [_]bool{false} ** ab.indicators.MAX_REQUESTS;
     var first = true;
+    var oldest_fetch_ms: i64 = 0;
     for (reqs, 0..) |req, i| {
         if (done[i]) continue;
         // Group all requests sharing this bar into one candle fetch.
@@ -2413,9 +2516,16 @@ fn computeIndicatorObservation(
                 defer gpa.free(body);
                 var raw: [300]ab.okx_rest.Candle = undefined;
                 if (ab.okx_rest.parseCandles(gpa, body, raw[0..limit])) |n| {
-                    // newest-first → oldest-first for the calculator
-                    for (0..n) |k| ordered[k] = raw[n - 1 - k];
-                    count = n;
+                    const fetched_at = nowMs();
+                    const frame = ab.market_tools.CandleFrame{ .bar = req.bar, .candles = raw[0..n], .fetched_at_ms = fetched_at };
+                    if (ab.market_tools.candleFrameUsable(frame, fetched_at, nowMs(), spec.max_age_ms)) {
+                        // The calculator explicitly labels includes_forming vs
+                        // completed. Preserve the requested lookback (dropping
+                        // one row would starve EMA20/long-period requests).
+                        count = n;
+                        if (oldest_fetch_ms == 0 or fetched_at < oldest_fetch_ms) oldest_fetch_ms = fetched_at;
+                        for (0..count) |k| ordered[k] = raw[n - 1 - k];
+                    }
                 } else |_| {}
             } else |_| {}
         } else |_| {}
@@ -2438,7 +2548,7 @@ fn computeIndicatorObservation(
     w.writeAll("]}") catch return null;
 
     const latency: u32 = @intCast(@max(@as(i64, 0), nowMs() - t_start));
-    const result = ab.market_tools.okResult("local-calc", nowMs(), latency, w.buffered());
+    const result = ab.market_tools.okResult("local-calc", oldest_fetch_ms, latency, w.buffered());
     const rec = ab.tools.auditRecord(spec, result, nowMs());
     journalToolCall(tools_repo, run_id, rec);
     return ab.market_tools.formatObservation(obs_buf[0..obs_buf.len], spec.name, rec, result.data_json) catch null;
@@ -2931,6 +3041,40 @@ fn compactProposalLines(
     return n;
 }
 
+/// Scope follows the authorized venue, including legacy demo+real-money mode.
+/// Shadow remains isolated even when real credentials happen to be configured.
+fn decisionMode(configured: ab.config.Mode, real_money: bool) ab.config.Mode {
+    return if (configured.isTrading() and real_money) .live else configured;
+}
+
+/// Carry only the newest plan from this policy and mode. Old plans stay in
+/// audit history; they cannot set today's re-entry levels or sizing corridor.
+fn priorDecisionPlan(gpa: std.mem.Allocator, rows: []const ab.storage.EventsRepo.ProposalRow, mode: ab.config.Mode, now_ms: i64, buf: []u8) ?[]const u8 {
+    if (rows.len == 0) return null;
+    const row = rows[rows.len - 1]; // repository returns oldest first
+    const ts = ab.clock.parseRfc3339Ms(row.ts) catch return null;
+    if (!ab.tools.timestampFresh(ts, now_ms, ab.memory.MAX_DECISION_AGE_MS)) return null;
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, row.payload, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const obj = parsed.value.object;
+    const epoch = obj.get("decision_policy_epoch") orelse return null;
+    if (epoch != .integer or epoch.integer != ab.memory.CURRENT_POLICY_EPOCH) return null;
+    const plan_mode = jsonStr(obj, "mode") orelse return null;
+    if (!std.mem.eql(u8, plan_mode, @tagName(mode))) return null;
+    const duration = ab.scheduler.parseIsoDurationMs(jsonStr(obj, "review_after") orelse return null) orelse return null;
+    if (duration <= 0) return null;
+    var w: std.Io.Writer = .fixed(buf);
+    w.print("{{\"ts\":\"{s}\",\"review_due\":{},\"authority\":\"comparison_only\"", .{ row.ts, now_ms - ts >= duration }) catch return null;
+    for ([_][]const u8{ "decision_id", "action", "target_btc_weight", "invalid_if", "review_after" }) |key| {
+        const value = obj.get(key) orelse return null;
+        w.print(",\"{s}\":", .{key}) catch return null;
+        std.json.Stringify.value(value, .{}, &w) catch return null;
+    }
+    w.writeByte('}') catch return null;
+    return w.buffered();
+}
+
 /// Pull `"ts":"..."` from a compact JSON line already on the context path.
 fn compactJsonTsMs(line: []const u8) ?i64 {
     const key = "\"ts\":\"";
@@ -3015,14 +3159,15 @@ fn runAgentDecision(
         return;
     };
 
-    var obs_bufs: [5][20480]u8 = undefined;
+    var obs_bufs: [5][32768]u8 = undefined;
     var obs_ptrs: [5][]const u8 = .{ "", "", "", "", "" };
     const obs_n = collectMarketTools(gpa, okx, cfg, registry, run_id, tools_repo, &obs_bufs, &obs_ptrs);
     const observations = obs_ptrs[0..obs_n];
 
     // Retrieve long-term memories into the decision envelope (§4.5 / FR-07).
     var scored = ab.memory.retrieve(mem_store, gpa, .{
-        .tags = &.{ cfg.instrument, "BTC", "demo" },
+        .tags = &.{cfg.instrument},
+        .decision_scope = .{ .mode = decisionMode(cfg.mode, exec_real_money), .not_before_ms = decision_evidence_start_ms },
         .now_ms = nowMs(),
         .limit = 8,
     }, ab.memory.substringTagMatch) catch blk: {
@@ -3033,23 +3178,39 @@ fn runAgentDecision(
     // Significant recent events (oldest first) for context narrative.
     var ev_backing: [4096]u8 = undefined;
     var ev_ptrs: [12][]const u8 = undefined;
-    const ev_n = events_repo.listCompactForContext(db, &ev_backing, &ev_ptrs) catch 0;
+    const ev_raw_n = events_repo.listCompactForContext(db, &ev_backing, &ev_ptrs) catch 0;
+    const ev_n = filterEvidenceLines(ev_ptrs[0..ev_raw_n], decision_evidence_start_ms, nowMs());
     const recent_events = ev_ptrs[0..ev_n];
 
     var flow_backing: [4096]u8 = undefined;
     var flow_ptrs: [ab.context.MAX_CAPITAL_FLOWS][]const u8 = undefined;
-    const flow_n = capital_flows_repo.listForContext(db, &flow_backing, &flow_ptrs) catch 0;
+    const flow_raw_n = capital_flows_repo.listForContext(db, &flow_backing, &flow_ptrs) catch 0;
+    const flow_n = filterEvidenceLines(flow_ptrs[0..flow_raw_n], decision_evidence_start_ms, nowMs());
     const capital_flows = flow_ptrs[0..flow_n];
 
     // Self-review: own recent proposals compacted from the audit log,
     // executions (fills joined to orders), and equity marks at fixed horizons.
     var prop_raw_backing: [24 * 1024]u8 = undefined;
     var prop_rows: [6]ab.storage.EventsRepo.ProposalRow = undefined;
-    const prop_raw_n = events_repo.listProposalsForContext(db, &prop_raw_backing, &prop_rows) catch 0;
+    const prop_loaded_n = events_repo.listProposalsForContext(db, &prop_raw_backing, &prop_rows) catch 0;
+    // Preserve the operational restart gate even when old policy narratives
+    // are excluded from model evidence. Only this timestamp crosses the gate.
+    const latest_audit_proposal_ms: ?i64 = if (prop_loaded_n > 0)
+        ab.clock.parseRfc3339Ms(prop_rows[prop_loaded_n - 1].ts) catch null
+    else
+        null;
+    var prop_raw_n: usize = 0;
+    for (prop_rows[0..prop_loaded_n]) |row| {
+        if (!evidenceTimestampUsable(row.ts, decision_evidence_start_ms, nowMs())) continue;
+        prop_rows[prop_raw_n] = row;
+        prop_raw_n += 1;
+    }
     var prop_backing: [2048]u8 = undefined;
     var prop_ptrs: [6][]const u8 = undefined;
     const prop_n = compactProposalLines(gpa, prop_rows[0..prop_raw_n], &prop_backing, &prop_ptrs);
     const recent_proposals = prop_ptrs[0..prop_n];
+    var prior_plan_buf: [4096]u8 = undefined;
+    const prior_plan = priorDecisionPlan(gpa, prop_rows[0..prop_raw_n], decisionMode(cfg.mode, exec_real_money), nowMs(), &prior_plan_buf);
 
     // Restart guard: the first decision after a (re)start sees a bare context
     // — no scheduler state, no in-loop history — and in production twice
@@ -3058,14 +3219,14 @@ fn runAgentDecision(
     // for the next regular cycle with full context.
     const restart_guard = blk: {
         if (!std.mem.eql(u8, trigger_reason, "first_run")) break :blk false;
-        if (prop_raw_n == 0) break :blk false;
-        const last_ts = ab.clock.parseRfc3339Ms(prop_rows[prop_raw_n - 1].ts) catch break :blk false;
+        const last_ts = latest_audit_proposal_ms orelse break :blk false;
         break :blk nowMs() - last_ts < restart_guard_window_ms;
     };
 
     var fill_backing: [2048]u8 = undefined;
     var fill_ptrs: [6][]const u8 = undefined;
-    const fill_n = fills_repo.listCompactForContext(db, &fill_backing, &fill_ptrs) catch 0;
+    const fill_raw_n = fills_repo.listCompactForContext(db, &fill_backing, &fill_ptrs) catch 0;
+    const fill_n = filterEvidenceLines(fill_ptrs[0..fill_raw_n], decision_evidence_start_ms, nowMs());
     const recent_fills = fill_ptrs[0..fill_n];
 
     const eq_horizons = [_]struct { label: []const u8, ms: i64 }{
@@ -3082,6 +3243,8 @@ fn runAgentDecision(
         var cutoff_buf: [32]u8 = undefined;
         const cutoff = ab.clock.formatRfc3339Ms(nowMs() - h.ms, &cutoff_buf) catch continue;
         if (equity_repo.equityMarkJson(db, h.label, cutoff, &eq_bufs[hi])) |mark| {
+            const at = compactJsonTsMs(mark) orelse continue;
+            if (at < decision_evidence_start_ms or at > nowMs()) continue;
             eq_ptrs[eq_n] = mark;
             eq_n += 1;
         } else |_| {}
@@ -3094,24 +3257,20 @@ fn runAgentDecision(
     const intel_rows = intel_ptrs[0..intel_n];
 
     var review_facts = ab.context.ReviewFacts{};
-    // Consecutive no-ops since the last executed rebalance (audit log). The
-    // memory counter is a lifetime total and only a fallback.
-    review_facts.hold_streak = events_repo.noopStreakSinceLastExecution(db) catch blk: {
-        if (mem_store.find("E_hold_streak")) |hm| break :blk hm.evidence_count;
-        break :blk 0;
-    };
+    // Consecutive no-ops are ledger facts, never a lifetime model-memory count.
+    var cohort_ts_buf: [32]u8 = undefined;
+    const cohort_ts = ab.clock.formatRfc3339Ms(decision_evidence_start_ms, &cohort_ts_buf) catch return;
+    review_facts.hold_streak = events_repo.noopStreakSince(db, cohort_ts) catch 0;
     if (fill_n > 0) {
         if (compactJsonTsMs(recent_fills[0])) |fts| {
             const age = nowMs() - fts;
             if (age >= 0) review_facts.ms_since_last_fill = age;
         }
     }
-    if (bh_cmp.entry_bid.gt(ab.decimal.Decimal.zero)) {
-        review_facts.has_benchmark = true;
-        review_facts.shadow_return = bh_cmp.shadow_return;
-        review_facts.bh_return = bh_cmp.bh_return;
-        review_facts.alpha_return = bh_cmp.alpha_return;
-    }
+    // The cumulative benchmark may predate this evidence cohort. Keep it in
+    // the audit/dashboard, not as a current-policy result. Periodic reviews
+    // compute flow-adjusted comparisons from cohort-local window edges.
+    _ = bh_cmp;
 
     var ctx_buf: [80 * 1024]u8 = undefined;
     const ctx_json = ab.context.render(&ctx_buf, .{
@@ -3119,6 +3278,7 @@ fn runAgentDecision(
         .recent_events = recent_events,
         .capital_flows = capital_flows,
         .memories = scored.items,
+        .prior_plan = prior_plan,
         .registry = registry,
         .tool_observations = observations,
         .recent_proposals = recent_proposals,
@@ -3131,6 +3291,7 @@ fn runAgentDecision(
         .now_ms = nowMs(),
         .min_size = instrument.min_size,
         .min_notional = instrument.min_notional,
+        .lot_size = instrument.lot_size,
     }) catch {
         std.debug.print("[agent] context render failed\n", .{});
         completeRun(runs, run_id, "error_context", "", "", nowMs());
@@ -3147,22 +3308,12 @@ fn runAgentDecision(
         .{ client.base_url, client.model, snap.version, obs_n, scored.items.len, ev_n },
     );
 
-    const tension = ab.context.positionTension(ab.context.btcWeight(snap), review_facts.hold_streak);
-    const cash_tension = ab.context.cashTension(
-        ab.context.btcWeight(snap),
-        review_facts.hold_streak,
-        ab.context.cashCoversMinBuy(snap.cash_usdt, ab.context.quotePrice(snap), instrument.min_size, instrument.min_notional),
-    );
-    const user_msg_prefix: []const u8 = if (tension)
-        \\Respond with ONE JSON Decision Proposal only. position_tension=true: HOLD requires reduce_eval {verdict:keep|cut, reason>=8 chars}; cut must be action REBALANCE.
+    const reviews = ab.context.exposureReviewRequirements(snap, instrument.min_size, instrument.min_notional, instrument.lot_size);
+    const tension = reviews.reduce_eval_required;
+    const cash_tension = reviews.add_eval_required;
+    const user_msg_prefix: []const u8 =
+        \\Respond with ONE JSON Decision Proposal only. On HOLD, include reduce_eval when self_review.facts.reduce_eval_required is true and add_eval when self_review.facts.add_eval_required is true. Both may be required. Evaluations justify keep/stay; they do not require trading. Use current evidence, not inherited targets.
         \\Context:
-        \\
-    else if (cash_tension)
-        \\Respond with ONE JSON Decision Proposal only. cash_tension=true: HOLD requires add_eval {verdict:stay|add, reason>=8 chars}; add must be action REBALANCE to a higher weight.
-        \\Context:
-        \\
-    else
-        \\Respond with ONE JSON Decision Proposal only. Context:
         \\
     ;
     var user_buf: [88 * 1024]u8 = undefined;
@@ -3461,8 +3612,9 @@ fn runAgentDecision(
     const streak_after = review_facts.hold_streak + 1;
     const periodic_hold_reflect = cfg.agent_llm_reflection_hold_every > 0 and
         streak_after % cfg.agent_llm_reflection_hold_every == 0;
-    const reflect_this_action = cfg.agent_llm_reflection_on_hold or prop.action != .hold or
-        tension or cash_tension or periodic_hold_reflect;
+    // Capacity-based evaluations apply every round; they must not turn every
+    // neutral mixed-book HOLD into an extra model call or self-confirming note.
+    const reflect_this_action = cfg.agent_llm_reflection_on_hold or prop.action != .hold or periodic_hold_reflect;
     const want_llm_reflect = cfg.agent_llm_reflection and reflect_this_action and llmReflectionWanted(env);
     var reflected = false;
     if (want_llm_reflect) {
@@ -3530,8 +3682,8 @@ fn runAgentDecision(
     const executed = executionNoteMeansFill(exec_note);
     const ok_payload = std.fmt.bufPrint(
         &ok_buf,
-        "{{\"run_id\":\"{s}\",\"decision_id\":\"{s}\",\"action\":\"{s}\",\"target_btc_weight\":\"{s}\",\"confidence\":\"{s}\",\"snapshot_version\":{d},\"output_digest\":\"{s}\",\"tools\":{d},\"executed\":{},\"exec\":\"{s}\",\"thesis\":{s},\"invalid_if\":{s},\"review_after\":\"{s}\",\"reduce_eval\":{s},\"add_eval\":{s},\"admission\":{{\"verdict\":\"{s}\",\"reason\":\"{s}\",\"admitted_weight\":\"{s}\",\"stress_equity\":\"{s}\",\"floor\":\"{s}\"}},\"usage\":{{\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d}}}}}",
-        .{ run_id, prop.decision_id, action_txt, weight_s, conf_s, prop.snapshot_version, out_digest, tools_used, executed, exec_note, thesis_json, invalid_json, review_s, reduce_eval_json, add_eval_json, admission.verdict_txt, admission.reason_txt, admitted_s, stress_s, floor_s, usage.prompt_tokens, usage.completion_tokens, usage.total_tokens },
+        "{{\"decision_policy_epoch\":{d},\"mode\":\"{s}\",\"run_id\":\"{s}\",\"decision_id\":\"{s}\",\"action\":\"{s}\",\"target_btc_weight\":\"{s}\",\"confidence\":\"{s}\",\"snapshot_version\":{d},\"output_digest\":\"{s}\",\"tools\":{d},\"executed\":{},\"exec\":\"{s}\",\"thesis\":{s},\"invalid_if\":{s},\"review_after\":\"{s}\",\"reduce_eval\":{s},\"add_eval\":{s},\"admission\":{{\"verdict\":\"{s}\",\"reason\":\"{s}\",\"admitted_weight\":\"{s}\",\"stress_equity\":\"{s}\",\"floor\":\"{s}\"}},\"usage\":{{\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d}}}}}",
+        .{ ab.memory.CURRENT_POLICY_EPOCH, @tagName(decisionMode(cfg.mode, exec_real_money)), run_id, prop.decision_id, action_txt, weight_s, conf_s, prop.snapshot_version, out_digest, tools_used, executed, exec_note, thesis_json, invalid_json, review_s, reduce_eval_json, add_eval_json, admission.verdict_txt, admission.reason_txt, admitted_s, stress_s, floor_s, usage.prompt_tokens, usage.completion_tokens, usage.total_tokens },
     ) catch "{\"executed\":false}";
     {
         var dbuf: [160]u8 = undefined;
@@ -3622,13 +3774,13 @@ fn loadMemoriesFromDb(repo: *ab.storage.MemoriesRepo, db: *ab.storage.Db, store:
     };
 }
 
-fn persistMemory(repo: *ab.storage.MemoriesRepo, m: ab.memory.Memory) void {
+fn persistMemory(repo: *ab.storage.MemoriesRepo, store: *ab.memory.Store, m: ab.memory.Memory) void {
     var ts_buf: [32]u8 = undefined;
     const ts = ab.clock.formatRfc3339Ms(m.created_ms, &ts_buf) catch return;
     var conf_buf: [48]u8 = undefined;
     const conf_s = decFmt(&conf_buf, m.confidence);
     const conf_f = std.fmt.parseFloat(f64, conf_s) catch 0;
-    repo.append(.{
+    const version = repo.appendNext(.{
         .memory_id = m.memory_id,
         .version = @intCast(m.version),
         .kind = m.kind.text(),
@@ -3639,7 +3791,9 @@ fn persistMemory(repo: *ab.storage.MemoriesRepo, m: ab.memory.Memory) void {
         .created_ts = ts,
     }) catch |err| {
         std.debug.print("[memory] persist failed: {t}\n", .{err});
+        return;
     };
+    if (store.find(m.memory_id)) |current| current.version = @intCast(version);
 }
 
 fn seedBootstrapMemories(
@@ -3667,13 +3821,13 @@ fn seedBootstrapMemories(
         .confidence = ab.decimal.Decimal.parse("0.40") catch ab.decimal.Decimal.zero,
         .content_json = neutral_hypothesis_json,
     } }, now, &touched) catch {};
-    for (touched.items) |m| persistMemory(repo, m);
+    for (touched.items) |m| persistMemory(repo, store, m);
     logEventPayload(events_repo, engine, "MEMORY_BOOTSTRAP", "memory", "INFO", cfg, "{\"seeded\":true}");
     std.debug.print("[boot] seeded bootstrap memories n={d}\n", .{touched.items.len});
 }
 
 /// Neutral hypothesis text shared by seed and migration: no sizing recipe.
-const neutral_hypothesis_json = "{\"hypothesis\":\"No validated sizing strategy yet. Form hypotheses from market evidence, test them via proposals, and revise them through reflection.\",\"tags\":[\"BTC\",\"BTC-USDT\",\"demo\"]}";
+const neutral_hypothesis_json = "{\"hypothesis\":\"No validated sizing strategy yet. Form hypotheses from market evidence, test them via proposals, and revise them through reflection.\",\"tags\":[\"BTC\",\"BTC-USDT\"]}";
 
 /// One-time deterministic migration for existing DBs: rewrite legacy
 /// H_btc_spot_default bootstrap priors (v1 "prefer cash / default HOLD",
@@ -3701,7 +3855,7 @@ fn migrateBootstrapMemories(
         std.debug.print("[boot] bootstrap memory migration failed: {t}\n", .{err});
         return;
     };
-    for (touched.items) |mem| persistMemory(repo, mem);
+    for (touched.items) |mem| persistMemory(repo, store, mem);
     logEventPayload(events_repo, engine, "MEMORY_BOOTSTRAP", "memory", "INFO", cfg, "{\"migrated\":\"H_btc_spot_default\",\"reason\":\"strip_sizing_prior\"}");
     std.debug.print("[boot] migrated H_btc_spot_default to neutral hypothesis\n", .{});
 }
@@ -3730,7 +3884,7 @@ fn recordProposalEpisode(
     var content_buf: [512]u8 = undefined;
     const content = std.fmt.bufPrint(
         &content_buf,
-        "{{\"type\":\"proposal_episode\",\"run_id\":\"{s}\",\"decision_id\":\"{s}\",\"action\":\"{s}\",\"target_btc_weight\":\"{s}\",\"confidence\":\"{s}\",\"tags\":[\"BTC-USDT\",\"demo\",\"episode\"]}}",
+        "{{\"type\":\"proposal_episode\",\"run_id\":\"{s}\",\"decision_id\":\"{s}\",\"action\":\"{s}\",\"target_btc_weight\":\"{s}\",\"confidence\":\"{s}\",\"tags\":[\"BTC-USDT\",\"episode\"]}}",
         .{ run_id, decision_id, action, t_s, c_s },
     ) catch return;
     var touched: std.ArrayList(ab.memory.Memory) = .empty;
@@ -3751,13 +3905,13 @@ fn recordProposalEpisode(
             .content_json = content,
         } }, nowMs(), &touched) catch return;
     }
-    for (touched.items) |m| persistMemory(repo, m);
+    for (touched.items) |m| persistMemory(repo, store, m);
 
     // Refresh working "last decision" pointer (update if exists else create).
     var w_content_buf: [256]u8 = undefined;
     const w_content = std.fmt.bufPrint(
         &w_content_buf,
-        "{{\"summary\":\"Last proposal {s} action={s}\",\"decision_id\":\"{s}\",\"tags\":[\"BTC-USDT\",\"demo\"]}}",
+        "{{\"summary\":\"Last proposal {s} action={s}\",\"decision_id\":\"{s}\",\"tags\":[\"BTC-USDT\"]}}",
         .{ run_id, action, decision_id },
     ) catch return;
     touched.clearRetainingCapacity();
@@ -3778,7 +3932,7 @@ fn recordProposalEpisode(
             .content_json = w_content,
         } }, nowMs(), &touched) catch {};
     }
-    for (touched.items) |m| persistMemory(repo, m);
+    for (touched.items) |m| persistMemory(repo, store, m);
 }
 
 fn refreshSystemCache(
@@ -3891,13 +4045,31 @@ fn llmReflectionWanted(env: *const std.process.Environ.Map) bool {
 
 /// Copy s into buf replacing " and \ with space — safe inside a JSON string value.
 fn sanitizeJsonString(s: []const u8, buf: []u8) []const u8 {
-    const n = @min(s.len, buf.len);
+    const n = utf8SafePrefix(s, buf.len).len;
     var i: usize = 0;
     while (i < n) : (i += 1) {
         const c = s[i];
-        buf[i] = if (c == '"' or c == '\\' or c == '\n' or c == '\r') ' ' else c;
+        buf[i] = if (c == '"' or c == '\\' or c < 0x20) ' ' else c;
     }
     return buf[0..n];
+}
+
+/// Select whole first-party sections only. Legacy narratives must not be
+/// laundered through a new reflection with a fresh policy stamp.
+fn reflectionFactsContext(gpa: std.mem.Allocator, context: []const u8, buf: []u8) ?[]const u8 {
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, context, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    var w: std.Io.Writer = .fixed(buf);
+    w.writeByte('{') catch return null;
+    for ([_][]const u8{ "current_state", "self_review", "capital_flows" }, 0..) |key, i| {
+        const value = parsed.value.object.get(key) orelse return null;
+        if (i > 0) w.writeByte(',') catch return null;
+        w.print("\"{s}\":", .{key}) catch return null;
+        std.json.Stringify.value(value, .{}, &w) catch return null;
+    }
+    w.writeByte('}') catch return null;
+    return w.buffered();
 }
 
 /// Second LLM call → strict Reflection schema → memory_ops. Returns true if applied.
@@ -3923,9 +4095,11 @@ fn tryLlmReflection(
     const t_s = decFmt(&t_buf, target);
     const c_s = decFmt(&c_buf, conf);
 
-    // Keep user payload bounded: proposal summary + truncated decision context.
-    const ctx_snip = if (decision_ctx_json.len > 6000) decision_ctx_json[0..6000] else decision_ctx_json;
-    var user_buf: [8 * 1024]u8 = undefined;
+    // Reflect on first-party state and ledger outcomes, not a truncated JSON
+    // prefix full of yesterday's narratives. Never cut through a JSON value.
+    var reflection_ctx_buf: [12 * 1024]u8 = undefined;
+    const ctx_snip = reflectionFactsContext(gpa, decision_ctx_json, &reflection_ctx_buf) orelse return false;
+    var user_buf: [16 * 1024]u8 = undefined;
     const user_msg = std.fmt.bufPrint(
         &user_buf,
         \\Emit ONE Reflection JSON for this proposal (execution is risk-gated, not assumed).
@@ -3987,7 +4161,7 @@ fn tryLlmReflection(
     };
     defer reflection.deinit();
 
-    const applied = applyReflectionOps(gpa, store, repo, reflection.memory_ops);
+    const applied = applyReflectionOps(gpa, store, repo, cfg, reflection.memory_ops);
     // HOLD reflections roll into R_hold_streak; per-run R_{run_id} is noise.
     var rid_buf: [80]u8 = undefined;
     const is_hold = std.mem.eql(u8, action, "HOLD");
@@ -3999,7 +4173,7 @@ fn tryLlmReflection(
     const expected0 = sanitizeJsonString(reflection.expected_outcome, &expected_buf);
     const content = std.fmt.bufPrint(
         &content_buf,
-        "{{\"episode_id\":\"{s}\",\"expected_outcome\":\"{s}\",\"actual_outcome\":{s},\"lesson\":\"{s}\",\"ops\":{d},\"source\":\"llm\",\"tags\":[\"BTC-USDT\",\"demo\",\"reflection\"]}}",
+        "{{\"episode_id\":\"{s}\",\"expected_outcome\":\"{s}\",\"actual_outcome\":{s},\"lesson\":\"{s}\",\"ops\":{d},\"source\":\"llm\",\"tags\":[\"BTC-USDT\",\"reflection\"]}}",
         .{ reflection.episode_id, expected0, reflection.actual_outcome_json, lesson0, applied },
     ) catch null;
     if (content) |cj| {
@@ -4007,22 +4181,22 @@ fn tryLlmReflection(
         defer touched.deinit(gpa);
         // Prefer CREATE; if id collides (re-run), UPDATE content.
         if (store.find(rid) == null) {
-            store.applyOp(.{ .create = .{
+            store.applyOpWithScope(.{ .create = .{
                 .memory_id = rid,
                 .kind = .reflection,
                 .status = .active,
                 .confidence = conf,
                 .content_json = cj,
-            } }, nowMs(), &touched) catch {};
+            } }, nowMs(), .{ .mode = decisionMode(cfg.mode, exec_real_money), .not_before_ms = decision_evidence_start_ms }, &touched) catch {};
         } else {
-            store.applyOp(.{ .update = .{
+            store.applyOpWithScope(.{ .update = .{
                 .memory_id = rid,
                 .evidence_increment = 1,
                 .new_status = .active,
                 .content_json = cj,
-            } }, nowMs(), &touched) catch {};
+            } }, nowMs(), .{ .mode = decisionMode(cfg.mode, exec_real_money), .not_before_ms = decision_evidence_start_ms }, &touched) catch {};
         }
-        for (touched.items) |m| persistMemory(repo, m);
+        for (touched.items) |m| persistMemory(repo, store, m);
     }
 
     var ok_buf: [320]u8 = undefined;
@@ -4040,6 +4214,7 @@ fn applyReflectionOps(
     gpa: std.mem.Allocator,
     store: *ab.memory.Store,
     repo: *ab.storage.MemoriesRepo,
+    cfg: *const ab.config.Config,
     ops: []const ab.memory.Op,
 ) usize {
     var applied: usize = 0;
@@ -4060,11 +4235,11 @@ fn applyReflectionOps(
             },
             else => {},
         }
-        store.applyOp(op, nowMs(), &touched) catch |err| {
+        store.applyOpWithScope(op, nowMs(), .{ .mode = decisionMode(cfg.mode, exec_real_money), .not_before_ms = decision_evidence_start_ms }, &touched) catch |err| {
             std.debug.print("[reflect] op skipped: {t}\n", .{err});
             continue;
         };
-        for (touched.items) |m| persistMemory(repo, m);
+        for (touched.items) |m| persistMemory(repo, store, m);
         applied += 1;
     }
     return applied;
@@ -4700,7 +4875,7 @@ fn collectPeriodicFacts(
         .window_from = ts_from,
         .window_to = ts_to,
         .window_hours = @divTrunc(window_ms, 3_600_000),
-        .mode = @tagName(cfg.mode),
+        .mode = @tagName(decisionMode(cfg.mode, exec_real_money)),
         .instrument = cfg.instrument,
     };
 
@@ -4853,10 +5028,15 @@ fn runPeriodicReview(
 
     var from_buf: [32]u8 = undefined;
     var to_buf: [32]u8 = undefined;
-    const ts_from = ab.clock.formatRfc3339Ms(now_ms - window_ms, &from_buf) catch return;
+    const effective_from_ms = @max(now_ms - window_ms, decision_evidence_start_ms);
+    const ts_from = ab.clock.formatRfc3339Ms(effective_from_ms, &from_buf) catch return;
     const ts_to = ab.clock.formatRfc3339Ms(now_ms, &to_buf) catch return;
 
-    const facts = collectPeriodicFacts(db, periodic_repo, capital_flows_repo, mem_store, engine, cfg, cycle, ts_from, ts_to, window_ms, min_size, min_notional);
+    var facts = collectPeriodicFacts(db, periodic_repo, capital_flows_repo, mem_store, engine, cfg, cycle, ts_from, ts_to, now_ms - effective_from_ms, min_size, min_notional);
+    facts.evidence_cohort_start_ms = decision_evidence_start_ms;
+    facts.window_clipped = effective_from_ms > now_ms - window_ms;
+    // Do not label a partial new-policy window a complete benchmark comparison.
+    if (facts.window_clipped) facts.has_benchmark = false;
     var facts_buf: [4096]u8 = undefined;
     var fw: std.Io.Writer = .fixed(&facts_buf);
     facts.writeJson(&fw) catch {
@@ -4884,14 +5064,13 @@ fn runPeriodicReview(
     defer if (doc_opt) |*d| d.deinit();
 
     if (client_opt) |client| {
-        var prior_buf: [3072]u8 = undefined;
-        const prior = if (cycle == .long)
-            periodic_repo.summaryTail(db, &prior_buf, "short", ts_from, 12) catch ""
-        else
-            "";
+        // Old reports have no policy/mode provenance. Keep them in the audit
+        // UI, but never recycle their narratives as new-policy evidence.
+        const prior = "omitted: unscoped historical summaries; use ledger facts";
 
-        var mem_buf: [4096]u8 = undefined;
-        const mem_digest = renderPeriodicMemories(gpa, mem_store, cfg, &mem_buf);
+        // This pass creates fresh-scoped notes. Feeding prior narratives back
+        // into it would let paraphrases renew their age indefinitely.
+        const mem_digest = "[]";
 
         var user_buf: [16 * 1024]u8 = undefined;
         const user_msg = std.fmt.bufPrint(
@@ -4948,7 +5127,7 @@ fn runPeriodicReview(
                     st.setLlm("ok", "periodic_review");
                     status = "ok";
                     summary = doc.summary;
-                    ops_applied = applyReflectionOps(gpa, mem_store, memories_repo, doc.memory_ops);
+                    ops_applied = applyReflectionOps(gpa, mem_store, memories_repo, cfg, doc.memory_ops);
                     memory_id = distillPeriodicMemory(
                         gpa,
                         mem_store,
@@ -5034,48 +5213,6 @@ fn runPeriodicReview(
     });
 }
 
-/// Compact digest of the memories the review may revise (ids + confidence).
-fn renderPeriodicMemories(
-    gpa: std.mem.Allocator,
-    mem_store: *ab.memory.Store,
-    cfg: *const ab.config.Config,
-    out: []u8,
-) []const u8 {
-    var scored = ab.memory.retrieve(mem_store, gpa, .{
-        .tags = &.{ cfg.instrument, "BTC", "periodic_review" },
-        .now_ms = nowMs(),
-        .limit = 12,
-    }, ab.memory.substringTagMatch) catch return "[]";
-    defer scored.deinit(gpa);
-
-    var w: std.Io.Writer = .fixed(out);
-    w.writeByte('[') catch return "[]";
-    for (scored.items, 0..) |s, i| {
-        const mark = w.end;
-        const wrote = blk: {
-            if (i > 0) w.writeByte(',') catch break :blk false;
-            const cj = s.memory.content_json;
-            var esc_buf: [512]u8 = undefined;
-            const snip = jsonEscapeInto(&esc_buf, if (cj.len > 300) cj[0..300] else cj);
-            w.print("{{\"id\":\"{s}\",\"kind\":\"{s}\",\"status\":\"{s}\",\"conf\":\"{f}\",\"evidence\":{d},\"content\":\"{s}\"}}", .{
-                s.memory.memory_id,
-                s.memory.kind.text(),
-                s.memory.status.text(),
-                s.memory.confidence,
-                s.memory.evidence_count,
-                snip,
-            }) catch break :blk false;
-            break :blk true;
-        };
-        if (!wrote) {
-            w.end = mark;
-            break;
-        }
-    }
-    w.writeByte(']') catch return "[]";
-    return w.buffered();
-}
-
 /// One rolling memory per cycle (`PR_short` / `PR_long`), refreshed with the
 /// newest window summary. Low confidence on purpose: it is a *reference* the
 /// agent may weigh, never an instruction.
@@ -5092,7 +5229,7 @@ fn distillPeriodicMemory(
     const rid = std.fmt.bufPrint(id_buf, "PR_{s}", .{cycle.text()}) catch return null;
 
     var note_buf: [1024]u8 = undefined;
-    const note = sanitizeJsonString(if (summary.len > 640) summary[0..640] else summary, &note_buf);
+    const note = sanitizeJsonString(utf8SafePrefix(summary, 640), &note_buf);
     var alpha_buf: [48]u8 = undefined;
     const alpha_s: []const u8 = if (facts.has_benchmark)
         (facts.alpha_return.toString(&alpha_buf) catch "0")
@@ -5117,28 +5254,28 @@ fn distillPeriodicMemory(
     defer touched.deinit(gpa);
     const now = nowMs();
     if (mem_store.find(rid) == null) {
-        mem_store.applyOp(.{ .create = .{
+        mem_store.applyOpWithScope(.{ .create = .{
             .memory_id = rid,
             .kind = .reflection,
             .status = .active,
             .confidence = low_conf,
             .content_json = content,
-        } }, now, &touched) catch |err| {
+        } }, now, .{ .mode = decisionMode(cfg.mode, exec_real_money), .not_before_ms = decision_evidence_start_ms }, &touched) catch |err| {
             std.debug.print("[periodic] memory create failed: {t}\n", .{err});
             return null;
         };
     } else {
-        mem_store.applyOp(.{ .update = .{
+        mem_store.applyOpWithScope(.{ .update = .{
             .memory_id = rid,
             .evidence_increment = 1,
             .new_status = .active,
             .content_json = content,
-        } }, now, &touched) catch |err| {
+        } }, now, .{ .mode = decisionMode(cfg.mode, exec_real_money), .not_before_ms = decision_evidence_start_ms }, &touched) catch |err| {
             std.debug.print("[periodic] memory update failed: {t}\n", .{err});
             return null;
         };
     }
-    for (touched.items) |m| persistMemory(memories_repo, m);
+    for (touched.items) |m| persistMemory(memories_repo, mem_store, m);
     return rid;
 }
 
@@ -5503,7 +5640,7 @@ fn runReviewSummarize(
 
     const note_raw = std.mem.trim(u8, chat_res.content, " \t\r\n");
     var note_buf: [512]u8 = undefined;
-    const note = sanitizeJsonString(if (note_raw.len > 480) note_raw[0..480] else note_raw, &note_buf);
+    const note = sanitizeJsonString(utf8SafePrefix(note_raw, 480), &note_buf);
 
     // One memory per decision: HR_<decision_id>, low confidence, human-review tag.
     var rid_buf: [128]u8 = undefined;
@@ -5540,13 +5677,15 @@ fn runReviewSummarize(
             applied = false;
         };
     }
-    for (touched.items) |m| persistMemory(memories_repo, m);
+    for (touched.items) |m| persistMemory(memories_repo, mem_store, m);
 
     if (!applied) {
         appendReviewTurn(review_repo, decision_id, req.anchorTs(), "summary", "沉淀失败：记忆库拒绝写入（可能已满）。", "");
         return;
     }
-    appendReviewTurn(review_repo, decision_id, req.anchorTs(), "summary", note, client.model);
+    var archived_buf: [768]u8 = undefined;
+    const archived_note = std.fmt.bufPrint(&archived_buf, "{s}\n（历史复盘归档，不进入当前交易决策记忆。）", .{note}) catch note;
+    appendReviewTurn(review_repo, decision_id, req.anchorTs(), "summary", archived_note, client.model);
 
     var ok_buf: [1024]u8 = undefined;
     var id_esc2: [128]u8 = undefined;
@@ -5590,7 +5729,7 @@ fn applyShadowReflection(
     var content_buf: [640]u8 = undefined;
     const content = std.fmt.bufPrint(
         &content_buf,
-        "{{\"episode_id\":\"ep_{s}\",\"expected_outcome\":\"risk-gated execution\",\"actual_outcome\":{{\"executed\":false,\"action\":\"{s}\",\"target_btc_weight\":\"{s}\"}},\"lessons\":[\"Only risk-admitted weights may execute.\"],\"tags\":[\"BTC-USDT\",\"demo\",\"reflection\"],\"decision_id\":\"{s}\",\"confidence\":\"{s}\"}}",
+        "{{\"episode_id\":\"ep_{s}\",\"expected_outcome\":\"risk-gated execution\",\"actual_outcome\":{{\"executed\":false,\"action\":\"{s}\",\"target_btc_weight\":\"{s}\"}},\"lessons\":[\"Only risk-admitted weights may execute.\"],\"tags\":[\"BTC-USDT\",\"reflection\"],\"decision_id\":\"{s}\",\"confidence\":\"{s}\"}}",
         .{ run_id, action, t_s, decision_id, c_s },
     ) catch return;
 
@@ -5617,7 +5756,7 @@ fn applyShadowReflection(
         };
     }
 
-    for (touched.items) |m| persistMemory(repo, m);
+    for (touched.items) |m| persistMemory(repo, store, m);
 
     var payload_buf: [320]u8 = undefined;
     const payload = std.fmt.bufPrint(
@@ -5850,6 +5989,145 @@ fn jsonStringArrayLimited(buf: []u8, items: []const []const u8, max_items: usize
     }
     w.writeAll("]") catch return "[]";
     return w.buffered();
+}
+
+test "memory summaries remain valid UTF-8 JSON at bounded lengths" {
+    var buf: [640]u8 = undefined;
+    const note = sanitizeJsonString("市" ** 220, &buf);
+    try std.testing.expectEqual(@as(usize, 639), note.len);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(note));
+    var small: [10]u8 = undefined;
+    const cleaned = sanitizeJsonString("市\t\x01\"\\", &small);
+    var json_buf: [32]u8 = undefined;
+    const json = try std.fmt.bufPrint(&json_buf, "{{\"note\":\"{s}\"}}", .{cleaned});
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+}
+
+test "reflection context retains ledger facts without historical narratives" {
+    const input =
+        \\{"current_state":{"btc_weight":"0.22"},"self_review":{"fills":[{"side":"sell"}]},"capital_flows":[],"memories":[{"summary":"LEGACY_CORRIDOR"}],"prior_plan":{"invalid_if":["OLD_LEVEL"]},"tool_observations":[{"data":"STALE_CLAIM"}]}
+    ;
+    var buf: [1024]u8 = undefined;
+    const out = reflectionFactsContext(std.testing.allocator, input, &buf).?;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 3), parsed.value.object.count());
+    try std.testing.expect(std.mem.indexOf(u8, out, "sell") != null);
+    for ([_][]const u8{ "LEGACY_CORRIDOR", "OLD_LEVEL", "STALE_CLAIM" }) |claim|
+        try std.testing.expect(std.mem.indexOf(u8, out, claim) == null);
+    var tiny: [8]u8 = undefined;
+    try std.testing.expect(reflectionFactsContext(std.testing.allocator, input, &tiny) == null);
+}
+
+test "persisted decision cohort isolates historical modes without deleting audit rows" {
+    var db = try ab.storage.Db.open(":memory:");
+    defer db.close();
+    var kv = try ab.storage.KvRepo.init(&db);
+    defer kv.deinit();
+    var events = try ab.storage.EventsRepo.init(&db);
+    defer events.deinit();
+    const old_ts = "2026-01-01T00:00:00.000Z";
+    const new_ts = "2026-01-02T00:00:00.000Z";
+    const t0 = try ab.clock.parseRfc3339Ms(old_ts);
+    const t1 = try ab.clock.parseRfc3339Ms(new_ts);
+    try std.testing.expectEqual(t0, try ensureDecisionCohort(std.testing.allocator, &kv, .demo, "BTC-USDT", t0));
+    try std.testing.expectEqual(t0, try ensureDecisionCohort(std.testing.allocator, &kv, .demo, "BTC-USDT", t0 + 100));
+    for ([_][]const u8{ old_ts, new_ts }, 0..) |ts, i| {
+        try events.append(.{
+            .event_id = if (i == 0) "evt_demo" else "evt_live",
+            .ts = ts,
+            .type = "AGENT_PROPOSAL_OK",
+            .source = "synthetic",
+            .severity = "INFO",
+            .payload_json = "{\"action\":\"HOLD\",\"executed\":false}",
+        });
+    }
+    const live_start = try ensureDecisionCohort(std.testing.allocator, &kv, .live, "BTC-USDT", t1);
+    try std.testing.expectEqual(t1, live_start);
+    try std.testing.expectEqual(@as(u32, 1), try events.noopStreakSince(&db, new_ts));
+    try std.testing.expectEqual(@as(u32, 2), try events.noopStreakSinceLastExecution(&db));
+    // Fill/equity/event context rows all use the same timestamp boundary.
+    var histories = [_][]const u8{
+        "{\"ts\":\"2026-01-01T00:00:00.000Z\",\"side\":\"sell\"}",
+        "{\"ts\":\"2026-01-01T00:00:00.000Z\",\"equity\":\"100\"}",
+        "{\"ts\":\"2026-01-02T00:00:00.000Z\",\"equity\":\"100\"}",
+    };
+    try std.testing.expectEqual(@as(usize, 1), filterEvidenceLines(&histories, live_start, t1));
+    try std.testing.expect(!evidenceTimestampUsable(old_ts, live_start, t1));
+    try std.testing.expect(evidenceTimestampUsable(new_ts, live_start, t1));
+    try std.testing.expectEqual(t1, try ensureDecisionCohort(std.testing.allocator, &kv, .live, "BTC-USDT", t1 + 100));
+    try std.testing.expectEqual(t1 + 200, try ensureDecisionCohort(std.testing.allocator, &kv, .demo, "BTC-USDT", t1 + 200));
+    try std.testing.expectEqual(t1 + 300, try ensureDecisionCohort(std.testing.allocator, &kv, .live, "BTC-USDT", t1 + 300));
+    try std.testing.expectEqual(@as(i64, 2), try db.queryInt("SELECT COUNT(*) FROM events"));
+}
+
+test "exposure review capacity agrees with venue lot planner" {
+    const D = ab.decimal.Decimal;
+    const instrument = ab.planner.Instrument{
+        .tick_size = D.one,
+        .lot_size = try D.parse("0.1"),
+        .min_size = try D.parse("0.01"),
+        .min_notional = try D.parse("10.5"),
+    };
+    for ([_][]const u8{ "10.5", "20.5" }) |cash| {
+        var snap = ab.state.PortfolioState{
+            .cash_usdt = try D.parse(cash),
+            .conservative_equity = try D.parse(cash),
+            .mark_price = D.fromInt(100),
+            .risk_mode = .normal,
+            .reconciled = true,
+        };
+        const buy = try ab.planner.plan(.{
+            .cash_usdt = snap.cash_usdt,
+            .btc_total = D.zero,
+            .equity = snap.conservative_equity,
+            .mark_price = snap.mark_price,
+            .admitted_btc_weight = D.one,
+            .instrument = instrument,
+        });
+        try std.testing.expectEqual(buy == .order, ab.context.exposureReviewRequirements(snap, instrument.min_size, instrument.min_notional, instrument.lot_size).add_eval_required);
+        snap.btc_total = try snap.cash_usdt.div(snap.mark_price, .down);
+        snap.btc_available = snap.btc_total;
+        snap.cash_usdt = D.zero;
+        const sell = try ab.planner.plan(.{
+            .cash_usdt = snap.cash_usdt,
+            .btc_total = snap.btc_total,
+            .equity = snap.conservative_equity,
+            .mark_price = snap.mark_price,
+            .admitted_btc_weight = D.zero,
+            .instrument = instrument,
+        });
+        try std.testing.expectEqual(sell == .order, ab.context.exposureReviewRequirements(snap, instrument.min_size, instrument.min_notional, instrument.lot_size).reduce_eval_required);
+    }
+}
+
+test "decision scope follows actual venue not legacy mode label" {
+    try std.testing.expectEqual(ab.config.Mode.live, decisionMode(.demo, true));
+    try std.testing.expectEqual(ab.config.Mode.demo, decisionMode(.demo, false));
+    try std.testing.expectEqual(ab.config.Mode.live, decisionMode(.live, true));
+    try std.testing.expectEqual(ab.config.Mode.shadow, decisionMode(.shadow, true));
+}
+
+test "prior plans need current policy mode and bounded age and expose overdue review" {
+    const payload =
+        \\{"decision_policy_epoch":1,"mode":"live","decision_id":"dec_synthetic","action":"HOLD","target_btc_weight":"0","invalid_if":["completed close beyond fixed prior high"],"review_after":"PT1H"}
+    ;
+    const ts = "2026-01-01T00:00:00.000Z";
+    const start = try ab.clock.parseRfc3339Ms(ts);
+    const rows = [_]ab.storage.EventsRepo.ProposalRow{.{ .ts = ts, .payload = payload }};
+    var buf: [2048]u8 = undefined;
+    const plan = priorDecisionPlan(std.testing.allocator, &rows, .live, start + 3_600_000, &buf).?;
+    try std.testing.expect(std.mem.indexOf(u8, plan, "\"review_due\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plan, "fixed prior high") != null);
+    try std.testing.expect(priorDecisionPlan(std.testing.allocator, &rows, .demo, start, &buf) == null);
+    try std.testing.expect(priorDecisionPlan(std.testing.allocator, &rows, .live, start - 1, &buf) == null);
+    try std.testing.expect(priorDecisionPlan(std.testing.allocator, &rows, .live, start + ab.memory.MAX_DECISION_AGE_MS + 1, &buf) == null);
+    const legacy = [_]ab.storage.EventsRepo.ProposalRow{.{ .ts = ts, .payload = "{\"invalid_if\":[\"LEGACY\"]}" }};
+    try std.testing.expect(priorDecisionPlan(std.testing.allocator, &legacy, .live, start, &buf) == null);
+    // Never revive an older scoped plan when the latest run has unknown policy.
+    const mixed = [_]ab.storage.EventsRepo.ProposalRow{ rows[0], legacy[0] };
+    try std.testing.expect(priorDecisionPlan(std.testing.allocator, &mixed, .live, start, &buf) == null);
 }
 
 test "version string sane" {
