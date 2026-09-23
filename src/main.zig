@@ -1038,9 +1038,9 @@ pub fn main(init: std.process.Init) !u8 {
         @intCast(cfg.review_long_interval_ms),
     );
     restorePeriodicSchedule(&periodic_repo, &db, &review_sched);
-    runtime_status.setReviewNext(
-        review_sched.msUntil(.short, now_boot),
-        review_sched.msUntil(.long, now_boot),
+    runtime_status.setReviewDueAt(
+        review_sched.nextAt(.short),
+        review_sched.nextAt(.long),
     );
     ab.web_cache.refreshPeriodicReviewCache(&web_state, &db, &periodic_repo);
     // Cooldown between auto flatten market sells while risk_mode=FLATTENING.
@@ -1473,9 +1473,9 @@ pub fn main(init: std.process.Init) !u8 {
                         trade_instrument.min_size,
                         trade_instrument.min_notional,
                     );
-                    runtime_status.setReviewNext(
-                        review_sched.msUntil(.short, tnow),
-                        review_sched.msUntil(.long, tnow),
+                    runtime_status.setReviewDueAt(
+                        review_sched.nextAt(.short),
+                        review_sched.nextAt(.long),
                     );
                     refreshSystemCache(&web_state, &db, &cfg, &mem_store, boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), llm_client != null, admin_paused, &runtime_status, &risk_latency);
                 }
@@ -4343,7 +4343,7 @@ fn processReviewInbox(
                 min_size,
                 min_notional,
             );
-            st.setReviewNext(review_sched.msUntil(.short, now), review_sched.msUntil(.long, now));
+            st.setReviewDueAt(review_sched.nextAt(.short), review_sched.nextAt(.long));
         },
     }
 }

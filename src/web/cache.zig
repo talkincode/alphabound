@@ -25,6 +25,9 @@ fn nowMs() i64 {
     return clock.SystemClock.clock().wallMs();
 }
 
+pub const EQUITY_JSON_BUFFER_BYTES: usize = 64 * 1024;
+pub const EVENTS_JSON_BUFFER_BYTES: usize = 32 * 1024;
+
 pub const WebState = struct {
     /// Seqlock: odd = write in progress. Single writer (core loop), many
     /// readers (web connections) — no blocking, no Io dependency.
@@ -38,10 +41,13 @@ pub const WebState = struct {
     /// Pre-rendered JSON blobs (owned buffers inside WebState).
     agent_runs_buf: [24576]u8 = undefined,
     agent_runs_len: usize = 2,
-    /// ~1m samples × ~170B; 48KiB holds ~280 points (~4.5h) with headroom.
-    equity_buf: [49152]u8 = undefined,
+    /// 64KiB accommodates the 240-sample (~4h) dashboard target at current
+    /// row sizes, with an adaptive fallback for unusually large values.
+    equity_buf: [EQUITY_JSON_BUFFER_BYTES]u8 = undefined,
     equity_len: usize = 2,
-    events_buf: [12288]u8 = undefined,
+    /// Sized for the 40-row feed under typical event payloads; cache rendering
+    /// reports truncation and retries at the largest fitting row count.
+    events_buf: [EVENTS_JSON_BUFFER_BYTES]u8 = undefined,
     events_len: usize = 2,
     shadow_buf: [512]u8 = undefined,
     shadow_len: usize = 2,
@@ -140,8 +146,8 @@ pub const WebState = struct {
         // Safe: web accept loop is single-threaded.
         const Tls = struct {
             var agent: [24576]u8 = undefined;
-            var equity: [49152]u8 = undefined;
-            var events: [12288]u8 = undefined;
+            var equity: [EQUITY_JSON_BUFFER_BYTES]u8 = undefined;
+            var events: [EVENTS_JSON_BUFFER_BYTES]u8 = undefined;
             var shadow: [512]u8 = undefined;
             var candles: [131072]u8 = undefined;
             var memories: [24576]u8 = undefined;
@@ -430,8 +436,8 @@ pub const RuntimeStatus = struct {
     review_status: []const u8 = "idle",
     review_cycle: []const u8 = "",
     review_ms: i64 = 0,
-    review_next_short_ms: i64 = 0,
-    review_next_long_ms: i64 = 0,
+    review_next_short_due_ms: i64 = 0,
+    review_next_long_due_ms: i64 = 0,
     // Owned scratch for mutable strings
     bid_buf: [48]u8 = undefined,
     bid_len: usize = 0,
@@ -515,9 +521,9 @@ pub const RuntimeStatus = struct {
         self.review_cycle = cycle;
         self.review_ms = nowMs();
     }
-    pub fn setReviewNext(self: *RuntimeStatus, next_short_ms: i64, next_long_ms: i64) void {
-        self.review_next_short_ms = next_short_ms;
-        self.review_next_long_ms = next_long_ms;
+    pub fn setReviewDueAt(self: *RuntimeStatus, short_due_ms: i64, long_due_ms: i64) void {
+        self.review_next_short_due_ms = short_due_ms;
+        self.review_next_long_due_ms = long_due_ms;
     }
     pub fn setEgress(self: *RuntimeStatus, ip: []const u8) void {
         const n = @min(ip.len, self.egress_buf.len);
@@ -544,6 +550,87 @@ pub const RuntimeStatus = struct {
     }
 };
 
+const EventListKind = enum { events, agent_decisions };
+
+fn listEventJson(
+    events: *storage.EventsRepo,
+    db: *storage.Db,
+    out: []u8,
+    limit: i64,
+    kind: EventListKind,
+) storage.DbError!storage.EventJsonResult {
+    return switch (kind) {
+        .events => events.listRecentJsonWithStatus(db, out, limit),
+        .agent_decisions => events.listAgentDecisionsJsonWithStatus(db, out, limit),
+    };
+}
+
+/// Render the newest rows that fit. The API remains a JSON array for
+/// compatibility, while byte-budget truncation is reported with the requested
+/// and returned row counts rather than silently appearing complete.
+fn renderEventJson(
+    events: *storage.EventsRepo,
+    db: *storage.Db,
+    out: []u8,
+    requested_limit: i64,
+    kind: EventListKind,
+) ?[]const u8 {
+    if (requested_limit <= 0 or out.len < 2) return null;
+    const name: []const u8 = switch (kind) {
+        .events => "events",
+        .agent_decisions => "decisions",
+    };
+    const rendered = listEventJson(events, db, out, requested_limit, kind) catch |err| {
+        std.debug.print("[dashboard] {s} json render failed: {t}\n", .{ name, err });
+        return null;
+    };
+    if (rendered.truncated) {
+        std.debug.print(
+            "[dashboard] {s} json truncated by byte budget: requested={d} returned={d} buffer={d}\n",
+            .{ name, requested_limit, rendered.returned_rows, out.len },
+        );
+    }
+    return rendered.json;
+}
+
+test "event dashboard cache reports byte-budget truncation" {
+    var db = try storage.Db.open(":memory:");
+    defer db.close();
+    var events = try storage.EventsRepo.init(&db);
+    defer events.deinit();
+
+    var payload_buf: [1048]u8 = undefined;
+    const prefix = "{\"note\":\"";
+    const suffix = "\"}";
+    @memcpy(payload_buf[0..prefix.len], prefix);
+    @memset(payload_buf[prefix.len .. prefix.len + 1024], 'x');
+    @memcpy(payload_buf[prefix.len + 1024 .. prefix.len + 1024 + suffix.len], suffix);
+    const payload_json = payload_buf[0 .. prefix.len + 1024 + suffix.len];
+    for (0..40) |i| {
+        var id_buf: [24]u8 = undefined;
+        var ts_buf: [40]u8 = undefined;
+        const event_id = try std.fmt.bufPrint(&id_buf, "evt_{d:0>3}", .{i});
+        const ts = try std.fmt.bufPrint(&ts_buf, "2026-08-09T08:{d:0>2}:00.000Z", .{i});
+        try events.append(.{
+            .event_id = event_id,
+            .ts = ts,
+            .type = "SYNTHETIC",
+            .source = "test",
+            .severity = "INFO",
+            .payload_json = payload_json,
+        });
+    }
+
+    var out: [EVENTS_JSON_BUFFER_BYTES]u8 = undefined;
+    const json = renderEventJson(&events, &db, &out, 40, .events) orelse return error.MissingEventJson;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    const returned = parsed.value.array.items.len;
+    try std.testing.expect(returned > 0);
+    try std.testing.expect(returned < 40);
+    try std.testing.expect(json.len <= EVENTS_JSON_BUFFER_BYTES);
+}
+
 pub fn refreshWebCaches(
     ws: *WebState,
     db: *storage.Db,
@@ -557,21 +644,28 @@ pub fn refreshWebCaches(
 ) void {
     // Separate scratch buffers so a large events dump cannot clobber shadow JSON mid-format.
     var tmp_agent: [24576]u8 = undefined;
-    // Must match WebState.equity_buf. Old 8KiB overflowed ~60×1m rows → API stuck at [].
-    var tmp_equity: [49152]u8 = undefined;
-    var tmp_events: [12288]u8 = undefined;
+    // Must match WebState.equity_buf; 64KiB makes the intended 240 samples viable.
+    var tmp_equity: [EQUITY_JSON_BUFFER_BYTES]u8 = undefined;
+    var tmp_events: [EVENTS_JSON_BUFFER_BYTES]u8 = undefined;
     var tmp_shadow: [768]u8 = undefined;
     var tmp_mem: [24576]u8 = undefined;
     if (runs.listRecentJson(db, &tmp_agent, 50)) |j| {
         ws.setJson(.agent, j);
     } else |_| {}
-    // Prefer ~4h of 1m samples; fall back if a row ever grows past estimate.
+    // Prefer ~4h of 1m samples; fall back if a row ever grows past the budget.
     {
-        var eq_limit: i64 = 240;
+        const requested_eq_limit: i64 = 240;
+        var eq_limit = requested_eq_limit;
         var equity_ok = false;
         while (eq_limit >= 30) : (eq_limit = @divTrunc(eq_limit, 2)) {
             if (equity.listRecentJson(db, &tmp_equity, eq_limit)) |j| {
                 ws.setJson(.equity, j);
+                if (eq_limit < requested_eq_limit) {
+                    std.debug.print(
+                        "[dashboard] equity window reduced: requested={d} retry_limit={d} bytes={d} buffer={d}\n",
+                        .{ requested_eq_limit, eq_limit, j.len, tmp_equity.len },
+                    );
+                }
                 equity_ok = true;
                 break;
             } else |_| {}
@@ -580,13 +674,13 @@ pub fn refreshWebCaches(
             std.debug.print("[dashboard] equity json render failed (buffer/db)\n", .{});
         }
     }
-    if (events.listRecentJson(db, &tmp_events, 40)) |j| {
+    if (renderEventJson(events, db, &tmp_events, 40, .events)) |j| {
         ws.setJson(.events, j);
-    } else |_| {}
+    }
     var tmp_dec: [49152]u8 = undefined;
-    if (events.listAgentDecisionsJson(db, &tmp_dec, 80)) |j| {
+    if (renderEventJson(events, db, &tmp_dec, 80, .agent_decisions)) |j| {
         ws.setJson(.decisions, j);
-    } else |_| {}
+    }
     if (memories.listLatestJson(db, &tmp_mem, 40)) |j| {
         ws.setJson(.memories, j);
     } else |_| {}
@@ -816,6 +910,26 @@ pub const ExecFlags = struct {
     real_money: bool = false,
 };
 
+fn countdownUntil(due_ms: i64, now_ms: i64) i64 {
+    if (due_ms <= 0) return 0;
+    return @max(@as(i64, 0), due_ms - now_ms);
+}
+
+fn writeReview(w: *std.Io.Writer, cfg: *const config.Config, st: *const RuntimeStatus, now_ms: i64) !void {
+    try w.print(
+        "\"review\":{{\"status\":\"{s}\",\"cycle\":\"{s}\",\"ts_ms\":{d},\"short_interval_ms\":{d},\"long_interval_ms\":{d},\"next_short_ms\":{d},\"next_long_ms\":{d}}},",
+        .{
+            st.review_status,
+            st.review_cycle,
+            st.review_ms,
+            cfg.review_short_interval_ms,
+            cfg.review_long_interval_ms,
+            countdownUntil(st.review_next_short_due_ms, now_ms),
+            countdownUntil(st.review_next_long_due_ms, now_ms),
+        },
+    );
+}
+
 fn writeVolatility(w: *std.Io.Writer, cfg: *const config.Config, st: *const RuntimeStatus) !void {
     try w.print(
         "{{\"enabled\":{},\"ready\":{},\"active\":{},\"range\":\"{f}\",\"as_of_ms\":{d},\"window_ms\":{d},\"max_gap_ms\":{d},\"enter\":\"{f}\",\"exit\":\"{f}\",\"interval_ms\":{d},\"exit_hold_ms\":{d}}}",
@@ -833,6 +947,24 @@ fn writeVolatility(w: *std.Io.Writer, cfg: *const config.Config, st: *const Runt
             cfg.volatility_exit_hold_ms,
         },
     );
+}
+
+test "system review JSON counts down from the absolute due time" {
+    const hour_ms: i64 = 3_600_000;
+    var cfg = try config.parse(std.testing.allocator, "");
+    defer cfg.deinit();
+    var st: RuntimeStatus = .{};
+    st.setReviewDueAt(9 * hour_ms, 0);
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try w.writeByte('{');
+    try writeReview(&w, &cfg, &st, 2 * hour_ms);
+    try w.writeAll("\"extra\":0}");
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, w.buffered(), .{});
+    defer parsed.deinit();
+    const review_json = parsed.value.object.get("review").?.object;
+    try std.testing.expectEqual(@as(i64, 7 * hour_ms), review_json.get("next_short_ms").?.integer);
+    try std.testing.expectEqual(@as(i64, 0), review_json.get("next_long_ms").?.integer);
 }
 
 test "system volatility JSON exposes effective cadence and observed state" {
@@ -915,18 +1047,8 @@ pub fn refreshSystemCache(
         "\"audit\":{{\"status\":\"{s}\",\"ts_ms\":{d},\"findings\":{d},\"interval_ms\":{d},\"alerts\":{s}}},",
         .{ st.audit_status, st.audit_ms, st.audit_findings, cfg.audit_interval_ms, st.audit_alerts },
     ) catch return;
-    w.print(
-        "\"review\":{{\"status\":\"{s}\",\"cycle\":\"{s}\",\"ts_ms\":{d},\"short_interval_ms\":{d},\"long_interval_ms\":{d},\"next_short_ms\":{d},\"next_long_ms\":{d}}},",
-        .{
-            st.review_status,
-            st.review_cycle,
-            st.review_ms,
-            cfg.review_short_interval_ms,
-            cfg.review_long_interval_ms,
-            st.review_next_short_ms,
-            st.review_next_long_ms,
-        },
-    ) catch return;
+    writeReview(&w, cfg, st, nowMs()) catch return;
+
     w.print(
         "\"schedule\":{{\"base_ms\":{d},\"quiet_ms\":{d},\"min_ms\":{d},\"active_hours_utc\":\"{s}\",\"price_move\":\"{f}\",\"drawdown_step\":\"{f}\",\"reflect_on_hold\":{},\"review_backoff_max_ms\":{d},\"noop_backoff_max_ms\":{d}}},",
         .{

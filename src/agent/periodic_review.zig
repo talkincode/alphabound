@@ -105,8 +105,10 @@ pub const Schedule = struct {
         return now_ms - @max(span, 0);
     }
 
-    /// ms until the next run of `cycle`; 0 when due or disabled-safe.
-    pub fn msUntil(self: Schedule, cycle: Cycle, now_ms: i64) i64 {
+    /// Absolute due time for `cycle`; 0 when the cycle is disabled or has no
+    /// scheduling anchor yet. Store this value for display and derive a fresh
+    /// countdown at serialization time.
+    pub fn nextAt(self: Schedule, cycle: Cycle) i64 {
         const interval = switch (cycle) {
             .short => self.short_interval_ms,
             .long => self.long_interval_ms,
@@ -117,7 +119,14 @@ pub const Schedule = struct {
             .long => self.last_long_ms,
         };
         if (last <= 0) return 0;
-        return @max(@as(i64, 0), last + interval - now_ms);
+        return last + interval;
+    }
+
+    /// ms until the next run of `cycle`; 0 when due or disabled-safe.
+    pub fn msUntil(self: Schedule, cycle: Cycle, now_ms: i64) i64 {
+        const due_ms = self.nextAt(cycle);
+        if (due_ms <= 0) return 0;
+        return @max(@as(i64, 0), due_ms - now_ms);
     }
 };
 
@@ -340,6 +349,7 @@ test "schedule: zero interval disables a cycle; unknown last fires immediately" 
     const t0: i64 = 5_000_000;
     var off = Schedule.initAt(t0, 0, 0);
     try testing.expect(off.due(t0 + 30 * 24 * hour_ms) == null);
+    try testing.expectEqual(@as(i64, 0), off.msUntil(.short, -1));
 
     // Restored-from-DB style: long never ran (0) → due at once.
     var s: Schedule = .{ .short_interval_ms = 8 * hour_ms, .long_interval_ms = 7 * 24 * hour_ms };
@@ -351,7 +361,8 @@ test "schedule: zero interval disables a cycle; unknown last fires immediately" 
     try testing.expectEqual(t0 - 8 * hour_ms, s.windowStartMs(.short, t0));
     try testing.expectEqual(t0 - 7 * 24 * hour_ms, s.windowStartMs(.long, t0));
     s.commit(.short, t0 + MIN_GAP_MS);
-    try testing.expectEqual(@as(i64, 8 * hour_ms), s.msUntil(.short, t0 + MIN_GAP_MS));
+    try testing.expectEqual(t0 + MIN_GAP_MS + 8 * hour_ms, s.nextAt(.short));
+    try testing.expectEqual(@as(i64, 7 * hour_ms), s.msUntil(.short, t0 + MIN_GAP_MS + hour_ms));
 }
 
 test "downtime longer than the interval fires once, not once per missed slot" {

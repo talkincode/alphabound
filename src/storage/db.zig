@@ -238,6 +238,12 @@ pub const EventRow = struct {
     content_hash: []const u8 = "",
 };
 
+pub const EventJsonResult = struct {
+    json: []const u8,
+    returned_rows: usize,
+    truncated: bool,
+};
+
 pub const EventsRepo = struct {
     insert: Stmt,
 
@@ -272,6 +278,13 @@ pub const EventsRepo = struct {
 
     /// Newest events as a JSON array (newest first). payload_json must already be valid JSON object.
     pub fn listRecentJson(self: *EventsRepo, db: *Db, out: []u8, limit: i64) DbError![]const u8 {
+        return (try self.listRecentJsonWithStatus(db, out, limit)).json;
+    }
+
+    /// Like `listRecentJson`, but reports when the output byte budget stopped
+    /// the listing early. Callers with a fixed-size cache can log the shortfall
+    /// rather than silently mistaking a partial array for a full one.
+    pub fn listRecentJsonWithStatus(self: *EventsRepo, db: *Db, out: []u8, limit: i64) DbError!EventJsonResult {
         _ = self;
         var stmt = try db.prepare(
             \\SELECT event_id, ts, type, source, severity, state_version, payload_json
@@ -279,12 +292,16 @@ pub const EventsRepo = struct {
         );
         defer stmt.finalize();
         try stmt.bindInt(1, limit);
-        return writeEventRows(&stmt, out);
+        return writeEventRowsWithStatus(&stmt, out);
     }
 
     /// Agent decision-related events (proposal / invalid / llm fail / reflection), newest first.
     /// Scheduler wake-ups (AGENT_TRIGGER) stay in the raw events feed only.
     pub fn listAgentDecisionsJson(self: *EventsRepo, db: *Db, out: []u8, limit: i64) DbError![]const u8 {
+        return (try self.listAgentDecisionsJsonWithStatus(db, out, limit)).json;
+    }
+
+    pub fn listAgentDecisionsJsonWithStatus(self: *EventsRepo, db: *Db, out: []u8, limit: i64) DbError!EventJsonResult {
         _ = self;
         var stmt = try db.prepare(
             \\SELECT event_id, ts, type, source, severity, state_version, payload_json
@@ -295,7 +312,7 @@ pub const EventsRepo = struct {
         );
         defer stmt.finalize();
         try stmt.bindInt(1, limit);
-        return writeEventRows(&stmt, out);
+        return writeEventRowsWithStatus(&stmt, out);
     }
 
     /// Events inside [ts_from, ts_to] (RFC3339 strings compare lexicographically),
@@ -430,15 +447,15 @@ pub const EventsRepo = struct {
         w.writeAll("]") catch return DbError.StepFailed;
     }
 
-    /// Serialize stepped event rows as a JSON array, keeping as many newest
-    /// rows as fit: a row that overflows `out` is dropped (with every older
-    /// row) instead of failing the whole listing — the dashboard must never
-    /// go blank because one payload grew.
-    fn writeEventRows(stmt: *Stmt, out: []u8) DbError![]const u8 {
+    /// Serialize stepped event rows as a valid JSON array. If a row overflows,
+    /// keep the newest rows that fit and report the truncation so cache callers
+    /// can retry with a smaller SQL limit.
+    fn writeEventRowsWithStatus(stmt: *Stmt, out: []u8) DbError!EventJsonResult {
         if (out.len < 2) return DbError.StepFailed;
         var w: std.Io.Writer = .fixed(out[0 .. out.len - 1]); // reserve "]"
         w.writeAll("[") catch return DbError.StepFailed;
         var i: usize = 0;
+        var truncated = false;
         while (try stmt.step()) : (i += 1) {
             const mark = w.end;
             const wrote = blk: {
@@ -459,11 +476,20 @@ pub const EventsRepo = struct {
             };
             if (!wrote) {
                 w.end = mark;
+                truncated = true;
                 break;
             }
         }
         out[w.end] = ']';
-        return out[0 .. w.end + 1];
+        return .{
+            .json = out[0 .. w.end + 1],
+            .returned_rows = i,
+            .truncated = truncated,
+        };
+    }
+
+    fn writeEventRows(stmt: *Stmt, out: []u8) DbError![]const u8 {
+        return (try writeEventRowsWithStatus(stmt, out)).json;
     }
 
     /// Compact event objects for agent context (oldest first). Writes into `backing`
@@ -3266,10 +3292,13 @@ test "events append and read back" {
     try testing.expect(std.mem.indexOf(u8, all, "evt_001") != null);
     try testing.expect(std.mem.indexOf(u8, all, "evt_002") != null);
 
-    // Undersized buffer truncates to the newest rows that fit — still valid
-    // JSON, never a hard failure that would blank the dashboard feed.
+    // Undersized buffers keep the newest rows as valid JSON and explicitly
+    // report that older rows were omitted, so cache callers can retry.
     var small: [180]u8 = undefined;
-    const truncated = try repo.listRecentJson(&db, &small, 40);
+    const partial = try repo.listRecentJsonWithStatus(&db, &small, 40);
+    const truncated = partial.json;
+    try testing.expect(partial.truncated);
+    try testing.expectEqual(@as(usize, 1), partial.returned_rows);
     try testing.expect(truncated.len >= 2);
     try testing.expectEqual(@as(u8, '['), truncated[0]);
     try testing.expectEqual(@as(u8, ']'), truncated[truncated.len - 1]);
@@ -3622,6 +3651,40 @@ test "fills idempotent, equity samples, agent runs and tool calls" {
     try testing.expect(std.mem.indexOf(u8, mem_json, "\"memory_id\":\"m1\"") != null);
     try testing.expect(std.mem.indexOf(u8, mem_json, "\"version\":2") != null);
     try testing.expect(std.mem.indexOf(u8, mem_json, "\"version\":1") == null);
+}
+
+test "dashboard equity buffer holds the full 240-sample window" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const path = try tmpDbPath(&tmp, &path_buf);
+    var db = try Db.open(path);
+    defer db.close();
+    var repo = try EquityRepo.init(&db);
+    defer repo.deinit();
+
+    for (0..240) |i| {
+        var ts_buf: [40]u8 = undefined;
+        const ts = try std.fmt.bufPrint(&ts_buf, "2026-08-09T{d:0>2}:{d:0>2}:00.000Z", .{ 8 + i / 60, i % 60 });
+        try repo.append(.{
+            .ts = ts,
+            .interval = "1m",
+            .equity = "12345678901234",
+            .hwm = "12345678901234",
+            .drawdown = "12345678901234",
+            .cash = "12345678901234",
+            .btc_value = "12345678901234",
+            .bid_price = "12345678901234",
+            .capital_flow = "12345678901234",
+        });
+    }
+
+    var json_buf: [64 * 1024]u8 = undefined;
+    const json = try repo.listRecentJson(&db, &json_buf, 240);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 240), parsed.value.array.items.len);
+    try testing.expect(json.len > 49_152); // would not fit the former 48KiB buffer
 }
 
 test "memory recreated after index eviction continues durable versions" {
