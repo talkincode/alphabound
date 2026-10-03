@@ -1,0 +1,33 @@
+# AlphaBound analytics MCP gateway — systemd unit
+[Unit]
+Description=AlphaBound analytics MCP gateway (Streamable HTTP with OAuth 2.1)
+After=network-online.target alphabound.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=alphabound
+Group=alphabound
+WorkingDirectory=/opt/alphabound/mcp
+ExecStart=/usr/bin/node /opt/alphabound/mcp/src/index.js --http
+EnvironmentFile=/etc/alphabound/secrets.env
+Restart=always
+RestartSec=5
+
+# 安全加固
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/alphabound-mcp
+CapabilityBoundingSet=
+AmbientCapabilities=
+LockPersonality=true
+RestrictSUIDSGID=true
+
+# 资源可见性
+MemoryAccounting=true
+TasksAccounting=true
+
+[Install]
+WantedBy=multi-user.target
