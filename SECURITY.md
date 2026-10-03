@@ -9,6 +9,7 @@
 - **Brute-force:** in-process FailGuard rate-limits bad logins / bad tokens per IP (and global login flood). Prefer edge WAF limits as well.
 - **Passkeys** need a browser secure context (HTTPS or localhost). Plain HTTP to a LAN IP supports token login only.
 - **Control plane** is local CLI control files only (`--control …`). HTTP Dashboard and Analytics MCP do not place orders, flatten, or read secrets. The sole HTTP/MCP write besides auth is signed intel ingest (`POST /api/v1/intel` / MCP `submit_intel`); see [docs/INTEL.md](docs/INTEL.md).
+- **Remote MCP (opt-in):** `alphabound-mcp --http` listens on loopback and refuses a non-loopback bind unless inbound auth is on: OAuth 2.1 (`ALPHABOUND_MCP_OAUTH=1`; the operator approves each client with the API token) and/or the pre-shared token. Inbound tokens are never forwarded to the daemon, and rotating `ALPHABOUND_API_TOKEN` signs every OAuth client out. See [docs/DASHBOARD_AUTH_MCP.md](docs/DASHBOARD_AUTH_MCP.md).
 - Logs and events pass through redaction (`src/observability/redaction.zig`) before persistence.
 - Live trading requires explicit `OKX_REAL_MONEY_OK=1` on a small sub-account key with **no withdraw** permission.
 - Report vulnerabilities privately to the maintainers; do not open public issues with secrets.

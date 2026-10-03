@@ -1,15 +1,12 @@
 export const DEFAULT_API_BASE = "http://127.0.0.1:18180";
 
 /** Resolve base/token at call time so CLI/tests can use env without re-importing. */
-export function resolveConfig(overrides = {}) {
-  const base = String(overrides.base || process.env.ALPHABOUND_API_BASE || DEFAULT_API_BASE).replace(
-    /\/$/,
-    "",
-  );
+export function resolveConfig(overrides = {}, env = process.env) {
+  const base = String(overrides.base || env.ALPHABOUND_API_BASE || DEFAULT_API_BASE).replace(/\/$/, "");
   const token =
     overrides.token !== undefined
       ? String(overrides.token)
-      : process.env.ALPHABOUND_API_TOKEN || process.env.DASHBOARD_API_TOKEN || "";
+      : env.ALPHABOUND_API_TOKEN || env.DASHBOARD_API_TOKEN || "";
   return { base, token };
 }
 

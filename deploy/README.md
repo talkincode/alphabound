@@ -98,6 +98,17 @@ export CF_API_TOKEN=...   # do not commit
 # Dashboard SSL/TLS mode: Full (not Flexible) when origin serves HTTPS
 ```
 
+### Remote MCP gateway (optional)
+
+To let remote MCP clients (Claude, ChatGPT, Cursor, VS Code, …) read the Dashboard API, run
+`alphabound-mcp --http` on loopback next to the daemon and publish it on its **own hostname**
+with `deploy/nginx-alphabound-mcp.conf.example`. The gateway does the OAuth 2.1 sign-in; the
+operator approves each client with `ALPHABOUND_API_TOKEN`. Gateway variables
+(`ALPHABOUND_MCP_OAUTH`, `ALPHABOUND_MCP_PUBLIC_URL`, `ALPHABOUND_MCP_OAUTH_STATE_FILE`,
+`ALPHABOUND_MCP_TRUST_PROXY`) are listed in `tools/alphabound-mcp/README.md`; keep them, and the
+token, in the service's `EnvironmentFile` (`0600`), never in git. Rotating `ALPHABOUND_API_TOKEN`
+signs every OAuth client out.
+
 ## OKX
 
 Add the **server egress public IP** to the API key whitelist so private

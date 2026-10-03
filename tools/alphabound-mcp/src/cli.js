@@ -5,7 +5,8 @@ export const HELP = `alphabound-mcp — AlphaBound analytics MCP (read-only + si
 
 Usage:
   alphabound-mcp                 Start stdio MCP (IDE / Copilot default)
-  alphabound-mcp --http          Start loopback HTTP gateway
+  alphabound-mcp --http          Start the HTTP server: MCP Streamable HTTP at /mcp
+                                 (OAuth 2.1 capable) plus the plain /tools gateway
   alphabound-mcp install [opts]  Write MCP client config (npx -y auto-install)
   alphabound-mcp tools           List MCP tools (JSON)
   alphabound-mcp call <tool>     Invoke a tool; JSON on stdout
@@ -15,6 +16,17 @@ Usage:
 Auth (environment variables; preferred over flags):
   ALPHABOUND_API_BASE     Dashboard origin (default http://127.0.0.1:18180)
   ALPHABOUND_API_TOKEN    Same token as the daemon (or DASHBOARD_API_TOKEN)
+
+HTTP server (--http), environment:
+  ALPHABOUND_MCP_BIND / ALPHABOUND_MCP_PORT   Listen address (default 127.0.0.1:8723)
+  ALPHABOUND_MCP_OAUTH=1                      OAuth 2.1 for remote MCP clients; the operator
+                                              approves a client with ALPHABOUND_API_TOKEN
+  ALPHABOUND_MCP_PUBLIC_URL                   https origin clients connect to (required with
+                                              OAuth), e.g. https://mcp.example.com
+  ALPHABOUND_MCP_OAUTH_STATE_FILE             Keep clients signed in across restarts (0600 file)
+  ALPHABOUND_MCP_REQUIRE_TOKEN=1              Accept ALPHABOUND_API_TOKEN as Bearer / X-API-Token
+  ALPHABOUND_MCP_TRUST_PROXY=<hops>           Behind a TLS proxy: trusted proxy hops (usually 1)
+  A non-loopback bind needs OAuth and/or REQUIRE_TOKEN; otherwise it refuses to start.
 
 Call options:
   --base <url>    Override ALPHABOUND_API_BASE
@@ -216,7 +228,13 @@ export async function runCli(argv, io = {}) {
     return runInstall(action.options, { log, err });
   }
   if (action.kind === "http") {
-    await import("./http.js");
+    try {
+      const { startHttp } = await import("./http.js");
+      await startHttp();
+    } catch (e) {
+      err(`http: ${e.message}`);
+      return 1;
+    }
     return undefined;
   }
   if (action.kind === "tools") {

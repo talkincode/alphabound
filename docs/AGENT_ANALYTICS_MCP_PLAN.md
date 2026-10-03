@@ -1,6 +1,6 @@
 # Agent 分析面 / MCP 计划
 
-> 状态：审计 ACCEPT；**L1 已实现**（`tools/alphabound-mcp` + Dashboard token/passkey auth）  
+> 状态：审计 ACCEPT；**L1 已实现**（`tools/alphabound-mcp` + Dashboard token/passkey auth）；远程 **Streamable HTTP + OAuth 2.1** 已实现（`--http`，见 [DASHBOARD_AUTH_MCP.md](DASHBOARD_AUTH_MCP.md)）  
 > 动机：其他编码 Agent 需要稳定查询决策/订单/状态，用于复盘与优化，而不是 ssh 抠库。
 
 ---
@@ -61,7 +61,7 @@
 
 **硬规则**
 
-1. 默认 **stdio MCP**（本机 Agent 连接）；远程仅经 SSH 隧道 + token  
+1. 默认 **stdio MCP**（本机 Agent 连接）；远程二选一：**HTTPS 反代后的 Streamable HTTP + OAuth 2.1**（`ALPHABOUND_MCP_OAUTH=1`，operator 用 API token 在授权页逐个批准 client），或 SSH 隧道 + token。HTTP 网关无入站鉴权时只许 loopback，非 loopback 绑定会拒绝启动；入站 token 永不转发给 daemon（无 token passthrough）  
 2. **无** place_order / flatten / resume / target-weight  
 3. 响应过 redaction；余额可给数量级/已有 API 字段，不给密钥  
 4. 与 public 仓库：MCP 配置示例用占位符，真实 URL 只在 `DEPLOY.local.md`
@@ -83,6 +83,8 @@
 - [x] 每个 tool：loopback mock HTTP + `ALPHABOUND_API_TOKEN` → CLI 调用（`test/tools-cli.test.js`）
 - [ ] 集成：对 running daemon `get_state` 与 `curl /api/v1/state` 字段一致
 - [x] 负向：CLI 无 `place_order` / `flatten` / 控制面；缺 token 对需鉴权 API → 401
+- [x] 远程 HTTP：`POST /mcp` 与 stdio 同一工具面（`test/http.test.js`）；MCP SDK client 互操作测试走完 OAuth（发现 → DCR → PKCE → 授权页 → token → 调工具 → refresh）
+- [x] OAuth 负向（`test/oauth.test.js`、`test/oauth-unit.test.js`）：错 token / 暴力破解锁定、PKCE 错配、授权码重放（并撤销已签发 token）、refresh 轮换与重放撤销、redirect_uri 与 resource 绑定、daemon 只见网关自己的凭证
 - [ ] SEC3：响应扫描无 `OKX_` / `sk-` / 私钥头
 - [ ] 人工：用 Cursor/Copilot MCP 拉最近 5 条 REBALANCE thesis 成功
 

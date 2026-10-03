@@ -110,7 +110,7 @@ npx -y alphabound-mcp install --client copilot
 # from a clone:        node tools/alphabound-mcp/src/index.js install --source local --client copilot
 ```
 
-3. stdio is the IDE default (`npx -y alphabound-mcp`). `npx -y alphabound-mcp --http` is a small remote tool gateway (bind loopback; tunnel as needed).
+3. stdio is the IDE default (`npx -y alphabound-mcp`). `npx -y alphabound-mcp --http` serves **MCP Streamable HTTP** at `/mcp` (plus a plain `/tools` JSON gateway) for remote clients; see [Remote MCP over HTTP](#remote-mcp-over-http-oauth-21) below.
 4. The same binary is a CLI for every MCP tool. Token comes from `ALPHABOUND_API_TOKEN` (or `DASHBOARD_API_TOKEN`) at call time:
 
 ```bash
@@ -127,5 +127,38 @@ Control stays on `--control` / local admin.
 The sole write is `submit_intel`: a **pre-signed** `alphabound.intel.v1`
 envelope forwarded to `POST /api/v1/intel`. MCP never holds
 `ALPHABOUND_INTEL_HMAC`. See `docs/INTEL.md`.
+
+### Remote MCP over HTTP (OAuth 2.1)
+
+`alphabound-mcp --http` listens on loopback by default and **refuses a non-loopback bind**
+unless inbound auth is on:
+
+| Mode | Env | How a client authenticates |
+|------|-----|----------------------------|
+| OAuth 2.1 | `ALPHABOUND_MCP_OAUTH=1` + `ALPHABOUND_MCP_PUBLIC_URL=https://mcp.example.com` | Remote MCP clients (Claude, ChatGPT, Cursor, VS Code, …) discover the gateway's authorization server, register, and send the operator to a consent page; the operator approves by entering `ALPHABOUND_API_TOKEN` |
+| Pre-shared token | `ALPHABOUND_MCP_REQUIRE_TOKEN=1` | Scripts: `Authorization: Bearer <ALPHABOUND_API_TOKEN>` or `X-API-Token` |
+
+Rules:
+
+1. TLS terminates at a trusted reverse proxy on the gateway's own hostname
+   (`deploy/nginx-alphabound-mcp.conf.example`); the gateway stays on loopback and gets
+   `ALPHABOUND_MCP_TRUST_PROXY=<hops>` so lockouts see real client IPs (same XFF caveats as above).
+2. **No token passthrough.** Inbound OAuth / API tokens are checked at the gateway and never
+   forwarded; the daemon is always called with the gateway's own `ALPHABOUND_API_TOKEN`.
+3. The consent form uses the Dashboard's FailGuard numbers: 8 failures / IP / 15 min lock that IP
+   for 15 min; 60 submissions / min overall.
+4. Access tokens live 1 h; refresh tokens rotate (30 d sliding) and presenting any already-used one
+   revokes the sign-in. Tokens are HMAC-signed with a key derived from the API token and the
+   endpoint URL and nothing token-like is stored, so
+   **rotating `ALPHABOUND_API_TOKEN` or changing the public URL signs every OAuth client out.**
+   Set `ALPHABOUND_MCP_OAUTH_STATE_FILE` to keep clients signed in across restarts; restoring an
+   old copy of it revives sign-ins revoked since, so rotate the API token after a restore.
+5. Registered clients are public, PKCE-only clients (no client secret); redirect URIs must be
+   `https`, loopback `http` (port may vary), or a private-use app scheme. Registration is open but
+   capped, and junk registrations never evict an approved client.
+6. The hard rule above is unchanged: remote clients get the same tools as stdio.
+
+Endpoints, client configs and limits:
+[`tools/alphabound-mcp/README.md`](https://github.com/talkincode/alphabound/blob/main/tools/alphabound-mcp/README.md).
 
 See also: `docs/AGENT_ANALYTICS_MCP_PLAN.md`.

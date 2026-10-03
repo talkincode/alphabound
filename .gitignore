@@ -6,6 +6,9 @@ zig-out/
 dashboard/node_modules/
 dashboard/dist/
 
+# Analytics MCP (npm)
+tools/alphabound-mcp/node_modules/
+
 # 运行时与本地数据
 *.db
 *.db-wal

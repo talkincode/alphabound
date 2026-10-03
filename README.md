@@ -75,6 +75,7 @@ curl -sS http://127.0.0.1:18180/api/v1/state | head
 | 本机控制进程 | `--control pause\|resume\|reconcile\|cancel-all\|flatten\|target-weight=W\|shutdown\|status` |
 | 保护 Dashboard API | 设 `ALPHABOUND_API_TOKEN`（见 [鉴权与 MCP](docs/DASHBOARD_AUTH_MCP.md)） |
 | 给 IDE Agent 只读盘面 | `npx -y alphabound-mcp`（stdio / `install` / CLI `get_system` 等；token 走 `ALPHABOUND_API_TOKEN`；见 [鉴权与 MCP](docs/DASHBOARD_AUTH_MCP.md)） |
+| 给远程 MCP 客户端（Claude / ChatGPT / Cursor…）接入 | `alphabound-mcp --http` + `ALPHABOUND_MCP_OAUTH=1`：Streamable HTTP `/mcp`，OAuth 2.1，operator 用 API token 批准客户端；见 [鉴权与 MCP](docs/DASHBOARD_AUTH_MCP.md) |
 | 换数据目录 / 端口 | 复制 `config/local.toml` 或 `config/alphabound.toml` 改 `[storage]` / `[web]` |
 
 更完整的配置、CLI、部署步骤：[使用手册](https://talkincode.github.io/alphabound/)。
@@ -184,7 +185,7 @@ alphabound/
 │   ├── web/             # HTTP API、鉴权、健康检查
 │   └── observability/   # 事件、指标、脱敏
 ├── dashboard/           # 零依赖 HTML + favicon（编译期嵌入）
-├── tools/alphabound-mcp # 只读 Analytics MCP + CLI（stdio / HTTP / 工具子命令）
+├── tools/alphabound-mcp # 只读 Analytics MCP + CLI（stdio / Streamable HTTP + OAuth / 工具子命令）
 ├── config/              # 示例 TOML（local / 生产 / docker）
 ├── prompts/             # 系统 / 反思 / 定期复盘 Prompt（版本可审计）
 ├── migrations/          # SQLite 迁移

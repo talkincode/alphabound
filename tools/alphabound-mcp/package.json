@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": false,
   "type": "module",
-  "description": "Read-only AlphaBound analytics MCP and CLI (proxies authenticated Dashboard HTTP API)",
+  "description": "AlphaBound analytics MCP and CLI: stdio, plus Streamable HTTP with OAuth 2.1 (proxies the authenticated Dashboard HTTP API)",
   "bin": {
     "alphabound-mcp": "./src/index.js"
   },
@@ -14,7 +14,7 @@
   ],
   "scripts": {
     "start": "node src/index.js",
-    "http": "node src/http.js",
+    "http": "node src/index.js --http",
     "install-mcp": "node src/index.js install",
     "test": "node --test test/*.test.js"
   },
@@ -35,12 +35,15 @@
     "mcp",
     "alphabound",
     "model-context-protocol",
-    "analytics"
+    "analytics",
+    "oauth",
+    "streamable-http"
   ],
   "publishConfig": {
     "access": "public"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.12.1"
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "express": "^5.2.1"
   }
 }
