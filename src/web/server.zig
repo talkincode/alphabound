@@ -689,6 +689,12 @@ fn renderState(buf: []u8, ctx: Context) Response {
         s.write(riskModeText(snap.risk_mode)) catch break :render;
         s.objectField("reconciled") catch break :render;
         s.write(snap.reconciled) catch break :render;
+        s.objectField("unresolved_orders") catch break :render;
+        s.write(snap.unresolved_orders) catch break :render;
+        s.objectField("account_projected") catch break :render;
+        s.write(snap.account_projected) catch break :render;
+        s.objectField("ledger_ok") catch break :render;
+        s.write(snap.ledger_ok) catch break :render;
 
         s.objectField("cash_usdt") catch break :render;
         s.write(decStr(&num_buf, snap.cash_usdt)) catch break :render;
@@ -1218,6 +1224,10 @@ test "state endpoint renders decimals as strings" {
     try testing.expectEqualStrings("87.5", obj.get("cash_usdt").?.string);
     try testing.expectEqualStrings("0.0267", obj.get("drawdown").?.string);
     try testing.expectEqualStrings("sha256:abc", obj.get("config_hash").?.string);
+    // Order-chain health is visible to operators and drills.
+    try testing.expect(!obj.get("unresolved_orders").?.bool);
+    try testing.expect(!obj.get("account_projected").?.bool);
+    try testing.expect(obj.get("ledger_ok").?.bool);
 }
 
 test "events endpoint concatenates recent lines" {

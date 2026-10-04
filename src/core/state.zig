@@ -258,8 +258,13 @@ pub const Engine = struct {
 
     /// Sequentially apply one message. This is the only place state mutates.
     pub fn apply(self: *Engine, msg: Message) dec.DecimalError!ApplyResult {
-        // Other threads must `submit`; applying from one would make it a second writer.
-        std.debug.assert(self.isOwner());
+        // A second writer would race the owner. Instead of mutating from here,
+        // hand the message to the owner (it is applied, in order, on its next
+        // `drainInbox`); the result is empty because nothing changed yet.
+        if (!self.isOwner()) {
+            _ = try self.submit(msg);
+            return .{};
+        }
         self.lockState();
         defer self.lock.unlock();
         return self.applyLocked(msg);
@@ -881,4 +886,23 @@ test "an external capital flow advances the flow epoch" {
         .flow_equity_after = d("200"),
     } });
     try testing.expectEqual(@as(u32, 1), e.snapshot().flow_epoch);
+}
+
+const NonOwnerApply = struct {
+    engine: *Engine,
+
+    fn run(self: *NonOwnerApply) void {
+        _ = self.engine.apply(.{ .order_ambiguity = .{ .present = true } }) catch {};
+    }
+};
+
+test "apply from a non-owner thread is queued for the owner, not applied in place" {
+    var e = try reconciledNormalEngine();
+    e.claimOwner();
+    var w = NonOwnerApply{ .engine = &e };
+    const t = try std.Thread.spawn(.{}, NonOwnerApply.run, .{&w});
+    t.join();
+    try testing.expect(!e.snapshot().unresolved_orders);
+    try testing.expectEqual(@as(usize, 1), e.drainInbox());
+    try testing.expect(e.snapshot().unresolved_orders);
 }

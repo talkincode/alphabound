@@ -829,6 +829,7 @@ pub const FillsRepo = struct {
         _ = db;
         const D = dec.Decimal;
         self.sums.reset();
+        defer self.sums.reset();
         self.sums.bindText(1, cum.order_id) catch return DbError.BindFailed;
         var rows: i64 = 0;
         var seen_qty = D.zero;
@@ -3019,6 +3020,10 @@ pub const KvRepo = struct {
 
     pub fn getChecked(self: *KvRepo, key: []const u8, out: []u8) DbError!?[]const u8 {
         self.get_stmt.reset();
+        // A statement left mid-result pins a read snapshot; with several
+        // writer connections that turns this connection's next write into
+        // SQLITE_BUSY_SNAPSHOT, which busy_timeout never retries.
+        defer self.get_stmt.reset();
         try self.get_stmt.bindText(1, key);
         const has = try self.get_stmt.step();
         if (!has) return null;
@@ -4388,4 +4393,54 @@ test "cumulative fill projection records increments once and survives repeats" {
     }
     try testing.expect(total.eql(try D.parse("0.001")));
     try testing.expect(notional.eql(try D.parse("99")));
+}
+
+test "a connection that read the kv store can still write after another connection wrote" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const path = try tmpDbPath(&tmp, &buf);
+    var a = try Db.open(path);
+    defer a.close();
+    var b = try Db.open(path);
+    defer b.close();
+    var kv_a = try KvRepo.init(&a);
+    defer kv_a.deinit();
+    var kv_b = try KvRepo.init(&b);
+    defer kv_b.deinit();
+    var events_a = try EventsRepo.init(&a);
+    defer events_a.deinit();
+
+    try kv_a.put("k", "v1", "t1");
+    var out: [16]u8 = undefined;
+    try testing.expectEqualStrings("v1", (try kv_a.getChecked("k", &out)).?);
+    // Another connection (a lane) commits in between.
+    try kv_b.put("k", "v2", "t2");
+    // The reader's next write must not fail on a pinned read snapshot.
+    try events_a.append(.{ .event_id = "e1", .ts = "t", .type = "T", .source = "s", .severity = "INFO", .state_version = 1, .payload_json = "{}" });
+    try kv_a.put("k", "v3", "t3");
+    try testing.expectEqualStrings("v3", (try kv_b.getChecked("k", &out)).?);
+}
+
+test "cumulative fill reads do not pin a read snapshot" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const path = try tmpDbPath(&tmp, &buf);
+    var a = try Db.open(path);
+    defer a.close();
+    var b = try Db.open(path);
+    defer b.close();
+    var orders_a = try OrdersRepo.init(&a);
+    defer orders_a.deinit();
+    var fills_a = try FillsRepo.init(&a);
+    defer fills_a.deinit();
+    var events_b = try EventsRepo.init(&b);
+    defer events_b.deinit();
+    try orders_a.upsert(testOrder("abpin", "ACKNOWLEDGED"));
+    const D = dec.Decimal;
+    _ = try fills_a.applyCumulative(&a, .{ .order_id = "abpin", .cum_qty = try D.parse("0.0001"), .avg_price = try D.parse("100"), .cum_fee = D.zero, .fee_ccy = "USDT", .ts = "t" });
+    try events_b.append(.{ .event_id = "e2", .ts = "t", .type = "T", .source = "s", .severity = "INFO", .state_version = 1, .payload_json = "{}" });
+    _ = try fills_a.applyCumulative(&a, .{ .order_id = "abpin", .cum_qty = try D.parse("0.0003"), .avg_price = try D.parse("100"), .cum_fee = D.zero, .fee_ccy = "USDT", .ts = "t" });
+    try testing.expectEqual(@as(i64, 2), try a.queryInt("SELECT COUNT(*) FROM fills"));
 }
