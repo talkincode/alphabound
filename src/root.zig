@@ -6,10 +6,12 @@ pub const clock = @import("core/clock.zig");
 pub const risk_equity = @import("risk/equity.zig");
 pub const risk_state = @import("risk/state_machine.zig");
 pub const admission = @import("risk/admission.zig");
+pub const gate = @import("risk/gate.zig");
 pub const orders = @import("execution/orders.zig");
 pub const planner = @import("execution/planner.zig");
 pub const okx_trade = @import("execution/okx_trade.zig");
 pub const demo_runner = @import("execution/demo_runner.zig");
+pub const operator = @import("execution/operator.zig");
 pub const proposal = @import("agent/proposal.zig");
 pub const events = @import("core/events.zig");
 pub const redaction = @import("observability/redaction.zig");
@@ -55,6 +57,9 @@ pub const intel_inbox = @import("intel/inbox.zig");
 pub const analytics = @import("analytics/ab_factor.zig");
 pub const fault_matrix = @import("fault/matrix.zig");
 pub const security_isolation = @import("security/isolation.zig");
+pub const fake_okx = @import("testing/fake_okx.zig");
+pub const test_harness = @import("testing/harness.zig");
+pub const exec_chain_tests = @import("execution/exec_chain_tests.zig");
 
 pub const Decimal = decimal.Decimal;
 

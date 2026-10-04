@@ -39,12 +39,18 @@ pub const PortfolioState = struct {
     drawdown: Decimal = Decimal.zero,
     risk_mode: sm.RiskMode = .exit_only, // fail-closed until reconciled
     reconciled: bool = false,
+    /// Cash/BTC hold a local projection of fills the venue has not yet
+    /// confirmed through an authoritative balance. Never counts as fresh.
+    account_projected: bool = false,
     unresolved_orders: bool = false,
     /// False when the DB volume is in low/critical free-space band (FD7).
     disk_ok: bool = true,
     /// False when the audit journal (events append) is failing (AC-GO6):
     /// un-auditable trading must not continue increasing risk.
     journal_ok: bool = true,
+    /// False when the order ledger cannot persist intents/progress: orders
+    /// the process cannot recover after a crash must not be created.
+    ledger_ok: bool = true,
     freshness: FreshnessState = .{},
 };
 
@@ -55,6 +61,16 @@ pub const Message = union(enum) {
         mark: Decimal,
     },
     account_update: struct {
+        ts_ms: i64,
+        cash_usdt: Decimal,
+        btc_total: Decimal,
+        btc_available: Decimal,
+    },
+    /// Local best-effort book from verified fill increments while the venue
+    /// balance is unavailable or lagging. Unlike `account_update` it does not
+    /// refresh account freshness, never advances the HWM and leaves the book
+    /// flagged as unconfirmed until the next authoritative balance.
+    account_projection: struct {
         ts_ms: i64,
         cash_usdt: Decimal,
         btc_total: Decimal,
@@ -78,6 +94,8 @@ pub const Message = union(enum) {
     disk_status: struct { ok: bool },
     /// Audit journal write health (AC-GO6). `ok=false` → degraded.
     journal_status: struct { ok: bool },
+    /// Order ledger (intent/progress rows) write health. `ok=false` → degraded.
+    ledger_status: struct { ok: bool },
     clock_tick: struct { ts_ms: i64 }, // periodic freshness re-evaluation
 };
 
@@ -146,8 +164,16 @@ pub const Engine = struct {
                 self.state.btc_total = u.btc_total;
                 self.state.btc_available = u.btc_available;
                 self.state.freshness.account_last_ms = u.ts_ms;
+                self.state.account_projected = false;
                 self.state.as_of_ms = u.ts_ms;
                 try self.revalue(u.ts_ms);
+            },
+            .account_projection => |u| {
+                self.state.cash_usdt = u.cash_usdt;
+                self.state.btc_total = u.btc_total;
+                self.state.btc_available = u.btc_available;
+                self.state.account_projected = true;
+                try self.revalueWith(self.state.as_of_ms, false);
             },
             .reconcile_result => |r| {
                 self.state.cash_usdt = r.cash_usdt;
@@ -162,6 +188,7 @@ pub const Engine = struct {
                     );
                 }
                 self.state.freshness.account_last_ms = r.ts_ms;
+                self.state.account_projected = false;
                 self.state.reconciled = r.clean;
                 self.state.as_of_ms = r.ts_ms;
                 try self.revalue(r.ts_ms);
@@ -179,6 +206,10 @@ pub const Engine = struct {
             },
             .journal_status => |j| {
                 self.state.journal_ok = j.ok;
+                self.evaluateHealth(self.state.as_of_ms);
+            },
+            .ledger_status => |l| {
+                self.state.ledger_ok = l.ok;
                 self.evaluateHealth(self.state.as_of_ms);
             },
             .clock_tick => |c| {
@@ -213,6 +244,12 @@ pub const Engine = struct {
     }
 
     fn revalue(self: *Engine, now_ms: i64) dec.DecimalError!void {
+        return self.revalueWith(now_ms, true);
+    }
+
+    /// `advance_hwm=false` re-prices an unconfirmed projection: it may deepen
+    /// drawdown (conservative) but must never raise the boundary reference.
+    fn revalueWith(self: *Engine, now_ms: i64, advance_hwm: bool) dec.DecimalError!void {
         if (self.state.bid_price.gt(Decimal.zero)) {
             const r = try equity_mod.conservativeEquity(.{
                 .cash_usdt = self.state.cash_usdt,
@@ -221,7 +258,7 @@ pub const Engine = struct {
                 .exit_costs = self.exit_costs,
             });
             self.state.conservative_equity = r.equity;
-            if (self.state.reconciled) {
+            if (self.state.reconciled and advance_hwm and !self.state.account_projected) {
                 // HWM only advances on reconciled data — unconfirmed balances
                 // must not raise the boundary reference (§5.1 conservatism).
                 self.state.high_watermark = equity_mod.updateHighWatermark(self.state.high_watermark, r.equity);
@@ -244,6 +281,8 @@ pub const Engine = struct {
             !self.state.unresolved_orders and
             self.state.disk_ok and
             self.state.journal_ok and
+            self.state.ledger_ok and
+            !self.state.account_projected and
             self.state.freshness.marketFresh(now_ms) and
             self.state.freshness.accountFresh(now_ms);
         const trigger: sm.Trigger = if (healthy) .conditions_ok else .degraded;
@@ -537,4 +576,70 @@ test "engine records silent mode transitions with their cause" {
     try std.testing.expectEqualStrings("clock_tick", t.cause);
     try std.testing.expectEqual(@as(u32, 1), t.bounces);
     try std.testing.expect(e.takeModeTransition() == null);
+}
+
+fn reconciledNormalEngine() !Engine {
+    var e = testEngine();
+    _ = try e.apply(.{ .market_tick = .{ .ts_ms = 1000, .bid = d("100000"), .mark = d("100000") } });
+    _ = try e.apply(.{ .reconcile_result = .{
+        .ts_ms = 1000,
+        .cash_usdt = d("100"),
+        .btc_total = d("0"),
+        .btc_available = d("0"),
+        .hwm_from_db = d("100"),
+        .clean = true,
+    } });
+    try testing.expectEqual(sm.RiskMode.normal, e.snapshot().risk_mode);
+    return e;
+}
+
+test "projection moves the book without refreshing account freshness or the HWM" {
+    var e = try reconciledNormalEngine();
+    const before = e.snapshot();
+    // A projected buy that (wrongly or not) shows the book richer than reality.
+    _ = try e.apply(.{ .account_projection = .{
+        .ts_ms = 2000,
+        .cash_usdt = d("0"),
+        .btc_total = d("0.002"),
+        .btc_available = d("0.002"),
+    } });
+    const after = e.snapshot();
+    try testing.expect(after.btc_total.eql(d("0.002")));
+    try testing.expectEqual(before.freshness.account_last_ms, after.freshness.account_last_ms);
+    try testing.expect(after.high_watermark.eql(before.high_watermark));
+    try testing.expect(after.account_projected);
+    // Not authoritative: new risk must wait for a venue reconcile.
+    try testing.expectEqual(sm.RiskMode.exit_only, after.risk_mode);
+}
+
+test "an authoritative balance clears the projection flag" {
+    var e = try reconciledNormalEngine();
+    _ = try e.apply(.{ .account_projection = .{ .ts_ms = 2000, .cash_usdt = d("50"), .btc_total = d("0.0005"), .btc_available = d("0.0005") } });
+    try testing.expect(e.snapshot().account_projected);
+    _ = try e.apply(.{ .reconcile_result = .{
+        .ts_ms = 2100,
+        .cash_usdt = d("50"),
+        .btc_total = d("0.0005"),
+        .btc_available = d("0.0005"),
+        .hwm_from_db = d("100"),
+        .clean = true,
+    } });
+    try testing.expect(!e.snapshot().account_projected);
+    try testing.expectEqual(sm.RiskMode.normal, e.snapshot().risk_mode);
+}
+
+test "a projection can deepen drawdown into flattening but never lift the boundary" {
+    var e = try reconciledNormalEngine();
+    _ = try e.apply(.{ .account_projection = .{ .ts_ms = 2000, .cash_usdt = d("80"), .btc_total = d("0"), .btc_available = d("0") } });
+    try testing.expectEqual(sm.RiskMode.flattening, e.snapshot().risk_mode);
+    try testing.expect(e.snapshot().high_watermark.eql(d("100")));
+}
+
+test "ledger write failure degrades trading until a write succeeds again" {
+    var e = try reconciledNormalEngine();
+    _ = try e.apply(.{ .ledger_status = .{ .ok = false } });
+    try testing.expectEqual(sm.RiskMode.exit_only, e.snapshot().risk_mode);
+    try testing.expect(!e.snapshot().ledger_ok);
+    _ = try e.apply(.{ .ledger_status = .{ .ok = true } });
+    try testing.expectEqual(sm.RiskMode.normal, e.snapshot().risk_mode);
 }

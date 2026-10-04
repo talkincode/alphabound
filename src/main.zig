@@ -1114,16 +1114,8 @@ pub fn main(init: std.process.Init) !u8 {
                         logEvent(&events_repo, &engine, "ADMIN_RECONCILE", "admin", "INFO", &cfg);
                     },
                     .cancel_all => {
-                        const canceled_n = adminCancelAll(gpa, &okx, &cfg, &engine, &events_repo);
+                        const canceled_n = ab.operator.cancelAll(execEnv(gpa, &okx, &cfg, &engine, &db, &orders_repo, &fills_repo, &events_repo, portfolio_refresher, trade_instrument));
                         std.debug.print("[admin] cancel-all mode={t} canceled≈{d}\n", .{ cfg.mode, canceled_n });
-                        var cab: [192]u8 = undefined;
-                        const cap = std.fmt.bufPrint(
-                            &cab,
-                            "{{\"mode\":\"{t}\",\"canceled\":{d}}}",
-                            .{ cfg.mode, canceled_n },
-                        ) catch "{\"canceled\":0}";
-                        logEventPayload(&events_repo, &engine, "ADMIN_CANCEL_ALL", "admin", "CRITICAL", &cfg, cap);
-                        _ = engine.apply(.{ .order_ambiguity = .{ .present = false } }) catch {};
                     },
                     .flatten => {
                         const prev = engine.snapshot().risk_mode;
@@ -1139,39 +1131,15 @@ pub fn main(init: std.process.Init) !u8 {
                         logEventPayload(&events_repo, &engine, "ADMIN_FLATTEN", "admin", "CRITICAL", &cfg, flp);
                         // Drive position to cash immediately (mode alone does not sell).
                         last_flatten_exec_ms = 0;
-                        driveFlattenPosition(
-                            gpa,
-                            &okx,
-                            &cfg,
-                            &engine,
-                            &orders_repo,
-                            &fills_repo,
-                            &events_repo,
-                            &runtime_status,
-                            portfolio_refresher,
-                            trade_instrument,
-                            &last_flatten_exec_ms,
-                            true,
-                        );
+                        ab.operator.driveFlatten(execEnv(gpa, &okx, &cfg, &engine, &db, &orders_repo, &fills_repo, &events_repo, portfolio_refresher, trade_instrument), &last_flatten_exec_ms, true);
                         web_state.update(engine.snapshot(), true);
                         refreshWebCaches(&web_state, &db, &agent_runs, &equity_repo, &events_repo, &memories_repo, &orders_repo, &fills_repo, last_bh_cmp);
                     },
                     .target_weight => {
                         const w_s = req.weight() orelse "0";
-                        const note = runOperatorTargetWeight(
-                            gpa,
-                            &okx,
-                            &cfg,
-                            &engine,
-                            &orders_repo,
-                            &fills_repo,
-                            &events_repo,
-                            &runtime_status,
-                            portfolio_refresher,
-                            trade_instrument,
-                            w_s,
-                        );
-                        std.debug.print("[admin] target-weight={s} exec={s}\n", .{ w_s, note });
+                        const tw = ab.operator.runTargetWeight(execEnv(gpa, &okx, &cfg, &engine, &db, &orders_repo, &fills_repo, &events_repo, portfolio_refresher, trade_instrument), w_s);
+                        if (tw.status().len > 0) runtime_status.setLastDecision(tw.status());
+                        std.debug.print("[admin] target-weight={s} exec={s}\n", .{ w_s, tw.note });
                         web_state.update(engine.snapshot(), true);
                         refreshWebCaches(&web_state, &db, &agent_runs, &equity_repo, &events_repo, &memories_repo, &orders_repo, &fills_repo, last_bh_cmp);
                     },
@@ -1318,20 +1286,7 @@ pub fn main(init: std.process.Init) !u8 {
 
         // Operator flatten must sell to cash and complete → HALTED (not mode-only).
         if (cfg.mode.isTrading() and engine.snapshot().risk_mode == .flattening) {
-            driveFlattenPosition(
-                gpa,
-                &okx,
-                &cfg,
-                &engine,
-                &orders_repo,
-                &fills_repo,
-                &events_repo,
-                &runtime_status,
-                portfolio_refresher,
-                trade_instrument,
-                &last_flatten_exec_ms,
-                false,
-            );
+            ab.operator.driveFlatten(execEnv(gpa, &okx, &cfg, &engine, &db, &orders_repo, &fills_repo, &events_repo, portfolio_refresher, trade_instrument), &last_flatten_exec_ms, false);
             web_state.update(engine.snapshot(), true);
         }
 
@@ -2554,91 +2509,6 @@ fn computeIndicatorObservation(
     return ab.market_tools.formatObservation(obs_buf[0..obs_buf.len], spec.name, rec, result.data_json) catch null;
 }
 
-/// Shadow-path Risk Kernel admission (audit only — never places orders).
-const ShadowAdmission = struct {
-    verdict_txt: []const u8,
-    reason_txt: []const u8,
-    admitted_weight: ab.decimal.Decimal,
-    stress_equity: ab.decimal.Decimal,
-    floor: ab.decimal.Decimal,
-};
-
-fn defaultStressParams(cfg: *const ab.config.Config) ab.admission.StressParams {
-    return .{
-        .price_shock = ab.decimal.Decimal.parse("0.05") catch ab.decimal.Decimal.zero,
-        .trade_fee_rate = cfg.taker_fee_rate,
-        .trade_slippage_rate = cfg.slippage_rate,
-        .exit_costs = .{ .fee_rate = cfg.taker_fee_rate, .slippage_rate = cfg.slippage_rate },
-        // Small absolute reserve so tiny shadow books still exercise the floor path.
-        .exit_reserve = ab.decimal.Decimal.parse("0.50") catch ab.decimal.Decimal.zero,
-    };
-}
-
-fn admissionView(
-    snap: ab.state.PortfolioState,
-    now_ms: i64,
-) ab.admission.SnapshotView {
-    return .{
-        .version = snap.version,
-        .reconciled = snap.reconciled,
-        .market_fresh = snap.freshness.marketFresh(now_ms),
-        .account_fresh = snap.freshness.accountFresh(now_ms),
-        .unresolved_orders = snap.unresolved_orders,
-        .risk_mode = snap.risk_mode,
-        .cash_usdt = snap.cash_usdt,
-        .btc_total = snap.btc_total,
-        .liq_price = snap.bid_price,
-        .mark_price = if (snap.mark_price.gt(ab.decimal.Decimal.zero)) snap.mark_price else snap.bid_price,
-        .high_watermark = snap.high_watermark,
-    };
-}
-
-fn shadowAdmit(
-    snap: ab.state.PortfolioState,
-    proposal_snapshot_version: u64,
-    target_btc_weight: ab.decimal.Decimal,
-    cfg: *const ab.config.Config,
-    now_ms: i64,
-) ShadowAdmission {
-    const view = admissionView(snap, now_ms);
-    const prop = ab.admission.ProposalView{
-        .snapshot_version = proposal_snapshot_version,
-        .target_btc_weight = target_btc_weight,
-    };
-    const result = ab.admission.admit(view, prop, cfg.max_drawdown, defaultStressParams(cfg)) catch {
-        return .{
-            .verdict_txt = "ERROR",
-            .reason_txt = "admission_math_error",
-            .admitted_weight = ab.decimal.Decimal.zero,
-            .stress_equity = ab.decimal.Decimal.zero,
-            .floor = ab.decimal.Decimal.zero,
-        };
-    };
-    return switch (result.verdict) {
-        .approve => |w| .{
-            .verdict_txt = "APPROVE",
-            .reason_txt = "ok",
-            .admitted_weight = w,
-            .stress_equity = result.stress_equity,
-            .floor = result.floor,
-        },
-        .approve_reduced => |w| .{
-            .verdict_txt = "REDUCE",
-            .reason_txt = "reduced_to_boundary",
-            .admitted_weight = w,
-            .stress_equity = result.stress_equity,
-            .floor = result.floor,
-        },
-        .reject => |r| .{
-            .verdict_txt = "REJECT",
-            .reason_txt = r.text(),
-            .admitted_weight = ab.decimal.Decimal.zero,
-            .stress_equity = result.stress_equity,
-            .floor = result.floor,
-        },
-    };
-}
-
 /// Record what a HOLD is actually holding.
 ///
 /// The admission that precedes this stressed `target_btc_weight`, which is 0 for
@@ -2657,9 +2527,9 @@ fn logHeldExposure(
     now_ms: i64,
 ) void {
     const held = ab.admission.heldExposure(
-        admissionView(snap, now_ms),
+        ab.gate.admissionView(snap, now_ms),
         cfg.max_drawdown,
-        defaultStressParams(cfg),
+        ab.gate.defaultStressParams(cfg),
     ) catch {
         logEventPayload(events_repo, engine, "EXEC_HOLD", "execution", "INFO", cfg, "{\"reason\":\"action_hold\",\"held\":\"unavailable\"}");
         return;
@@ -2693,32 +2563,6 @@ fn logHeldExposure(
 fn bindProposalVersion(proposal_version: u64, decision_start_version: u64, current_version: u64) u64 {
     if (proposal_version == decision_start_version) return current_version;
     return proposal_version;
-}
-
-/// Pull fresh ticker (+ demo private balances) into the engine immediately before
-/// admission/execution. LLM calls routinely exceed market_ttl_ms (10s).
-fn refreshBeforeAdmission(
-    gpa: std.mem.Allocator,
-    okx: *ab.okx_rest.Client,
-    cfg: *const ab.config.Config,
-    engine: *ab.state.Engine,
-    portfolio_refresher: ab.demo_runner.PortfolioRefresher,
-) void {
-    var path_buf: [128]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buf, "/api/v5/market/ticker?instId={s}", .{cfg.instrument}) catch return;
-    if (okx.getPublic(path)) |body| {
-        defer gpa.free(body);
-        if (ab.okx_rest.parseTicker(gpa, body)) |ticker| {
-            _ = engine.apply(.{ .market_tick = .{
-                .ts_ms = ticker.ts_ms,
-                .bid = ticker.bid,
-                .mark = ticker.last,
-            } }) catch {};
-        } else |_| {}
-    } else |_| {}
-    if (cfg.mode.isTrading()) {
-        _ = portfolio_refresher.run();
-    }
 }
 
 /// `{"verdict":"...","reason":"..."}` with the reason UTF-8-safely capped.
@@ -2849,146 +2693,6 @@ fn drainModeTransitions(
     drain_persisted = logEventPayloadChecked(events_repo, engine, "RISK_MODE_CHANGED", "risk-kernel", severity, cfg, payload);
 }
 threadlocal var drain_persisted: bool = true;
-
-/// Operator path probe: same admission + trading execution stack as agent REBALANCE.
-/// Used to unblock Gate3 order-path verification without waiting on LLM HOLD bias.
-/// While risk_mode=FLATTENING: market-sell toward weight 0; when dust, emit flatten_complete → HALTED.
-fn driveFlattenPosition(
-    gpa: std.mem.Allocator,
-    okx: *ab.okx_rest.Client,
-    cfg: *const ab.config.Config,
-    engine: *ab.state.Engine,
-    orders_repo: *ab.storage.OrdersRepo,
-    fills_repo: *ab.storage.FillsRepo,
-    events_repo: *ab.storage.EventsRepo,
-    st: *RuntimeStatus,
-    portfolio_refresher: ab.demo_runner.PortfolioRefresher,
-    instrument: ab.planner.Instrument,
-    last_exec_ms: *i64,
-    force: bool,
-) void {
-    const snap0 = engine.snapshot();
-    if (snap0.risk_mode != .flattening) return;
-
-    const dust = if (instrument.min_size.gt(ab.decimal.Decimal.zero)) instrument.min_size else (ab.decimal.Decimal.parse("0.00001") catch ab.decimal.Decimal.zero);
-    if (snap0.btc_total.isZero() or snap0.btc_total.lt(dust)) {
-        const prev = snap0.risk_mode;
-        _ = engine.apply(.{ .risk_trigger = .flatten_complete }) catch {};
-        const now_mode = engine.snapshot().risk_mode;
-        std.debug.print("[admin] flatten-complete {t} -> {t} (btc dust)\n", .{ prev, now_mode });
-        var fb: [192]u8 = undefined;
-        const fp = std.fmt.bufPrint(
-            &fb,
-            "{{\"from\":\"{t}\",\"to\":\"{t}\",\"trigger\":\"flatten_complete\"}}",
-            .{ prev, now_mode },
-        ) catch "{\"trigger\":\"flatten_complete\"}";
-        logEventPayload(events_repo, engine, "ADMIN_FLATTEN_COMPLETE", "admin", "CRITICAL", cfg, fp);
-        return;
-    }
-
-    const tnow = nowMs();
-    const cooldown_ms: i64 = 15_000;
-    if (!force and last_exec_ms.* != 0 and tnow - last_exec_ms.* < cooldown_ms) return;
-    last_exec_ms.* = tnow;
-
-    const note = runOperatorTargetWeight(
-        gpa,
-        okx,
-        cfg,
-        engine,
-        orders_repo,
-        fills_repo,
-        events_repo,
-        st,
-        portfolio_refresher,
-        instrument,
-        "0",
-    );
-    std.debug.print("[admin] flatten-drive btc={f} exec={s}\n", .{ snap0.btc_total, note });
-    var pb: [256]u8 = undefined;
-    var btc_buf: [48]u8 = undefined;
-    const bs = decFmt(&btc_buf, snap0.btc_total);
-    const payload = std.fmt.bufPrint(
-        &pb,
-        "{{\"btc_total\":\"{s}\",\"exec\":\"{s}\",\"source\":\"flatten_drive\"}}",
-        .{ bs, note },
-    ) catch "{\"source\":\"flatten_drive\"}";
-    logEventPayload(events_repo, engine, "ADMIN_FLATTEN_DRIVE", "admin", "CRITICAL", cfg, payload);
-}
-
-fn runOperatorTargetWeight(
-    gpa: std.mem.Allocator,
-    okx: *ab.okx_rest.Client,
-    cfg: *const ab.config.Config,
-    engine: *ab.state.Engine,
-    orders_repo: *ab.storage.OrdersRepo,
-    fills_repo: *ab.storage.FillsRepo,
-    events_repo: *ab.storage.EventsRepo,
-    st: *RuntimeStatus,
-    portfolio_refresher: ab.demo_runner.PortfolioRefresher,
-    instrument: ab.planner.Instrument,
-    weight_s: []const u8,
-) []const u8 {
-    const target = ab.decimal.Decimal.parse(weight_s) catch {
-        logEventPayload(events_repo, engine, "ADMIN_TARGET_WEIGHT", "admin", "WARN", cfg, "{\"error\":\"bad_weight\"}");
-        return "bad_weight";
-    };
-    if (target.isNegative() or target.gt(ab.decimal.Decimal.one)) {
-        logEventPayload(events_repo, engine, "ADMIN_TARGET_WEIGHT", "admin", "WARN", cfg, "{\"error\":\"weight_out_of_range\"}");
-        return "bad_weight";
-    }
-    if (!ab.okx_trade.executionAllowed(cfg.mode.isTrading(), exec_venue_authorized)) {
-        logEventPayload(events_repo, engine, "ADMIN_TARGET_WEIGHT", "admin", "WARN", cfg, "{\"error\":\"execution_not_allowed\"}");
-        return "exec_off";
-    }
-
-    refreshBeforeAdmission(gpa, okx, cfg, engine, portfolio_refresher);
-    const snap = engine.snapshot();
-    const admit_now = nowMs();
-    const admission = shadowAdmit(snap, snap.version, target, cfg, admit_now);
-
-    var id_buf: [48]u8 = undefined;
-    const decision_id = std.fmt.bufPrint(&id_buf, "dec_op_tw_{d}", .{admit_now}) catch "dec_op_tw";
-    const policy = ab.proposal.OrderPolicy{
-        .type = .limit_or_market,
-        .urgency = ab.decimal.Decimal.parse("0.5") catch ab.decimal.Decimal.zero,
-        .max_wait_ms = 120_000,
-    };
-    const exec_note = tryDemoExecute(
-        gpa,
-        okx,
-        cfg,
-        engine,
-        orders_repo,
-        fills_repo,
-        events_repo,
-        portfolio_refresher,
-        decision_id,
-        admission,
-        instrument,
-        snap,
-        policy,
-    );
-
-    var wbuf: [48]u8 = undefined;
-    var awbuf: [48]u8 = undefined;
-    const ws = decFmt(&wbuf, target);
-    const aws = decFmt(&awbuf, admission.admitted_weight);
-    var pbuf: [384]u8 = undefined;
-    const payload = std.fmt.bufPrint(
-        &pbuf,
-        "{{\"decision_id\":\"{s}\",\"target_btc_weight\":\"{s}\",\"admission\":\"{s}\",\"reason\":\"{s}\",\"admitted_weight\":\"{s}\",\"exec\":\"{s}\",\"source\":\"operator\"}}",
-        .{ decision_id, ws, admission.verdict_txt, admission.reason_txt, aws, exec_note },
-    ) catch "{\"source\":\"operator\"}";
-    logEventPayload(events_repo, engine, "ADMIN_TARGET_WEIGHT", "admin", "CRITICAL", cfg, payload);
-    logEventPayload(events_repo, engine, "RISK_ADMISSION", "risk", "INFO", cfg, payload);
-    {
-        var dbuf: [160]u8 = undefined;
-        const dtxt = std.fmt.bufPrint(&dbuf, "OP_TW {s} conf=1 admit={s} exec={s}", .{ decision_id, admission.verdict_txt, exec_note }) catch "OP_TW";
-        st.setLastDecision(dtxt);
-    }
-    return exec_note;
-}
 
 /// One slow-loop decision: tools → context → LLM → proposal → admission → optional demo exec.
 /// Compact own AGENT_PROPOSAL_OK payloads into small self-review JSON lines
@@ -3544,12 +3248,12 @@ fn runAgentDecision(
         .hold => "HOLD",
         .rebalance => "REBALANCE",
     };
-    refreshBeforeAdmission(gpa, okx, cfg, engine, portfolio_refresher);
+    ab.operator.refreshBeforeAdmission(gpa, okx, cfg, engine, portfolio_refresher);
     drainModeTransitions(events_repo, engine, cfg);
     const admit_snap = engine.snapshot();
     const admit_now = nowMs();
     const bound_version = bindProposalVersion(prop.snapshot_version, decision_start_version, admit_snap.version);
-    const admission = shadowAdmit(admit_snap, bound_version, prop.target_btc_weight, cfg, admit_now);
+    const admission = ab.gate.shadowAdmit(admit_snap, bound_version, prop.target_btc_weight, cfg, admit_now);
     var exec_note: []const u8 = "not_executed";
     // HOLD is always a no-op at the execution boundary. target_btc_weight is 0 by
     // schema for HOLD — must NEVER be planned as "flatten to cash" (that wiped a
@@ -3566,20 +3270,23 @@ fn runAgentDecision(
         logEventPayload(events_repo, engine, "EXEC_HOLD", "execution", "WARN", cfg, "{\"reason\":\"restart_guard\",\"detail\":\"first decision after restart with a recent prior decision; rebalance deferred to next cycle\"}");
         std.debug.print("[agent] restart guard: REBALANCE deferred (first_run, prior decision <{d}m ago)\n", .{@divTrunc(restart_guard_window_ms, 60_000)});
     } else if (ab.okx_trade.executionAllowed(cfg.mode.isTrading(), exec_venue_authorized)) {
-        exec_note = tryDemoExecute(
+        exec_note = ab.demo_runner.tryDemoExecute(
             gpa,
             okx,
             cfg,
             engine,
+            db,
             orders_repo,
             fills_repo,
             events_repo,
             portfolio_refresher,
             prop.decision_id,
-            admission,
+            admission.verdict_txt,
+            admission.admitted_weight,
             instrument,
             admit_snap,
             prop.order_policy,
+            .{ .requested_weight = prop.target_btc_weight },
         );
         // Dust / below-min rebalances are the same no-op as HOLD: honor
         // review_after so leftover cash below the trade floor does not
@@ -3697,37 +3404,6 @@ fn runAgentDecision(
 /// Demo-only: plan + place market order after APPROVE/REDUCE. Never called for live.
 /// Partial fills: REST-reconcile portfolio then re-plan residual (max 3 legs).
 /// Returns a short stable token for logs/events (no secrets).
-/// Thin forwarding wrappers — the demo/live execution chain lives in
-/// src/execution/demo_runner.zig; call sites keep their original shape.
-fn tryDemoExecute(
-    gpa: std.mem.Allocator,
-    okx: *ab.okx_rest.Client,
-    cfg: *const ab.config.Config,
-    engine: *ab.state.Engine,
-    orders_repo: *ab.storage.OrdersRepo,
-    fills_repo: *ab.storage.FillsRepo,
-    events_repo: *ab.storage.EventsRepo,
-    portfolio_refresher: ab.demo_runner.PortfolioRefresher,
-    decision_id: []const u8,
-    admission: ShadowAdmission,
-    instrument: ab.planner.Instrument,
-    snap_in: ab.state.PortfolioState,
-    order_policy: ab.proposal.OrderPolicy,
-) []const u8 {
-    return ab.demo_runner.tryDemoExecute(gpa, okx, cfg, engine, orders_repo, fills_repo, events_repo, portfolio_refresher, decision_id, admission.verdict_txt, admission.admitted_weight, instrument, snap_in, order_policy);
-}
-
-/// Cancel pending trading orders (shadow: no-op count 0).
-fn adminCancelAll(
-    gpa: std.mem.Allocator,
-    okx: *ab.okx_rest.Client,
-    cfg: *const ab.config.Config,
-    engine: *ab.state.Engine,
-    events_repo: *ab.storage.EventsRepo,
-) usize {
-    return ab.demo_runner.adminCancelAll(gpa, okx, cfg, engine, events_repo, ab.okx_trade.executionAllowed(cfg.mode.isTrading(), exec_venue_authorized));
-}
-
 fn completeRun(
     runs: *ab.storage.AgentRunsRepo,
     run_id: []const u8,
@@ -5783,6 +5459,33 @@ fn webThreadMain(io: std.Io, host: []const u8, port: u16, ws: *WebState) void {
 /// Venue authorization for trading execution: simulated keys, or explicit
 /// real-money opt-in (OKX_REAL_MONEY_OK=1). Set once during boot.
 var exec_venue_authorized: bool = false;
+
+fn execEnv(
+    gpa: std.mem.Allocator,
+    okx: *ab.okx_rest.Client,
+    cfg: *const ab.config.Config,
+    engine: *ab.state.Engine,
+    db: *ab.storage.Db,
+    orders_repo: *ab.storage.OrdersRepo,
+    fills_repo: *ab.storage.FillsRepo,
+    events_repo: *ab.storage.EventsRepo,
+    refresher: ab.demo_runner.PortfolioRefresher,
+    instrument: ab.planner.Instrument,
+) ab.operator.Env {
+    return .{
+        .gpa = gpa,
+        .okx = okx,
+        .cfg = cfg,
+        .engine = engine,
+        .db = db,
+        .orders_repo = orders_repo,
+        .fills_repo = fills_repo,
+        .events_repo = events_repo,
+        .refresher = refresher,
+        .instrument = instrument,
+        .venue_authorized = exec_venue_authorized,
+    };
+}
 /// True only when real (non-simulated) keys run with explicit opt-in.
 var exec_real_money: bool = false;
 

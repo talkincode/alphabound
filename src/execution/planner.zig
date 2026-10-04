@@ -33,6 +33,9 @@ pub const PlanInputs = struct {
     /// apply). Applies only to the initial leg — residual replans after a
     /// partial fill pass 0 so they can finish the admitted delta.
     min_weight_delta: Decimal = Decimal.zero,
+    /// Hard ceiling on a SELL (free, unencumbered holdings). Emergency exits
+    /// pass the admitted maximum so a plan can never oversell.
+    max_sell_qty: ?Decimal = null,
 };
 
 pub const Plan = union(enum) {
@@ -80,6 +83,7 @@ pub fn plan(in: PlanInputs) PlanError!Plan {
         qty = Decimal.min(qty, try max_affordable.floorToStep(in.instrument.lot_size));
     } else {
         qty = Decimal.min(qty, try in.btc_total.floorToStep(in.instrument.lot_size));
+        if (in.max_sell_qty) |cap| qty = Decimal.min(qty, try cap.floorToStep(in.instrument.lot_size));
     }
 
     if (qty.lt(in.instrument.min_size) or qty.isZero()) return .hold;
@@ -422,4 +426,19 @@ test "AC-GO3 property: partial-fill replan converges without flipping side" {
         }
         try testing.expect(steps < 200); // always converges to HOLD
     }
+}
+
+test "sell plan never exceeds the admitted sell cap" {
+    const p = try plan(.{
+        .cash_usdt = d("0"),
+        .btc_total = d("0.002"),
+        .equity = d("200"),
+        .mark_price = d("100000"),
+        .admitted_btc_weight = d("0"),
+        .instrument = btc_usdt,
+        .max_sell_qty = d("0.0015"),
+    });
+    try testing.expect(p == .order);
+    try testing.expectEqual(orders.Side.sell, p.order.side);
+    try testing.expect(p.order.qty.eql(d("0.0015")));
 }
