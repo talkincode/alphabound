@@ -282,3 +282,246 @@ test "P0-1: a flatten cannot sell on a projected (non-authoritative) book" {
     try testing.expectEqual(@as(usize, 0), h.fake.countCalls(.POST, place_path));
     try testing.expectEqual(risk_sm.RiskMode.flattening, h.engine.snapshot().risk_mode);
 }
+
+fn recordLiveOrder(h: *Harness, cl_id: []const u8, status: []const u8, created_ts: []const u8) !void {
+    try h.orders.upsert(.{
+        .client_order_id = cl_id,
+        .decision_id = "dec_restart",
+        .side = "buy",
+        .qty = "0.001",
+        .price = "99000",
+        .status = status,
+        .created_ts = created_ts,
+        .updated_ts = created_ts,
+    });
+}
+
+test "P1-6: after a restart a resting order is canceled and verified before trading reopens" {
+    var h = try Harness.create(testing.allocator, "demo");
+    defer h.destroy();
+    h.seed("1000", "0", "100000", "1000");
+    h.fake.fill_mode = .none;
+    const cl = "abrestart00000000000000000000001";
+    try placeRestingOrder(h, cl);
+    try recordLiveOrder(h, cl, "ACKNOWLEDGED", "2026-01-01T00:00:00.000Z");
+    h.restartProcess();
+    try testing.expect(h.engine.snapshot().unresolved_orders);
+
+    // Trading stays closed while the previous process' order is unaccounted for.
+    try testing.expectEqualStrings("unresolved_orders", h.execute("dec_after_restart", "0.5", false));
+    try testing.expectEqual(@as(usize, 1), h.fake.countCalls(.POST, place_path));
+
+    const report = h.recover();
+    try testing.expect(report.complete);
+    try testing.expectEqual(@as(usize, 1), report.canceled);
+    try testing.expectEqual(fake_okx.OrderState.canceled, h.fake.findOrder(cl).?.state);
+    var buf: [16]u8 = undefined;
+    try testing.expectEqualStrings("CANCELED", h.orderStatus(cl, &buf).?);
+    try testing.expect(!h.engine.snapshot().unresolved_orders);
+}
+
+test "P1-6: an order that filled while the process was down is booked, not re-traded" {
+    var h = try Harness.create(testing.allocator, "demo");
+    defer h.destroy();
+    h.seed("1000", "0", "100000", "1000");
+    h.fake.fill_mode = .none;
+    const cl = "abrestart00000000000000000000002";
+    try placeRestingOrder(h, cl);
+    try recordLiveOrder(h, cl, "ACKNOWLEDGED", "2026-01-01T00:00:00.000Z");
+    try h.fake.fillOrder(cl, d("0.001"), d("99000"));
+    h.restartProcess();
+
+    const report = h.recover();
+    try testing.expect(report.complete);
+    var buf: [16]u8 = undefined;
+    try testing.expectEqualStrings("FILLED", h.orderStatus(cl, &buf).?);
+    try testing.expect(h.filledQty(cl).eql(d("0.001")));
+    try testing.expect(!h.engine.snapshot().unresolved_orders);
+}
+
+test "P1-6: an unknown order the venue cannot see yet keeps trading closed" {
+    var h = try Harness.create(testing.allocator, "demo");
+    defer h.destroy();
+    h.seed("1000", "0", "100000", "1000");
+    var now_buf: [32]u8 = undefined;
+    const now_ts = try @import("../core/clock.zig").formatRfc3339Ms(@import("../core/clock.zig").SystemClock.clock().wallMs(), &now_buf);
+    try recordLiveOrder(h, "abrestart00000000000000000000003", "UNKNOWN", now_ts);
+    h.restartProcess();
+
+    const report = h.recover();
+    try testing.expect(!report.complete);
+    try testing.expectEqual(@as(usize, 1), report.unresolved);
+    try testing.expect(h.engine.snapshot().unresolved_orders);
+    try testing.expectEqual(@as(i64, 0), h.countOrdersWithStatus("CANCELED"));
+}
+
+test "P1-6: an intent the venue never saw is resolved only after the visibility grace" {
+    var h = try Harness.create(testing.allocator, "demo");
+    defer h.destroy();
+    h.seed("1000", "0", "100000", "1000");
+    try recordLiveOrder(h, "abrestart00000000000000000000004", "PLANNED", "2026-01-01T00:00:00.000Z");
+    h.restartProcess();
+
+    const report = h.recover();
+    try testing.expect(report.complete);
+    try testing.expectEqual(@as(i64, 1), h.countOrdersWithStatus("CANCELED"));
+    try testing.expect(!h.engine.snapshot().unresolved_orders);
+}
+
+test "P1-6: a venue order the ledger does not own keeps trading closed until cancel-all verifies" {
+    var h = try Harness.create(testing.allocator, "demo");
+    defer h.destroy();
+    h.seed("1000", "0", "100000", "1000");
+    h.fake.fill_mode = .none;
+    try placeRestingOrder(h, "abforeign0000000000000000000001");
+    h.restartProcess();
+
+    const report = h.recover();
+    try testing.expect(!report.complete);
+    try testing.expectEqual(@as(usize, 1), report.foreign);
+    try testing.expect(h.engine.snapshot().unresolved_orders);
+
+    const cancel = operator.cancelAll(h.operatorEnv());
+    try testing.expect(cancel.verified_clear);
+    try testing.expect(!h.engine.snapshot().unresolved_orders);
+}
+
+test "P1-6: an unreadable pending list is not proof of a clean venue" {
+    var h = try Harness.create(testing.allocator, "demo");
+    defer h.destroy();
+    h.seed("1000", "0", "100000", "1000");
+    try h.fake.addFault(.{ .method = .GET, .path = "orders-pending", .nth = 0, .action = .http_error });
+    h.restartProcess();
+    _ = try h.engine.apply(.{ .order_ambiguity = .{ .present = true } });
+
+    const report = h.recover();
+    try testing.expect(!report.complete);
+    try testing.expect(h.engine.snapshot().unresolved_orders);
+}
+
+test "P1-6: kill after acceptance, restart, recover: the old order is settled before new trading" {
+    var h = try Harness.create(testing.allocator, "demo");
+    defer h.destroy();
+    h.seed("1000", "0", "100000", "1000");
+    h.fake.fill_mode = .none;
+    // The process "dies" mid-leg: nothing it asks the venue afterwards is answered.
+    try h.fake.addFault(.{ .method = .GET, .path = "/trade/order?", .nth = 0, .action = .http_error });
+    _ = h.execute("dec_kill", "0.5", true);
+    try testing.expect(h.engine.snapshot().unresolved_orders);
+    const orphan = h.fake.lastOrder().?;
+    try testing.expectEqual(fake_okx.OrderState.live, orphan.state);
+
+    h.fake.clearFaults();
+    h.restartProcess();
+    const report = h.recover();
+    try testing.expect(report.complete);
+    try testing.expectEqual(fake_okx.OrderState.canceled, h.fake.lastOrder().?.state);
+    h.fake.fill_mode = .full;
+    try testing.expectEqualStrings("filled", h.execute("dec_after_kill", "0.5", false));
+}
+
+test "P1-7: cancel-all clears the ambiguity only after a verified clean venue and ledger" {
+    var h = try Harness.create(testing.allocator, "demo");
+    defer h.destroy();
+    h.seed("1000", "0", "100000", "1000");
+    h.fake.fill_mode = .none;
+    try placeRestingOrder(h, "abresting03");
+    _ = try h.engine.apply(.{ .order_ambiguity = .{ .present = true } });
+
+    const report = operator.cancelAll(h.operatorEnv());
+
+    try testing.expect(report.verified_clear);
+    try testing.expectEqual(@as(usize, 1), report.canceled);
+    try testing.expectEqual(fake_okx.OrderState.canceled, h.fake.findOrder("abresting03").?.state);
+    try testing.expect(!h.engine.snapshot().unresolved_orders);
+}
+
+test "P1-7: an order that fills during cancel-all is observed, not assumed canceled" {
+    var h = try Harness.create(testing.allocator, "demo");
+    defer h.destroy();
+    h.seed("1000", "0", "100000", "1000");
+    h.fake.fill_mode = .none;
+    const cl = "abfillcancel000000000000000000001";
+    try placeRestingOrder(h, cl);
+    try recordLiveOrder(h, cl, "ACKNOWLEDGED", "2026-01-01T00:00:00.000Z");
+    try h.fake.fillOrder(cl, d("0.001"), d("99000")); // filled before the cancel lands
+
+    const report = operator.cancelAll(h.operatorEnv());
+    _ = report;
+    var buf: [16]u8 = undefined;
+    // Not pending any more, so cancel-all had nothing to cancel; the ledger
+    // still lists it as open until recovery observes the fill.
+    try testing.expect(h.engine.snapshot().unresolved_orders);
+    const rec = h.recover();
+    try testing.expect(rec.complete);
+    try testing.expectEqualStrings("FILLED", h.orderStatus(cl, &buf).?);
+}
+
+test "control: a clean market rebalance fills in one leg and leaves nothing open" {
+    var h = try Harness.create(testing.allocator, "demo");
+    defer h.destroy();
+    h.seed("1000", "0", "100000", "1000");
+    try testing.expectEqualStrings("filled", h.execute("dec_clean", "0.5", false));
+    try testing.expectEqual(@as(usize, 1), h.fake.countCalls(.POST, place_path));
+    try testing.expectEqual(@as(i64, 0), h.countOrders() - h.countOrdersWithStatus("FILLED"));
+    try testing.expect(!h.engine.snapshot().unresolved_orders);
+    try testing.expect(h.filledQty(h.fake.lastOrder().?.cl_id).eql(h.fake.lastOrder().?.acc_fill));
+}
+
+test "limit wait expires: the resting order is canceled and confirmed, never left working" {
+    var h = try Harness.create(testing.allocator, "demo");
+    defer h.destroy();
+    h.seed("1000", "0", "100000", "1000");
+    h.fake.fill_mode = .none;
+    h.max_wait_ms = 30;
+    try testing.expectEqualStrings("limit_timeout", h.execute("dec_timeout", "0.5", true));
+    try testing.expectEqual(fake_okx.OrderState.canceled, h.fake.lastOrder().?.state);
+    try testing.expectEqual(@as(usize, 1), h.fake.countCalls(.POST, place_path));
+    try testing.expect(!h.engine.snapshot().unresolved_orders);
+}
+
+test "partial fills across legs never exceed the admitted exposure" {
+    var h = try Harness.create(testing.allocator, "demo");
+    defer h.destroy();
+    h.seed("1000", "0", "100000", "1000");
+    h.fake.fill_mode = .fraction;
+    _ = h.execute("dec_legs", "0.5", true);
+    // Target is 0.5 of ~1000 USDT at 100k: 0.005 BTC. Fees and rounding aside,
+    // the venue must never end up holding more than that.
+    try testing.expect(h.fake.btc.lte(d("0.00501")));
+    try testing.expect(h.fake.countCalls(.POST, place_path) <= 3);
+    // Every order the venue holds is terminal (canceled remainder / filled).
+    for (h.fake.orders.items) |o| {
+        try testing.expect(o.state == .canceled or o.state == .filled);
+    }
+}
+
+test "an abort request cancels the resting order and stops before another leg" {
+    var h = try Harness.create(testing.allocator, "demo");
+    defer h.destroy();
+    h.seed("1000", "0", "100000", "1000");
+    h.fake.fill_mode = .none;
+    h.max_wait_ms = 60_000;
+    var abort = std.atomic.Value(bool).init(true);
+    const snap = h.engine.snapshot();
+    const note = demo_runner.tryDemoExecute(
+        h.gpa,
+        &h.okx,
+        &h.cfg,
+        &h.engine,
+        &h.db,
+        &h.orders,
+        &h.fills,
+        &h.events,
+        h.refresher(),
+        "dec_abort",
+        "APPROVE",
+        d("0.5"),
+        h.instrument,
+        snap,
+        .{ .type = .limit_only, .urgency = d("1"), .max_wait_ms = 60_000 },
+        .{ .abort = &abort },
+    );
+    try testing.expectEqualStrings("aborted", note);
+    try testing.expectEqual(@as(usize, 0), h.fake.countCalls(.POST, place_path));
+}

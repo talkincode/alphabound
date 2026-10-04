@@ -31,6 +31,7 @@ pub const Harness = struct {
     cfg: config.Config,
     instrument: planner.Instrument,
     refresh_calls: u32 = 0,
+    max_wait_ms: u32 = 1_000,
     /// Lets a test mutate the venue/engine right before the next refresh.
     before_refresh: ?*const fn (*Harness) void = null,
 
@@ -62,6 +63,7 @@ pub const Harness = struct {
             .min_notional = d("1"),
         };
         self.refresh_calls = 0;
+        self.max_wait_ms = 1_000;
         self.before_refresh = null;
         demo_runner.timing = .{ .query_retry_ms = 1, .poll_ms = 1, .absent_grace_ms = 60_000 };
         return self;
@@ -122,9 +124,31 @@ pub const Harness = struct {
         self.fake.btc = d(btc);
         self.fake.bid = d(bid);
         self.fake.ask = d(bid);
+        // Like the daemon: the book is known before the stored HWM is judged
+        // against it (an empty book under a restored HWM is a 100% drawdown).
+        std.debug.assert(self.refresh());
         self.engine.restoreHwm(d(hwm));
         std.debug.assert(self.refresh());
         self.refresh_calls = 0;
+    }
+
+    /// Simulate a process restart: new engine (no memory of the old run) over
+    /// the same ledger and venue, closed for trading until orders are recovered.
+    pub fn restartProcess(self: *Harness) void {
+        const hwm = self.engine.snapshot().high_watermark;
+        self.engine = state.Engine.init(
+            .{ .fee_rate = self.cfg.taker_fee_rate, .slippage_rate = self.cfg.slippage_rate },
+            self.cfg.max_drawdown,
+        );
+        std.debug.assert(self.refresh());
+        self.engine.restoreHwm(hwm);
+        var rows: [4]storage.OpenOrderRow = undefined;
+        const open = self.orders.listNonTerminal(&self.db, &rows) catch 1;
+        _ = self.engine.apply(.{ .order_ambiguity = .{ .present = open > 0 } }) catch {};
+    }
+
+    pub fn recover(self: *Harness) demo_runner.RecoveryReport {
+        return demo_runner.recoverOrders(self.gpa, &self.okx, &self.cfg, &self.engine, &self.db, &self.orders, &self.fills, &self.events);
     }
 
     pub fn orderStatus(self: *Harness, cl_id: []const u8, out: []u8) ?[]const u8 {
@@ -213,7 +237,7 @@ pub const Harness = struct {
             .{
                 .type = if (policy_limit_only) .limit_only else .limit_or_market,
                 .urgency = d("1"),
-                .max_wait_ms = 1_000,
+                .max_wait_ms = self.max_wait_ms,
             },
             .{},
         );

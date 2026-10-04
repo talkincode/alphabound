@@ -123,17 +123,122 @@ pub const ModeTransition = struct {
     bounces: u32 = 0,
 };
 
+/// Capacity of the cross-thread message inbox (see `Engine.submit`).
+pub const inbox_cap: usize = 256;
+
 pub const Engine = struct {
     state: PortfolioState = .{},
     exit_costs: equity_mod.ExitCostParams,
     max_drawdown: Decimal,
     pending_transition: ?ModeTransition = null,
 
+    // -- Concurrency ---------------------------------------------------------
+    // One thread (the owner) mutates state. Other threads never touch it: they
+    // `submit` messages that the owner applies in order via `drainInbox`, and
+    // read immutable snapshots. `lock` only guards the short copy-in/copy-out
+    // sections, so a reader can never observe a half-applied message.
+    lock: std.atomic.Mutex = .unlocked,
+    /// Owner thread id; 0 = unclaimed (single-threaded use, tests).
+    owner: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    inbox: [inbox_cap]Queued = undefined,
+    inbox_len: usize = 0,
+    inbox_overflowed: bool = false,
+    submitted_seq: u64 = 0,
+    applied_seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    const Queued = struct { seq: u64, msg: Message };
+
+    fn currentThread() u64 {
+        return @as(u64, @intCast(std.Thread.getCurrentId())) + 1;
+    }
+
+    fn lockState(self: *Engine) void {
+        while (!self.lock.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    /// Declare the calling thread the state owner (the fast risk loop).
+    pub fn claimOwner(self: *Engine) void {
+        self.owner.store(currentThread(), .release);
+    }
+
+    pub fn isOwner(self: *const Engine) bool {
+        const o = self.owner.load(.acquire);
+        return o == 0 or o == currentThread();
+    }
+
     /// Return and clear the pending transition record, if any.
     pub fn takeModeTransition(self: *Engine) ?ModeTransition {
+        self.lockState();
+        defer self.lock.unlock();
         const t = self.pending_transition;
         self.pending_transition = null;
         return t;
+    }
+
+    /// Send a message to the state owner. On the owner thread it applies
+    /// immediately; from any other thread it is queued (bounded, never blocks)
+    /// and applied in submission order by the owner's next `drainInbox`.
+    /// Returns a ticket for `waitApplied` (0 when applied inline).
+    pub fn submit(self: *Engine, msg: Message) dec.DecimalError!u64 {
+        if (self.isOwner()) {
+            _ = try self.apply(msg);
+            return 0;
+        }
+        self.lockState();
+        defer self.lock.unlock();
+        if (self.inbox_len >= inbox_cap) {
+            // Dropping silently could lose an "order ambiguity: true"; the owner
+            // fails closed instead (see drainInbox).
+            self.inbox_overflowed = true;
+            return 0;
+        }
+        self.submitted_seq += 1;
+        self.inbox[self.inbox_len] = .{ .seq = self.submitted_seq, .msg = msg };
+        self.inbox_len += 1;
+        return self.submitted_seq;
+    }
+
+    /// Block (bounded) until a submitted message has been applied.
+    pub fn waitApplied(self: *Engine, ticket: u64, io: std.Io, timeout_ms: u32) bool {
+        if (ticket == 0) return true;
+        var waited: u32 = 0;
+        while (self.applied_seq.load(.acquire) < ticket) {
+            if (waited >= timeout_ms) return false;
+            io.sleep(.{ .nanoseconds = 2_000_000 }, .awake) catch return false;
+            waited += 2;
+        }
+        return true;
+    }
+
+    /// Submit and wait until the owner applied it (later reads see the effect).
+    pub fn submitSync(self: *Engine, msg: Message, io: std.Io) void {
+        const ticket = self.submit(msg) catch return;
+        _ = self.waitApplied(ticket, io, 1_000);
+    }
+
+    /// Owner only: apply every queued message in order. Returns how many.
+    pub fn drainInbox(self: *Engine) usize {
+        var batch: [inbox_cap]Queued = undefined;
+        var n: usize = 0;
+        var overflowed = false;
+        {
+            self.lockState();
+            defer self.lock.unlock();
+            n = self.inbox_len;
+            @memcpy(batch[0..n], self.inbox[0..n]);
+            self.inbox_len = 0;
+            overflowed = self.inbox_overflowed;
+            self.inbox_overflowed = false;
+        }
+        for (batch[0..n]) |q| {
+            _ = self.apply(q.msg) catch {};
+            self.applied_seq.store(q.seq, .release);
+        }
+        if (overflowed) {
+            std.debug.print("[state] inbox overflow — failing closed (order ambiguity)\n", .{});
+            _ = self.apply(.{ .order_ambiguity = .{ .present = true } }) catch {};
+        }
+        return n;
     }
 
     pub fn init(exit_costs: equity_mod.ExitCostParams, max_drawdown: Decimal) Engine {
@@ -142,12 +247,20 @@ pub const Engine = struct {
 
     /// Restore high watermark from storage at boot (§7.1 BOOTING).
     pub fn restoreHwm(self: *Engine, hwm: Decimal) void {
+        self.lockState();
+        defer self.lock.unlock();
         self.state.high_watermark = hwm;
         self.state.version += 1;
     }
 
     /// Sequentially apply one message. This is the only place state mutates.
     pub fn apply(self: *Engine, msg: Message) dec.DecimalError!ApplyResult {
+        self.lockState();
+        defer self.lock.unlock();
+        return self.applyLocked(msg);
+    }
+
+    fn applyLocked(self: *Engine, msg: Message) dec.DecimalError!ApplyResult {
         var result = ApplyResult{};
         const prev_mode = self.state.risk_mode;
 
@@ -240,6 +353,9 @@ pub const Engine = struct {
 
     /// Immutable snapshot for readers (agent, dashboard, risk worker).
     pub fn snapshot(self: *const Engine) PortfolioState {
+        const mutable: *Engine = @constCast(self);
+        mutable.lockState();
+        defer mutable.lock.unlock();
         return self.state;
     }
 
@@ -642,4 +758,105 @@ test "ledger write failure degrades trading until a write succeeds again" {
     try testing.expect(!e.snapshot().ledger_ok);
     _ = try e.apply(.{ .ledger_status = .{ .ok = true } });
     try testing.expectEqual(sm.RiskMode.normal, e.snapshot().risk_mode);
+}
+
+const Producer = struct {
+    engine: *Engine,
+    count: usize,
+
+    fn run(self: *Producer) void {
+        var i: usize = 0;
+        while (i < self.count) : (i += 1) {
+            // Alternating flags; the last submitted value must win.
+            _ = self.engine.submit(.{ .order_ambiguity = .{ .present = i % 2 == 0 } }) catch {};
+        }
+    }
+};
+
+test "non-owner submissions are applied by the owner in order, never inline" {
+    var e = try reconciledNormalEngine();
+    e.claimOwner();
+    var producer = Producer{ .engine = &e, .count = 101 }; // last value: present = true
+    const t = try std.Thread.spawn(.{}, Producer.run, .{&producer});
+    t.join();
+    // The producer thread must not have touched the state.
+    try testing.expect(!e.snapshot().unresolved_orders);
+    try testing.expectEqual(@as(usize, 101), e.drainInbox());
+    try testing.expect(e.snapshot().unresolved_orders);
+    try testing.expectEqual(@as(u64, 101), e.applied_seq.load(.acquire));
+}
+
+test "owner submissions apply immediately" {
+    var e = try reconciledNormalEngine();
+    e.claimOwner();
+    const ticket = try e.submit(.{ .order_ambiguity = .{ .present = true } });
+    try testing.expectEqual(@as(u64, 0), ticket);
+    try testing.expect(e.snapshot().unresolved_orders);
+}
+
+test "an inbox overflow fails closed instead of losing a message" {
+    var e = try reconciledNormalEngine();
+    e.claimOwner();
+    var producer = Producer{ .engine = &e, .count = inbox_cap + 50 };
+    const t = try std.Thread.spawn(.{}, Producer.run, .{&producer});
+    t.join();
+    _ = e.drainInbox();
+    try testing.expect(e.snapshot().unresolved_orders);
+}
+
+const Reader = struct {
+    engine: *Engine,
+    stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    torn: bool = false,
+
+    fn run(self: *Reader) void {
+        while (!self.stop.load(.acquire)) {
+            const s = self.engine.snapshot();
+            // The writer always sets cash and btc to the same value.
+            if (!s.cash_usdt.eql(s.btc_total)) self.torn = true;
+        }
+    }
+};
+
+test "snapshots are never torn while the owner applies messages" {
+    var e = try reconciledNormalEngine();
+    e.claimOwner();
+    var reader = Reader{ .engine = &e };
+    const t = try std.Thread.spawn(.{}, Reader.run, .{&reader});
+    var i: i64 = 1;
+    while (i < 4000) : (i += 1) {
+        const v = Decimal.fromInt(i);
+        _ = try e.apply(.{ .account_projection = .{ .ts_ms = 0, .cash_usdt = v, .btc_total = v, .btc_available = v } });
+    }
+    reader.stop.store(true, .release);
+    t.join();
+    try testing.expect(!reader.torn);
+}
+
+test "submitSync returns once the owner applied the message" {
+    var e = try reconciledNormalEngine();
+    e.claimOwner();
+    const Drainer = struct {
+        fn run(engine: *Engine, stop: *std.atomic.Value(bool)) void {
+            while (!stop.load(.acquire)) {
+                _ = engine.drainInbox();
+                std.atomic.spinLoopHint();
+            }
+        }
+    };
+    var stop = std.atomic.Value(bool).init(false);
+    // The drainer plays the owner: claim ownership from its own thread.
+    const Owner = struct {
+        fn run(engine: *Engine, stop_flag: *std.atomic.Value(bool)) void {
+            engine.claimOwner();
+            Drainer.run(engine, stop_flag);
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Owner.run, .{ &e, &stop });
+    // Wait until the spawned thread owns the engine.
+    while (e.isOwner()) std.atomic.spinLoopHint();
+    e.submitSync(.{ .order_ambiguity = .{ .present = true } }, testing.io);
+    try testing.expect(e.snapshot().unresolved_orders);
+    stop.store(true, .release);
+    t.join();
 }

@@ -109,12 +109,12 @@ pub const Ctx = struct {
     }
 
     fn setAmbiguity(self: *const Ctx, present: bool) void {
-        _ = self.engine.apply(.{ .order_ambiguity = .{ .present = present } }) catch {};
+        self.engine.submitSync(.{ .order_ambiguity = .{ .present = present } }, self.okx.http.io);
     }
 
     fn setLedger(self: *const Ctx, ok: bool) void {
         if (self.engine.snapshot().ledger_ok == ok) return;
-        _ = self.engine.apply(.{ .ledger_status = .{ .ok = ok } }) catch {};
+        self.engine.submitSync(.{ .ledger_status = .{ .ok = ok } }, self.okx.http.io);
     }
 
     /// Number of order rows whose final state is not on record; null = ledger unreadable.
@@ -411,12 +411,12 @@ fn projectFill(ctx: *const Ctx, side: orders.Side, obs: Observation) void {
     cash = Decimal.max(cash, Decimal.zero);
     btc = Decimal.max(btc, Decimal.zero);
     avail = Decimal.min(Decimal.max(avail, Decimal.zero), btc);
-    _ = ctx.engine.apply(.{ .account_projection = .{
+    ctx.engine.submitSync(.{ .account_projection = .{
         .ts_ms = nowMs(),
         .cash_usdt = cash,
         .btc_total = btc,
         .btc_available = avail,
-    } }) catch {};
+    } }, ctx.okx.http.io);
 }
 
 const Leg = struct {
@@ -1021,8 +1021,7 @@ pub fn cancelAllVerified(
     }
     report.remaining = after_n + after_unnamed;
     const ledger_open = ctx.openOrderCount();
-    report.verified_clear = after_ok and scan.n + scan.unnamed == 0 or
-        (after_ok and report.remaining == 0 and !scan.truncated);
+    report.verified_clear = after_ok and report.remaining == 0 and !scan.truncated;
     if (report.verified_clear and ledger_open != null and ledger_open.? == 0) {
         ctx.setAmbiguity(false);
     } else {

@@ -12,6 +12,7 @@ pub const planner = @import("execution/planner.zig");
 pub const okx_trade = @import("execution/okx_trade.zig");
 pub const demo_runner = @import("execution/demo_runner.zig");
 pub const operator = @import("execution/operator.zig");
+pub const exec_lane = @import("execution/exec_lane.zig");
 pub const proposal = @import("agent/proposal.zig");
 pub const events = @import("core/events.zig");
 pub const redaction = @import("observability/redaction.zig");
@@ -21,6 +22,7 @@ pub const auditor = @import("observability/auditor.zig");
 pub const llm_usage = @import("observability/llm_usage.zig");
 pub const config = @import("config.zig");
 pub const state = @import("core/state.zig");
+pub const lanes = @import("core/lanes.zig");
 pub const storage = @import("storage/db.zig");
 pub const storage_policy = @import("storage/policy.zig");
 pub const storage_disk = @import("storage/disk.zig");
@@ -60,6 +62,7 @@ pub const security_isolation = @import("security/isolation.zig");
 pub const fake_okx = @import("testing/fake_okx.zig");
 pub const test_harness = @import("testing/harness.zig");
 pub const exec_chain_tests = @import("execution/exec_chain_tests.zig");
+pub const exec_lane_tests = @import("execution/exec_lane_tests.zig");
 
 pub const Decimal = decimal.Decimal;
 

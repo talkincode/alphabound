@@ -983,7 +983,7 @@ pub fn main(init: std.process.Init) !u8 {
     refreshEgressIp(&okx, &runtime_status);
     refreshDiskStatus(&cfg, &engine, &events_repo, &runtime_status);
     runtime_status.setResources(res_sampler.sample(nowMs()));
-    refreshSystemCache(&web_state, &db, &cfg, &mem_store, boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), llm_client != null, admin_paused, &runtime_status, &risk_latency);
+    refreshSystemCache(&web_state, &db, &cfg, mem_store.count(), boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), llm_client != null, admin_paused, &runtime_status, &risk_latency);
     logEvent(&events_repo, &engine, "STATE_READY", "core", "INFO", &cfg);
 
     var tick_count: u64 = 0;
@@ -1294,7 +1294,7 @@ pub fn main(init: std.process.Init) !u8 {
         // even while an LLM call blocks the loop for tens of seconds.
         runtime_status.volatility_as_of_ms = nowMs();
         runtime_status.volatility = schedulerVolatilityStatus(&agent_sched, engine.snapshot(), runtime_status.volatility_as_of_ms);
-        refreshSystemCache(&web_state, &db, &cfg, &mem_store, boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), llm_client != null, admin_paused, &runtime_status, &risk_latency);
+        refreshSystemCache(&web_state, &db, &cfg, mem_store.count(), boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), llm_client != null, admin_paused, &runtime_status, &risk_latency);
 
         // Slow agent loop: proposals always risk-admitted; trading modes may execute.
         // Paused: keep risk/market/reconcile; skip agent decisions.
@@ -1323,7 +1323,7 @@ pub fn main(init: std.process.Init) !u8 {
                     runAgentDecision(gpa, client, &okx, &cfg, &engine, &tool_reg, &agent_runs, &tool_calls, &llm_usage_repo, &events_repo, &orders_repo, &fills_repo, &equity_repo, &capital_flows_repo, &db, &mem_store, &memories_repo, &intel_repo, env, &runtime_status, trade_instrument, &agent_sched, portfolio_refresher, last_bh_cmp, reason_txt);
                     refreshWebCaches(&web_state, &db, &agent_runs, &equity_repo, &events_repo, &memories_repo, &orders_repo, &fills_repo, last_bh_cmp);
                     ab.web_cache.refreshStatisticsCache(&web_state, &db, &llm_usage_repo);
-                    refreshSystemCache(&web_state, &db, &cfg, &mem_store, boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), llm_client != null, admin_paused, &runtime_status, &risk_latency);
+                    refreshSystemCache(&web_state, &db, &cfg, mem_store.count(), boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), llm_client != null, admin_paused, &runtime_status, &risk_latency);
                 }
             }
         }
@@ -1372,7 +1372,7 @@ pub fn main(init: std.process.Init) !u8 {
                     last_sentiment_ms = tnow;
                     refreshSentimentCache(gpa, &web_state, &okx);
                 }
-                refreshSystemCache(&web_state, &db, &cfg, &mem_store, boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), llm_client != null, admin_paused, &runtime_status, &risk_latency);
+                refreshSystemCache(&web_state, &db, &cfg, mem_store.count(), boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), llm_client != null, admin_paused, &runtime_status, &risk_latency);
             }
             if (last_egress_ms == 0 or tnow - last_egress_ms >= egress_refresh_ms) {
                 last_egress_ms = tnow;
@@ -1398,7 +1398,7 @@ pub fn main(init: std.process.Init) !u8 {
                     const agent_live = llm_client != null and cfg.agent_enabled and
                         cfg.decision_interval_ms > 0 and !admin_paused;
                     runScheduledAudit(&db, &audit_repo, &events_repo, &engine, &cfg, &web_state, &runtime_status, agent_live);
-                    refreshSystemCache(&web_state, &db, &cfg, &mem_store, boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), llm_client != null, admin_paused, &runtime_status, &risk_latency);
+                    refreshSystemCache(&web_state, &db, &cfg, mem_store.count(), boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), llm_client != null, admin_paused, &runtime_status, &risk_latency);
                 }
             }
             // 定期复盘 (default: 8h short / weekly long; 0 = off). Paused with the
@@ -1432,7 +1432,7 @@ pub fn main(init: std.process.Init) !u8 {
                         review_sched.nextAt(.short),
                         review_sched.nextAt(.long),
                     );
-                    refreshSystemCache(&web_state, &db, &cfg, &mem_store, boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), llm_client != null, admin_paused, &runtime_status, &risk_latency);
+                    refreshSystemCache(&web_state, &db, &cfg, mem_store.count(), boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), llm_client != null, admin_paused, &runtime_status, &risk_latency);
                 }
             }
         }
@@ -3248,7 +3248,7 @@ fn runAgentDecision(
         .hold => "HOLD",
         .rebalance => "REBALANCE",
     };
-    ab.operator.refreshBeforeAdmission(gpa, okx, cfg, engine, portfolio_refresher);
+    ab.operator.refreshBeforeAdmission(gpa, okx, cfg, engine, portfolio_refresher, true);
     drainModeTransitions(events_repo, engine, cfg);
     const admit_snap = engine.snapshot();
     const admit_now = nowMs();
@@ -3615,16 +3615,16 @@ fn refreshSystemCache(
     ws: *WebState,
     db: *ab.storage.Db,
     cfg: *const ab.config.Config,
-    mem_store: *const ab.memory.Store,
+    mem_count: usize,
     boot_ms: i64,
     private_keys: bool,
     private_ws: bool,
     agent_on: bool,
     paused: bool,
-    st: *const RuntimeStatus,
+    st: *RuntimeStatus,
     risk_lat: *const ab.latency.Histogram,
 ) void {
-    ab.web_cache.refreshSystemCache(ws, db, cfg, mem_store, boot_ms, private_keys, private_ws, agent_on, paused, st, risk_lat, .{
+    ab.web_cache.refreshSystemCache(ws, db, cfg, mem_count, boot_ms, private_keys, private_ws, agent_on, paused, st, risk_lat, .{
         .allowed = ab.okx_trade.executionAllowed(cfg.mode.isTrading(), exec_venue_authorized),
         .real_money = exec_real_money,
     });

@@ -33,6 +33,9 @@ pub const Env = struct {
     instrument: planner.Instrument,
     /// OKX_SIMULATED=1 (demo) or OKX_REAL_MONEY_OK=1 (live).
     venue_authorized: bool,
+    /// Only the state-owner thread may apply market ticks. Slow lanes pass
+    /// false and rely on the fast loop's polling for market freshness.
+    fetch_ticker: bool = true,
 };
 
 fn nowMs() i64 {
@@ -53,19 +56,22 @@ pub fn refreshBeforeAdmission(
     cfg: *const config.Config,
     engine: *state.Engine,
     portfolio_refresher: demo_runner.PortfolioRefresher,
+    with_ticker: bool,
 ) void {
     var path_buf: [128]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buf, "/api/v5/market/ticker?instId={s}", .{cfg.instrument}) catch return;
-    if (okx.getPublic(path)) |body| {
-        defer gpa.free(body);
-        if (okx_rest.parseTicker(gpa, body)) |ticker| {
-            _ = engine.apply(.{ .market_tick = .{
-                .ts_ms = ticker.ts_ms,
-                .bid = ticker.bid,
-                .mark = ticker.last,
-            } }) catch {};
+    if (with_ticker) {
+        const path = std.fmt.bufPrint(&path_buf, "/api/v5/market/ticker?instId={s}", .{cfg.instrument}) catch return;
+        if (okx.getPublic(path)) |body| {
+            defer gpa.free(body);
+            if (okx_rest.parseTicker(gpa, body)) |ticker| {
+                _ = engine.apply(.{ .market_tick = .{
+                    .ts_ms = ticker.ts_ms,
+                    .bid = ticker.bid,
+                    .mark = ticker.last,
+                } }) catch {};
+            } else |_| {}
         } else |_| {}
-    } else |_| {}
+    }
     if (cfg.mode.isTrading()) {
         _ = portfolio_refresher.run();
     }
@@ -83,7 +89,7 @@ fn authoritative(snap: state.PortfolioState) bool {
 
 fn completeFlatten(env: Env, snap: state.PortfolioState) void {
     const prev = snap.risk_mode;
-    _ = env.engine.apply(.{ .risk_trigger = .flatten_complete }) catch {};
+    env.engine.submitSync(.{ .risk_trigger = .flatten_complete }, env.okx.http.io);
     const now_mode = env.engine.snapshot().risk_mode;
     std.debug.print("[admin] flatten-complete {t} -> {t} (btc dust)\n", .{ prev, now_mode });
     var fb: [192]u8 = undefined;
@@ -142,7 +148,7 @@ pub fn runExit(env: Env) TargetOutcome {
         logEventPayload(env.events_repo, engine, "ADMIN_FLATTEN_EXIT", "admin", "WARN", cfg, "{\"error\":\"execution_not_allowed\"}");
         return .{ .note = "exec_off" };
     }
-    refreshBeforeAdmission(env.gpa, env.okx, cfg, engine, env.refresher);
+    refreshBeforeAdmission(env.gpa, env.okx, cfg, engine, env.refresher, env.fetch_ticker);
     const snap = engine.snapshot();
     const now = nowMs();
     var id_buf: [48]u8 = undefined;
@@ -216,7 +222,7 @@ pub fn runTargetWeight(env: Env, weight_s: []const u8) TargetOutcome {
         return .{ .note = "exec_off" };
     }
 
-    refreshBeforeAdmission(env.gpa, env.okx, cfg, engine, env.refresher);
+    refreshBeforeAdmission(env.gpa, env.okx, cfg, engine, env.refresher, env.fetch_ticker);
     const snap = engine.snapshot();
     const admit_now = nowMs();
     const admission = gate.shadowAdmit(snap, snap.version, target, cfg, admit_now);

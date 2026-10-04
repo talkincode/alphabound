@@ -95,7 +95,6 @@ pub fn shadowAdmit(
     };
 }
 
-
 pub fn exitView(snap: state.PortfolioState, now_ms: i64) admission.ExitView {
     return .{
         .reconciled = snap.reconciled,
