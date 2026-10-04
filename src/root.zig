@@ -14,6 +14,7 @@ pub const demo_runner = @import("execution/demo_runner.zig");
 pub const operator = @import("execution/operator.zig");
 pub const exec_lane = @import("execution/exec_lane.zig");
 pub const proposal = @import("agent/proposal.zig");
+pub const validity = @import("agent/validity.zig");
 pub const events = @import("core/events.zig");
 pub const redaction = @import("observability/redaction.zig");
 pub const journal = @import("observability/journal.zig");

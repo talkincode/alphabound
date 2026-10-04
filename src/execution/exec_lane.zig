@@ -128,6 +128,7 @@ pub const ExecLane = struct {
     /// Last restart-recovery pass reached agreement (ledger == venue).
     recovery_complete: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     thread: ?std.Thread = null,
+    stopped: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     db: storage.Db = undefined,
     orders_repo: storage.OrdersRepo = undefined,
@@ -169,12 +170,19 @@ pub const ExecLane = struct {
         return self.dirty.swap(false, .acq_rel);
     }
 
-    /// Stop the thread (finishing the current job's cancel-and-confirm path
-    /// first) and release resources.
-    pub fn shutdown(self: *ExecLane) void {
-        if (!self.started) return;
+    /// Stop the thread (the running job finishes its cancel-and-confirm path
+    /// first) and release resources. False = the lane is still stuck (for
+    /// example in a hung venue call) after `timeout_ms`; nothing is released.
+    pub fn shutdown(self: *ExecLane, timeout_ms: u32) bool {
+        if (!self.started) return true;
         self.stop.store(true, .release);
         self.agent_blocked.store(true, .release);
+        var waited: u32 = 0;
+        while (!self.stopped.load(.acquire)) {
+            if (waited >= timeout_ms) return false;
+            self.deps.io.sleep(.{ .nanoseconds = 10_000_000 }, .awake) catch break;
+            waited += 10;
+        }
         if (self.thread) |t| t.join();
         self.thread = null;
         self.okx.deinit();
@@ -183,6 +191,7 @@ pub const ExecLane = struct {
         self.orders_repo.deinit();
         self.db.close();
         self.started = false;
+        return true;
     }
 
     fn refresherThunk(raw: *anyopaque) bool {
@@ -208,6 +217,7 @@ pub const ExecLane = struct {
     }
 
     fn run(self: *ExecLane) void {
+        defer self.stopped.store(true, .release);
         while (!self.stop.load(.acquire)) {
             const job = self.jobs.pop() orelse {
                 self.deps.io.sleep(.{ .nanoseconds = @as(i96, self.deps.idle_poll_ms) * 1_000_000 }, .awake) catch return;

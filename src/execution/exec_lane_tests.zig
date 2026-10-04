@@ -84,7 +84,7 @@ const Rig = struct {
     }
 
     fn destroy(self: *Rig) void {
-        self.lane.shutdown();
+        _ = self.lane.shutdown(5_000);
         self.main_okx.deinit();
         self.fake.deinit();
         self.cfg.deinit();

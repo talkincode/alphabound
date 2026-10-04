@@ -51,6 +51,9 @@ pub const PortfolioState = struct {
     /// False when the order ledger cannot persist intents/progress: orders
     /// the process cannot recover after a crash must not be created.
     ledger_ok: bool = true,
+    /// Bumped whenever an external deposit/withdrawal rescales the book; a
+    /// proposal formed before it no longer describes the account.
+    flow_epoch: u32 = 0,
     freshness: FreshnessState = .{},
 };
 
@@ -294,6 +297,7 @@ pub const Engine = struct {
                 self.state.btc_available = r.btc_available;
                 self.state.high_watermark = Decimal.max(self.state.high_watermark, r.hwm_from_db);
                 if (!r.flow_equity_before.eql(Decimal.zero) or !r.flow_equity_after.eql(Decimal.zero)) {
+                    self.state.flow_epoch +%= 1;
                     self.state.high_watermark = try equity_mod.adjustHighWatermarkForFlow(
                         self.state.high_watermark,
                         r.flow_equity_before,
@@ -859,4 +863,20 @@ test "submitSync returns once the owner applied the message" {
     try testing.expect(e.snapshot().unresolved_orders);
     stop.store(true, .release);
     t.join();
+}
+
+test "an external capital flow advances the flow epoch" {
+    var e = try reconciledNormalEngine();
+    try testing.expectEqual(@as(u32, 0), e.snapshot().flow_epoch);
+    _ = try e.apply(.{ .reconcile_result = .{
+        .ts_ms = 1300,
+        .cash_usdt = d("200"),
+        .btc_total = Decimal.zero,
+        .btc_available = Decimal.zero,
+        .hwm_from_db = d("100"),
+        .clean = true,
+        .flow_equity_before = d("100"),
+        .flow_equity_after = d("200"),
+    } });
+    try testing.expectEqual(@as(u32, 1), e.snapshot().flow_epoch);
 }

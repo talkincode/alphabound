@@ -525,6 +525,9 @@ pub fn main(init: std.process.Init) !u8 {
         .fee_rate = cfg.taker_fee_rate,
         .slippage_rate = cfg.slippage_rate,
     }, cfg.max_drawdown);
+    // This thread is the single writer of trading state; the slow lanes only
+    // submit messages and read snapshots.
+    engine.claimOwner();
 
     var events_repo = try ab.storage.EventsRepo.init(&db);
     defer events_repo.deinit();
@@ -670,15 +673,9 @@ pub fn main(init: std.process.Init) !u8 {
     var tool_reg = ab.tools.Registry{};
     registerDefaultTools(&tool_reg) catch {};
 
-    // Optional OpenAI-compatible client for shadow decisions.
-    var llm_client: ?ab.openai.Client = null;
-    defer if (llm_client) |*c| c.deinit();
-    if (cfg.agent_enabled) {
-        if (llm_env) |l| {
-            llm_client = ab.openai.Client.init(gpa, io, l.base_url, l.api_key, l.model);
-            llm_client.?.timeout_ms = cfg.decision_timeout_ms;
-        }
-    }
+    // The OpenAI-compatible client lives in the thinking lane (own sockets);
+    // the risk loop never calls the model.
+    const agent_on = cfg.agent_enabled and llm_env != null;
 
     // ---- Web API thread (loopback only, §6.4) -----------------------------
     const web_thread = std.Thread.spawn(.{}, webThreadMain, .{ io, cfg.webHost(), cfg.webPort(), &web_state }) catch |err| {
@@ -933,6 +930,13 @@ pub fn main(init: std.process.Init) !u8 {
     } else {
         logEvent(&events_repo, &engine, "RECONCILE_DEGRADED", "core", "CRITICAL", &cfg);
     }
+    // A previous process may have left orders on the book or in an unknown
+    // state. Trading stays closed until the execution lane has aligned the
+    // order ledger with the venue (recoverOrders).
+    if (cfg.mode.isTrading() and okx_env != null) {
+        _ = engine.apply(.{ .order_ambiguity = .{ .present = true } }) catch {};
+        logEvent(&events_repo, &engine, "ORDER_RECOVERY_REQUIRED", "execution", "WARN", &cfg);
+    }
 
     // Local admin pause flag (control file). Risk/market loop keeps running.
     var admin_paused: bool = false;
@@ -965,7 +969,7 @@ pub fn main(init: std.process.Init) !u8 {
             engine.snapshot().btc_total,
             cfg.web_bind,
             if (okx_env != null) "yes" else "no",
-            if (llm_client != null) "on" else "off",
+            if (agent_on) "on" else "off",
             execLabel(cfg.mode),
         },
     );
@@ -983,7 +987,7 @@ pub fn main(init: std.process.Init) !u8 {
     refreshEgressIp(&okx, &runtime_status);
     refreshDiskStatus(&cfg, &engine, &events_repo, &runtime_status);
     runtime_status.setResources(res_sampler.sample(nowMs()));
-    refreshSystemCache(&web_state, &db, &cfg, mem_store.count(), boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), llm_client != null, admin_paused, &runtime_status, &risk_latency);
+    refreshSystemCache(&web_state, &db, &cfg, mem_store.count(), boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), agent_on, admin_paused, &runtime_status, &risk_latency);
     logEvent(&events_repo, &engine, "STATE_READY", "core", "INFO", &cfg);
 
     var tick_count: u64 = 0;
@@ -1030,21 +1034,10 @@ pub fn main(init: std.process.Init) !u8 {
     var last_private_ws_ms: i64 = now_boot;
     var last_backup_ms: i64 = 0;
     var last_audit_ms: i64 = 0;
-    // 定期复盘 cadence. Seeded from boot so a fresh DB does not review an empty
-    // window, then overridden by the newest stored report per cycle.
-    var review_sched = ab.periodic_review.Schedule.initAt(
-        now_boot,
-        @intCast(cfg.review_short_interval_ms),
-        @intCast(cfg.review_long_interval_ms),
-    );
-    restorePeriodicSchedule(&periodic_repo, &db, &review_sched);
-    runtime_status.setReviewDueAt(
-        review_sched.nextAt(.short),
-        review_sched.nextAt(.long),
-    );
     ab.web_cache.refreshPeriodicReviewCache(&web_state, &db, &periodic_repo);
-    // Cooldown between auto flatten market sells while risk_mode=FLATTENING.
-    var last_flatten_exec_ms: i64 = 0;
+    var last_flatten_submit_ms: i64 = 0;
+    var last_recover_submit_ms: i64 = 0;
+    var next_poll_ms: i64 = 0;
     var account_reconcile_ctx = AccountReconcileContext{
         .gpa = gpa,
         .okx = &okx,
@@ -1059,16 +1052,116 @@ pub fn main(init: std.process.Init) !u8 {
         .status = &runtime_status,
         .sched = &agent_sched,
     };
-    const portfolio_refresher = ab.demo_runner.PortfolioRefresher{
-        .context = &account_reconcile_ctx,
-        .run_fn = refreshAccountForExecution,
+    // ---- Slow lanes -----------------------------------------------------------
+    // Everything that can take seconds or minutes (venue order work, LLM calls,
+    // reviews) runs off this thread, each with its own HTTP client and SQLite
+    // connection. This loop stays the only writer of trading state.
+    var reconcile_service = ab.lanes.Service{};
+    var lane_client = LaneClientCfg{
+        .rest_url = cfg.rest_url,
+        .creds = auth_creds,
+        .simulated = if (okx_env) |c| c.simulated else false,
     };
+    var exec = ab.exec_lane.ExecLane{};
+    var exec_started = false;
+    if (cfg.mode.isTrading() and okx_env != null) {
+        exec.start(.{
+            .gpa = gpa,
+            .io = io,
+            .cfg = &cfg,
+            .engine = &engine,
+            .instrument = trade_instrument,
+            .venue_authorized = exec_venue_authorized,
+            .db_path = db_path,
+            .make_client = makeLaneClient,
+            .client_ctx = &lane_client,
+            .service = &reconcile_service,
+            .status = &runtime_status,
+        }) catch |err| {
+            std.debug.print("[boot] FATAL execution lane: {t}\n", .{err});
+            return 1;
+        };
+        exec_started = true;
+        exec.setAgentBlocked(true); // until recovery says the book is clean
+        _ = exec.submit(.recover, true);
+    }
+    defer if (exec_started) {
+        if (!exec.shutdown(10_000)) {
+            std.debug.print("[shutdown] execution lane still busy — exiting without join\n", .{});
+            std.process.exit(0);
+        }
+    };
+    var think = ThinkLane{
+        .gpa = gpa,
+        .io = io,
+        .env = env,
+        .cfg = &cfg,
+        .engine = &engine,
+        .tool_reg = &tool_reg,
+        .db_path = db_path,
+        .llm_env = llm_env,
+        .okx_env = okx_env,
+        .instrument = trade_instrument,
+        .web_state = &web_state,
+        .status = &runtime_status,
+        .exec = &exec,
+        .mem_store = &mem_store,
+        .agent_on = agent_on,
+        .now_boot_ms = now_boot,
+    };
+    think.mem_count.store(mem_store.count(), .release);
+    think.start() catch |err| {
+        std.debug.print("[boot] FATAL thinking lane: {t}\n", .{err});
+        return 1;
+    };
+    defer {
+        if (!think.shutdown(if (cli.max_ticks > 0) 120_000 else 10_000)) {
+            std.debug.print("[shutdown] thinking lane still busy — exiting without join\n", .{});
+            std.process.exit(0);
+        }
+    }
 
     while (!shutdown_requested.load(.acquire)) {
         if (cli.max_ticks > 0 and tick_count >= cli.max_ticks) break;
+        // Messages from the slow lanes: state changes are applied here, in
+        // order, by the single writer; owner-only work (account reconcile)
+        // is run on request; scheduler feedback from finished decisions.
+        _ = engine.drainInbox();
+        _ = reconcile_service.pump(&account_reconcile_ctx, refreshAccountForExecution);
+        drainThinkFeedback(&think, &agent_sched);
         // Journal any risk-mode transition from the previous iteration, whatever
         // engine message caused it (single emission point).
         drainModeTransitions(&events_repo, &engine, &cfg);
+        {
+            const lane_snap = engine.snapshot();
+            const blocked = admin_paused or lane_snap.risk_mode == .flattening or lane_snap.risk_mode == .halted;
+            if (exec_started) exec.setAgentBlocked(blocked or !exec.recovery_complete.load(.acquire));
+            think.paused.store(admin_paused, .release);
+            if (exec_started) {
+                const lane_now = nowMs();
+                // Operator flatten / boundary flatten must actually sell: queue the
+                // drive (urgent) every second while FLATTENING; the cooldown that
+                // limits real order frequency lives in the drive itself.
+                if (lane_snap.risk_mode == .flattening and lane_now - last_flatten_submit_ms >= 1_000 and exec.jobs.depth() < 2) {
+                    last_flatten_submit_ms = lane_now;
+                    _ = exec.submit(.{ .flatten = .{ .force = false } }, true);
+                }
+                // Unresolved orders (restart, unknown outcome): keep trying to
+                // align ledger and venue; trading stays closed until it does.
+                if (lane_snap.unresolved_orders and !exec.isBusy() and exec.jobs.depth() == 0 and lane_now - last_recover_submit_ms >= 10_000) {
+                    last_recover_submit_ms = lane_now;
+                    _ = exec.submit(.recover, false);
+                }
+                if (exec.takeDirty() or think.takeDirty()) {
+                    web_state.update(engine.snapshot(), true);
+                    refreshWebCaches(&web_state, &db, &agent_runs, &equity_repo, &events_repo, &memories_repo, &orders_repo, &fills_repo, last_bh_cmp);
+                    ab.web_cache.refreshStatisticsCache(&web_state, &db, &llm_usage_repo);
+                }
+            } else if (think.takeDirty()) {
+                refreshWebCaches(&web_state, &db, &agent_runs, &equity_repo, &events_repo, &memories_repo, &orders_repo, &fills_repo, last_bh_cmp);
+                ab.web_cache.refreshStatisticsCache(&web_state, &db, &llm_usage_repo);
+            }
+        }
 
         // One-shot admin commands from local control file.
         {
@@ -1114,8 +1207,13 @@ pub fn main(init: std.process.Init) !u8 {
                         logEvent(&events_repo, &engine, "ADMIN_RECONCILE", "admin", "INFO", &cfg);
                     },
                     .cancel_all => {
-                        const canceled_n = ab.operator.cancelAll(execEnv(gpa, &okx, &cfg, &engine, &db, &orders_repo, &fills_repo, &events_repo, portfolio_refresher, trade_instrument));
-                        std.debug.print("[admin] cancel-all mode={t} canceled≈{d}\n", .{ cfg.mode, canceled_n });
+                        if (exec_started) {
+                            const queued = exec.submit(.cancel_all, true);
+                            std.debug.print("[admin] cancel-all queued={}\n", .{queued});
+                        } else {
+                            std.debug.print("[admin] cancel-all ignored (mode={t}, no execution lane)\n", .{cfg.mode});
+                            logEventPayload(&events_repo, &engine, "ADMIN_CANCEL_ALL", "admin", "WARN", &cfg, "{\"error\":\"execution_not_available\"}");
+                        }
                     },
                     .flatten => {
                         const prev = engine.snapshot().risk_mode;
@@ -1130,18 +1228,26 @@ pub fn main(init: std.process.Init) !u8 {
                         ) catch "{\"trigger\":\"operator_exit\"}";
                         logEventPayload(&events_repo, &engine, "ADMIN_FLATTEN", "admin", "CRITICAL", &cfg, flp);
                         // Drive position to cash immediately (mode alone does not sell).
-                        last_flatten_exec_ms = 0;
-                        ab.operator.driveFlatten(execEnv(gpa, &okx, &cfg, &engine, &db, &orders_repo, &fills_repo, &events_repo, portfolio_refresher, trade_instrument), &last_flatten_exec_ms, true);
+                        // Any resting agent order is canceled first (agent work is blocked
+                        // while FLATTENING) and the exit job jumps the lane's queue.
+                        if (exec_started) {
+                            exec.setAgentBlocked(true);
+                            last_flatten_submit_ms = nowMs();
+                            _ = exec.submit(.{ .flatten = .{ .force = true } }, true);
+                        }
                         web_state.update(engine.snapshot(), true);
-                        refreshWebCaches(&web_state, &db, &agent_runs, &equity_repo, &events_repo, &memories_repo, &orders_repo, &fills_repo, last_bh_cmp);
                     },
                     .target_weight => {
                         const w_s = req.weight() orelse "0";
-                        const tw = ab.operator.runTargetWeight(execEnv(gpa, &okx, &cfg, &engine, &db, &orders_repo, &fills_repo, &events_repo, portfolio_refresher, trade_instrument), w_s);
-                        if (tw.status().len > 0) runtime_status.setLastDecision(tw.status());
-                        std.debug.print("[admin] target-weight={s} exec={s}\n", .{ w_s, tw.note });
-                        web_state.update(engine.snapshot(), true);
-                        refreshWebCaches(&web_state, &db, &agent_runs, &equity_repo, &events_repo, &memories_repo, &orders_repo, &fills_repo, last_bh_cmp);
+                        if (exec_started) {
+                            var job = ab.exec_lane.Job{ .target_weight = .{ .weight = .{} } };
+                            job.target_weight.weight.set(w_s);
+                            const queued = exec.submit(job, true);
+                            std.debug.print("[admin] target-weight={s} queued={}\n", .{ w_s, queued });
+                        } else {
+                            std.debug.print("[admin] target-weight={s} ignored (mode={t}, no execution lane)\n", .{ w_s, cfg.mode });
+                            logEventPayload(&events_repo, &engine, "ADMIN_TARGET_WEIGHT", "admin", "WARN", &cfg, "{\"error\":\"execution_not_available\"}");
+                        }
                     },
                     .shutdown => {
                         std.debug.print("[admin] safe-shutdown requested\n", .{});
@@ -1153,6 +1259,15 @@ pub fn main(init: std.process.Init) !u8 {
                 writeControlState(io, control_state_path, admin_paused, req.cmd, true);
             }
         }
+
+        // Fine-grained work above runs every spin; the market/reconcile/cache
+        // cycle below keeps its configured cadence.
+        const spin_now = nowMs();
+        if (spin_now < next_poll_ms) {
+            io.sleep(.{ .nanoseconds = 40_000_000 }, .awake) catch break;
+            continue;
+        }
+        next_poll_ms = spin_now + @as(i64, cfg.poll_interval_ms);
 
         if (okx.getPublic(ticker_path)) |body| {
             defer gpa.free(body);
@@ -1284,23 +1399,20 @@ pub fn main(init: std.process.Init) !u8 {
             }
         }
 
-        // Operator flatten must sell to cash and complete → HALTED (not mode-only).
-        if (cfg.mode.isTrading() and engine.snapshot().risk_mode == .flattening) {
-            ab.operator.driveFlatten(execEnv(gpa, &okx, &cfg, &engine, &db, &orders_repo, &fills_repo, &events_repo, portfolio_refresher, trade_instrument), &last_flatten_exec_ms, false);
-            web_state.update(engine.snapshot(), true);
-        }
-
         // Publish connectivity status before slow agent work so Dashboard stays fresh
         // even while an LLM call blocks the loop for tens of seconds.
         runtime_status.volatility_as_of_ms = nowMs();
         runtime_status.volatility = schedulerVolatilityStatus(&agent_sched, engine.snapshot(), runtime_status.volatility_as_of_ms);
-        refreshSystemCache(&web_state, &db, &cfg, mem_store.count(), boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), llm_client != null, admin_paused, &runtime_status, &risk_latency);
+        refreshSystemCache(&web_state, &db, &cfg, think.mem_count.load(.acquire), boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), agent_on, admin_paused, &runtime_status, &risk_latency);
 
         // Slow agent loop: proposals always risk-admitted; trading modes may execute.
         // Paused: keep risk/market/reconcile; skip agent decisions.
         // While FLATTENING/HALTED, skip agent so it cannot fight the exit path.
         if (advisoryDecisionAllowed(admin_paused, engine.snapshot().risk_mode)) {
-            if (llm_client) |*client| {
+            // One decision in flight at a time; the model runs on the thinking
+            // lane, so this loop never waits for it. Not firing while the lane
+            // is busy leaves the schedule due, so it fires right after.
+            if (agent_on and !think.isBusy() and think.jobs.depth() == 0) {
                 const tnow = nowMs();
                 const snap_now = engine.snapshot();
                 const verdict = evaluateAgentSchedule(&agent_sched, snap_now, tnow);
@@ -1320,43 +1432,18 @@ pub fn main(init: std.process.Init) !u8 {
                         .{ reason_txt, ab.scheduler.hourUtc(tnow), agent_sched.params.effectiveInterval(ab.scheduler.hourUtc(tnow)), elapsed_ms, vol.ready, vol.active, vol.range, @max(agent_sched.params.min_interval_ms, agent_sched.params.volatility_interval_ms) },
                     ) catch "{\"reason\":\"unknown\"}";
                     logEventPayload(&events_repo, &engine, "AGENT_TRIGGER", "agent", "INFO", &cfg, trig_payload);
-                    runAgentDecision(gpa, client, &okx, &cfg, &engine, &tool_reg, &agent_runs, &tool_calls, &llm_usage_repo, &events_repo, &orders_repo, &fills_repo, &equity_repo, &capital_flows_repo, &db, &mem_store, &memories_repo, &intel_repo, env, &runtime_status, trade_instrument, &agent_sched, portfolio_refresher, last_bh_cmp, reason_txt);
-                    refreshWebCaches(&web_state, &db, &agent_runs, &equity_repo, &events_repo, &memories_repo, &orders_repo, &fills_repo, last_bh_cmp);
-                    ab.web_cache.refreshStatisticsCache(&web_state, &db, &llm_usage_repo);
-                    refreshSystemCache(&web_state, &db, &cfg, mem_store.count(), boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), llm_client != null, admin_paused, &runtime_status, &risk_latency);
+                    var think_job = ThinkJob{ .bh_cmp = last_bh_cmp };
+                    const rn = @min(reason_txt.len, think_job.reason.len);
+                    @memcpy(think_job.reason[0..rn], reason_txt[0..rn]);
+                    think_job.reason_len = rn;
+                    if (!think.jobs.push(think_job)) {
+                        std.debug.print("[agent] thinking lane queue full — decision dropped\n", .{});
+                    }
                 }
             }
         }
 
         processIntelInbox(&intel_repo, &events_repo, &engine, &cfg, &web_state, &db);
-
-        // Human review mailbox (复盘): analysis-only side channel. Reads DB,
-        // may call the LLM, writes review_chats/memories — never trading state.
-        // Skipped while FLATTENING so the exit path keeps the loop fast.
-        if (engine.snapshot().risk_mode != .flattening) {
-            processReviewInbox(
-                gpa,
-                if (llm_client) |*client| client else null,
-                &okx,
-                &db,
-                &review_repo,
-                &llm_usage_repo,
-                &events_repo,
-                &memories_repo,
-                &equity_repo,
-                &capital_flows_repo,
-                &intel_repo,
-                &mem_store,
-                &engine,
-                &cfg,
-                &web_state,
-                &runtime_status,
-                &periodic_repo,
-                &review_sched,
-                trade_instrument.min_size,
-                trade_instrument.min_notional,
-            );
-        }
 
         // Refresh dashboard JSON caches from SQLite (single-writer thread).
         {
@@ -1372,7 +1459,7 @@ pub fn main(init: std.process.Init) !u8 {
                     last_sentiment_ms = tnow;
                     refreshSentimentCache(gpa, &web_state, &okx);
                 }
-                refreshSystemCache(&web_state, &db, &cfg, mem_store.count(), boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), llm_client != null, admin_paused, &runtime_status, &risk_latency);
+                refreshSystemCache(&web_state, &db, &cfg, think.mem_count.load(.acquire), boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), agent_on, admin_paused, &runtime_status, &risk_latency);
             }
             if (last_egress_ms == 0 or tnow - last_egress_ms >= egress_refresh_ms) {
                 last_egress_ms = tnow;
@@ -1395,50 +1482,15 @@ pub fn main(init: std.process.Init) !u8 {
                 const audit_interval: i64 = @intCast(cfg.audit_interval_ms);
                 if (last_audit_ms == 0 or tnow - last_audit_ms >= audit_interval) {
                     last_audit_ms = tnow;
-                    const agent_live = llm_client != null and cfg.agent_enabled and
+                    const agent_live = agent_on and
                         cfg.decision_interval_ms > 0 and !admin_paused;
                     runScheduledAudit(&db, &audit_repo, &events_repo, &engine, &cfg, &web_state, &runtime_status, agent_live);
-                    refreshSystemCache(&web_state, &db, &cfg, mem_store.count(), boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), llm_client != null, admin_paused, &runtime_status, &risk_latency);
-                }
-            }
-            // 定期复盘 (default: 8h short / weekly long; 0 = off). Paused with the
-            // agent and skipped while flattening so the exit path stays fast.
-            if (!admin_paused and engine.snapshot().risk_mode != .flattening) {
-                if (review_sched.due(tnow)) |cycle| {
-                    const window_ms: i64 = tnow - review_sched.windowStartMs(cycle, tnow);
-                    review_sched.commit(cycle, tnow);
-                    runPeriodicReview(
-                        gpa,
-                        if (llm_client) |*c| @as(?*ab.openai.Client, c) else null,
-                        &db,
-                        &periodic_repo,
-                        &capital_flows_repo,
-                        &llm_usage_repo,
-                        &events_repo,
-                        &memories_repo,
-                        &mem_store,
-                        &engine,
-                        &cfg,
-                        &web_state,
-                        &runtime_status,
-                        cycle,
-                        "schedule",
-                        window_ms,
-                        tnow,
-                        trade_instrument.min_size,
-                        trade_instrument.min_notional,
-                    );
-                    runtime_status.setReviewDueAt(
-                        review_sched.nextAt(.short),
-                        review_sched.nextAt(.long),
-                    );
-                    refreshSystemCache(&web_state, &db, &cfg, mem_store.count(), boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), llm_client != null, admin_paused, &runtime_status, &risk_latency);
+                    refreshSystemCache(&web_state, &db, &cfg, think.mem_count.load(.acquire), boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), agent_on, admin_paused, &runtime_status, &risk_latency);
                 }
             }
         }
 
         tick_count += 1;
-        io.sleep(.{ .nanoseconds = @as(i96, cfg.poll_interval_ms) * 1_000_000 }, .awake) catch break;
     }
 
     // ---- Graceful shutdown (§7.4) -------------------------------------------
@@ -1450,6 +1502,305 @@ pub fn main(init: std.process.Init) !u8 {
     logEvent(&events_repo, &engine, "SHUTDOWN_CLEAN", "core", "CRITICAL", &cfg);
     return 0;
 }
+
+// ---------------------------------------------------------------------------
+// Slow lanes
+// ---------------------------------------------------------------------------
+
+/// Everything the execution lane needs to build its own venue client.
+const LaneClientCfg = struct {
+    rest_url: []const u8,
+    creds: ?ab.okx_auth.Credentials,
+    simulated: bool,
+};
+
+fn makeLaneClient(ctx: ?*anyopaque, gpa: std.mem.Allocator, io: std.Io) ab.okx_rest.Client {
+    const c: *const LaneClientCfg = @ptrCast(@alignCast(ctx.?));
+    var client = ab.okx_rest.Client.init(gpa, io, c.rest_url, c.creds);
+    client.simulated = c.simulated;
+    return client;
+}
+
+/// What a finished decision tells the scheduler (owned by the risk loop).
+const ThinkMsg = union(enum) {
+    agent_failure,
+    outcome: bool,
+    defer_after_hold: i64,
+};
+
+const ThinkFeedback = struct {
+    box: ab.lanes.Mailbox(ThinkMsg, 32) = .{},
+
+    fn noteAgentFailure(self: *ThinkFeedback) void {
+        _ = self.box.push(.agent_failure);
+    }
+
+    fn noteOutcome(self: *ThinkFeedback, real_intent: bool) void {
+        _ = self.box.push(.{ .outcome = real_intent });
+    }
+
+    fn deferAfterHold(self: *ThinkFeedback, review_after_ms: i64) void {
+        _ = self.box.push(.{ .defer_after_hold = review_after_ms });
+    }
+};
+
+fn drainThinkFeedback(think: *ThinkLane, sched: *ab.scheduler.Scheduler) void {
+    while (think.fb.box.pop()) |msg| {
+        switch (msg) {
+            .agent_failure => sched.noteAgentFailure(),
+            .outcome => |real_intent| sched.noteOutcome(real_intent),
+            .defer_after_hold => |ms| {
+                const applied = sched.deferAfterHold(nowMs(), ms);
+                if (applied > 0) std.debug.print("[agent] backoff applied_ms={d}\n", .{applied});
+            },
+        }
+    }
+}
+
+const ThinkJob = struct {
+    reason: [48]u8 = undefined,
+    reason_len: usize = 0,
+    bh_cmp: ab.shadow_bench.Comparison,
+};
+
+/// A proposal that went stale is redone once on fresh context, then dropped.
+const max_stale_redos: u8 = 1;
+
+/// Thinking lane: the only thread that calls the model. Owns the memory index,
+/// the periodic-review schedule and its own HTTP clients and DB connection.
+/// Results reach the risk loop as scheduler feedback and engine messages.
+const ThinkLane = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    cfg: *const ab.config.Config,
+    engine: *ab.state.Engine,
+    tool_reg: *const ab.tools.Registry,
+    db_path: [:0]const u8,
+    llm_env: ?LlmEnv,
+    okx_env: ?OkxEnvCreds,
+    instrument: ab.planner.Instrument,
+    web_state: *WebState,
+    status: *RuntimeStatus,
+    exec: *ab.exec_lane.ExecLane,
+    mem_store: *ab.memory.Store,
+    agent_on: bool,
+    now_boot_ms: i64,
+
+    jobs: ab.lanes.Mailbox(ThinkJob, 2) = .{},
+    fb: ThinkFeedback = .{},
+    stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    busy: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    stopped: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    dirty: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    paused: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    mem_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    thread: ?std.Thread = null,
+
+    fn start(self: *ThinkLane) !void {
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+    }
+
+    fn isBusy(self: *const ThinkLane) bool {
+        return self.busy.load(.acquire);
+    }
+
+    fn takeDirty(self: *ThinkLane) bool {
+        return self.dirty.swap(false, .acq_rel);
+    }
+
+    /// Ask the lane to stop and wait (bounded) for the current job to finish.
+    /// False = still busy after the timeout (caller decides how to exit).
+    fn shutdown(self: *ThinkLane, timeout_ms: u32) bool {
+        self.stop.store(true, .release);
+        var waited: u32 = 0;
+        while (!self.stopped.load(.acquire)) {
+            if (waited >= timeout_ms) return false;
+            self.io.sleep(.{ .nanoseconds = 20_000_000 }, .awake) catch break;
+            waited += 20;
+        }
+        if (self.thread) |t| t.join();
+        self.thread = null;
+        return true;
+    }
+
+    fn run(self: *ThinkLane) void {
+        defer self.stopped.store(true, .release);
+        self.runInner() catch |err| {
+            std.debug.print("[think] lane stopped: {t}\n", .{err});
+        };
+    }
+
+    fn runInner(self: *ThinkLane) !void {
+        const gpa = self.gpa;
+        const cfg = self.cfg;
+        var db = try ab.storage.Db.open(self.db_path);
+        defer db.close();
+        var events_repo = try ab.storage.EventsRepo.init(&db);
+        defer events_repo.deinit();
+        var agent_runs = try ab.storage.AgentRunsRepo.init(&db);
+        defer agent_runs.deinit();
+        var tool_calls = try ab.storage.ToolCallsRepo.init(&db);
+        defer tool_calls.deinit();
+        var llm_usage_repo = try ab.storage.LlmUsageRepo.init(&db);
+        defer llm_usage_repo.deinit();
+        var memories_repo = try ab.storage.MemoriesRepo.init(&db);
+        defer memories_repo.deinit();
+        var review_repo = try ab.storage.ReviewChatsRepo.init(&db);
+        defer review_repo.deinit();
+        var periodic_repo = try ab.storage.PeriodicReviewsRepo.init(&db);
+        defer periodic_repo.deinit();
+        var intel_repo = try ab.storage.IntelRepo.init(&db);
+        defer intel_repo.deinit();
+        var fills_repo = try ab.storage.FillsRepo.init(&db);
+        defer fills_repo.deinit();
+        var equity_repo = try ab.storage.EquityRepo.init(&db);
+        defer equity_repo.deinit();
+        var capital_flows_repo = try ab.storage.CapitalFlowsRepo.init(&db);
+        defer capital_flows_repo.deinit();
+
+        const auth_creds: ?ab.okx_auth.Credentials = if (self.okx_env) |c| c.asAuth() else null;
+        var okx = ab.okx_rest.Client.init(gpa, self.io, cfg.rest_url, auth_creds);
+        defer okx.deinit();
+        if (self.okx_env) |c| okx.simulated = c.simulated;
+
+        var llm_client: ?ab.openai.Client = null;
+        defer if (llm_client) |*c| c.deinit();
+        if (self.agent_on) {
+            if (self.llm_env) |l| {
+                llm_client = ab.openai.Client.init(gpa, self.io, l.base_url, l.api_key, l.model);
+                llm_client.?.timeout_ms = cfg.decision_timeout_ms;
+            }
+        }
+
+        // 定期复盘 cadence. Seeded from boot so a fresh DB does not review an
+        // empty window, then overridden by the newest stored report per cycle.
+        var review_sched = ab.periodic_review.Schedule.initAt(
+            self.now_boot_ms,
+            @intCast(cfg.review_short_interval_ms),
+            @intCast(cfg.review_long_interval_ms),
+        );
+        restorePeriodicSchedule(&periodic_repo, &db, &review_sched);
+        self.status.setReviewDueAt(review_sched.nextAt(.short), review_sched.nextAt(.long));
+
+        while (!self.stop.load(.acquire)) {
+            if (self.jobs.pop()) |job| {
+                self.busy.store(true, .release);
+                defer self.busy.store(false, .release);
+                if (llm_client) |*client| {
+                    var attempt: u8 = 0;
+                    var reason: []const u8 = job.reason[0..job.reason_len];
+                    while (true) {
+                        const out = runAgentDecision(
+                            gpa,
+                            client,
+                            &okx,
+                            cfg,
+                            self.engine,
+                            self.tool_reg,
+                            &agent_runs,
+                            &tool_calls,
+                            &llm_usage_repo,
+                            &events_repo,
+                            &fills_repo,
+                            &equity_repo,
+                            &capital_flows_repo,
+                            &db,
+                            self.mem_store,
+                            &memories_repo,
+                            &intel_repo,
+                            self.env,
+                            self.status,
+                            self.instrument,
+                            &self.fb,
+                            self.exec,
+                            self.io,
+                            job.bh_cmp,
+                            reason,
+                        );
+                        const mode = self.engine.snapshot().risk_mode;
+                        if (out == .stale_proposal and attempt < max_stale_redos and
+                            !self.stop.load(.acquire) and advisoryDecisionAllowed(self.paused.load(.acquire), mode))
+                        {
+                            attempt += 1;
+                            reason = "stale_redo";
+                            continue;
+                        }
+                        break;
+                    }
+                }
+                self.mem_count.store(self.mem_store.count(), .release);
+                self.dirty.store(true, .release);
+                continue;
+            }
+
+            // Idle: scheduled reviews and the human review mailbox.
+            const snap = self.engine.snapshot();
+            if (!self.paused.load(.acquire) and snap.risk_mode != .flattening) {
+                const tnow = nowMs();
+                if (review_sched.due(tnow)) |cycle| {
+                    self.busy.store(true, .release);
+                    defer self.busy.store(false, .release);
+                    const window_ms: i64 = tnow - review_sched.windowStartMs(cycle, tnow);
+                    review_sched.commit(cycle, tnow);
+                    runPeriodicReview(
+                        gpa,
+                        if (llm_client) |*c| @as(?*ab.openai.Client, c) else null,
+                        &db,
+                        &periodic_repo,
+                        &capital_flows_repo,
+                        &llm_usage_repo,
+                        &events_repo,
+                        &memories_repo,
+                        self.mem_store,
+                        self.engine,
+                        cfg,
+                        self.web_state,
+                        self.status,
+                        cycle,
+                        "schedule",
+                        window_ms,
+                        tnow,
+                        self.instrument.min_size,
+                        self.instrument.min_notional,
+                    );
+                    self.status.setReviewDueAt(review_sched.nextAt(.short), review_sched.nextAt(.long));
+                    self.mem_count.store(self.mem_store.count(), .release);
+                    self.dirty.store(true, .release);
+                    continue;
+                }
+            }
+            if (snap.risk_mode != .flattening and self.web_state.review_inbox != null) {
+                self.busy.store(true, .release);
+                defer self.busy.store(false, .release);
+                processReviewInbox(
+                    gpa,
+                    if (llm_client) |*c| c else null,
+                    &okx,
+                    &db,
+                    &review_repo,
+                    &llm_usage_repo,
+                    &events_repo,
+                    &memories_repo,
+                    &equity_repo,
+                    &capital_flows_repo,
+                    &intel_repo,
+                    self.mem_store,
+                    self.engine,
+                    cfg,
+                    self.web_state,
+                    self.status,
+                    &periodic_repo,
+                    &review_sched,
+                    self.instrument.min_size,
+                    self.instrument.min_notional,
+                );
+                self.mem_count.store(self.mem_store.count(), .release);
+            }
+            self.io.sleep(.{ .nanoseconds = 100_000_000 }, .awake) catch return;
+        }
+    }
+};
 
 const PrivateProbe = union(enum) {
     ok: ab.okx_rest.Balance,
@@ -2556,15 +2907,6 @@ fn logHeldExposure(
     logEventPayload(events_repo, engine, "EXEC_HOLD", "execution", severity, cfg, payload);
 }
 
-/// If the agent bound to the decision-start snapshot, rebind to the post-refresh
-/// version so a slow LLM call does not fail-closed on stale_data / version drift
-/// from market ticks that landed during the call. Mismatched versions stay as-is
-/// (still REJECT stale_snapshot).
-fn bindProposalVersion(proposal_version: u64, decision_start_version: u64, current_version: u64) u64 {
-    if (proposal_version == decision_start_version) return current_version;
-    return proposal_version;
-}
-
 /// `{"verdict":"...","reason":"..."}` with the reason UTF-8-safely capped.
 fn evalJson(buf: []u8, verdict: []const u8, reason: []const u8) []const u8 {
     var esc: [2 * 200 + 8]u8 = undefined;
@@ -2798,17 +3140,22 @@ fn jsonStr(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
 }
 
 fn applyReviewAfterBackoff(
-    sched: *ab.scheduler.Scheduler,
-    now_ms: i64,
+    fb: *ThinkFeedback,
     review_after: ?[]const u8,
     why: []const u8,
 ) void {
     const ra = review_after orelse return;
     const ra_ms = ab.scheduler.parseIsoDurationMs(ra) orelse return;
-    const applied = sched.deferAfterHold(now_ms, ra_ms);
-    if (applied > 0)
-        std.debug.print("[agent] {s} backoff review_after={s} applied_ms={d}\n", .{ why, ra, applied });
+    fb.deferAfterHold(ra_ms);
+    std.debug.print("[agent] {s} backoff requested review_after={s}\n", .{ why, ra });
 }
+
+const AgentOutcome = enum {
+    /// The decision ran to a conclusion (including degraded-to-HOLD paths).
+    done,
+    /// The proposal went stale before execution; nothing was admitted or sent.
+    stale_proposal,
+};
 
 fn runAgentDecision(
     gpa: std.mem.Allocator,
@@ -2821,7 +3168,6 @@ fn runAgentDecision(
     tools_repo: *ab.storage.ToolCallsRepo,
     llm_usage_repo: *ab.storage.LlmUsageRepo,
     events_repo: *ab.storage.EventsRepo,
-    orders_repo: *ab.storage.OrdersRepo,
     fills_repo: *ab.storage.FillsRepo,
     equity_repo: *ab.storage.EquityRepo,
     capital_flows_repo: *ab.storage.CapitalFlowsRepo,
@@ -2832,18 +3178,21 @@ fn runAgentDecision(
     env: *const std.process.Environ.Map,
     st: *RuntimeStatus,
     instrument: ab.planner.Instrument,
-    sched: *ab.scheduler.Scheduler,
-    portfolio_refresher: ab.demo_runner.PortfolioRefresher,
+    fb: *ThinkFeedback,
+    exec: *ab.exec_lane.ExecLane,
+    io: std.Io,
     bh_cmp: ab.shadow_bench.Comparison,
     trigger_reason: []const u8,
-) void {
+) AgentOutcome {
     const snap = engine.snapshot();
-    const decision_start_version = snap.version;
+    // What the model sees; proposals are only executable while this still
+    // describes the account (see agent/validity.zig).
+    const anchor = ab.validity.anchorOf(snap, nowMs());
 
     var run_id_buf: [64]u8 = undefined;
-    const run_id = std.fmt.bufPrint(&run_id_buf, "run_{d}", .{nowMs()}) catch return;
+    const run_id = std.fmt.bufPrint(&run_id_buf, "run_{d}", .{nowMs()}) catch return .done;
     var started_buf: [32]u8 = undefined;
-    const started_ts = ab.clock.formatRfc3339Ms(nowMs(), &started_buf) catch return;
+    const started_ts = ab.clock.formatRfc3339Ms(nowMs(), &started_buf) catch return .done;
 
     var prompt_hash_buf: [64]u8 = undefined;
     ab.context.digest(default_system_prompt, &prompt_hash_buf);
@@ -2860,7 +3209,7 @@ fn runAgentDecision(
         .started_ts = started_ts,
     }) catch |err| {
         std.debug.print("[agent] agent_runs start failed: {t}\n", .{err});
-        return;
+        return .done;
     };
 
     var obs_bufs: [5][32768]u8 = undefined;
@@ -2963,7 +3312,7 @@ fn runAgentDecision(
     var review_facts = ab.context.ReviewFacts{};
     // Consecutive no-ops are ledger facts, never a lifetime model-memory count.
     var cohort_ts_buf: [32]u8 = undefined;
-    const cohort_ts = ab.clock.formatRfc3339Ms(decision_evidence_start_ms, &cohort_ts_buf) catch return;
+    const cohort_ts = ab.clock.formatRfc3339Ms(decision_evidence_start_ms, &cohort_ts_buf) catch return .done;
     review_facts.hold_streak = events_repo.noopStreakSince(db, cohort_ts) catch 0;
     if (fill_n > 0) {
         if (compactJsonTsMs(recent_fills[0])) |fts| {
@@ -2999,8 +3348,8 @@ fn runAgentDecision(
     }) catch {
         std.debug.print("[agent] context render failed\n", .{});
         completeRun(runs, run_id, "error_context", "", "", nowMs());
-        sched.noteAgentFailure();
-        return;
+        fb.noteAgentFailure();
+        return .done;
     };
 
     var digest_hex: [64]u8 = undefined;
@@ -3023,8 +3372,8 @@ fn runAgentDecision(
     var user_buf: [88 * 1024]u8 = undefined;
     const user_msg = std.fmt.bufPrint(&user_buf, "{s}{s}", .{ user_msg_prefix, ctx_json }) catch {
         completeRun(runs, run_id, "error_buffer", "", input_digest, nowMs());
-        sched.noteAgentFailure();
-        return;
+        fb.noteAgentFailure();
+        return .done;
     };
 
     const chat_res = meteredChat(
@@ -3055,8 +3404,8 @@ fn runAgentDecision(
             .{ run_id, client.model, tag },
         ) catch "{\"degraded\":\"HOLD\"}";
         logEventPayload(events_repo, engine, "AGENT_LLM_FAILED", "agent", "WARN", cfg, fail_payload);
-        sched.noteAgentFailure();
-        return;
+        fb.noteAgentFailure();
+        return .done;
     };
     defer gpa.free(chat_res.content);
     st.addUsage(chat_res.usage);
@@ -3077,7 +3426,7 @@ fn runAgentDecision(
             .{ run_id, out_digest },
         ) catch "{\"degraded\":\"HOLD\"}";
         logEventPayload(events_repo, engine, "AGENT_INVALID_OUTPUT", "agent", "WARN", cfg, inv_payload);
-        return;
+        return .done;
     };
 
     // Optional single indicator round (market.indicators): the model may ask
@@ -3162,8 +3511,8 @@ fn runAgentDecision(
                 .{ run_id, client.model, tag },
             ) catch "{\"degraded\":\"HOLD\"}";
             logEventPayload(events_repo, engine, "AGENT_LLM_FAILED", "agent", "WARN", cfg, fail_payload);
-            sched.noteAgentFailure();
-            return;
+            fb.noteAgentFailure();
+            return .done;
         };
         raw2 = chat2.content;
         st.addUsage(chat2.usage);
@@ -3182,8 +3531,8 @@ fn runAgentDecision(
                 .{ run_id, out_digest },
             ) catch "{\"degraded\":\"HOLD\"}";
             logEventPayload(events_repo, engine, "AGENT_INVALID_OUTPUT", "agent", "WARN", cfg, inv_payload);
-            sched.noteAgentFailure();
-            return;
+            fb.noteAgentFailure();
+            return .done;
         };
     }
 
@@ -3197,8 +3546,8 @@ fn runAgentDecision(
             .{ run_id, out_digest, err },
         ) catch "{\"degraded\":\"HOLD\"}";
         logEventPayload(events_repo, engine, "AGENT_INVALID_PROPOSAL", "agent", "WARN", cfg, invp_payload);
-        sched.noteAgentFailure();
-        return;
+        fb.noteAgentFailure();
+        return .done;
     };
     defer prop.deinit();
     ab.proposal.enforceEvalDirection(&prop, ab.context.btcWeight(snap)) catch |err| {
@@ -3211,8 +3560,8 @@ fn runAgentDecision(
             .{ run_id, out_digest, err },
         ) catch "{\"degraded\":\"HOLD\"}";
         logEventPayload(events_repo, engine, "AGENT_INVALID_PROPOSAL", "agent", "WARN", cfg, invd_payload);
-        sched.noteAgentFailure();
-        return;
+        fb.noteAgentFailure();
+        return .done;
     };
     ab.proposal.enforceAddEval(&prop, cash_tension) catch |err| {
         std.debug.print("[agent] proposal invalid ({t}) → HOLD\n", .{err});
@@ -3224,8 +3573,8 @@ fn runAgentDecision(
             .{ run_id, out_digest, err },
         ) catch "{\"degraded\":\"HOLD\"}";
         logEventPayload(events_repo, engine, "AGENT_INVALID_PROPOSAL", "agent", "WARN", cfg, inva_payload);
-        sched.noteAgentFailure();
-        return;
+        fb.noteAgentFailure();
+        return .done;
     };
     ab.proposal.enforceReduceEval(&prop, tension) catch |err| {
         std.debug.print("[agent] proposal invalid ({t}) → HOLD\n", .{err});
@@ -3237,24 +3586,73 @@ fn runAgentDecision(
             .{ run_id, out_digest, err },
         ) catch "{\"degraded\":\"HOLD\"}";
         logEventPayload(events_repo, engine, "AGENT_INVALID_PROPOSAL", "agent", "WARN", cfg, invr_payload);
-        sched.noteAgentFailure();
-        return;
+        fb.noteAgentFailure();
+        return .done;
     };
 
     // Risk Kernel admission (always). Demo may execute; shadow never does.
-    // Refresh market/account first: LLM latency routinely exceeds market_ttl_ms,
-    // and ticks during the call bump version — rebind if agent matched start snap.
+    // A slow model call spans many ticks, so the proposal is first checked
+    // against the situation the model saw (age, price, book, risk mode, flows).
+    // Only a still-valid proposal is bound to the execution snapshot — and both
+    // snapshots are recorded. Anything else is void and the decision is redone.
     const action_txt: []const u8 = switch (prop.action) {
         .hold => "HOLD",
         .rebalance => "REBALANCE",
     };
-    ab.operator.refreshBeforeAdmission(gpa, okx, cfg, engine, portfolio_refresher, true);
-    drainModeTransitions(events_repo, engine, cfg);
     const admit_snap = engine.snapshot();
     const admit_now = nowMs();
-    const bound_version = bindProposalVersion(prop.snapshot_version, decision_start_version, admit_snap.version);
+    const validity_limits = ab.validity.Limits{
+        .max_age_ms = @as(i64, cfg.proposal_max_age_ms),
+        .max_price_drift = cfg.proposal_max_price_drift,
+        .max_book_drift = cfg.proposal_max_book_drift,
+    };
+    const validity: ab.validity.Verdict = if (prop.action == .rebalance)
+        ab.validity.check(anchor, admit_snap, admit_now, validity_limits)
+    else
+        .valid;
+    var decision_bid_buf: [48]u8 = undefined;
+    var exec_bid_buf: [48]u8 = undefined;
+    const decision_bid_s = decFmt(&decision_bid_buf, anchor.bid);
+    const exec_bid_s = decFmt(&exec_bid_buf, admit_snap.bid_price);
+    if (validity == .stale) {
+        var stale_buf: [640]u8 = undefined;
+        const stale_payload = std.fmt.bufPrint(
+            &stale_buf,
+            "{{\"run_id\":\"{s}\",\"decision_id\":\"{s}\",\"reason\":\"{s}\",\"age_ms\":{d},\"decision_snapshot\":{{\"version\":{d},\"ts_ms\":{d},\"bid\":\"{s}\",\"risk_mode\":\"{s}\"}},\"execution_snapshot\":{{\"version\":{d},\"ts_ms\":{d},\"bid\":\"{s}\",\"risk_mode\":\"{s}\"}}}}",
+            .{
+                run_id,
+                prop.decision_id,
+                validity.stale.text(),
+                admit_now - anchor.ts_ms,
+                anchor.version,
+                anchor.ts_ms,
+                decision_bid_s,
+                anchor.risk_mode.jsonName(),
+                admit_snap.version,
+                admit_now,
+                exec_bid_s,
+                admit_snap.risk_mode.jsonName(),
+            },
+        ) catch "{\"reason\":\"stale\"}";
+        logEventPayload(events_repo, engine, "AGENT_PROPOSAL_STALE", "agent", "WARN", cfg, stale_payload);
+        std.debug.print("[agent] proposal {s} void ({s}) — nothing admitted\n", .{ prop.decision_id, validity.stale.text() });
+        completeRun(runs, run_id, "stale_proposal", out_digest, input_digest, admit_now);
+        return .stale_proposal;
+    }
+    const bound_version = ab.validity.bindExecutionVersion(prop.snapshot_version, anchor, admit_snap.version, validity) orelse prop.snapshot_version;
     const admission = ab.gate.shadowAdmit(admit_snap, bound_version, prop.target_btc_weight, cfg, admit_now);
+    var admission_verdict: []const u8 = admission.verdict_txt;
+    var admission_reason: []const u8 = admission.reason_txt;
+    var admitted_text_buf: [48]u8 = undefined;
+    var stress_text_buf: [48]u8 = undefined;
+    var floor_text_buf: [48]u8 = undefined;
+    var admitted_text: []const u8 = decFmt(&admitted_text_buf, admission.admitted_weight);
+    var stress_text: []const u8 = decFmt(&stress_text_buf, admission.stress_equity);
+    var floor_text: []const u8 = decFmt(&floor_text_buf, admission.floor);
+    var exec_version: u64 = admit_snap.version;
     var exec_note: []const u8 = "not_executed";
+    var reply_owned: ?*ab.exec_lane.Reply = null;
+    defer if (reply_owned) |r| gpa.destroy(r);
     // HOLD is always a no-op at the execution boundary. target_btc_weight is 0 by
     // schema for HOLD — must NEVER be planned as "flatten to cash" (that wiped a
     // live BTC book after balance reconcile recovered).
@@ -3264,35 +3662,61 @@ fn runAgentDecision(
         // Honor the model's own review_after as a regular-cadence backoff
         // (clamped; event triggers still cut through). Quiet markets stop
         // burning LLM calls re-stating the same HOLD.
-        applyReviewAfterBackoff(sched, admit_now, prop.review_after, "hold");
+        applyReviewAfterBackoff(fb, prop.review_after, "hold");
     } else if (restart_guard) {
         exec_note = "restart_guard";
         logEventPayload(events_repo, engine, "EXEC_HOLD", "execution", "WARN", cfg, "{\"reason\":\"restart_guard\",\"detail\":\"first decision after restart with a recent prior decision; rebalance deferred to next cycle\"}");
         std.debug.print("[agent] restart guard: REBALANCE deferred (first_run, prior decision <{d}m ago)\n", .{@divTrunc(restart_guard_window_ms, 60_000)});
     } else if (ab.okx_trade.executionAllowed(cfg.mode.isTrading(), exec_venue_authorized)) {
-        exec_note = ab.demo_runner.tryDemoExecute(
-            gpa,
-            okx,
-            cfg,
-            engine,
-            db,
-            orders_repo,
-            fills_repo,
-            events_repo,
-            portfolio_refresher,
-            prop.decision_id,
-            admission.verdict_txt,
-            admission.admitted_weight,
-            instrument,
-            admit_snap,
-            prop.order_policy,
-            .{ .requested_weight = prop.target_btc_weight },
-        );
+        // Orders are worked on the execution lane: this lane waits, the risk
+        // loop does not. The lane admits again on its own fresh snapshot.
+        const reply = gpa.create(ab.exec_lane.Reply) catch null;
+        if (reply) |rp| {
+            rp.* = .{};
+            var job = ab.exec_lane.AgentJob{
+                .requested_weight = prop.target_btc_weight,
+                .order_type = prop.order_policy.type,
+                .urgency = prop.order_policy.urgency,
+                .max_wait_ms = prop.order_policy.max_wait_ms,
+                .created_ms = admit_now,
+                .reply = rp,
+            };
+            job.decision_id.set(prop.decision_id);
+            if (!exec.submit(.{ .agent = job }, false)) {
+                gpa.destroy(rp);
+                exec_note = "exec_queue_full";
+            } else {
+                const wait_cap_ms: i64 = @as(i64, prop.order_policy.max_wait_ms) + 240_000;
+                const wait_t0 = nowMs();
+                while (!rp.done.load(.acquire)) {
+                    if (nowMs() - wait_t0 > wait_cap_ms) break;
+                    io.sleep(.{ .nanoseconds = 20_000_000 }, .awake) catch break;
+                }
+                if (rp.done.load(.acquire)) {
+                    reply_owned = rp;
+                    exec_note = rp.note.get();
+                    if (rp.verdict.len > 0) {
+                        // The execution-time admission is the authoritative one.
+                        admission_verdict = rp.verdict.get();
+                        admission_reason = rp.reason.get();
+                        admitted_text = rp.admitted_weight.get();
+                        stress_text = rp.stress_equity.get();
+                        floor_text = rp.floor.get();
+                        exec_version = rp.exec_version;
+                    }
+                } else {
+                    // The lane may still write the reply later: never free it.
+                    exec_note = "exec_timeout_unknown";
+                }
+            }
+        } else {
+            exec_note = "exec_oom";
+        }
         // Dust / below-min rebalances are the same no-op as HOLD: honor
         // review_after so leftover cash below the trade floor does not
         // re-ask the LLM every base interval.
         if (std.mem.eql(u8, exec_note, "plan_hold")) {
-            applyReviewAfterBackoff(sched, admit_now, prop.review_after, "plan_hold");
+            applyReviewAfterBackoff(fb, prop.review_after, "plan_hold");
         }
     }
     // Feed the outcome back to the scheduler: consecutive no-ops (HOLD or
@@ -3303,10 +3727,10 @@ fn runAgentDecision(
         std.mem.eql(u8, exec_note, "plan_hold") or
         std.mem.eql(u8, exec_note, "restart_guard") or
         std.mem.eql(u8, exec_note, "skipped_reject");
-    sched.noteOutcome(!noop_outcome);
+    fb.noteOutcome(!noop_outcome);
     std.debug.print(
         "[agent] proposal ok id={s} action={s} target_btc={f} conf={f} mem={d} admit={s} exec={s}\n",
-        .{ prop.decision_id, action_txt, prop.target_btc_weight, prop.confidence, scored.items.len, admission.verdict_txt, exec_note },
+        .{ prop.decision_id, action_txt, prop.target_btc_weight, prop.confidence, scored.items.len, admission_verdict, exec_note },
     );
     completeRun(runs, run_id, "ok", out_digest, input_digest, admit_now);
     recordProposalEpisode(gpa, mem_store, memories_repo, run_id, prop.decision_id, action_txt, prop.target_btc_weight, prop.confidence);
@@ -3362,9 +3786,12 @@ fn runAgentDecision(
     var review_buf: [48]u8 = undefined;
     const weight_s = decFmt(&w_buf, prop.target_btc_weight);
     const conf_s = decFmt(&c_buf, prop.confidence);
-    const admitted_s = decFmt(&aw_buf, admission.admitted_weight);
-    const stress_s = decFmt(&se_buf, admission.stress_equity);
-    const floor_s = decFmt(&fl_buf, admission.floor);
+    _ = &aw_buf;
+    _ = &se_buf;
+    _ = &fl_buf;
+    const admitted_s = admitted_text;
+    const stress_s = stress_text;
+    const floor_s = floor_text;
     // 400/240 bytes keep the full sentence the model actually wrote (the old
     // 180/120 cut most theses mid-clause); the array cap bounds the payload.
     const thesis_json = jsonStringArrayLimited(&thesis_buf, prop.thesis, 6, 400);
@@ -3389,16 +3816,17 @@ fn runAgentDecision(
     const executed = executionNoteMeansFill(exec_note);
     const ok_payload = std.fmt.bufPrint(
         &ok_buf,
-        "{{\"decision_policy_epoch\":{d},\"mode\":\"{s}\",\"run_id\":\"{s}\",\"decision_id\":\"{s}\",\"action\":\"{s}\",\"target_btc_weight\":\"{s}\",\"confidence\":\"{s}\",\"snapshot_version\":{d},\"output_digest\":\"{s}\",\"tools\":{d},\"executed\":{},\"exec\":\"{s}\",\"thesis\":{s},\"invalid_if\":{s},\"review_after\":\"{s}\",\"reduce_eval\":{s},\"add_eval\":{s},\"admission\":{{\"verdict\":\"{s}\",\"reason\":\"{s}\",\"admitted_weight\":\"{s}\",\"stress_equity\":\"{s}\",\"floor\":\"{s}\"}},\"usage\":{{\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d}}}}}",
-        .{ ab.memory.CURRENT_POLICY_EPOCH, @tagName(decisionMode(cfg.mode, exec_real_money)), run_id, prop.decision_id, action_txt, weight_s, conf_s, prop.snapshot_version, out_digest, tools_used, executed, exec_note, thesis_json, invalid_json, review_s, reduce_eval_json, add_eval_json, admission.verdict_txt, admission.reason_txt, admitted_s, stress_s, floor_s, usage.prompt_tokens, usage.completion_tokens, usage.total_tokens },
+        "{{\"decision_policy_epoch\":{d},\"mode\":\"{s}\",\"run_id\":\"{s}\",\"decision_id\":\"{s}\",\"action\":\"{s}\",\"target_btc_weight\":\"{s}\",\"confidence\":\"{s}\",\"snapshot_version\":{d},\"output_digest\":\"{s}\",\"tools\":{d},\"executed\":{},\"exec\":\"{s}\",\"thesis\":{s},\"invalid_if\":{s},\"review_after\":\"{s}\",\"reduce_eval\":{s},\"add_eval\":{s},\"admission\":{{\"verdict\":\"{s}\",\"reason\":\"{s}\",\"admitted_weight\":\"{s}\",\"stress_equity\":\"{s}\",\"floor\":\"{s}\"}},\"proposal_validity\":\"valid\",\"decision_snapshot\":{{\"version\":{d},\"ts_ms\":{d},\"bid\":\"{s}\"}},\"execution_snapshot\":{{\"version\":{d},\"ts_ms\":{d},\"bid\":\"{s}\"}},\"usage\":{{\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d}}}}}",
+        .{ ab.memory.CURRENT_POLICY_EPOCH, @tagName(decisionMode(cfg.mode, exec_real_money)), run_id, prop.decision_id, action_txt, weight_s, conf_s, prop.snapshot_version, out_digest, tools_used, executed, exec_note, thesis_json, invalid_json, review_s, reduce_eval_json, add_eval_json, admission_verdict, admission_reason, admitted_s, stress_s, floor_s, anchor.version, anchor.ts_ms, decision_bid_s, exec_version, admit_now, exec_bid_s, usage.prompt_tokens, usage.completion_tokens, usage.total_tokens },
     ) catch "{\"executed\":false}";
     {
         var dbuf: [160]u8 = undefined;
-        const dtxt = std.fmt.bufPrint(&dbuf, "{s} {s} conf={s} admit={s} exec={s}", .{ action_txt, prop.decision_id, conf_s, admission.verdict_txt, exec_note }) catch action_txt;
+        const dtxt = std.fmt.bufPrint(&dbuf, "{s} {s} conf={s} admit={s} exec={s}", .{ action_txt, prop.decision_id, conf_s, admission_verdict, exec_note }) catch action_txt;
         st.setLastDecision(dtxt);
     }
     logEventPayload(events_repo, engine, "AGENT_PROPOSAL_OK", "agent", "INFO", cfg, ok_payload);
     logEventPayload(events_repo, engine, "RISK_ADMISSION", "risk", "INFO", cfg, ok_payload);
+    return .done;
 }
 
 /// Demo-only: plan + place market order after APPROVE/REDUCE. Never called for live.
@@ -5460,32 +5888,6 @@ fn webThreadMain(io: std.Io, host: []const u8, port: u16, ws: *WebState) void {
 /// real-money opt-in (OKX_REAL_MONEY_OK=1). Set once during boot.
 var exec_venue_authorized: bool = false;
 
-fn execEnv(
-    gpa: std.mem.Allocator,
-    okx: *ab.okx_rest.Client,
-    cfg: *const ab.config.Config,
-    engine: *ab.state.Engine,
-    db: *ab.storage.Db,
-    orders_repo: *ab.storage.OrdersRepo,
-    fills_repo: *ab.storage.FillsRepo,
-    events_repo: *ab.storage.EventsRepo,
-    refresher: ab.demo_runner.PortfolioRefresher,
-    instrument: ab.planner.Instrument,
-) ab.operator.Env {
-    return .{
-        .gpa = gpa,
-        .okx = okx,
-        .cfg = cfg,
-        .engine = engine,
-        .db = db,
-        .orders_repo = orders_repo,
-        .fills_repo = fills_repo,
-        .events_repo = events_repo,
-        .refresher = refresher,
-        .instrument = instrument,
-        .venue_authorized = exec_venue_authorized,
-    };
-}
 /// True only when real (non-simulated) keys run with explicit opt-in.
 var exec_real_money: bool = false;
 
