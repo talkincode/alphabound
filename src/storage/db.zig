@@ -131,6 +131,14 @@ pub const Db = struct {
         return DbError.NotFound;
     }
 
+    /// True when this connection can take the write lock right now. Used to
+    /// prove the ledger is writable again after a failed write.
+    pub fn probeWritable(self: *Db) bool {
+        self.execAll("BEGIN IMMEDIATE") catch return false;
+        self.execAll("ROLLBACK") catch return false;
+        return true;
+    }
+
     pub fn lastInsertRowid(self: *Db) i64 {
         return c.sqlite3_last_insert_rowid(self.handle);
     }

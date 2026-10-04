@@ -39,7 +39,7 @@ pub fn admissionView(
         .reconciled = snap.reconciled,
         .market_fresh = snap.freshness.marketFresh(now_ms),
         .account_fresh = snap.freshness.accountFresh(now_ms) and !snap.account_projected,
-        .unresolved_orders = snap.unresolved_orders,
+        .unresolved_orders = snap.unresolved_orders or snap.foreign_pending,
         .risk_mode = snap.risk_mode,
         .cash_usdt = snap.cash_usdt,
         .btc_total = snap.btc_total,
@@ -100,6 +100,8 @@ pub fn exitView(snap: state.PortfolioState, now_ms: i64) admission.ExitView {
         .reconciled = snap.reconciled,
         .market_fresh = snap.freshness.marketFresh(now_ms),
         .account_fresh = snap.freshness.accountFresh(now_ms) and !snap.account_projected,
+        // Own ledger only: foreign resting orders cannot cause an oversell (the
+        // sell is capped by free BTC) and must not stop a risk-reducing exit.
         .unresolved_orders = snap.unresolved_orders,
         .risk_mode = snap.risk_mode,
         .btc_total = snap.btc_total,

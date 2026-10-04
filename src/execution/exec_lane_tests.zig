@@ -284,3 +284,29 @@ test "the lane queue is bounded and tells the sender when it is full" {
     try testing.expect(!lane.submit(.cancel_all, false));
     try testing.expect(!lane.submit(.{ .flatten = .{ .force = true } }, true)); // even urgent work cannot grow it
 }
+
+fn waitJobs(rig: *Rig, target: u64) !void {
+    const t0 = wallMs();
+    while (wallMs() - t0 < 5000 and rig.lane.jobs_done.load(.acquire) < target) {
+        rig.spin();
+        try testing.io.sleep(.{ .nanoseconds = 2_000_000 }, .awake);
+    }
+    try testing.expect(rig.lane.jobs_done.load(.acquire) >= target);
+}
+
+test "review: cancel-all after a blocked recovery re-opens agent execution" {
+    const rig = try Rig.create(testing.allocator);
+    defer rig.destroy();
+    rig.seed("1000", "0", "100000", "1000");
+    rig.fake.fill_mode = .none;
+    // Another client's order is resting: recovery cannot complete.
+    try rig.fake.injectOrder("abforeign0000000000000000000012", true, d("0.0005"), d("80000"));
+    try testing.expect(rig.lane.submit(.recover, false));
+    try waitJobs(rig, 1);
+    try testing.expect(!rig.lane.recovery_complete.load(.acquire));
+
+    // The operator cancels it as documented; the lane must notice the book is clean.
+    try testing.expect(rig.lane.submit(.cancel_all, false));
+    try waitJobs(rig, 2);
+    try testing.expect(rig.lane.recovery_complete.load(.acquire));
+}

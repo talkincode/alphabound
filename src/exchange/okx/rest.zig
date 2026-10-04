@@ -637,6 +637,18 @@ fn definitivePreMatchCode(code: []const u8) bool {
     return false;
 }
 
+/// sCode values after which the order is certainly not on the book: trading-rule
+/// and balance refusals (51xxx) and gateway refusals before matching. Timeout
+/// and "try again" codes (50004, 50013, 51149, ...) are deliberately excluded.
+fn definitiveRejectionCode(code: []const u8) bool {
+    const ambiguous = [_][]const u8{ "51149", "51411", "51412" };
+    for (ambiguous) |c| {
+        if (std.mem.eql(u8, code, c)) return false;
+    }
+    if (definitivePreMatchCode(code)) return true;
+    return code.len == 5 and std.mem.startsWith(u8, code, "51");
+}
+
 fn firstDataObject(root: std.json.ObjectMap) ?std.json.ObjectMap {
     const data = switch (root.get("data") orelse return null) {
         .array => |a| a,
@@ -667,7 +679,12 @@ pub fn classifyPlaceResponse(gpa: std.mem.Allocator, body: []const u8) PlaceOutc
     const item = firstDataObject(root);
     if (item) |obj| {
         if (stringField(obj, "sCode")) |s_code| {
-            if (!std.mem.eql(u8, s_code, "0")) return .{ .rejected = ApiCode.from(s_code) };
+            if (!std.mem.eql(u8, s_code, "0")) {
+                // Only codes that prove the venue refused the order count as a
+                // rejection; timeout-class and unrecognised codes leave it unknown.
+                if (definitiveRejectionCode(s_code)) return .{ .rejected = ApiCode.from(s_code) };
+                return .unknown;
+            }
         }
     }
     if (!std.mem.eql(u8, top, "0")) {
@@ -1136,6 +1153,31 @@ pub fn parsePendingClOrdIds(gpa: std.mem.Allocator, body: []const u8, out: [][]c
     return n;
 }
 
+/// Order ids (`ordId`) of pending orders that carry no client id: not placed
+/// by this process, but still cancelable by id.
+pub fn parsePendingUnnamedOrdIds(gpa: std.mem.Allocator, body: []const u8, out: [][]const u8, backing: []u8) usize {
+    var parsed = std.json.parseFromSlice(std.json.Value, gpa, body, .{}) catch return 0;
+    defer parsed.deinit();
+    const data = unwrapEnvelope(parsed.value) catch return 0;
+    var n: usize = 0;
+    var w: usize = 0;
+    for (data.items) |item| {
+        const obj = switch (item) {
+            .object => |o| o,
+            else => continue,
+        };
+        const cl = getString(obj, "clOrdId") catch "";
+        if (cl.len != 0) continue;
+        const ord = getString(obj, "ordId") catch continue;
+        if (ord.len == 0 or n >= out.len or w + ord.len > backing.len) continue;
+        @memcpy(backing[w .. w + ord.len], ord);
+        out[n] = backing[w .. w + ord.len];
+        w += ord.len;
+        n += 1;
+    }
+    return n;
+}
+
 pub const PendingScan = struct {
     /// Reply was a successful, parseable envelope.
     ok: bool = false,
@@ -1329,4 +1371,35 @@ test "parsePendingOrders reports truncation instead of silently dropping orders"
     try testing.expect(scan2.ok and !scan2.truncated);
     try testing.expectEqual(@as(usize, 3), scan2.n);
     try testing.expect(!parsePendingOrders(testing.allocator, "{\"code\":\"50011\",\"data\":[]}", &ids2, &backing).ok);
+}
+
+test "classifyPlaceResponse never turns a timeout-class sCode into a rejection" {
+    const unknown_codes = [_][]const u8{ "51149", "50004", "50013", "50026" };
+    for (unknown_codes) |code| {
+        var buf: [256]u8 = undefined;
+        const body = try std.fmt.bufPrint(&buf, "{{\"code\":\"1\",\"msg\":\"\",\"data\":[{{\"clOrdId\":\"ab1\",\"ordId\":\"\",\"sCode\":\"{s}\",\"sMsg\":\"x\"}}]}}", .{code});
+        try testing.expect(classifyPlaceResponse(testing.allocator, body) == .unknown);
+    }
+    const refused = [_][]const u8{ "51008", "51020", "51000", "51016" };
+    for (refused) |code| {
+        var buf: [256]u8 = undefined;
+        const body = try std.fmt.bufPrint(&buf, "{{\"code\":\"1\",\"msg\":\"\",\"data\":[{{\"clOrdId\":\"ab1\",\"ordId\":\"\",\"sCode\":\"{s}\",\"sMsg\":\"x\"}}]}}", .{code});
+        try testing.expect(classifyPlaceResponse(testing.allocator, body) == .rejected);
+    }
+    // An sCode we have never heard of says nothing definite.
+    try testing.expect(classifyPlaceResponse(testing.allocator,
+        \\{"code":"1","msg":"","data":[{"clOrdId":"ab1","ordId":"","sCode":"59999","sMsg":"?"}]}
+    ) == .unknown);
+}
+
+test "parsePendingUnnamedOrdIds returns order ids of pending orders without a client id" {
+    const body =
+        \\{"code":"0","msg":"","data":[{"clOrdId":"","ordId":"111"},{"clOrdId":"ab2","ordId":"222"},{"ordId":"333"}]}
+    ;
+    var ids: [4][]const u8 = undefined;
+    var backing: [64]u8 = undefined;
+    const n = parsePendingUnnamedOrdIds(testing.allocator, body, &ids, &backing);
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqualStrings("111", ids[0]);
+    try testing.expectEqualStrings("333", ids[1]);
 }

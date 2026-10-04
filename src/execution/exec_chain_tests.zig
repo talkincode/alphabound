@@ -11,6 +11,7 @@ const demo_runner = @import("demo_runner.zig");
 const operator = @import("operator.zig");
 const harness = @import("../testing/harness.zig");
 const fake_okx = @import("../testing/fake_okx.zig");
+const gate = @import("../risk/gate.zig");
 
 const Harness = harness.Harness;
 const d = harness.d;
@@ -379,10 +380,12 @@ test "P1-6: a venue order the ledger does not own keeps trading closed until can
     const report = h.recover();
     try testing.expect(!report.complete);
     try testing.expectEqual(@as(usize, 1), report.foreign);
-    try testing.expect(h.engine.snapshot().unresolved_orders);
+    try testing.expect(h.engine.snapshot().foreign_pending);
+    try testing.expectEqual(risk_sm.RiskMode.exit_only, h.engine.snapshot().risk_mode);
 
     const cancel = operator.cancelAll(h.operatorEnv());
     try testing.expect(cancel.verified_clear);
+    try testing.expect(!h.engine.snapshot().foreign_pending);
     try testing.expect(!h.engine.snapshot().unresolved_orders);
 }
 
@@ -524,4 +527,70 @@ test "an abort request cancels the resting order and stops before another leg" {
     );
     try testing.expectEqualStrings("aborted", note);
     try testing.expectEqual(@as(usize, 0), h.fake.countCalls(.POST, place_path));
+}
+
+test "review: a pending order the bot does not own never blocks the emergency exit" {
+    var h = try Harness.create(testing.allocator, "live");
+    defer h.destroy();
+    h.seed("0", "0.001", "89000", "100");
+    h.fake.fill_mode = .none;
+    try h.fake.injectOrder("abforeign0000000000000000000009", true, d("0.0005"), d("80000"));
+    try h.fake.injectOrder("", true, d("0.0005"), d("79000")); // no client id at all
+
+    const report = h.recover();
+    try testing.expect(!report.complete); // new risk stays closed
+    try testing.expectEqual(@as(usize, 2), report.foreign);
+    try testing.expect(h.engine.snapshot().foreign_pending);
+    try testing.expect(!h.engine.snapshot().unresolved_orders); // own ledger is clean
+
+    h.fake.fill_mode = .full; // the exit itself fills normally
+    var last: i64 = 0;
+    operator.driveFlatten(h.operatorEnv(), &last, true);
+    try testing.expectEqual(@as(usize, 1), h.fake.countCalls(.POST, place_path));
+    try testing.expect(h.fake.btc.lt(d("0.00001")));
+}
+
+test "review: foreign pending orders still block new risk" {
+    var h = try Harness.create(testing.allocator, "demo");
+    defer h.destroy();
+    h.seed("1000", "0", "100000", "1000");
+    h.fake.fill_mode = .none;
+    try h.fake.injectOrder("abforeign0000000000000000000010", true, d("0.0005"), d("80000"));
+    _ = h.recover();
+    const snap = h.engine.snapshot();
+    const adm = gate.shadowAdmit(snap, snap.version, d("0.5"), &h.cfg, @import("../core/clock.zig").SystemClock.clock().wallMs());
+    try testing.expectEqualStrings("REJECT", adm.verdict_txt);
+    try testing.expectEqualStrings("unresolved order ambiguity", adm.reason_txt);
+}
+
+test "review: cancel-all cancels unnamed orders by ordId and verifies the venue is clear" {
+    var h = try Harness.create(testing.allocator, "demo");
+    defer h.destroy();
+    h.seed("1000", "0", "100000", "1000");
+    h.fake.fill_mode = .none;
+    try h.fake.injectOrder("", true, d("0.0005"), d("79000"));
+    try h.fake.injectOrder("abforeign0000000000000000000011", true, d("0.0005"), d("79000"));
+    _ = h.recover();
+    try testing.expect(h.engine.snapshot().foreign_pending);
+
+    const report = operator.cancelAll(h.operatorEnv());
+    try testing.expect(report.verified_clear);
+    try testing.expect(!h.engine.snapshot().foreign_pending);
+    try testing.expect(!h.engine.snapshot().unresolved_orders);
+    for (h.fake.orders.items) |o| try testing.expectEqual(fake_okx.OrderState.canceled, o.state);
+}
+
+test "review: a transient ledger write failure heals once the ledger is writable again" {
+    var h = try Harness.create(testing.allocator, "demo");
+    defer h.destroy();
+    h.seed("1000", "0", "100000", "1000");
+    try h.db.execAll("CREATE TRIGGER fail_orders_insert BEFORE INSERT ON orders BEGIN SELECT RAISE(ABORT, 'database is locked'); END;");
+    try testing.expectEqualStrings("intent_persist_failed", h.execute("dec_ledger_fail", "0.5", false));
+    try testing.expect(!h.engine.snapshot().ledger_ok);
+    try h.db.execAll("DROP TRIGGER fail_orders_insert;");
+
+    // Nothing to place on a cash-only book in EXIT_ONLY: recovery alone must heal it.
+    const report = h.recover();
+    try testing.expect(report.complete);
+    try testing.expect(h.engine.snapshot().ledger_ok);
 }

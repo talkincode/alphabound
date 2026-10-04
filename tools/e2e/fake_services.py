@@ -208,7 +208,12 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/v5/trade/cancel-order":
             req = json.loads(body or b"{}")
             cl = req.get("clOrdId", "")
-            o = V.orders.get(cl)
+            o = V.orders.get(cl) if cl else None
+            if o is None and req.get("ordId"):
+                for k, cand in V.orders.items():
+                    if str(cand["id"]) == req["ordId"]:
+                        o = cand
+                        break
             if not o:
                 return scode("1", cl, "", "51400", "Order does not exist")
             if o["state"] in ("filled", "canceled"):
@@ -308,6 +313,14 @@ class Handler(BaseHTTPRequestHandler):
                 V.faults.append(req)
             elif path == "/_ctl/clear_faults":
                 V.faults = []
+            elif path == "/_ctl/inject":
+                # A resting order placed by "another client" (empty clOrdId allowed).
+                oid = V.next_ord
+                V.next_ord += 1
+                V.orders[req.get("clOrdId", "")] = {
+                    "id": oid, "buy": req.get("side", "buy") == "buy", "type": "limit",
+                    "sz": Decimal(str(req.get("sz", "0.0005"))), "px": Decimal(str(req.get("px", "80000"))),
+                    "state": "live", "acc": Decimal("0"), "avg": Decimal("0"), "fee": Decimal("0"), "fee_ccy": "USDT"}
             elif path == "/_ctl/fill":
                 o = V.orders[req["clOrdId"]]
                 V.apply_fill(o, Decimal(str(req["qty"])), Decimal(str(req["px"])))

@@ -124,6 +124,7 @@
 | AC-EX10 (P1-8) | 累计成交以**增量行**入账(`applyCumulative`),重复/乱序查询不重复计入,partial→更大 partial→filled 总量/均价/手续费正确 | Unit + Integration | P3 | ☑ `storage/db.zig` `FillsRepo.applyCumulative`;`cumulative fill projection …`、`P1-8: …`。与未来逐笔 WS 的去重见 EXECUTION_SAFETY 剩余限制 |
 | AC-EX11 | 提案时效:模型决策锚定快照(时间/价格/账户/风险模式/资金流),执行前超龄、价格漂移、账户/资金流/风险状态变化即**作废并重做一次决策**;原始与执行快照随决策落库;不再把旧版本自动换绑到新快照 | Unit + E2E | P3 | ☑ `agent/validity.zig`(`proposal_max_age_ms`/`proposal_max_price_drift`/`proposal_max_book_drift`);事件 `AGENT_PROPOSAL_STALE`;`AGENT_PROPOSAL_OK` 含 `decision_snapshot`/`execution_snapshot`;E2E 日志 `proposal … void (risk_mode_changed)` 后重做 |
 | AC-EX12 | 多连接写库不得因遗留的读语句固定快照而 `SQLITE_BUSY`(E2E 发现并修复) | Integration | P3 | ☑ `KvRepo.getChecked` 与 `applyCumulative` 读后复位;`a connection that read the kv store can still write …` |
+| AC-EX13 | 独立评审发现项:① 非本进程挂单(含无 clOrdId)只关闭**新增风险**(`foreign_pending`),**不得**阻断只减仓退出;cancel-all 对无 clOrdId 订单按 `ordId` 撤销并以场馆重新列表核验;② 下单回包中超时类/未识别 `sCode`(如 50004/50013/51149)视为 UNKNOWN 而非拒绝;③ 单次账本写失败导致的 `ledger_ok=false` 在后续成功写或恢复通过后自愈;④ cancel-all 之后执行 lane 重新对账,解除“恢复未完成”对 agent 的封锁 | Unit + Integration + E2E | P3 | ☑ `state.zig` `foreign_pending`;`risk/gate.zig` `exitView` 仅看本地账本;`rest.zig` `definitiveRejectionCode`/`parsePendingUnnamedOrdIds`;`demo_runner.zig` `recoverOrders`/`cancelAllVerified`;`exec_lane.zig` `runRecovery`;测试 `review: …`×5、`classifyPlaceResponse never turns a timeout-class sCode …`;E2E `foreign_order_exit` |
 
 ## H. 阶段闸门汇总
 

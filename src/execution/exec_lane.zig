@@ -158,6 +158,17 @@ pub const ExecLane = struct {
         return if (urgent) self.jobs.pushFront(job) else self.jobs.push(job);
     }
 
+    /// Ask the thread to finish: resting agent orders are canceled and confirmed
+    /// first. Pair with `isStopped`, then `shutdown`.
+    pub fn requestStop(self: *ExecLane) void {
+        self.stop.store(true, .release);
+        self.agent_blocked.store(true, .release);
+    }
+
+    pub fn isStopped(self: *const ExecLane) bool {
+        return self.stopped.load(.acquire);
+    }
+
     pub fn setAgentBlocked(self: *ExecLane, blocked: bool) void {
         self.agent_blocked.store(blocked, .release);
     }
@@ -255,24 +266,31 @@ pub const ExecLane = struct {
             .cancel_all => {
                 const report = operator.cancelAll(e);
                 std.debug.print("[admin] cancel-all canceled={d} remaining={d} verified={}\n", .{ report.canceled, report.remaining, report.verified_clear });
+                // The book changed: re-derive whether trading may reopen (a blocked
+                // boot recovery is only released by a fresh, complete pass).
+                self.runRecovery();
                 self.dirty.store(true, .release);
             },
             .recover => {
-                const report = demo_runner.recoverOrders(
-                    self.deps.gpa,
-                    &self.okx,
-                    self.deps.cfg,
-                    self.deps.engine,
-                    &self.db,
-                    &self.orders_repo,
-                    &self.fills_repo,
-                    &self.events_repo,
-                );
-                self.recovery_complete.store(report.complete, .release);
+                self.runRecovery();
                 self.dirty.store(true, .release);
             },
             .agent => |a| self.runAgent(e, a),
         }
+    }
+
+    fn runRecovery(self: *ExecLane) void {
+        const report = demo_runner.recoverOrders(
+            self.deps.gpa,
+            &self.okx,
+            self.deps.cfg,
+            self.deps.engine,
+            &self.db,
+            &self.orders_repo,
+            &self.fills_repo,
+            &self.events_repo,
+        );
+        self.recovery_complete.store(report.complete, .release);
     }
 
     fn runAgent(self: *ExecLane, e: operator.Env, job: AgentJob) void {

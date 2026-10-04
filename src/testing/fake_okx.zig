@@ -180,6 +180,25 @@ pub const Fake = struct {
         return &self.orders.items[self.orders.items.len - 1];
     }
 
+    /// Put a resting order on the book as if another client placed it. An empty
+    /// `cl_id` models an order without a client id.
+    pub fn injectOrder(self: *Fake, cl_id: []const u8, buy: bool, sz: Decimal, px: Decimal) !void {
+        self.lock();
+        defer self.unlock();
+        const id_copy = try self.gpa.dupe(u8, cl_id);
+        errdefer self.gpa.free(id_copy);
+        const ord_id = self.next_ord_id;
+        self.next_ord_id += 1;
+        try self.orders.append(self.gpa, .{
+            .cl_id = id_copy,
+            .ord_id = ord_id,
+            .buy = buy,
+            .market = false,
+            .sz = sz,
+            .px = px,
+        });
+    }
+
     /// Venue-side fill of `qty` at `px` (late / partial fills driven by tests).
     pub fn fillOrder(self: *Fake, cl_id: []const u8, qty: Decimal, px: Decimal) !void {
         self.lock();
@@ -402,8 +421,19 @@ pub const Fake = struct {
             .object => |o| o,
             else => return self.errBody("50000", "bad body"),
         };
-        const cl_id = jsonStr(obj, "clOrdId") orelse return self.errBody("50000", "clOrdId");
-        const o = self.findOrder(cl_id) orelse return self.sCodeBody("1", cl_id, "", "51400", "Order does not exist");
+        const cl_id = jsonStr(obj, "clOrdId") orelse "";
+        const by_ord = jsonStr(obj, "ordId") orelse "";
+        if (cl_id.len == 0 and by_ord.len == 0) return self.errBody("50000", "clOrdId/ordId");
+        const found: ?*Order = blk: {
+            if (cl_id.len > 0) break :blk self.findOrder(cl_id);
+            for (self.orders.items) |*cand| {
+                var ob: [24]u8 = undefined;
+                const txt = std.fmt.bufPrint(&ob, "{d}", .{cand.ord_id}) catch continue;
+                if (std.mem.eql(u8, txt, by_ord)) break :blk cand;
+            }
+            break :blk null;
+        };
+        const o = found orelse return self.sCodeBody("1", cl_id, "", "51400", "Order does not exist");
         if (o.state == .filled or o.state == .canceled) {
             return self.sCodeBody("1", cl_id, "", "51402", "Cancellation failed as the order is already completed");
         }

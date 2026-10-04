@@ -303,7 +303,36 @@ class _Keep:
         print("kept %s" % self.path)
 
 
+def scenario_foreign_order_exit(binpath, workdir):
+    """Review finding: an order the bot does not own (one even without a client id)
+    keeps new risk closed but must never block the emergency exit; cancel-all
+    clears it by order id and verifies the venue."""
+    ctl("reset")
+    ctl("set", usdt="1000", btc="0.01", bid="100000", llm_action="HOLD", llm_delay_s=0)
+    ctl("inject", clOrdId="", side="buy", sz="0.0005", px="80000")
+    ctl("inject", clOrdId="abforeign0000000000000000000001", side="buy", sz="0.0005", px="79000")
+    dm = Daemon(binpath, workdir, "foreign").start()
+    try:
+        web_ready(dm)
+        wait_for(lambda: any(json.loads(p).get("foreign") == 2 for _, _, p in dm.events("ORDER_RECOVERY")), 30,
+                 "recovery sees both foreign orders")
+        wait_for(lambda: dm.api("/api/v1/state").get("risk_mode") == "EXIT_ONLY", 10, "new risk closed (EXIT_ONLY)")
+        st = dm.api("/api/v1/state")
+        evidence("foreign", "state after recovery: unresolved_orders=%s mode=%s" % (st.get("unresolved_orders"), st.get("risk_mode")))
+        assert st.get("unresolved_orders") is False
+        ctl("set", bid="70000")
+        wait_for(lambda: float(vstate()["btc"]) < 0.00001, 20, "position sold despite foreign orders")
+        wait_for(lambda: dm.api("/api/v1/state").get("risk_mode") == "HALTED", 15, "HALTED")
+        evidence("foreign", "exit completed: sell_orders=%d" % vstate()["sell_orders"])
+        dm.control("cancel-all")
+        wait_for(lambda: all(o["state"] != "live" for o in vstate()["orders"]), 20, "cancel-all cleared the foreign orders")
+        evidence("foreign", "cancel-all cleared: %s" % [(o["clOrdId"][:8], o["state"]) for o in vstate()["orders"]])
+    finally:
+        dm.stop()
+
+
 SCENARIOS = {
+    "foreign_order_exit": scenario_foreign_order_exit,
     "slow_model": scenario_slow_model_risk_and_flatten,
     "lost_response": scenario_lost_order_response,
     "restart_recovery": scenario_restart_recovery,

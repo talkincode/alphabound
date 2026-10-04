@@ -43,6 +43,9 @@ pub const PortfolioState = struct {
     /// confirmed through an authoritative balance. Never counts as fresh.
     account_projected: bool = false,
     unresolved_orders: bool = false,
+    /// Orders the local ledger does not own are resting on the venue. Blocks
+    /// new risk (like `unresolved_orders`) but never blocks a risk-reducing exit.
+    foreign_pending: bool = false,
     /// False when the DB volume is in low/critical free-space band (FD7).
     disk_ok: bool = true,
     /// False when the audit journal (events append) is failing (AC-GO6):
@@ -92,6 +95,8 @@ pub const Message = union(enum) {
         flow_equity_after: Decimal = Decimal.zero,
     },
     order_ambiguity: struct { present: bool },
+    /// Orders outside the local ledger are resting on the venue.
+    foreign_pending: struct { present: bool },
     risk_trigger: sm.Trigger,
     /// Disk free-space health for the DB volume (FD7). `ok=false` → degraded.
     disk_status: struct { ok: bool },
@@ -321,6 +326,10 @@ pub const Engine = struct {
                 self.state.unresolved_orders = o.present;
                 self.evaluateHealth(self.state.as_of_ms);
             },
+            .foreign_pending => |f| {
+                self.state.foreign_pending = f.present;
+                self.evaluateHealth(self.state.as_of_ms);
+            },
             .risk_trigger => |t| {
                 self.state.risk_mode = sm.next(self.state.risk_mode, t);
             },
@@ -406,6 +415,7 @@ pub const Engine = struct {
     fn evaluateHealth(self: *Engine, now_ms: i64) void {
         const healthy = self.state.reconciled and
             !self.state.unresolved_orders and
+            !self.state.foreign_pending and
             self.state.disk_ok and
             self.state.journal_ok and
             self.state.ledger_ok and
@@ -905,4 +915,14 @@ test "apply from a non-owner thread is queued for the owner, not applied in plac
     try testing.expect(!e.snapshot().unresolved_orders);
     try testing.expectEqual(@as(usize, 1), e.drainInbox());
     try testing.expect(e.snapshot().unresolved_orders);
+}
+
+test "foreign pending orders degrade like unresolved ones and clear independently" {
+    var e = try reconciledNormalEngine();
+    _ = try e.apply(.{ .foreign_pending = .{ .present = true } });
+    try testing.expectEqual(sm.RiskMode.exit_only, e.snapshot().risk_mode);
+    try testing.expect(e.snapshot().foreign_pending);
+    try testing.expect(!e.snapshot().unresolved_orders);
+    _ = try e.apply(.{ .foreign_pending = .{ .present = false } });
+    try testing.expectEqual(sm.RiskMode.normal, e.snapshot().risk_mode);
 }

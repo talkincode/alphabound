@@ -112,6 +112,11 @@ pub const Ctx = struct {
         self.engine.submitSync(.{ .order_ambiguity = .{ .present = present } }, self.okx.http.io);
     }
 
+    fn setForeign(self: *const Ctx, present: bool) void {
+        if (self.engine.snapshot().foreign_pending == present) return;
+        self.engine.submitSync(.{ .foreign_pending = .{ .present = present } }, self.okx.http.io);
+    }
+
     fn setLedger(self: *const Ctx, ok: bool) void {
         if (self.engine.snapshot().ledger_ok == ok) return;
         self.engine.submitSync(.{ .ledger_status = .{ .ok = ok } }, self.okx.http.io);
@@ -200,6 +205,8 @@ fn persistOrder(ctx: *const Ctx, ref: OrderRef, status: orders.OrderStatus, exch
         ctx.setLedger(false);
         return false;
     };
+    // A write that landed proves the ledger is writable again.
+    ctx.setLedger(true);
     return true;
 }
 
@@ -928,9 +935,14 @@ pub fn recoverOrders(
         ctx.event("ORDER_FOREIGN_PENDING", "CRITICAL", p);
     }
 
-    report.complete = report.scan_ok and !more_rows_exist and report.unresolved == 0 and report.foreign == 0 and
+    // Own ledger and venue agree; foreign orders are tracked separately so they
+    // keep new risk closed without ever blocking a risk-reducing exit.
+    const own_complete = report.scan_ok and !more_rows_exist and report.unresolved == 0 and
         (ctx.openOrderCount() orelse 1) == 0;
-    ctx.setAmbiguity(!report.complete);
+    report.complete = own_complete and report.foreign == 0;
+    ctx.setAmbiguity(!own_complete);
+    if (report.scan_ok) ctx.setForeign(report.foreign > 0);
+    if (db.probeWritable()) ctx.setLedger(true);
     var pbuf: [256]u8 = undefined;
     const p = std.fmt.bufPrint(
         &pbuf,
@@ -980,10 +992,24 @@ pub fn cancelAllVerified(
     var path_buf: [160]u8 = undefined;
     const path = okx_trade.formatPendingPath(&path_buf, cfg.instrument) catch return report;
     const body = okx.getPrivate(path, nowMs()) catch return report;
+    defer gpa.free(body);
     const scan = okx_rest.parsePendingOrders(gpa, body, &ids, &backing);
-    gpa.free(body);
     if (!scan.ok) return report;
     report.listed = true;
+
+    // Orders without a client id are canceled by exchange id; the re-listing
+    // below is what proves they are gone.
+    var unnamed_ids: [16][]const u8 = undefined;
+    var unnamed_backing: [512]u8 = undefined;
+    const unnamed_n = okx_rest.parsePendingUnnamedOrdIds(gpa, body, &unnamed_ids, &unnamed_backing);
+    for (unnamed_ids[0..unnamed_n]) |ord_id| {
+        var cbuf: [160]u8 = undefined;
+        const cbody = okx_trade.formatCancelByOrdIdBody(&cbuf, .{ .inst_id = cfg.instrument, .exchange_order_id = ord_id }) catch continue;
+        if (okx.postPrivate("/api/v5/trade/cancel-order", cbody, nowMs())) |resp| gpa.free(resp) else |_| {}
+        var pbuf: [160]u8 = undefined;
+        const p = std.fmt.bufPrint(&pbuf, "{{\"ordId\":\"{s}\",\"reason\":\"operator_cancel_all_unnamed\"}}", .{ord_id}) catch "{}";
+        ctx.event("ORDER_CANCEL_SENT", "INFO", p);
+    }
 
     for (ids[0..scan.n]) |id| {
         var st_buf: [16]u8 = undefined;
@@ -1023,6 +1049,7 @@ pub fn cancelAllVerified(
     const ledger_open = ctx.openOrderCount();
     report.verified_clear = after_ok and report.remaining == 0 and !scan.truncated;
     if (report.verified_clear and ledger_open != null and ledger_open.? == 0) {
+        ctx.setForeign(false);
         ctx.setAmbiguity(false);
     } else {
         report.verified_clear = false;

@@ -691,6 +691,8 @@ fn renderState(buf: []u8, ctx: Context) Response {
         s.write(snap.reconciled) catch break :render;
         s.objectField("unresolved_orders") catch break :render;
         s.write(snap.unresolved_orders) catch break :render;
+        s.objectField("foreign_pending") catch break :render;
+        s.write(snap.foreign_pending) catch break :render;
         s.objectField("account_projected") catch break :render;
         s.write(snap.account_projected) catch break :render;
         s.objectField("ledger_ok") catch break :render;
@@ -1226,6 +1228,7 @@ test "state endpoint renders decimals as strings" {
     try testing.expectEqualStrings("sha256:abc", obj.get("config_hash").?.string);
     // Order-chain health is visible to operators and drills.
     try testing.expect(!obj.get("unresolved_orders").?.bool);
+    try testing.expect(!obj.get("foreign_pending").?.bool);
     try testing.expect(!obj.get("account_projected").?.bool);
     try testing.expect(obj.get("ledger_ok").?.bool);
 }

@@ -1036,7 +1036,7 @@ pub fn main(init: std.process.Init) !u8 {
     var last_audit_ms: i64 = 0;
     ab.web_cache.refreshPeriodicReviewCache(&web_state, &db, &periodic_repo);
     var last_flatten_submit_ms: i64 = 0;
-    var last_recover_submit_ms: i64 = 0;
+    var last_recovery_submit_ms: i64 = 0;
     var next_poll_ms: i64 = 0;
     var account_reconcile_ctx = AccountReconcileContext{
         .gpa = gpa,
@@ -1148,9 +1148,14 @@ pub fn main(init: std.process.Init) !u8 {
                 }
                 // Unresolved orders (restart, unknown outcome): keep trying to
                 // align ledger and venue; trading stays closed until it does.
-                if (lane_snap.unresolved_orders and !exec.isBusy() and exec.jobs.depth() == 0 and lane_now - last_recover_submit_ms >= 10_000) {
-                    last_recover_submit_ms = lane_now;
-                    _ = exec.submit(.recover, false);
+                // While FLATTENING the exit cannot sell behind an unresolved order, so
+                // recovery jumps the queue instead of starving behind flatten jobs.
+                const recovery_open = lane_snap.unresolved_orders or lane_snap.foreign_pending or !lane_snap.ledger_ok or
+                    !exec.recovery_complete.load(.acquire);
+                const recovery_interval_ms: i64 = if (lane_snap.unresolved_orders or !lane_snap.ledger_ok) 10_000 else 60_000;
+                if (recovery_open and exec.jobs.depth() < 4 and lane_now - last_recovery_submit_ms >= recovery_interval_ms) {
+                    last_recovery_submit_ms = lane_now;
+                    _ = exec.submit(.recover, lane_snap.risk_mode == .flattening);
                 }
                 if (exec.takeDirty() or think.takeDirty()) {
                     web_state.update(engine.snapshot(), true);
@@ -1496,7 +1501,19 @@ pub fn main(init: std.process.Init) !u8 {
     // ---- Graceful shutdown (§7.4) -------------------------------------------
     // Stop agent order work first: a resting limit order is canceled and
     // confirmed before the lanes are joined, never abandoned on the book.
-    if (exec_started) exec.setAgentBlocked(true);
+    if (exec_started) exec.requestStop();
+    think.requestStop();
+    {
+        // A lane finishing its cancel-and-confirm may still need this thread:
+        // account reconciles (Service) and state messages (inbox).
+        const stop_deadline = nowMs() + @as(i64, if (cli.max_ticks > 0) 120_000 else 10_000);
+        while (nowMs() < stop_deadline and !((!exec_started or exec.isStopped()) and think.isStopped())) {
+            _ = engine.drainInbox();
+            _ = reconcile_service.pump(&account_reconcile_ctx, refreshAccountForExecution);
+            io.sleep(.{ .nanoseconds = 20_000_000 }, .awake) catch break;
+        }
+        _ = engine.drainInbox();
+    }
     std.debug.print("[shutdown] draining after {d} ticks\n", .{tick_count});
     drainModeTransitions(&events_repo, &engine, &cfg);
     _ = writeEquitySample(&equity_repo, &capital_flows_repo, &kv_repo, &db, engine.snapshot(), last_bh_cmp);
@@ -1602,6 +1619,14 @@ const ThinkLane = struct {
 
     fn start(self: *ThinkLane) !void {
         self.thread = try std.Thread.spawn(.{}, run, .{self});
+    }
+
+    fn requestStop(self: *ThinkLane) void {
+        self.stop.store(true, .release);
+    }
+
+    fn isStopped(self: *const ThinkLane) bool {
+        return self.stopped.load(.acquire);
     }
 
     fn isBusy(self: *const ThinkLane) bool {
