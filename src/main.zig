@@ -1494,6 +1494,9 @@ pub fn main(init: std.process.Init) !u8 {
     }
 
     // ---- Graceful shutdown (§7.4) -------------------------------------------
+    // Stop agent order work first: a resting limit order is canceled and
+    // confirmed before the lanes are joined, never abandoned on the book.
+    if (exec_started) exec.setAgentBlocked(true);
     std.debug.print("[shutdown] draining after {d} ticks\n", .{tick_count});
     drainModeTransitions(&events_repo, &engine, &cfg);
     _ = writeEquitySample(&equity_repo, &capital_flows_repo, &kv_repo, &db, engine.snapshot(), last_bh_cmp);

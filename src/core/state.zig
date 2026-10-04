@@ -258,6 +258,8 @@ pub const Engine = struct {
 
     /// Sequentially apply one message. This is the only place state mutates.
     pub fn apply(self: *Engine, msg: Message) dec.DecimalError!ApplyResult {
+        // Other threads must `submit`; applying from one would make it a second writer.
+        std.debug.assert(self.isOwner());
         self.lockState();
         defer self.lock.unlock();
         return self.applyLocked(msg);
