@@ -33,3 +33,7 @@ DEPLOY.local.md
 node_modules/
 *.tgz
 *.webauthn
+
+# Python bytecode (tools/e2e)
+__pycache__/
+*.pyc

@@ -528,6 +528,10 @@ pub fn parseOrderQuery(gpa: std.mem.Allocator, body: []const u8) Error!OrderQuer
     defer parsed.deinit();
     const data = try unwrapEnvelope(parsed.value);
     const obj = try firstObject(data);
+    return orderQueryFromObject(obj);
+}
+
+fn orderQueryFromObject(obj: std.json.ObjectMap) Error!OrderQuery {
     const state = try getString(obj, "state");
     const acc_fill = try getString(obj, "accFillSz");
     const avg_px = try getString(obj, "avgPx");
@@ -561,7 +565,183 @@ pub fn parseOrderQuery(gpa: std.mem.Allocator, body: []const u8) Error!OrderQuer
     return q;
 }
 
+/// Short venue business code ("51603") for classification and journaling.
+pub const ApiCode = struct {
+    buf: [12]u8 = undefined,
+    len: usize = 0,
+
+    fn from(text: []const u8) ApiCode {
+        var c = ApiCode{};
+        const n = @min(text.len, c.buf.len);
+        @memcpy(c.buf[0..n], text[0..n]);
+        c.len = n;
+        return c;
+    }
+
+    pub fn code(self: *const ApiCode) []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+
+/// Result of GET /api/v5/trade/order. Only `found` and `absent` are venue
+/// statements about the order; `failed` (transport leftovers, throttling,
+/// auth, malformed bodies) says nothing and must never change order state.
+pub const OrderLookup = union(enum) {
+    found: OrderQuery,
+    /// The venue reports it does not know the order (code 51603, or an empty
+    /// success list). May still be visibility lag right after placement.
+    absent,
+    failed,
+};
+
+pub fn lookupOrder(gpa: std.mem.Allocator, body: []const u8) OrderLookup {
+    var parsed = std.json.parseFromSlice(std.json.Value, gpa, body, .{}) catch return .failed;
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |o| o,
+        else => return .failed,
+    };
+    const code = switch (root.get("code") orelse return .failed) {
+        .string => |c| c,
+        else => return .failed,
+    };
+    if (std.mem.eql(u8, code, "51603")) return .absent;
+    if (!std.mem.eql(u8, code, "0")) return .failed;
+    const data = switch (root.get("data") orelse return .failed) {
+        .array => |a| a,
+        else => return .failed,
+    };
+    if (data.items.len == 0) return .absent;
+    const first = switch (data.items[0]) {
+        .object => |o| o,
+        else => return .failed,
+    };
+    const q = orderQueryFromObject(first) catch return .failed;
+    return .{ .found = q };
+}
+
+/// What a placement reply proves. Only `accepted`/`rejected` are definitive;
+/// anything else leaves the order possibly on the book.
+pub const PlaceOutcome = union(enum) {
+    accepted: OrderAck,
+    /// The venue (or its gateway, before matching) refused: nothing resting.
+    rejected: ApiCode,
+    unknown,
+};
+
+fn definitivePreMatchCode(code: []const u8) bool {
+    const codes = [_][]const u8{ "50011", "50102", "50110", "50111", "50113", "50119" };
+    for (codes) |c| {
+        if (std.mem.eql(u8, code, c)) return true;
+    }
+    return false;
+}
+
+/// sCode values after which the order is certainly not on the book: trading-rule
+/// and balance refusals (51xxx) and gateway refusals before matching. Timeout
+/// and "try again" codes (50004, 50013, 51149, ...) are deliberately excluded.
+fn definitiveRejectionCode(code: []const u8) bool {
+    const ambiguous = [_][]const u8{ "51149", "51411", "51412" };
+    for (ambiguous) |c| {
+        if (std.mem.eql(u8, code, c)) return false;
+    }
+    if (definitivePreMatchCode(code)) return true;
+    return code.len == 5 and std.mem.startsWith(u8, code, "51");
+}
+
+fn firstDataObject(root: std.json.ObjectMap) ?std.json.ObjectMap {
+    const data = switch (root.get("data") orelse return null) {
+        .array => |a| a,
+        else => return null,
+    };
+    if (data.items.len == 0) return null;
+    return switch (data.items[0]) {
+        .object => |o| o,
+        else => null,
+    };
+}
+
+fn stringField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    return switch (obj.get(key) orelse return null) {
+        .string => |s| s,
+        else => null,
+    };
+}
+
+pub fn classifyPlaceResponse(gpa: std.mem.Allocator, body: []const u8) PlaceOutcome {
+    var parsed = std.json.parseFromSlice(std.json.Value, gpa, body, .{}) catch return .unknown;
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |o| o,
+        else => return .unknown,
+    };
+    const top = stringField(root, "code") orelse return .unknown;
+    const item = firstDataObject(root);
+    if (item) |obj| {
+        if (stringField(obj, "sCode")) |s_code| {
+            if (!std.mem.eql(u8, s_code, "0")) {
+                // Only codes that prove the venue refused the order count as a
+                // rejection; timeout-class and unrecognised codes leave it unknown.
+                if (definitiveRejectionCode(s_code)) return .{ .rejected = ApiCode.from(s_code) };
+                return .unknown;
+            }
+        }
+    }
+    if (!std.mem.eql(u8, top, "0")) {
+        if (definitivePreMatchCode(top)) return .{ .rejected = ApiCode.from(top) };
+        return .unknown;
+    }
+    const obj = item orelse return .unknown;
+    const ord_id = stringField(obj, "ordId") orelse return .unknown;
+    if (ord_id.len == 0 or ord_id.len > 32) return .unknown;
+    var ack = OrderAck{ .s_code_ok = true };
+    @memcpy(ack.exchange_order_id_buf[0..ord_id.len], ord_id);
+    ack.exchange_order_id_len = ord_id.len;
+    return .{ .accepted = ack };
+}
+
+/// What a cancel request proved about the request itself. The order's final
+/// state is only ever established by querying it afterwards.
+pub const CancelOutcome = enum {
+    accepted,
+    /// Venue says the order is already filled / canceled / unknown.
+    already_closed,
+    rejected,
+    unknown,
+};
+
+pub fn classifyCancelResponse(gpa: std.mem.Allocator, body: []const u8) CancelOutcome {
+    var parsed = std.json.parseFromSlice(std.json.Value, gpa, body, .{}) catch return .unknown;
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |o| o,
+        else => return .unknown,
+    };
+    const top = stringField(root, "code") orelse return .unknown;
+    if (firstDataObject(root)) |obj| {
+        if (stringField(obj, "sCode")) |s_code| {
+            if (std.mem.eql(u8, s_code, "0") or std.mem.eql(u8, s_code, "51410")) {
+                return if (std.mem.eql(u8, top, "0")) .accepted else .rejected;
+            }
+            if (std.mem.eql(u8, s_code, "51400") or std.mem.eql(u8, s_code, "51401") or std.mem.eql(u8, s_code, "51402")) {
+                return .already_closed;
+            }
+            return .rejected;
+        }
+    }
+    if (std.mem.eql(u8, top, "0")) return .unknown;
+    return .rejected;
+}
+
 // -- Network layer -----------------------------------------------------------
+
+/// Pluggable wire layer. Production leaves it null (std.http); tests inject a
+/// deterministic in-process venue so execution failure paths run without a network.
+pub const Transport = struct {
+    context: *anyopaque,
+    /// Returns a gpa-owned body. `Error.HttpFailed` models a lost/unknown outcome.
+    fetch_fn: *const fn (context: *anyopaque, gpa: std.mem.Allocator, method: auth.Method, url: []const u8, body: []const u8) Error![]u8,
+};
 
 pub const Client = struct {
     http: std.http.Client,
@@ -570,6 +750,7 @@ pub const Client = struct {
     creds: ?auth.Credentials,
     /// Set true when using OKX demo trading (adds x-simulated-trading: 1).
     simulated: bool = false,
+    transport: ?Transport = null,
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, base_url: []const u8, creds: ?auth.Credentials) Client {
         return .{
@@ -637,13 +818,20 @@ pub const Client = struct {
             if (err != Error.HttpFailed) return err;
             // Zig may re-offer a half-closed pooled TLS socket after a blip; drop the
             // pool and retry once so the daemon does not stay wedged until restart.
-            std.debug.print("[okx] transport_failed; reset_http_retry url={s}\n", .{url});
             self.resetHttp();
+            // A write whose outcome is unknown may already be on the book:
+            // surface the failure so the caller queries instead of re-sending.
+            if (method != .GET) {
+                std.debug.print("[okx] transport_failed on write; not re-sent url={s}\n", .{url});
+                return err;
+            }
+            std.debug.print("[okx] transport_failed; reset_http_retry url={s}\n", .{url});
             return self.fetchRawOnce(method, url, body, extra_headers);
         };
     }
 
     fn fetchRawOnce(self: *Client, method: auth.Method, url: []const u8, body: []const u8, extra_headers: []const std.http.Header) ![]u8 {
+        if (self.transport) |t| return t.fetch_fn(t.context, self.gpa, method, url, body);
 
         // AC-SEC5: fixed-capacity sink — a hostile/broken gateway cannot balloon memory.
         const sink = self.gpa.alloc(u8, limits.max_okx_response_bytes) catch return Error.OutOfMemory;
@@ -965,6 +1153,74 @@ pub fn parsePendingClOrdIds(gpa: std.mem.Allocator, body: []const u8, out: [][]c
     return n;
 }
 
+/// Order ids (`ordId`) of pending orders that carry no client id: not placed
+/// by this process, but still cancelable by id.
+pub fn parsePendingUnnamedOrdIds(gpa: std.mem.Allocator, body: []const u8, out: [][]const u8, backing: []u8) usize {
+    var parsed = std.json.parseFromSlice(std.json.Value, gpa, body, .{}) catch return 0;
+    defer parsed.deinit();
+    const data = unwrapEnvelope(parsed.value) catch return 0;
+    var n: usize = 0;
+    var w: usize = 0;
+    for (data.items) |item| {
+        const obj = switch (item) {
+            .object => |o| o,
+            else => continue,
+        };
+        const cl = getString(obj, "clOrdId") catch "";
+        if (cl.len != 0) continue;
+        const ord = getString(obj, "ordId") catch continue;
+        if (ord.len == 0 or n >= out.len or w + ord.len > backing.len) continue;
+        @memcpy(backing[w .. w + ord.len], ord);
+        out[n] = backing[w .. w + ord.len];
+        w += ord.len;
+        n += 1;
+    }
+    return n;
+}
+
+pub const PendingScan = struct {
+    /// Reply was a successful, parseable envelope.
+    ok: bool = false,
+    /// More named orders existed than `out` could hold.
+    truncated: bool = false,
+    n: usize = 0,
+    /// Pending orders without a client id (not placed by this process).
+    unnamed: usize = 0,
+};
+
+/// Like `parsePendingClOrdIds`, but never loses information silently: a failed
+/// envelope, truncation and client-id-less orders are all reported.
+pub fn parsePendingOrders(gpa: std.mem.Allocator, body: []const u8, out: [][]const u8, backing: []u8) PendingScan {
+    var parsed = std.json.parseFromSlice(std.json.Value, gpa, body, .{}) catch return .{};
+    defer parsed.deinit();
+    const data = unwrapEnvelope(parsed.value) catch return .{};
+    var scan = PendingScan{ .ok = true };
+    var w: usize = 0;
+    for (data.items) |item| {
+        const obj = switch (item) {
+            .object => |o| o,
+            else => {
+                scan.unnamed += 1;
+                continue;
+            },
+        };
+        const cl = getString(obj, "clOrdId") catch "";
+        if (cl.len == 0) {
+            scan.unnamed += 1;
+            continue;
+        }
+        if (scan.n >= out.len or w + cl.len > backing.len) {
+            scan.truncated = true;
+            continue;
+        }
+        @memcpy(backing[w .. w + cl.len], cl);
+        out[scan.n] = backing[w .. w + cl.len];
+        w += cl.len;
+        scan.n += 1;
+    }
+    return scan;
+}
+
 test "parse pending clOrdIds" {
     const body =
         \\{"code":"0","msg":"","data":[
@@ -1028,4 +1284,122 @@ pub fn probeBalance(client: *Client, gpa: std.mem.Allocator, now_ms: i64) Balanc
         return .{ .err = token };
     };
     return .{ .ok = bal };
+}
+
+test "lookupOrder separates found, absent and no-information outcomes" {
+    const found =
+        \\{"code":"0","msg":"","data":[{"ordId":"1","state":"live","accFillSz":"","avgPx":""}]}
+    ;
+    switch (lookupOrder(testing.allocator, found)) {
+        .found => |q| try testing.expectEqualStrings("live", q.status()),
+        else => return error.TestUnexpectedResult,
+    }
+    // The venue says it does not know the order (OKX 51603) — an observation.
+    try testing.expect(lookupOrder(testing.allocator,
+        \\{"code":"51603","msg":"Order does not exist","data":[]}
+    ) == .absent);
+    // Success envelope with nothing in it is the same observation.
+    try testing.expect(lookupOrder(testing.allocator,
+        \\{ "code" : "0", "msg" : "", "data" : [ ] }
+    ) == .absent);
+    // Any other business code carries no information about the order.
+    try testing.expect(lookupOrder(testing.allocator,
+        \\{"code":"50011","msg":"Too many requests","data":[]}
+    ) == .failed);
+    try testing.expect(lookupOrder(testing.allocator,
+        \\{"code":"50111","msg":"Invalid OK-ACCESS-KEY","data":[]}
+    ) == .failed);
+    try testing.expect(lookupOrder(testing.allocator, "<html>502</html>") == .failed);
+    try testing.expect(lookupOrder(testing.allocator, "") == .failed);
+}
+
+test "classifyPlaceResponse never calls an ambiguous reply a rejection" {
+    const ok =
+        \\{"code":"0","msg":"","data":[{"clOrdId":"ab1","ordId":"312","sCode":"0","sMsg":""}]}
+    ;
+    switch (classifyPlaceResponse(testing.allocator, ok)) {
+        .accepted => |a| try testing.expectEqualStrings("312", a.exchangeOrderId()),
+        else => return error.TestUnexpectedResult,
+    }
+    // Venue evaluated the order and refused it: definitive, nothing on the book.
+    const refused =
+        \\{"code":"1","msg":"All operations failed","data":[{"clOrdId":"ab1","ordId":"","sCode":"51008","sMsg":"Insufficient balance"}]}
+    ;
+    switch (classifyPlaceResponse(testing.allocator, refused)) {
+        .rejected => |r| try testing.expectEqualStrings("51008", r.code()),
+        else => return error.TestUnexpectedResult,
+    }
+    // Gateway-level throttling happens before matching: definitive too.
+    try testing.expect(classifyPlaceResponse(testing.allocator,
+        \\{"code":"50011","msg":"Too many requests","data":[]}
+    ) == .rejected);
+    // A success code without a usable order id, or a non-JSON reply, is unknown.
+    try testing.expect(classifyPlaceResponse(testing.allocator,
+        \\{"code":"0","msg":"","data":[]}
+    ) == .unknown);
+    try testing.expect(classifyPlaceResponse(testing.allocator, "bad gateway") == .unknown);
+    try testing.expect(classifyPlaceResponse(testing.allocator,
+        \\{"code":"50001","msg":"Service temporarily unavailable","data":[]}
+    ) == .unknown);
+}
+
+test "classifyCancelResponse distinguishes request outcomes; callers must still query" {
+    try testing.expect(classifyCancelResponse(testing.allocator,
+        \\{"code":"0","msg":"","data":[{"clOrdId":"ab1","ordId":"1","sCode":"0","sMsg":""}]}
+    ) == .accepted);
+    try testing.expect(classifyCancelResponse(testing.allocator,
+        \\{"code":"1","msg":"","data":[{"clOrdId":"ab1","ordId":"","sCode":"51402","sMsg":"already completed"}]}
+    ) == .already_closed);
+    try testing.expect(classifyCancelResponse(testing.allocator,
+        \\{"code":"1","msg":"","data":[{"clOrdId":"ab1","ordId":"","sCode":"50013","sMsg":"busy"}]}
+    ) == .rejected);
+    try testing.expect(classifyCancelResponse(testing.allocator, "") == .unknown);
+}
+
+test "parsePendingOrders reports truncation instead of silently dropping orders" {
+    const body =
+        \\{"code":"0","msg":"","data":[{"clOrdId":"a1"},{"clOrdId":"a2"},{"clOrdId":"a3"}]}
+    ;
+    var ids: [2][]const u8 = undefined;
+    var backing: [64]u8 = undefined;
+    const scan = parsePendingOrders(testing.allocator, body, &ids, &backing);
+    try testing.expect(scan.ok);
+    try testing.expect(scan.truncated);
+    try testing.expectEqual(@as(usize, 2), scan.n);
+    var ids2: [4][]const u8 = undefined;
+    const scan2 = parsePendingOrders(testing.allocator, body, &ids2, &backing);
+    try testing.expect(scan2.ok and !scan2.truncated);
+    try testing.expectEqual(@as(usize, 3), scan2.n);
+    try testing.expect(!parsePendingOrders(testing.allocator, "{\"code\":\"50011\",\"data\":[]}", &ids2, &backing).ok);
+}
+
+test "classifyPlaceResponse never turns a timeout-class sCode into a rejection" {
+    const unknown_codes = [_][]const u8{ "51149", "50004", "50013", "50026" };
+    for (unknown_codes) |code| {
+        var buf: [256]u8 = undefined;
+        const body = try std.fmt.bufPrint(&buf, "{{\"code\":\"1\",\"msg\":\"\",\"data\":[{{\"clOrdId\":\"ab1\",\"ordId\":\"\",\"sCode\":\"{s}\",\"sMsg\":\"x\"}}]}}", .{code});
+        try testing.expect(classifyPlaceResponse(testing.allocator, body) == .unknown);
+    }
+    const refused = [_][]const u8{ "51008", "51020", "51000", "51016" };
+    for (refused) |code| {
+        var buf: [256]u8 = undefined;
+        const body = try std.fmt.bufPrint(&buf, "{{\"code\":\"1\",\"msg\":\"\",\"data\":[{{\"clOrdId\":\"ab1\",\"ordId\":\"\",\"sCode\":\"{s}\",\"sMsg\":\"x\"}}]}}", .{code});
+        try testing.expect(classifyPlaceResponse(testing.allocator, body) == .rejected);
+    }
+    // An sCode we have never heard of says nothing definite.
+    try testing.expect(classifyPlaceResponse(testing.allocator,
+        \\{"code":"1","msg":"","data":[{"clOrdId":"ab1","ordId":"","sCode":"59999","sMsg":"?"}]}
+    ) == .unknown);
+}
+
+test "parsePendingUnnamedOrdIds returns order ids of pending orders without a client id" {
+    const body =
+        \\{"code":"0","msg":"","data":[{"clOrdId":"","ordId":"111"},{"clOrdId":"ab2","ordId":"222"},{"ordId":"333"}]}
+    ;
+    var ids: [4][]const u8 = undefined;
+    var backing: [64]u8 = undefined;
+    const n = parsePendingUnnamedOrdIds(testing.allocator, body, &ids, &backing);
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqualStrings("111", ids[0]);
+    try testing.expectEqualStrings("333", ids[1]);
 }

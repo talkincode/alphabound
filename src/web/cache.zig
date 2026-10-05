@@ -29,9 +29,11 @@ pub const EQUITY_JSON_BUFFER_BYTES: usize = 64 * 1024;
 pub const EVENTS_JSON_BUFFER_BYTES: usize = 32 * 1024;
 
 pub const WebState = struct {
-    /// Seqlock: odd = write in progress. Single writer (core loop), many
-    /// readers (web connections) — no blocking, no Io dependency.
+    /// Seqlock: odd = write in progress. Writers (core loop and the slow
+    /// lanes publishing their own caches) are serialized by `write_lock`; many
+    /// readers (web connections) never block — no Io dependency.
     seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    write_lock: std.atomic.Mutex = .unlocked,
     snapshot: state.PortfolioState = .{},
     ready: bool = false,
     config_hash: [71]u8 = @splat(0),
@@ -285,15 +287,25 @@ pub const WebState = struct {
         }
     }
 
-    pub fn update(self: *WebState, snap: state.PortfolioState, ready: bool) void {
+    fn beginWrite(self: *WebState) void {
+        while (!self.write_lock.tryLock()) std.atomic.spinLoopHint();
         _ = self.seq.fetchAdd(1, .acq_rel); // odd: writing
+    }
+
+    fn endWrite(self: *WebState) void {
+        _ = self.seq.fetchAdd(1, .release); // even: stable
+        self.write_lock.unlock();
+    }
+
+    pub fn update(self: *WebState, snap: state.PortfolioState, ready: bool) void {
+        self.beginWrite();
         self.snapshot = snap;
         self.ready = ready;
-        _ = self.seq.fetchAdd(1, .release); // even: stable
+        self.endWrite();
     }
 
     pub fn setJson(self: *WebState, comptime which: enum { agent, equity, events, shadow, candles, memories, system, decisions, orders, review, review_ctx, audit, periodic, analytics, statistics, intel, sentiment }, src: []const u8) void {
-        _ = self.seq.fetchAdd(1, .acq_rel);
+        self.beginWrite();
         switch (which) {
             .agent => {
                 const n = @min(src.len, self.agent_runs_buf.len);
@@ -381,12 +393,16 @@ pub const WebState = struct {
                 self.sentiment_len = n;
             },
         }
-        _ = self.seq.fetchAdd(1, .release);
+        self.endWrite();
     }
 };
 
 /// Live connectivity/status snapshot for Dashboard「状态」页.
 pub const RuntimeStatus = struct {
+    /// Setters are called from the fast loop and the slow lanes; readers
+    /// (`refreshSystemCache`) hold the lock while rendering. Strings point into
+    /// the owned scratch buffers below, so a copy would not be safe.
+    lock: std.atomic.Mutex = .unlocked,
     volatility: scheduler.VolatilityStatus = .{},
     volatility_as_of_ms: i64 = 0,
     okx_public: []const u8 = "unknown",
@@ -450,19 +466,33 @@ pub const RuntimeStatus = struct {
     egress_buf: [64]u8 = undefined,
     egress_len: usize = 0,
 
+    pub fn acquire(self: *RuntimeStatus) void {
+        while (!self.lock.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    pub fn release(self: *RuntimeStatus) void {
+        self.lock.unlock();
+    }
+
     pub fn addUsage(self: *RuntimeStatus, u: openai.Usage) void {
+        self.acquire();
+        defer self.release();
         self.llm_calls += 1;
         self.prompt_tokens += u.prompt_tokens;
         self.completion_tokens += u.completion_tokens;
         self.total_tokens += if (u.total_tokens > 0) u.total_tokens else u.prompt_tokens + u.completion_tokens;
     }
     pub fn setBid(self: *RuntimeStatus, bid_txt: []const u8) void {
+        self.acquire();
+        defer self.release();
         const n = @min(bid_txt.len, self.bid_buf.len);
         @memcpy(self.bid_buf[0..n], bid_txt[0..n]);
         self.bid_len = n;
         self.last_bid = self.bid_buf[0..self.bid_len];
     }
     pub fn setPub(self: *RuntimeStatus, status: []const u8, detail: []const u8) void {
+        self.acquire();
+        defer self.release();
         self.okx_public = status;
         self.okx_public_ms = nowMs();
         const n = @min(detail.len, self.pub_detail_buf.len);
@@ -471,6 +501,8 @@ pub const RuntimeStatus = struct {
         self.okx_public_detail = self.pub_detail_buf[0..self.pub_detail_len];
     }
     pub fn setPriv(self: *RuntimeStatus, status: []const u8, detail: []const u8) void {
+        self.acquire();
+        defer self.release();
         self.okx_private = status;
         self.okx_private_ms = nowMs();
         const n = @min(detail.len, self.priv_detail_buf.len);
@@ -479,6 +511,8 @@ pub const RuntimeStatus = struct {
         self.okx_private_detail = self.priv_detail_buf[0..self.priv_detail_len];
     }
     pub fn setLlm(self: *RuntimeStatus, status: []const u8, detail: []const u8) void {
+        self.acquire();
+        defer self.release();
         self.llm = status;
         self.llm_ms = nowMs();
         const n = @min(detail.len, self.llm_detail_buf.len);
@@ -487,6 +521,8 @@ pub const RuntimeStatus = struct {
         self.llm_detail = self.llm_detail_buf[0..self.llm_detail_len];
     }
     pub fn setAccount(self: *RuntimeStatus, usdt: []const u8, btc: []const u8) void {
+        self.acquire();
+        defer self.release();
         var n = @min(usdt.len, self.acct_usdt_buf.len);
         @memcpy(self.acct_usdt_buf[0..n], usdt[0..n]);
         self.acct_usdt = self.acct_usdt_buf[0..n];
@@ -495,6 +531,8 @@ pub const RuntimeStatus = struct {
         self.acct_btc = self.acct_btc_buf[0..n];
     }
     pub fn setLastDecision(self: *RuntimeStatus, text: []const u8) void {
+        self.acquire();
+        defer self.release();
         const n = @min(text.len, self.last_decision_buf.len);
         @memcpy(self.last_decision_buf[0..n], text[0..n]);
         self.last_decision = self.last_decision_buf[0..n];
@@ -504,6 +542,8 @@ pub const RuntimeStatus = struct {
     /// Publish the latest audit outcome. `status` must be a static string
     /// ("ok"/"warn"/"alert"); `alerts_json` is a findings JSON array.
     pub fn setAudit(self: *RuntimeStatus, status: []const u8, alerts_json: []const u8, findings: u32) void {
+        self.acquire();
+        defer self.release();
         self.audit_status = status;
         self.audit_findings = findings;
         self.audit_ms = nowMs();
@@ -517,15 +557,21 @@ pub const RuntimeStatus = struct {
     /// Publish the latest 定期复盘 outcome. `status` / `cycle` must be static
     /// strings ("ok"/"degraded"/"failed", "short"/"long").
     pub fn setPeriodicReview(self: *RuntimeStatus, status: []const u8, cycle: []const u8) void {
+        self.acquire();
+        defer self.release();
         self.review_status = status;
         self.review_cycle = cycle;
         self.review_ms = nowMs();
     }
     pub fn setReviewDueAt(self: *RuntimeStatus, short_due_ms: i64, long_due_ms: i64) void {
+        self.acquire();
+        defer self.release();
         self.review_next_short_due_ms = short_due_ms;
         self.review_next_long_due_ms = long_due_ms;
     }
     pub fn setEgress(self: *RuntimeStatus, ip: []const u8) void {
+        self.acquire();
+        defer self.release();
         const n = @min(ip.len, self.egress_buf.len);
         @memcpy(self.egress_buf[0..n], ip[0..n]);
         self.egress_len = n;
@@ -533,11 +579,15 @@ pub const RuntimeStatus = struct {
         self.egress_ip_ms = nowMs();
     }
     pub fn setDisk(self: *RuntimeStatus, band: []const u8, free_bytes: u64) void {
+        self.acquire();
+        defer self.release();
         self.disk = band;
         self.disk_free_bytes = free_bytes;
         self.disk_ms = nowMs();
     }
     pub fn setResources(self: *RuntimeStatus, snap: resources.Snapshot) void {
+        self.acquire();
+        defer self.release();
         self.cpu_pct_x10 = snap.cpu_pct_x10;
         self.host_cpu_pct_x10 = snap.host_cpu_pct_x10;
         self.rss_bytes = snap.rss_bytes;
@@ -993,16 +1043,19 @@ pub fn refreshSystemCache(
     ws: *WebState,
     db: *storage.Db,
     cfg: *const config.Config,
-    mem_store: *const memory.Store,
+    mem_count: usize,
     boot_ms: i64,
     private_keys: bool,
     private_ws: bool,
     agent_on: bool,
     paused: bool,
-    st: *const RuntimeStatus,
+    st_mut: *RuntimeStatus,
     risk_lat: *const latency.Histogram,
     exec: ExecFlags,
 ) void {
+    st_mut.acquire();
+    defer st_mut.release();
+    const st: *const RuntimeStatus = st_mut;
     const total = storage.Db.queryInt(db, "SELECT COUNT(*) FROM agent_runs") catch 0;
     const ok = storage.Db.queryInt(db, "SELECT COUNT(*) FROM agent_runs WHERE status = 'ok'") catch 0;
     const invalid = storage.Db.queryInt(db, "SELECT COUNT(*) FROM agent_runs WHERE status LIKE 'invalid%'") catch 0;
@@ -1031,7 +1084,7 @@ pub fn refreshSystemCache(
             private_keys,
             private_ws,
             agent_on,
-            mem_store.count(),
+            mem_count,
             memory.MAX_MEMORIES,
         },
     ) catch return;

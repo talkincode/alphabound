@@ -39,12 +39,24 @@ pub const PortfolioState = struct {
     drawdown: Decimal = Decimal.zero,
     risk_mode: sm.RiskMode = .exit_only, // fail-closed until reconciled
     reconciled: bool = false,
+    /// Cash/BTC hold a local projection of fills the venue has not yet
+    /// confirmed through an authoritative balance. Never counts as fresh.
+    account_projected: bool = false,
     unresolved_orders: bool = false,
+    /// Orders the local ledger does not own are resting on the venue. Blocks
+    /// new risk (like `unresolved_orders`) but never blocks a risk-reducing exit.
+    foreign_pending: bool = false,
     /// False when the DB volume is in low/critical free-space band (FD7).
     disk_ok: bool = true,
     /// False when the audit journal (events append) is failing (AC-GO6):
     /// un-auditable trading must not continue increasing risk.
     journal_ok: bool = true,
+    /// False when the order ledger cannot persist intents/progress: orders
+    /// the process cannot recover after a crash must not be created.
+    ledger_ok: bool = true,
+    /// Bumped whenever an external deposit/withdrawal rescales the book; a
+    /// proposal formed before it no longer describes the account.
+    flow_epoch: u32 = 0,
     freshness: FreshnessState = .{},
 };
 
@@ -55,6 +67,16 @@ pub const Message = union(enum) {
         mark: Decimal,
     },
     account_update: struct {
+        ts_ms: i64,
+        cash_usdt: Decimal,
+        btc_total: Decimal,
+        btc_available: Decimal,
+    },
+    /// Local best-effort book from verified fill increments while the venue
+    /// balance is unavailable or lagging. Unlike `account_update` it does not
+    /// refresh account freshness, never advances the HWM and leaves the book
+    /// flagged as unconfirmed until the next authoritative balance.
+    account_projection: struct {
         ts_ms: i64,
         cash_usdt: Decimal,
         btc_total: Decimal,
@@ -73,11 +95,15 @@ pub const Message = union(enum) {
         flow_equity_after: Decimal = Decimal.zero,
     },
     order_ambiguity: struct { present: bool },
+    /// Orders outside the local ledger are resting on the venue.
+    foreign_pending: struct { present: bool },
     risk_trigger: sm.Trigger,
     /// Disk free-space health for the DB volume (FD7). `ok=false` → degraded.
     disk_status: struct { ok: bool },
     /// Audit journal write health (AC-GO6). `ok=false` → degraded.
     journal_status: struct { ok: bool },
+    /// Order ledger (intent/progress rows) write health. `ok=false` → degraded.
+    ledger_status: struct { ok: bool },
     clock_tick: struct { ts_ms: i64 }, // periodic freshness re-evaluation
 };
 
@@ -105,17 +131,122 @@ pub const ModeTransition = struct {
     bounces: u32 = 0,
 };
 
+/// Capacity of the cross-thread message inbox (see `Engine.submit`).
+pub const inbox_cap: usize = 256;
+
 pub const Engine = struct {
     state: PortfolioState = .{},
     exit_costs: equity_mod.ExitCostParams,
     max_drawdown: Decimal,
     pending_transition: ?ModeTransition = null,
 
+    // -- Concurrency ---------------------------------------------------------
+    // One thread (the owner) mutates state. Other threads never touch it: they
+    // `submit` messages that the owner applies in order via `drainInbox`, and
+    // read immutable snapshots. `lock` only guards the short copy-in/copy-out
+    // sections, so a reader can never observe a half-applied message.
+    lock: std.atomic.Mutex = .unlocked,
+    /// Owner thread id; 0 = unclaimed (single-threaded use, tests).
+    owner: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    inbox: [inbox_cap]Queued = undefined,
+    inbox_len: usize = 0,
+    inbox_overflowed: bool = false,
+    submitted_seq: u64 = 0,
+    applied_seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    const Queued = struct { seq: u64, msg: Message };
+
+    fn currentThread() u64 {
+        return @as(u64, @intCast(std.Thread.getCurrentId())) + 1;
+    }
+
+    fn lockState(self: *Engine) void {
+        while (!self.lock.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    /// Declare the calling thread the state owner (the fast risk loop).
+    pub fn claimOwner(self: *Engine) void {
+        self.owner.store(currentThread(), .release);
+    }
+
+    pub fn isOwner(self: *const Engine) bool {
+        const o = self.owner.load(.acquire);
+        return o == 0 or o == currentThread();
+    }
+
     /// Return and clear the pending transition record, if any.
     pub fn takeModeTransition(self: *Engine) ?ModeTransition {
+        self.lockState();
+        defer self.lock.unlock();
         const t = self.pending_transition;
         self.pending_transition = null;
         return t;
+    }
+
+    /// Send a message to the state owner. On the owner thread it applies
+    /// immediately; from any other thread it is queued (bounded, never blocks)
+    /// and applied in submission order by the owner's next `drainInbox`.
+    /// Returns a ticket for `waitApplied` (0 when applied inline).
+    pub fn submit(self: *Engine, msg: Message) dec.DecimalError!u64 {
+        if (self.isOwner()) {
+            _ = try self.apply(msg);
+            return 0;
+        }
+        self.lockState();
+        defer self.lock.unlock();
+        if (self.inbox_len >= inbox_cap) {
+            // Dropping silently could lose an "order ambiguity: true"; the owner
+            // fails closed instead (see drainInbox).
+            self.inbox_overflowed = true;
+            return 0;
+        }
+        self.submitted_seq += 1;
+        self.inbox[self.inbox_len] = .{ .seq = self.submitted_seq, .msg = msg };
+        self.inbox_len += 1;
+        return self.submitted_seq;
+    }
+
+    /// Block (bounded) until a submitted message has been applied.
+    pub fn waitApplied(self: *Engine, ticket: u64, io: std.Io, timeout_ms: u32) bool {
+        if (ticket == 0) return true;
+        var waited: u32 = 0;
+        while (self.applied_seq.load(.acquire) < ticket) {
+            if (waited >= timeout_ms) return false;
+            io.sleep(.{ .nanoseconds = 2_000_000 }, .awake) catch return false;
+            waited += 2;
+        }
+        return true;
+    }
+
+    /// Submit and wait until the owner applied it (later reads see the effect).
+    pub fn submitSync(self: *Engine, msg: Message, io: std.Io) void {
+        const ticket = self.submit(msg) catch return;
+        _ = self.waitApplied(ticket, io, 1_000);
+    }
+
+    /// Owner only: apply every queued message in order. Returns how many.
+    pub fn drainInbox(self: *Engine) usize {
+        var batch: [inbox_cap]Queued = undefined;
+        var n: usize = 0;
+        var overflowed = false;
+        {
+            self.lockState();
+            defer self.lock.unlock();
+            n = self.inbox_len;
+            @memcpy(batch[0..n], self.inbox[0..n]);
+            self.inbox_len = 0;
+            overflowed = self.inbox_overflowed;
+            self.inbox_overflowed = false;
+        }
+        for (batch[0..n]) |q| {
+            _ = self.apply(q.msg) catch {};
+            self.applied_seq.store(q.seq, .release);
+        }
+        if (overflowed) {
+            std.debug.print("[state] inbox overflow — failing closed (order ambiguity)\n", .{});
+            _ = self.apply(.{ .order_ambiguity = .{ .present = true } }) catch {};
+        }
+        return n;
     }
 
     pub fn init(exit_costs: equity_mod.ExitCostParams, max_drawdown: Decimal) Engine {
@@ -124,12 +255,27 @@ pub const Engine = struct {
 
     /// Restore high watermark from storage at boot (§7.1 BOOTING).
     pub fn restoreHwm(self: *Engine, hwm: Decimal) void {
+        self.lockState();
+        defer self.lock.unlock();
         self.state.high_watermark = hwm;
         self.state.version += 1;
     }
 
     /// Sequentially apply one message. This is the only place state mutates.
     pub fn apply(self: *Engine, msg: Message) dec.DecimalError!ApplyResult {
+        // A second writer would race the owner. Instead of mutating from here,
+        // hand the message to the owner (it is applied, in order, on its next
+        // `drainInbox`); the result is empty because nothing changed yet.
+        if (!self.isOwner()) {
+            _ = try self.submit(msg);
+            return .{};
+        }
+        self.lockState();
+        defer self.lock.unlock();
+        return self.applyLocked(msg);
+    }
+
+    fn applyLocked(self: *Engine, msg: Message) dec.DecimalError!ApplyResult {
         var result = ApplyResult{};
         const prev_mode = self.state.risk_mode;
 
@@ -146,8 +292,16 @@ pub const Engine = struct {
                 self.state.btc_total = u.btc_total;
                 self.state.btc_available = u.btc_available;
                 self.state.freshness.account_last_ms = u.ts_ms;
+                self.state.account_projected = false;
                 self.state.as_of_ms = u.ts_ms;
                 try self.revalue(u.ts_ms);
+            },
+            .account_projection => |u| {
+                self.state.cash_usdt = u.cash_usdt;
+                self.state.btc_total = u.btc_total;
+                self.state.btc_available = u.btc_available;
+                self.state.account_projected = true;
+                try self.revalueWith(self.state.as_of_ms, false);
             },
             .reconcile_result => |r| {
                 self.state.cash_usdt = r.cash_usdt;
@@ -155,6 +309,7 @@ pub const Engine = struct {
                 self.state.btc_available = r.btc_available;
                 self.state.high_watermark = Decimal.max(self.state.high_watermark, r.hwm_from_db);
                 if (!r.flow_equity_before.eql(Decimal.zero) or !r.flow_equity_after.eql(Decimal.zero)) {
+                    self.state.flow_epoch +%= 1;
                     self.state.high_watermark = try equity_mod.adjustHighWatermarkForFlow(
                         self.state.high_watermark,
                         r.flow_equity_before,
@@ -162,12 +317,17 @@ pub const Engine = struct {
                     );
                 }
                 self.state.freshness.account_last_ms = r.ts_ms;
+                self.state.account_projected = false;
                 self.state.reconciled = r.clean;
                 self.state.as_of_ms = r.ts_ms;
                 try self.revalue(r.ts_ms);
             },
             .order_ambiguity => |o| {
                 self.state.unresolved_orders = o.present;
+                self.evaluateHealth(self.state.as_of_ms);
+            },
+            .foreign_pending => |f| {
+                self.state.foreign_pending = f.present;
                 self.evaluateHealth(self.state.as_of_ms);
             },
             .risk_trigger => |t| {
@@ -179,6 +339,10 @@ pub const Engine = struct {
             },
             .journal_status => |j| {
                 self.state.journal_ok = j.ok;
+                self.evaluateHealth(self.state.as_of_ms);
+            },
+            .ledger_status => |l| {
+                self.state.ledger_ok = l.ok;
                 self.evaluateHealth(self.state.as_of_ms);
             },
             .clock_tick => |c| {
@@ -209,10 +373,19 @@ pub const Engine = struct {
 
     /// Immutable snapshot for readers (agent, dashboard, risk worker).
     pub fn snapshot(self: *const Engine) PortfolioState {
+        const mutable: *Engine = @constCast(self);
+        mutable.lockState();
+        defer mutable.lock.unlock();
         return self.state;
     }
 
     fn revalue(self: *Engine, now_ms: i64) dec.DecimalError!void {
+        return self.revalueWith(now_ms, true);
+    }
+
+    /// `advance_hwm=false` re-prices an unconfirmed projection: it may deepen
+    /// drawdown (conservative) but must never raise the boundary reference.
+    fn revalueWith(self: *Engine, now_ms: i64, advance_hwm: bool) dec.DecimalError!void {
         if (self.state.bid_price.gt(Decimal.zero)) {
             const r = try equity_mod.conservativeEquity(.{
                 .cash_usdt = self.state.cash_usdt,
@@ -221,7 +394,7 @@ pub const Engine = struct {
                 .exit_costs = self.exit_costs,
             });
             self.state.conservative_equity = r.equity;
-            if (self.state.reconciled) {
+            if (self.state.reconciled and advance_hwm and !self.state.account_projected) {
                 // HWM only advances on reconciled data — unconfirmed balances
                 // must not raise the boundary reference (§5.1 conservatism).
                 self.state.high_watermark = equity_mod.updateHighWatermark(self.state.high_watermark, r.equity);
@@ -242,8 +415,11 @@ pub const Engine = struct {
     fn evaluateHealth(self: *Engine, now_ms: i64) void {
         const healthy = self.state.reconciled and
             !self.state.unresolved_orders and
+            !self.state.foreign_pending and
             self.state.disk_ok and
             self.state.journal_ok and
+            self.state.ledger_ok and
+            !self.state.account_projected and
             self.state.freshness.marketFresh(now_ms) and
             self.state.freshness.accountFresh(now_ms);
         const trigger: sm.Trigger = if (healthy) .conditions_ok else .degraded;
@@ -537,4 +713,216 @@ test "engine records silent mode transitions with their cause" {
     try std.testing.expectEqualStrings("clock_tick", t.cause);
     try std.testing.expectEqual(@as(u32, 1), t.bounces);
     try std.testing.expect(e.takeModeTransition() == null);
+}
+
+fn reconciledNormalEngine() !Engine {
+    var e = testEngine();
+    _ = try e.apply(.{ .market_tick = .{ .ts_ms = 1000, .bid = d("100000"), .mark = d("100000") } });
+    _ = try e.apply(.{ .reconcile_result = .{
+        .ts_ms = 1000,
+        .cash_usdt = d("100"),
+        .btc_total = d("0"),
+        .btc_available = d("0"),
+        .hwm_from_db = d("100"),
+        .clean = true,
+    } });
+    try testing.expectEqual(sm.RiskMode.normal, e.snapshot().risk_mode);
+    return e;
+}
+
+test "projection moves the book without refreshing account freshness or the HWM" {
+    var e = try reconciledNormalEngine();
+    const before = e.snapshot();
+    // A projected buy that (wrongly or not) shows the book richer than reality.
+    _ = try e.apply(.{ .account_projection = .{
+        .ts_ms = 2000,
+        .cash_usdt = d("0"),
+        .btc_total = d("0.002"),
+        .btc_available = d("0.002"),
+    } });
+    const after = e.snapshot();
+    try testing.expect(after.btc_total.eql(d("0.002")));
+    try testing.expectEqual(before.freshness.account_last_ms, after.freshness.account_last_ms);
+    try testing.expect(after.high_watermark.eql(before.high_watermark));
+    try testing.expect(after.account_projected);
+    // Not authoritative: new risk must wait for a venue reconcile.
+    try testing.expectEqual(sm.RiskMode.exit_only, after.risk_mode);
+}
+
+test "an authoritative balance clears the projection flag" {
+    var e = try reconciledNormalEngine();
+    _ = try e.apply(.{ .account_projection = .{ .ts_ms = 2000, .cash_usdt = d("50"), .btc_total = d("0.0005"), .btc_available = d("0.0005") } });
+    try testing.expect(e.snapshot().account_projected);
+    _ = try e.apply(.{ .reconcile_result = .{
+        .ts_ms = 2100,
+        .cash_usdt = d("50"),
+        .btc_total = d("0.0005"),
+        .btc_available = d("0.0005"),
+        .hwm_from_db = d("100"),
+        .clean = true,
+    } });
+    try testing.expect(!e.snapshot().account_projected);
+    try testing.expectEqual(sm.RiskMode.normal, e.snapshot().risk_mode);
+}
+
+test "a projection can deepen drawdown into flattening but never lift the boundary" {
+    var e = try reconciledNormalEngine();
+    _ = try e.apply(.{ .account_projection = .{ .ts_ms = 2000, .cash_usdt = d("80"), .btc_total = d("0"), .btc_available = d("0") } });
+    try testing.expectEqual(sm.RiskMode.flattening, e.snapshot().risk_mode);
+    try testing.expect(e.snapshot().high_watermark.eql(d("100")));
+}
+
+test "ledger write failure degrades trading until a write succeeds again" {
+    var e = try reconciledNormalEngine();
+    _ = try e.apply(.{ .ledger_status = .{ .ok = false } });
+    try testing.expectEqual(sm.RiskMode.exit_only, e.snapshot().risk_mode);
+    try testing.expect(!e.snapshot().ledger_ok);
+    _ = try e.apply(.{ .ledger_status = .{ .ok = true } });
+    try testing.expectEqual(sm.RiskMode.normal, e.snapshot().risk_mode);
+}
+
+const Producer = struct {
+    engine: *Engine,
+    count: usize,
+
+    fn run(self: *Producer) void {
+        var i: usize = 0;
+        while (i < self.count) : (i += 1) {
+            // Alternating flags; the last submitted value must win.
+            _ = self.engine.submit(.{ .order_ambiguity = .{ .present = i % 2 == 0 } }) catch {};
+        }
+    }
+};
+
+test "non-owner submissions are applied by the owner in order, never inline" {
+    var e = try reconciledNormalEngine();
+    e.claimOwner();
+    var producer = Producer{ .engine = &e, .count = 101 }; // last value: present = true
+    const t = try std.Thread.spawn(.{}, Producer.run, .{&producer});
+    t.join();
+    // The producer thread must not have touched the state.
+    try testing.expect(!e.snapshot().unresolved_orders);
+    try testing.expectEqual(@as(usize, 101), e.drainInbox());
+    try testing.expect(e.snapshot().unresolved_orders);
+    try testing.expectEqual(@as(u64, 101), e.applied_seq.load(.acquire));
+}
+
+test "owner submissions apply immediately" {
+    var e = try reconciledNormalEngine();
+    e.claimOwner();
+    const ticket = try e.submit(.{ .order_ambiguity = .{ .present = true } });
+    try testing.expectEqual(@as(u64, 0), ticket);
+    try testing.expect(e.snapshot().unresolved_orders);
+}
+
+test "an inbox overflow fails closed instead of losing a message" {
+    var e = try reconciledNormalEngine();
+    e.claimOwner();
+    var producer = Producer{ .engine = &e, .count = inbox_cap + 50 };
+    const t = try std.Thread.spawn(.{}, Producer.run, .{&producer});
+    t.join();
+    _ = e.drainInbox();
+    try testing.expect(e.snapshot().unresolved_orders);
+}
+
+const Reader = struct {
+    engine: *Engine,
+    stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    torn: bool = false,
+
+    fn run(self: *Reader) void {
+        while (!self.stop.load(.acquire)) {
+            const s = self.engine.snapshot();
+            // The writer always sets cash and btc to the same value.
+            if (!s.cash_usdt.eql(s.btc_total)) self.torn = true;
+        }
+    }
+};
+
+test "snapshots are never torn while the owner applies messages" {
+    var e = try reconciledNormalEngine();
+    e.claimOwner();
+    var reader = Reader{ .engine = &e };
+    const t = try std.Thread.spawn(.{}, Reader.run, .{&reader});
+    var i: i64 = 1;
+    while (i < 4000) : (i += 1) {
+        const v = Decimal.fromInt(i);
+        _ = try e.apply(.{ .account_projection = .{ .ts_ms = 0, .cash_usdt = v, .btc_total = v, .btc_available = v } });
+    }
+    reader.stop.store(true, .release);
+    t.join();
+    try testing.expect(!reader.torn);
+}
+
+test "submitSync returns once the owner applied the message" {
+    var e = try reconciledNormalEngine();
+    e.claimOwner();
+    const Drainer = struct {
+        fn run(engine: *Engine, stop: *std.atomic.Value(bool)) void {
+            while (!stop.load(.acquire)) {
+                _ = engine.drainInbox();
+                std.atomic.spinLoopHint();
+            }
+        }
+    };
+    var stop = std.atomic.Value(bool).init(false);
+    // The drainer plays the owner: claim ownership from its own thread.
+    const Owner = struct {
+        fn run(engine: *Engine, stop_flag: *std.atomic.Value(bool)) void {
+            engine.claimOwner();
+            Drainer.run(engine, stop_flag);
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Owner.run, .{ &e, &stop });
+    // Wait until the spawned thread owns the engine.
+    while (e.isOwner()) std.atomic.spinLoopHint();
+    e.submitSync(.{ .order_ambiguity = .{ .present = true } }, testing.io);
+    try testing.expect(e.snapshot().unresolved_orders);
+    stop.store(true, .release);
+    t.join();
+}
+
+test "an external capital flow advances the flow epoch" {
+    var e = try reconciledNormalEngine();
+    try testing.expectEqual(@as(u32, 0), e.snapshot().flow_epoch);
+    _ = try e.apply(.{ .reconcile_result = .{
+        .ts_ms = 1300,
+        .cash_usdt = d("200"),
+        .btc_total = Decimal.zero,
+        .btc_available = Decimal.zero,
+        .hwm_from_db = d("100"),
+        .clean = true,
+        .flow_equity_before = d("100"),
+        .flow_equity_after = d("200"),
+    } });
+    try testing.expectEqual(@as(u32, 1), e.snapshot().flow_epoch);
+}
+
+const NonOwnerApply = struct {
+    engine: *Engine,
+
+    fn run(self: *NonOwnerApply) void {
+        _ = self.engine.apply(.{ .order_ambiguity = .{ .present = true } }) catch {};
+    }
+};
+
+test "apply from a non-owner thread is queued for the owner, not applied in place" {
+    var e = try reconciledNormalEngine();
+    e.claimOwner();
+    var w = NonOwnerApply{ .engine = &e };
+    const t = try std.Thread.spawn(.{}, NonOwnerApply.run, .{&w});
+    t.join();
+    try testing.expect(!e.snapshot().unresolved_orders);
+    try testing.expectEqual(@as(usize, 1), e.drainInbox());
+    try testing.expect(e.snapshot().unresolved_orders);
+}
+
+test "foreign pending orders degrade like unresolved ones and clear independently" {
+    var e = try reconciledNormalEngine();
+    _ = try e.apply(.{ .foreign_pending = .{ .present = true } });
+    try testing.expectEqual(sm.RiskMode.exit_only, e.snapshot().risk_mode);
+    try testing.expect(e.snapshot().foreign_pending);
+    try testing.expect(!e.snapshot().unresolved_orders);
+    _ = try e.apply(.{ .foreign_pending = .{ .present = false } });
+    try testing.expectEqual(sm.RiskMode.normal, e.snapshot().risk_mode);
 }

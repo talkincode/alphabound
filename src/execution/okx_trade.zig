@@ -63,6 +63,19 @@ pub fn formatCancelBody(buf: []u8, req: CancelByClOrdId) error{BufferTooSmall}![
     ) catch return error.BufferTooSmall;
 }
 
+pub const CancelByOrdId = struct {
+    inst_id: []const u8,
+    exchange_order_id: []const u8,
+};
+
+pub fn formatCancelByOrdIdBody(buf: []u8, req: CancelByOrdId) error{BufferTooSmall}![]const u8 {
+    return std.fmt.bufPrint(
+        buf,
+        "{{\"instId\":\"{s}\",\"ordId\":\"{s}\"}}",
+        .{ req.inst_id, req.exchange_order_id },
+    ) catch return error.BufferTooSmall;
+}
+
 /// GET path for order query by client order id (includes leading path + query).
 pub fn formatQueryPath(buf: []u8, inst_id: []const u8, client_order_id: []const u8) error{BufferTooSmall}![]const u8 {
     return std.fmt.bufPrint(

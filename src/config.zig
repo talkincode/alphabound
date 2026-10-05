@@ -59,6 +59,12 @@ pub const Config = struct {
     /// Overridable by LLM_API_URL / OPENAI_BASE_URL env.
     agent_base_url: []const u8 = "https://api.openai.com/v1",
     decision_timeout_ms: u32 = 120_000,
+    /// A proposal is void when admission/execution happens later than this
+    /// after the decision snapshot, or when price/book/risk state moved
+    /// materially (see agent/validity.zig); the decision is then redone.
+    proposal_max_age_ms: u32 = 300_000,
+    proposal_max_price_drift: Decimal = Decimal.parse("0.01") catch unreachable,
+    proposal_max_book_drift: Decimal = Decimal.parse("0.01") catch unreachable,
     /// Slow-loop base cadence (active session); 0 disables scheduled agent
     /// ticks (manual/env only). Not a short-term strategy — default 10 min.
     decision_interval_ms: u32 = 600_000,
@@ -292,6 +298,17 @@ fn applyKey(a: std.mem.Allocator, cfg: *Config, section: []const u8, key: []cons
             cfg.agent_base_url = try parseString(a, val);
         } else if (std.mem.eql(u8, key, "decision_timeout_ms")) {
             cfg.decision_timeout_ms = parseInt(u32, val) catch return error.InvalidValue;
+        } else if (std.mem.eql(u8, key, "proposal_max_age_ms")) {
+            cfg.proposal_max_age_ms = parseInt(u32, val) catch return error.InvalidValue;
+            if (cfg.proposal_max_age_ms == 0) return error.InvalidValue;
+        } else if (std.mem.eql(u8, key, "proposal_max_price_drift")) {
+            cfg.proposal_max_price_drift = Decimal.parse(val) catch return error.InvalidValue;
+            if (!cfg.proposal_max_price_drift.gt(Decimal.zero) or
+                cfg.proposal_max_price_drift.gte(Decimal.fromInt(1))) return error.InvalidValue;
+        } else if (std.mem.eql(u8, key, "proposal_max_book_drift")) {
+            cfg.proposal_max_book_drift = Decimal.parse(val) catch return error.InvalidValue;
+            if (!cfg.proposal_max_book_drift.gt(Decimal.zero) or
+                cfg.proposal_max_book_drift.gte(Decimal.fromInt(1))) return error.InvalidValue;
         } else if (std.mem.eql(u8, key, "decision_interval_ms")) {
             cfg.decision_interval_ms = parseInt(u32, val) catch return error.InvalidValue;
         } else if (std.mem.eql(u8, key, "decision_interval_quiet_ms")) {
@@ -651,4 +668,18 @@ test "volatility scheduling is opt-in and validates hysteresis independent of ke
         "[agent]\nvolatility_exit_hold_ms = 3600001",
     };
     for (invalid) |text| try testing.expectError(error.InvalidValue, parse(testing.allocator, text));
+}
+
+test "proposal validity keys parse, default conservatively and reject nonsense" {
+    var cfg = try parse(testing.allocator, "[agent]\nproposal_max_age_ms = 90000\nproposal_max_price_drift = 0.005\nproposal_max_book_drift = 0.02\n");
+    defer cfg.deinit();
+    try testing.expectEqual(@as(u32, 90_000), cfg.proposal_max_age_ms);
+    try testing.expect(cfg.proposal_max_price_drift.eql(try Decimal.parse("0.005")));
+    try testing.expect(cfg.proposal_max_book_drift.eql(try Decimal.parse("0.02")));
+    var def = try parse(testing.allocator, "[agent]\nmodel = \"x\"\n");
+    defer def.deinit();
+    try testing.expectEqual(@as(u32, 300_000), def.proposal_max_age_ms);
+    try testing.expectError(error.InvalidValue, parse(testing.allocator, "[agent]\nproposal_max_age_ms = 0\n"));
+    try testing.expectError(error.InvalidValue, parse(testing.allocator, "[agent]\nproposal_max_price_drift = 1\n"));
+    try testing.expectError(error.InvalidValue, parse(testing.allocator, "[agent]\nproposal_max_book_drift = 0\n"));
 }

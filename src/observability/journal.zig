@@ -82,12 +82,12 @@ pub fn logEventPayloadChecked(
     }) catch |err| {
         std.debug.print("[journal] append failed: {t} — degrading (AC-GO6)\n", .{err});
         // Un-auditable trading must not continue increasing risk.
-        _ = engine.apply(.{ .journal_status = .{ .ok = false } }) catch {};
+        _ = engine.submit(.{ .journal_status = .{ .ok = false } }) catch {};
         return false;
     };
     if (!snap.journal_ok) {
         std.debug.print("[journal] append recovered — clearing degrade\n", .{});
-        _ = engine.apply(.{ .journal_status = .{ .ok = true } }) catch {};
+        _ = engine.submit(.{ .journal_status = .{ .ok = true } }) catch {};
     }
     return true;
 }

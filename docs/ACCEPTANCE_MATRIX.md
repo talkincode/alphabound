@@ -57,7 +57,7 @@
 | AC-RK1 | 保守净值 E_t 扣除退出费用/滑点/挂单风险;HWM 单调不减;DD 公式与设计一致 | Unit + Property | P3 | ☑ `risk/equity.zig`:保守估值扣费/滑点、HWM 单调、DD 公式、非负回撤全部单测通过 |
 | AC-RK2 | 任意输入下 Risk Kernel 不批准使压力净值 < HWM×90%+ExitReserve 的提案 | Property / Fuzz | P3 | ● 压力净值地板单测 + 随机化 property×2(2000+2000 例)+ decimal 极值 fuzz(4000 例:0/1/i64max/1e18 单位级 raw 组合,不 panic、Overflow fail-closed、APPROVE/REDUCE 压力净值 ≥ floor) |
 | AC-RK3 | 风险状态机转换(NORMAL/EXIT_ONLY/FLATTENING/HALTED)与 §5.3 条件表一致;HALTED 不自动恢复交易 | Unit(状态机)+ Fault | P3 | ◐ 转换表全路径单测 + 随机序列 property(500 walk×64 步:HALTED 无 reset 不出、出边仅 EXIT_ONLY、FLATTENING 不被健康信号中止);进程级 Fault 注入待做 |
-| AC-RK4 | FLATTENING 先撤增险挂单,再退出,持续对账至 BTC 可用≈0 | Integration(Demo 演练) | P3 | ☐ |
+| AC-RK4 | FLATTENING 先撤增险挂单,再退出,持续对账至 BTC 可用≈0 | Integration(Demo 演练) | P3 | ◐ 进入 FLATTENING 即置 `agent_blocked`,执行 lane 对在途 agent 挂单撤单并确认;只减仓退出驱动 + 权威对账确认 BTC≈0 才 HALTED(见 AC-EX1/EX2;E2E `slow_model`);撤单优先于增险单的整链演练待扩 |
 | AC-RK5 | 边界穿透时如实记录实际穿透幅度与成交成本(不掩饰) | Fault(极端行情 replay) | P3 | ☐ |
 | AC-RK6 | max_drawdown 与 Risk Kernel 参数不可热加载、Agent 不可修改 | Unit + Manual(配置评审) | P3 | ◐ config 仅启动时解析,`allow_runtime_override=false` 强制;Agent 模块无 config 写路径;评审待做 |
 
@@ -69,8 +69,8 @@
 | AC-FD2 | 外部工具不可用 | ToolResult=UNAVAILABLE;不得把缺失数据编造成零值 | Fault + Unit | ◐ UNAVAILABLE/`null` data 单测（`fault/matrix`）+ market HTTP 路径 |
 | AC-FD3 | 公共行情过期 | 进入 EXIT_ONLY;重连 + REST 校验;不增险 | Fault | ◐ stale→EXIT_ONLY + admission 拒增仓（`fault/matrix`）; 实网断线待做 |
 | AC-FD4 | 私有账户 WS 断开 | EXIT_ONLY + REST 对账;未知期间不自主开仓 | Fault | ◐ unresolved/stale account 拒增仓单测; WS 断线注入待做 |
-| AC-FD5 | 下单超时 | 订单 UNKNOWN→查询后处置;禁止直接重发 | Fault + Integration | ◐ UNKNOWN 禁止 submit 单测 + demo query 路径; 实网超时注入待做 |
-| AC-FD6 | SQLite busy | 短暂重试+降采样遥测;关键事件优先落库 | Fault | ◐ `stepCritical` 对 events/orders/fills/… 写路径重试 + busy_timeout; 注入待做 |
+| AC-FD5 | 下单超时 | 订单 UNKNOWN→查询后处置;禁止直接重发 | Fault + Integration | ◐ UNKNOWN 禁止 submit 单测 + demo query 路径; 实网超时注入待做;**整链**已由 AC-EX3/EX4 + E2E `lost_response` 覆盖 |
+| AC-FD6 | SQLite busy | 短暂重试+降采样遥测;关键事件优先落库 | Fault | ◐ `stepCritical` 对 events/orders/fills/… 写路径重试 + busy_timeout; 订单意图写失败不放行(AC-EX7);多连接 BUSY_SNAPSHOT 已修(AC-EX12);busy 注入待做 |
 | AC-FD7 | 磁盘接近满 | 停新交易,清理可重建缓存;严重时 HALTED | Fault | ◐ `storage/disk` statvfs + `disk_ok` 进健康检查; low→EXIT_ONLY critical→HALTED; 缓存清理待做 |
 | AC-FD8 | 数据库损坏 | 仅保留退出能力+应急文本日志;禁止静默新建空库继续交易 | Fault | ◐ boot：已存在文件 open 失败 → FATAL refuse recreate; 应急文本日志/只退能力待扩 |
 | AC-FD9 | 回撤边界触发 | FLATTENING → HALTED;记录穿透与成本 | Fault + Replay | ◐ FLATTENING→HALTED + 无自动恢复（`fault/matrix`）;极端行情 replay 待做 |
@@ -103,6 +103,29 @@
 | AC-OPS8 | 模型调用成本、基础设施成本可见可统计(成本 vs 本金一级指标) | Manual(Dashboard 走查) | P2 | ◐ system JSON 暴露 `llm_calls/prompt_tokens/completion_tokens/total_tokens` 会话累计;USD 折算与基础设施成本项待做 |
 | AC-OPS9 | equity_samples 保留策略生效(1s 保 7 天,1min 永久);tool_calls 原始 30 天 | Unit(保留任务) | P3 | ◐ `retention.zig` cutoff/prune SQL(单测)+每小时 `runRetentionSweep` 接线:tool_calls>30d、equity '1s'>7d 清理,'1m' 永久保留;长跑验证待做 |
 
+## I. 执行链与快循环加固(2026-10 缺陷审计修复)
+
+> 来源:2026-10-04 缺陷分析(基线 `d0c2fe8`)。每一行的回归测试都先在基线代码上**确实失败**再修复;
+> 单测在 `zig build test`,整链故障注入见 `src/execution/exec_chain_tests.zig`、`src/execution/exec_lane_tests.zig`,
+> 进程级演练见 `tools/e2e/run_e2e.py`(真实二进制 + 本地合成 OKX 模拟盘/模型,**不触碰任何真实交易所/密钥**)。
+> 设计与剩余限制见 [EXECUTION_SAFETY.md](EXECUTION_SAFETY.md)。
+
+| ID | 验收标准 | 验证方法 | 阶段 | 状态 |
+|---|---|---|---|---|
+| AC-EX1 (P0-1) | 穿透回撤边界后(FLATTENING / EXIT_ONLY),清仓走**严格只减仓**的 `admitExit`:不要求净值回到边界之上,但要求账户已对账且权威(非本地推算)、行情/账户新鲜、无未决订单、卖量 ≤ 可用 BTC;任何情况下不得增仓 | Unit + Property(3000 例) + Integration + E2E | P3 | ☑ `risk/admission.zig` `admitExit`;`execution/operator.zig` `driveFlatten`/`runExit`;测试 `P0-1 repro…`、`exit admission …`、`P0-1: …`(越界/跳空/退出成本>缓冲/未决订单/推算账本);E2E `slow_model` 在价格崩到 -30% 时仍卖出并 HALTED |
+| AC-EX2 (P0-2) | LLM、工具、反思、复盘与订单等待**不阻塞**行情/账户/clock_tick/本机指令;状态仍是单写者;有界队列;可取消;过期结果丢弃 | Unit + Integration(跨线程) + E2E | P3 | ☑ `core/state.zig` 所有者线程 + `submit`/`drainInbox`(溢出 fail-closed);`core/lanes.zig`;`execution/exec_lane.zig`(执行 lane);`main.zig` `ThinkLane`(思考 lane,独立 HTTP/SQLite);测试 `exec_lane_tests.zig`、`state.zig` 并发测试;E2E `slow_model`:模型挂 40s 期间 5s 内行情轮询 9 次、`pause` 0.5s 内生效、边界穿透后 0.7s 触发并卖出完成;基线同一演练 0 次轮询 |
+| AC-EX3 (P1-1) | 写类请求(下单/撤单)传输结果未知时**不自动重发**;转 UNKNOWN 后按同一 clOrdId 查询 | Integration + E2E | P3 | ☑ `exchange/okx/rest.zig` 仅 GET 自动重试;`P1-1: a lost placement response is queried, never re-sent`;E2E `lost_response`:场馆仅收到 1 次下单(基线 2 次) |
+| AC-EX4 (P1-2) | 查询空列表/业务错误码/暂不可见**不得**解除 UNKNOWN;`absent` 仅在对账中经宽限期 + 挂单列表完整核对后才可判定 | Unit + Integration | P3 | ☑ `rest.lookupOrder`/`classifyPlaceResponse`;`P1-2: …`×3;`P1-6: an intent the venue never saw …` |
+| AC-EX5 (P1-3) | 部分成交撤单必须经查询确认终态才可进入下一腿;每一腿在新鲜权威快照上**重新准入**;方向不得翻转 | Integration + E2E | P3 | ☑ `demo_runner.zig` `cancelAndConfirm`/`tryDemoExecute`;`P1-3: …`×2;E2E `cancel_rejected`:撤单被拒时仅 1 次下单(基线 3 次叠加),保持未决直到恢复核验 |
+| AC-EX6 (P1-4) | 余额刷新失败/滞后时只按**已核验的实际成交增量**(数量/均价/币种手续费)做本地推算;推算不刷新账户新鲜度、不推进 HWM、不能作为准入/清仓完成依据 | Unit + Integration | P3 | ☑ `state.zig` `account_projection`;`demo_runner.zig` `projectFill`;`P1-4: …`、`projection moves the book …`、`P0-1: a flatten cannot sell on a projected book` |
+| AC-EX7 (P1-5) | 下单意图(PLANNED)**先持久化成功**才可发送;ACK/进度写失败显式进入 `ledger_ok=false`+未决,不放行新增交易 | Fault(SQLite 触发器注入) | P3 | ☑ `P1-5: a failed intent write blocks the venue request`、`…acknowledgement write keeps the order unresolved`;`ledger_status` 消息 |
+| AC-EX8 (P1-6) | 启动与周期对账覆盖**订单**:DB 非终态订单 + 场馆挂单 + 单笔查询对齐前关闭新增交易;孤儿挂单撤销并核验;非本进程挂单需运维 cancel-all | Integration + E2E(kill -9) | P3 | ☑ `demo_runner.zig` `recoverOrders`;`P1-6: …`×7;E2E `restart_recovery`:kill -9 后新进程取消孤儿单并确认,期间 0 笔新订单 |
+| AC-EX9 (P1-7) | cancel-all 返回结构化结果;列表失败/撤单被拒/撤单期间成交都**保持**未决保护,直到场馆挂单与本地账本均核验为空 | Integration | P3 | ☑ `cancelAllVerified`;`P1-7: …`×4 |
+| AC-EX10 (P1-8) | 累计成交以**增量行**入账(`applyCumulative`),重复/乱序查询不重复计入,partial→更大 partial→filled 总量/均价/手续费正确 | Unit + Integration | P3 | ☑ `storage/db.zig` `FillsRepo.applyCumulative`;`cumulative fill projection …`、`P1-8: …`。与未来逐笔 WS 的去重见 EXECUTION_SAFETY 剩余限制 |
+| AC-EX11 | 提案时效:模型决策锚定快照(时间/价格/账户/风险模式/资金流),执行前超龄、价格漂移、账户/资金流/风险状态变化即**作废并重做一次决策**;原始与执行快照随决策落库;不再把旧版本自动换绑到新快照 | Unit + E2E | P3 | ☑ `agent/validity.zig`(`proposal_max_age_ms`/`proposal_max_price_drift`/`proposal_max_book_drift`);事件 `AGENT_PROPOSAL_STALE`;`AGENT_PROPOSAL_OK` 含 `decision_snapshot`/`execution_snapshot`;E2E 日志 `proposal … void (risk_mode_changed)` 后重做 |
+| AC-EX12 | 多连接写库不得因遗留的读语句固定快照而 `SQLITE_BUSY`(E2E 发现并修复) | Integration | P3 | ☑ `KvRepo.getChecked` 与 `applyCumulative` 读后复位;`a connection that read the kv store can still write …` |
+| AC-EX13 | 独立评审发现项:① 非本进程挂单(含无 clOrdId)只关闭**新增风险**(`foreign_pending`),**不得**阻断只减仓退出;cancel-all 对无 clOrdId 订单按 `ordId` 撤销并以场馆重新列表核验;② 下单回包中超时类/未识别 `sCode`(如 50004/50013/51149)视为 UNKNOWN 而非拒绝;③ 单次账本写失败导致的 `ledger_ok=false` 在后续成功写或恢复通过后自愈;④ cancel-all 之后执行 lane 重新对账,解除“恢复未完成”对 agent 的封锁 | Unit + Integration + E2E | P3 | ☑ `state.zig` `foreign_pending`;`risk/gate.zig` `exitView` 仅看本地账本;`rest.zig` `definitiveRejectionCode`/`parsePendingUnnamedOrdIds`;`demo_runner.zig` `recoverOrders`/`cancelAllVerified`;`exec_lane.zig` `runRecovery`;测试 `review: …`×5、`classifyPlaceResponse never turns a timeout-class sCode …`;E2E `foreign_order_exit` |
+
 ## H. 阶段闸门汇总
 
 | 闸门 | 必须全绿的条目 |
@@ -110,7 +133,7 @@
 | Gate 0(P0 退出) | 依赖决议 + 24h 长稳(见 ROADMAP,无正式 AC,产出决议记录) |
 | Gate 1(P1 退出) | AC-FR01/02、AC-FR09(基础)、AC-SEC4/8、AC-OPS1/2/3 |
 | Gate 2(P2 退出) | AC-FR03/04/07/08(市场类)、AC-NFR03、AC-SEC3/5/6/7、AC-OPS7/8 |
-| Gate 3(P3 退出) | AC-FR05/06/10、AC-NFR01/02/04/05/06、AC-RK1..6、AC-FD1..10、AC-OPS4/5/6/9 |
+| Gate 3(P3 退出) | AC-EX1..12、AC-FR05/06/10、AC-NFR01/02/04/05/06、AC-RK1..6、AC-FD1..10、AC-OPS4/5/6/9 |
 | Gate 4(MVP 运维判定) | AC-GO1..8 + AC-SEC1/2 + 以上全部；小额 live 已在 Gate3 解锁 |
 
 > 维护约定: 每次闸门评审更新状态列并附证据链接(CI run / 演练记录 / 评审纪要);

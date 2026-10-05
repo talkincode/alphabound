@@ -131,6 +131,14 @@ pub const Db = struct {
         return DbError.NotFound;
     }
 
+    /// True when this connection can take the write lock right now. Used to
+    /// prove the ledger is writable again after a failed write.
+    pub fn probeWritable(self: *Db) bool {
+        self.execAll("BEGIN IMMEDIATE") catch return false;
+        self.execAll("ROLLBACK") catch return false;
+        return true;
+    }
+
     pub fn lastInsertRowid(self: *Db) i64 {
         return c.sqlite3_last_insert_rowid(self.handle);
     }
@@ -634,6 +642,35 @@ pub const OrderRow = struct {
     updated_ts: []const u8,
 };
 
+/// Fixed-capacity text field so rows can outlive a statement without an allocator.
+pub fn FixedStr(comptime N: usize) type {
+    return struct {
+        buf: [N]u8 = undefined,
+        len: usize = 0,
+
+        pub fn set(self: *@This(), text: []const u8) void {
+            const n = @min(text.len, N);
+            @memcpy(self.buf[0..n], text[0..n]);
+            self.len = n;
+        }
+
+        pub fn get(self: *const @This()) []const u8 {
+            return self.buf[0..self.len];
+        }
+    };
+}
+
+/// An order row that may still be resting on the venue (not terminal).
+pub const OpenOrderRow = struct {
+    client_order_id: FixedStr(40) = .{},
+    exchange_order_id: FixedStr(40) = .{},
+    decision_id: FixedStr(64) = .{},
+    side: FixedStr(8) = .{},
+    qty: FixedStr(40) = .{},
+    status: FixedStr(16) = .{},
+    created_ts: FixedStr(40) = .{},
+};
+
 pub const OrdersRepo = struct {
     upsert_stmt: Stmt,
 
@@ -649,6 +686,8 @@ pub const OrdersRepo = struct {
             \\  status = excluded.status,
             \\  price = excluded.price,
             \\  updated_ts = excluded.updated_ts
+            \\WHERE orders.status NOT IN ('FILLED','CANCELED','REJECTED')
+            \\   OR excluded.status = orders.status
         ) };
     }
 
@@ -668,6 +707,34 @@ pub const OrdersRepo = struct {
         try self.upsert_stmt.bindText(8, row.created_ts);
         try self.upsert_stmt.bindText(9, row.updated_ts);
         _ = try self.upsert_stmt.stepCritical();
+    }
+
+    /// Orders whose final state this process has not recorded (oldest first).
+    /// A crash between intent and outcome leaves rows here; recovery must
+    /// resolve each against the venue before new trading is allowed.
+    pub fn listNonTerminal(self: *OrdersRepo, db: *Db, out: []OpenOrderRow) DbError!usize {
+        _ = self;
+        var stmt = try db.prepare(
+            \\SELECT client_order_id, exchange_order_id, decision_id, side, qty, status, created_ts
+            \\FROM orders WHERE status NOT IN ('FILLED','CANCELED','REJECTED')
+            \\ORDER BY created_ts ASC LIMIT ?1
+        );
+        defer stmt.finalize();
+        try stmt.bindInt(1, @intCast(out.len));
+        var n: usize = 0;
+        while (try stmt.step()) {
+            if (n >= out.len) break;
+            out[n] = .{};
+            out[n].client_order_id.set(stmt.columnText(0));
+            out[n].exchange_order_id.set(stmt.columnText(1));
+            out[n].decision_id.set(stmt.columnText(2));
+            out[n].side.set(stmt.columnText(3));
+            out[n].qty.set(stmt.columnText(4));
+            out[n].status.set(stmt.columnText(5));
+            out[n].created_ts.set(stmt.columnText(6));
+            n += 1;
+        }
+        return n;
     }
 
     /// Newest orders as JSON array (newest first by updated_ts).
@@ -715,18 +782,110 @@ pub const FillRow = struct {
     ts: []const u8,
 };
 
+/// Cumulative execution state of one order as the venue reports it
+/// (`accFillSz`, `avgPx`, accumulated fee).
+pub const CumulativeFill = struct {
+    order_id: []const u8,
+    cum_qty: dec.Decimal,
+    avg_price: dec.Decimal,
+    cum_fee: dec.Decimal,
+    fee_ccy: []const u8,
+    ts: []const u8,
+};
+
+/// The tranche newly recorded by `applyCumulative` (zero qty = nothing new).
+pub const FillIncrement = struct {
+    qty: dec.Decimal = dec.Decimal.zero,
+    price: dec.Decimal = dec.Decimal.zero,
+    fee: dec.Decimal = dec.Decimal.zero,
+};
+
 pub const FillsRepo = struct {
     insert: Stmt,
+    insert_strict: Stmt,
+    sums: Stmt,
 
     pub fn init(db: *Db) DbError!FillsRepo {
-        return .{ .insert = try db.prepare(
+        var insert = try db.prepare(
             \\INSERT OR IGNORE INTO fills (fill_id, order_id, price, qty, fee, fee_ccy, ts)
             \\VALUES (?1,?2,?3,?4,?5,?6,?7)
-        ) };
+        );
+        errdefer insert.finalize();
+        var insert_strict = try db.prepare(
+            \\INSERT INTO fills (fill_id, order_id, price, qty, fee, fee_ccy, ts)
+            \\VALUES (?1,?2,?3,?4,?5,?6,?7)
+        );
+        errdefer insert_strict.finalize();
+        const sums = try db.prepare("SELECT qty, price, fee, fee_ccy FROM fills WHERE order_id = ?1");
+        return .{ .insert = insert, .insert_strict = insert_strict, .sums = sums };
     }
 
     pub fn deinit(self: *FillsRepo) void {
         self.insert.finalize();
+        self.insert_strict.finalize();
+        self.sums.finalize();
+    }
+
+    /// Project the venue's *cumulative* order execution into the ledger as
+    /// increments. Rows are real tranches (qty/price/fee of what was newly
+    /// observed), so every reader that sums rows sees the correct total, a
+    /// repeated or out-of-order query adds nothing, and a per-trade feed that
+    /// lands later can reconcile against the same totals without double
+    /// counting. Replaces the old single `clOrdId + "f0"` row that
+    /// `INSERT OR IGNORE` froze at its first value.
+    pub fn applyCumulative(self: *FillsRepo, db: *Db, cum: CumulativeFill) DbError!FillIncrement {
+        _ = db;
+        const D = dec.Decimal;
+        self.sums.reset();
+        defer self.sums.reset();
+        self.sums.bindText(1, cum.order_id) catch return DbError.BindFailed;
+        var rows: i64 = 0;
+        var seen_qty = D.zero;
+        var seen_notional = D.zero;
+        var seen_fee = D.zero;
+        while (try self.sums.step()) {
+            rows += 1;
+            const q = D.parse(self.sums.columnText(0)) catch continue;
+            seen_qty = seen_qty.add(q) catch return DbError.StepFailed;
+            if (D.parse(self.sums.columnText(1))) |p| {
+                const notional = q.mul(p, .down) catch return DbError.StepFailed;
+                seen_notional = seen_notional.add(notional) catch return DbError.StepFailed;
+            } else |_| {}
+            if (std.mem.eql(u8, self.sums.columnText(3), cum.fee_ccy)) {
+                if (D.parse(self.sums.columnText(2))) |f| {
+                    seen_fee = seen_fee.add(f) catch return DbError.StepFailed;
+                } else |_| {}
+            }
+        }
+        self.sums.reset();
+
+        const new_qty = cum.cum_qty.sub(seen_qty) catch return DbError.StepFailed;
+        if (!new_qty.gt(D.zero)) return .{};
+
+        const cum_notional = cum.cum_qty.mul(cum.avg_price, .down) catch return DbError.StepFailed;
+        var price = cum.avg_price;
+        if (rows > 0) {
+            const tranche = cum_notional.sub(seen_notional) catch return DbError.StepFailed;
+            if (tranche.gt(D.zero)) price = tranche.div(new_qty, .down) catch return DbError.StepFailed;
+        }
+        var fee = cum.cum_fee.sub(seen_fee) catch return DbError.StepFailed;
+        if (fee.isNegative()) fee = D.zero;
+
+        var id_buf: [64]u8 = undefined;
+        const fill_id = std.fmt.bufPrint(&id_buf, "{s}f{d}", .{ cum.order_id, rows }) catch return DbError.BindFailed;
+        var price_buf: [48]u8 = undefined;
+        var qty_buf: [48]u8 = undefined;
+        var fee_buf: [48]u8 = undefined;
+        self.insert_strict.reset();
+        try self.insert_strict.bindText(1, fill_id);
+        try self.insert_strict.bindText(2, cum.order_id);
+        try self.insert_strict.bindText(3, price.toString(&price_buf) catch return DbError.BindFailed);
+        try self.insert_strict.bindText(4, new_qty.toString(&qty_buf) catch return DbError.BindFailed);
+        try self.insert_strict.bindText(5, fee.toString(&fee_buf) catch return DbError.BindFailed);
+        try self.insert_strict.bindText(6, cum.fee_ccy);
+        try self.insert_strict.bindText(7, cum.ts);
+        _ = try self.insert_strict.stepCritical();
+        return .{ .qty = new_qty, .price = price, .fee = fee };
     }
 
     pub fn append(self: *FillsRepo, row: FillRow) DbError!void {
@@ -2869,6 +3028,10 @@ pub const KvRepo = struct {
 
     pub fn getChecked(self: *KvRepo, key: []const u8, out: []u8) DbError!?[]const u8 {
         self.get_stmt.reset();
+        // A statement left mid-result pins a read snapshot; with several
+        // writer connections that turns this connection's next write into
+        // SQLITE_BUSY_SNAPSHOT, which busy_timeout never retries.
+        defer self.get_stmt.reset();
         try self.get_stmt.bindText(1, key);
         const has = try self.get_stmt.step();
         if (!has) return null;
@@ -4142,4 +4305,150 @@ test "intel repo appends, dedups, and lists without signature" {
     try testing.expectEqual(@as(usize, 1), n);
     try testing.expect(std.mem.indexOf(u8, ptrs[0], "intel_db_test_01") != null);
     try testing.expect(std.mem.indexOf(u8, ptrs[0], "\"untrusted\":true") != null);
+}
+
+fn testOrder(client_id: []const u8, status: []const u8) OrderRow {
+    return .{
+        .client_order_id = client_id,
+        .decision_id = "dec_t",
+        .side = "buy",
+        .qty = "0.001",
+        .price = "market",
+        .status = status,
+        .created_ts = "2026-01-01T00:00:00.000Z",
+        .updated_ts = "2026-01-01T00:00:00.000Z",
+    };
+}
+
+test "orders upsert never regresses a terminal order to a live status" {
+    var db = try Db.open(":memory:");
+    defer db.close();
+    var orders = try OrdersRepo.init(&db);
+    defer orders.deinit();
+    try orders.upsert(testOrder("abterm", "PLANNED"));
+    try orders.upsert(testOrder("abterm", "FILLED"));
+    try orders.upsert(testOrder("abterm", "UNKNOWN")); // late/stale writer
+    var stmt = try db.prepare("SELECT status FROM orders WHERE client_order_id = 'abterm'");
+    defer stmt.finalize();
+    try testing.expect(try stmt.step());
+    try testing.expectEqualStrings("FILLED", stmt.columnText(0));
+}
+
+test "orders listNonTerminal returns only orders that may still be on the book" {
+    var db = try Db.open(":memory:");
+    defer db.close();
+    var orders = try OrdersRepo.init(&db);
+    defer orders.deinit();
+    try orders.upsert(testOrder("abplan", "PLANNED"));
+    try orders.upsert(testOrder("abunk", "UNKNOWN"));
+    try orders.upsert(testOrder("abpart", "PARTIAL"));
+    try orders.upsert(testOrder("abdone", "FILLED"));
+    try orders.upsert(testOrder("abcanc", "CANCELED"));
+    try orders.upsert(testOrder("abrej", "REJECTED"));
+    var rows: [8]OpenOrderRow = undefined;
+    const n = try orders.listNonTerminal(&db, &rows);
+    try testing.expectEqual(@as(usize, 3), n);
+    var seen_plan = false;
+    for (rows[0..n]) |r| {
+        if (std.mem.eql(u8, r.client_order_id.get(), "abplan")) {
+            seen_plan = true;
+            try testing.expectEqualStrings("PLANNED", r.status.get());
+            try testing.expectEqualStrings("buy", r.side.get());
+        }
+    }
+    try testing.expect(seen_plan);
+}
+
+test "cumulative fill projection records increments once and survives repeats" {
+    var db = try Db.open(":memory:");
+    defer db.close();
+    var orders = try OrdersRepo.init(&db);
+    defer orders.deinit();
+    var fills = try FillsRepo.init(&db);
+    defer fills.deinit();
+    try orders.upsert(testOrder("abcum", "ACKNOWLEDGED"));
+    const D = dec.Decimal;
+    const ts = "2026-01-01T00:00:01.000Z";
+
+    const a = try fills.applyCumulative(&db, .{ .order_id = "abcum", .cum_qty = try D.parse("0.0002"), .avg_price = try D.parse("100000"), .cum_fee = try D.parse("0.00000020"), .fee_ccy = "BTC", .ts = ts });
+    try testing.expect(a.qty.eql(try D.parse("0.0002")));
+    try testing.expect(a.price.eql(try D.parse("100000")));
+
+    // Larger partial at a better average: only the new tranche is added.
+    const b = try fills.applyCumulative(&db, .{ .order_id = "abcum", .cum_qty = try D.parse("0.0007"), .avg_price = try D.parse("99000"), .cum_fee = try D.parse("0.00000070"), .fee_ccy = "BTC", .ts = ts });
+    try testing.expect(b.qty.eql(try D.parse("0.0005")));
+    try testing.expect(b.fee.eql(try D.parse("0.0000005")));
+    // 0.0007@99000 total notional 69.3 = 0.0002@100000 (20) + 0.0005@98600 (49.3)
+    try testing.expect(b.price.eql(try D.parse("98600")));
+
+    // Same cumulative again (duplicate query) and a stale lower one: nothing new.
+    const dup = try fills.applyCumulative(&db, .{ .order_id = "abcum", .cum_qty = try D.parse("0.0007"), .avg_price = try D.parse("99000"), .cum_fee = try D.parse("0.0000007"), .fee_ccy = "BTC", .ts = ts });
+    try testing.expect(dup.qty.isZero());
+    const stale = try fills.applyCumulative(&db, .{ .order_id = "abcum", .cum_qty = try D.parse("0.0002"), .avg_price = try D.parse("100000"), .cum_fee = try D.parse("0.0000002"), .fee_ccy = "BTC", .ts = ts });
+    try testing.expect(stale.qty.isZero());
+
+    const last = try fills.applyCumulative(&db, .{ .order_id = "abcum", .cum_qty = try D.parse("0.001"), .avg_price = try D.parse("99000"), .cum_fee = try D.parse("0.000001"), .fee_ccy = "BTC", .ts = ts });
+    try testing.expect(last.qty.eql(try D.parse("0.0003")));
+    try testing.expectEqual(@as(i64, 3), try db.queryInt("SELECT COUNT(*) FROM fills"));
+    var stmt = try db.prepare("SELECT qty, price FROM fills WHERE order_id = 'abcum'");
+    defer stmt.finalize();
+    var total = D.zero;
+    var notional = D.zero;
+    while (try stmt.step()) {
+        const q = try D.parse(stmt.columnText(0));
+        total = try total.add(q);
+        notional = try notional.add(try q.mul(try D.parse(stmt.columnText(1)), .down));
+    }
+    try testing.expect(total.eql(try D.parse("0.001")));
+    try testing.expect(notional.eql(try D.parse("99")));
+}
+
+test "a connection that read the kv store can still write after another connection wrote" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const path = try tmpDbPath(&tmp, &buf);
+    var a = try Db.open(path);
+    defer a.close();
+    var b = try Db.open(path);
+    defer b.close();
+    var kv_a = try KvRepo.init(&a);
+    defer kv_a.deinit();
+    var kv_b = try KvRepo.init(&b);
+    defer kv_b.deinit();
+    var events_a = try EventsRepo.init(&a);
+    defer events_a.deinit();
+
+    try kv_a.put("k", "v1", "t1");
+    var out: [16]u8 = undefined;
+    try testing.expectEqualStrings("v1", (try kv_a.getChecked("k", &out)).?);
+    // Another connection (a lane) commits in between.
+    try kv_b.put("k", "v2", "t2");
+    // The reader's next write must not fail on a pinned read snapshot.
+    try events_a.append(.{ .event_id = "e1", .ts = "t", .type = "T", .source = "s", .severity = "INFO", .state_version = 1, .payload_json = "{}" });
+    try kv_a.put("k", "v3", "t3");
+    try testing.expectEqualStrings("v3", (try kv_b.getChecked("k", &out)).?);
+}
+
+test "cumulative fill reads do not pin a read snapshot" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const path = try tmpDbPath(&tmp, &buf);
+    var a = try Db.open(path);
+    defer a.close();
+    var b = try Db.open(path);
+    defer b.close();
+    var orders_a = try OrdersRepo.init(&a);
+    defer orders_a.deinit();
+    var fills_a = try FillsRepo.init(&a);
+    defer fills_a.deinit();
+    var events_b = try EventsRepo.init(&b);
+    defer events_b.deinit();
+    try orders_a.upsert(testOrder("abpin", "ACKNOWLEDGED"));
+    const D = dec.Decimal;
+    _ = try fills_a.applyCumulative(&a, .{ .order_id = "abpin", .cum_qty = try D.parse("0.0001"), .avg_price = try D.parse("100"), .cum_fee = D.zero, .fee_ccy = "USDT", .ts = "t" });
+    try events_b.append(.{ .event_id = "e2", .ts = "t", .type = "T", .source = "s", .severity = "INFO", .state_version = 1, .payload_json = "{}" });
+    _ = try fills_a.applyCumulative(&a, .{ .order_id = "abpin", .cum_qty = try D.parse("0.0003"), .avg_price = try D.parse("100"), .cum_fee = D.zero, .fee_ccy = "USDT", .ts = "t" });
+    try testing.expectEqual(@as(i64, 2), try a.queryInt("SELECT COUNT(*) FROM fills"));
 }

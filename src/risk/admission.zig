@@ -239,6 +239,65 @@ pub fn admit(
     return .{ .verdict = .{ .approve_reduced = lo }, .stress_equity = e_admitted, .floor = floor };
 }
 
+/// Inputs for an emergency exit. Deliberately carries no equity, HWM or
+/// boundary data: whether the book is above or below the drawdown line is
+/// irrelevant to whether *reducing* it is allowed.
+pub const ExitView = struct {
+    reconciled: bool,
+    market_fresh: bool,
+    /// Authoritative (not projected) and within TTL.
+    account_fresh: bool,
+    unresolved_orders: bool,
+    risk_mode: sm.RiskMode,
+    btc_total: Decimal,
+    btc_available: Decimal,
+};
+
+pub const ExitRejectReason = enum {
+    not_reconciled,
+    stale_data,
+    unresolved_orders,
+    risk_mode_blocks,
+    nothing_to_sell,
+
+    pub fn text(self: ExitRejectReason) []const u8 {
+        return switch (self) {
+            .not_reconciled => "account not reconciled",
+            .stale_data => "market or account data stale",
+            .unresolved_orders => "unresolved order ambiguity",
+            .risk_mode_blocks => "risk mode does not allow an emergency exit",
+            .nothing_to_sell => "no free BTC to sell",
+        };
+    }
+};
+
+pub const ExitVerdict = union(enum) {
+    /// Sell-only: the executor may place sell orders totalling at most this.
+    approve: struct { max_sell_qty: Decimal },
+    reject: ExitRejectReason,
+};
+
+/// Strictly risk-reducing admission for FLATTENING / EXIT_ONLY.
+///
+/// `admit` demands that the post-trade stress equity clear
+/// `HWM·(1−maxdd) + reserve`. Once the book has crossed that line (the very
+/// reason a flatten starts) no target weight can clear it, so a normal
+/// admission refuses the only action that reduces risk. An exit therefore is
+/// not gated on the boundary at all; it is gated on being *verifiable* and
+/// *sell-only*: the book and orders must be known, nothing may be unresolved
+/// (no duplicate selling), and the approved size is capped by free holdings,
+/// so no verdict can ever request a purchase or an oversell.
+pub fn admitExit(view: ExitView) ExitVerdict {
+    if (view.risk_mode != .flattening and view.risk_mode != .exit_only)
+        return .{ .reject = .risk_mode_blocks };
+    if (!view.reconciled) return .{ .reject = .not_reconciled };
+    if (!view.market_fresh or !view.account_fresh) return .{ .reject = .stale_data };
+    if (view.unresolved_orders) return .{ .reject = .unresolved_orders };
+    const free = Decimal.min(view.btc_total, view.btc_available);
+    if (!free.gt(Decimal.zero)) return .{ .reject = .nothing_to_sell };
+    return .{ .approve = .{ .max_sell_qty = free } };
+}
+
 fn rejected(reason: RejectReason, snap: SnapshotView, weight: Decimal, p: StressParams, floor: Decimal) AdmissionError!Admission {
     const e = stressEquityAtWeight(snap, weight, p) catch Decimal.zero;
     return .{ .verdict = .{ .reject = reason }, .stress_equity = e, .floor = floor };
@@ -727,5 +786,111 @@ test "property: holding BTC is never scored safer than holding none under shock"
         // A 5% shock on the held leg costs strictly more than the 0.15% round
         // trip to cash, so the vacuous weight-0 number can only ever flatter.
         try testing.expect(held.stress_equity.lte(flat));
+    }
+}
+
+test "P0-1 repro: normal admission rejects the sell that a flatten needs, exit admission allows it" {
+    // HWM 100, nothing but 0.001 BTC at 89000: equity ≈ 88.9 is already below
+    // the boundary floor 90 + reserve, so no target weight (not even 0) clears it.
+    var snap = SnapshotView{
+        .version = 7,
+        .reconciled = true,
+        .market_fresh = true,
+        .account_fresh = true,
+        .unresolved_orders = false,
+        .risk_mode = .flattening,
+        .cash_usdt = Decimal.zero,
+        .btc_total = d("0.001"),
+        .liq_price = d("89000"),
+        .mark_price = d("89000"),
+        .high_watermark = d("100"),
+    };
+    const p = baseParams();
+    const normal = try admit(snap, .{ .snapshot_version = 7, .target_btc_weight = Decimal.zero }, d("0.10"), p);
+    try testing.expect(normal.verdict == .reject and normal.verdict.reject == .boundary_violated);
+
+    const exit = admitExit(.{
+        .reconciled = snap.reconciled,
+        .market_fresh = snap.market_fresh,
+        .account_fresh = snap.account_fresh,
+        .unresolved_orders = snap.unresolved_orders,
+        .risk_mode = snap.risk_mode,
+        .btc_total = snap.btc_total,
+        .btc_available = snap.btc_total,
+    });
+    try testing.expect(exit == .approve);
+    try testing.expect(exit.approve.max_sell_qty.eql(d("0.001")));
+    snap.risk_mode = .exit_only;
+}
+
+fn exitView() ExitView {
+    return .{
+        .reconciled = true,
+        .market_fresh = true,
+        .account_fresh = true,
+        .unresolved_orders = false,
+        .risk_mode = .flattening,
+        .btc_total = d("0.002"),
+        .btc_available = d("0.0015"),
+    };
+}
+
+test "exit admission is sell-capped by what is actually free" {
+    const v = admitExit(exitView());
+    try testing.expect(v == .approve);
+    try testing.expect(v.approve.max_sell_qty.eql(d("0.0015")));
+}
+
+test "exit admission still requires a verifiable account and no unresolved orders" {
+    var v = exitView();
+    v.reconciled = false;
+    try testing.expect(admitExit(v) == .reject and admitExit(v).reject == .not_reconciled);
+    v = exitView();
+    v.account_fresh = false;
+    try testing.expect(admitExit(v) == .reject and admitExit(v).reject == .stale_data);
+    v = exitView();
+    v.market_fresh = false;
+    try testing.expect(admitExit(v) == .reject and admitExit(v).reject == .stale_data);
+    v = exitView();
+    v.unresolved_orders = true;
+    try testing.expect(admitExit(v) == .reject and admitExit(v).reject == .unresolved_orders);
+    v = exitView();
+    v.risk_mode = .halted;
+    try testing.expect(admitExit(v) == .reject and admitExit(v).reject == .risk_mode_blocks);
+    v = exitView();
+    v.risk_mode = .normal;
+    try testing.expect(admitExit(v) == .reject and admitExit(v).reject == .risk_mode_blocks);
+    v = exitView();
+    v.btc_available = Decimal.zero;
+    try testing.expect(admitExit(v) == .reject and admitExit(v).reject == .nothing_to_sell);
+}
+
+test "property: exit admission can never approve more than the free holdings" {
+    var prng = std.Random.DefaultPrng.init(0xE917);
+    const random = prng.random();
+    const modes = [_]sm.RiskMode{ .normal, .exit_only, .flattening, .halted };
+    var i: usize = 0;
+    while (i < 3000) : (i += 1) {
+        const total = Decimal.fromRaw(random.intRangeAtMost(i128, 0, 500_000_000));
+        const avail = Decimal.fromRaw(random.intRangeAtMost(i128, 0, 600_000_000));
+        const v = ExitView{
+            .reconciled = random.boolean(),
+            .market_fresh = random.boolean(),
+            .account_fresh = random.boolean(),
+            .unresolved_orders = random.boolean(),
+            .risk_mode = modes[random.intRangeLessThan(usize, 0, modes.len)],
+            .btc_total = total,
+            .btc_available = avail,
+        };
+        switch (admitExit(v)) {
+            .approve => |a| {
+                try testing.expect(a.max_sell_qty.gt(Decimal.zero));
+                try testing.expect(a.max_sell_qty.lte(v.btc_total));
+                try testing.expect(a.max_sell_qty.lte(v.btc_available));
+                try testing.expect(v.reconciled and v.market_fresh and v.account_fresh and !v.unresolved_orders);
+                try testing.expect(v.risk_mode == .flattening or v.risk_mode == .exit_only);
+            },
+            .reject => {},
+        }
     }
 }
