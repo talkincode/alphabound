@@ -15,6 +15,7 @@
  */
 import http from "node:http";
 import path from "node:path";
+import { webcrypto } from "node:crypto";
 import express from "express";
 import { getOAuthProtectedResourceMetadataUrl, createOAuthMetadata, mcpAuthMetadataRouter } from "@modelcontextprotocol/sdk/server/auth/router.js";
 import { authorizationHandler } from "@modelcontextprotocol/sdk/server/auth/handlers/authorize.js";
@@ -34,6 +35,11 @@ import { OperatorOAuthProvider, isAllowedRedirectUri } from "./oauth/provider.js
 import { OAuthStore } from "./oauth/store.js";
 
 export const MCP_PATH = "/mcp";
+
+// The MCP SDK's Streamable HTTP transport calls the global WebCrypto `randomUUID()`.
+// That global is missing on some Node 18 runtimes, which turns every request-bearing
+// POST /mcp into `ReferenceError: crypto is not defined`. Shim it once, explicitly.
+if (typeof globalThis.crypto === "undefined") globalThis.crypto = webcrypto;
 
 const LOOPBACK_BINDS = new Set(["127.0.0.1", "localhost", "::1"]);
 const LOOPBACK_HOSTS = ["localhost", "127.0.0.1", "[::1]"]; // as they appear in a Host header
