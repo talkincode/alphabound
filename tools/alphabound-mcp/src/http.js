@@ -24,6 +24,7 @@ import { tokenHandler } from "@modelcontextprotocol/sdk/server/auth/handlers/tok
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
 import { hostHeaderValidation } from "@modelcontextprotocol/sdk/server/middleware/hostHeaderValidation.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { LATEST_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS } from "@modelcontextprotocol/sdk/types.js";
 import { TOOLS, callTool, findTool, listToolsPublic, resolveConfig } from "./client.js";
 import { createMcpServer } from "./server.js";
 import { safeEqual } from "./secret.js";
@@ -243,11 +244,30 @@ export function createApp(config, { log = () => {} } = {}) {
   // gets its own server + transport and nothing survives the request (no sessions to leak
   // or lose on restart); there is no server-initiated stream, hence 405 for GET/DELETE.
   app.post(MCP_PATH, express.json({ limit: "64kb" }), async (req, res) => {
+    // Forward compatibility: some clients (e.g. Cloudflare MCP Portal) pin a draft
+    // protocol version newer than this SDK knows. Version negotiation already covers
+    // `initialize`; for later requests the header is advisory, so serve them as the
+    // newest version we speak instead of 400ing every call after a successful OAuth.
+    const claimed = req.headers["mcp-protocol-version"];
+    if (typeof claimed === "string" && !SUPPORTED_PROTOCOL_VERSIONS.includes(claimed)) {
+      log(`mcp: protocol ${claimed} unsupported, serving as ${LATEST_PROTOCOL_VERSION}`);
+      // The SDK's Node adapter rebuilds headers from req.rawHeaders, not req.headers.
+      const raw = req.rawHeaders;
+      for (let i = 0; i + 1 < raw.length; i += 2) {
+        if (String(raw[i]).toLowerCase() === "mcp-protocol-version") raw[i + 1] = LATEST_PROTOCOL_VERSION;
+      }
+      req.headers["mcp-protocol-version"] = LATEST_PROTOCOL_VERSION;
+    }
     const server = createMcpServer(upstream);
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
     // Privacy-safe: the SDK calls this with validation reasons only (no headers,
-    // bodies, or tokens), e.g. "Not Acceptable: ..." or "Unsupported protocol version".
-    transport.onerror = (e) => log(`mcp request error: ${e.message}`);
+    // bodies, or tokens). Method names locate the failing call; the stack (SDK frames
+    // only) locates the cause.
+    const methods = (Array.isArray(req.body) ? req.body : [req.body])
+      .map((m) => (m && typeof m.method === "string" ? m.method : "?"))
+      .join(",");
+    transport.onerror = (e) =>
+      log(`mcp request error [${methods}]: ${String(e.stack || e.message).split("\n").slice(0, 4).join(" | ")}`);
     res.on("close", () => void server.close().catch(() => {}));
     await server.connect(transport);
     await transport.handleRequest(req, res, req.body);
