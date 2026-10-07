@@ -245,6 +245,9 @@ export function createApp(config, { log = () => {} } = {}) {
   app.post(MCP_PATH, express.json({ limit: "64kb" }), async (req, res) => {
     const server = createMcpServer(upstream);
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
+    // Privacy-safe: the SDK calls this with validation reasons only (no headers,
+    // bodies, or tokens), e.g. "Not Acceptable: ..." or "Unsupported protocol version".
+    transport.onerror = (e) => log(`mcp request error: ${e.message}`);
     res.on("close", () => void server.close().catch(() => {}));
     await server.connect(transport);
     await transport.handleRequest(req, res, req.body);
