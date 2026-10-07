@@ -64,6 +64,7 @@ if [[ -f "$SECRETS_FILE" ]]; then
     fi
   }
 
+  append_if_missing "ALPHABOUND_API_BASE" "http://127.0.0.1:8080"
   append_if_missing "ALPHABOUND_MCP_BIND" "127.0.0.1"
   append_if_missing "ALPHABOUND_MCP_PORT" "8723"
   append_if_missing "ALPHABOUND_MCP_OAUTH" "1"
