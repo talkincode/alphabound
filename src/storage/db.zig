@@ -932,12 +932,16 @@ pub const FillsRepo = struct {
     }
 
     /// Compact own executions (oldest first) for the agent self-review section:
-    /// fill joined to its order for side and decision linkage.
+    /// fill joined to its order for side and decision linkage. When
+    /// `mark_price` > 0 each row carries `vs_now_bps`: what the fill earned
+    /// versus not trading, marked at that price, before fees (positive = the
+    /// trade helped; a buy below / a sell above the mark).
     pub fn listCompactForContext(
         self: *FillsRepo,
         db: *Db,
         backing: []u8,
         out_ptrs: [][]const u8,
+        mark_price: f64,
     ) DbError!usize {
         _ = self;
         if (out_ptrs.len == 0) return 0;
@@ -957,17 +961,22 @@ pub const FillsRepo = struct {
         while (try stmt.step()) {
             if (n >= out_ptrs.len) break;
             var w: std.Io.Writer = .fixed(backing[off..]);
+            const side = stmt.columnText(1);
             w.print(
-                "{{\"ts\":\"{s}\",\"side\":\"{s}\",\"qty\":\"{s}\",\"price\":\"{s}\",\"fee\":\"{s}\",\"decision_id\":\"{s}\"}}",
+                "{{\"ts\":\"{s}\",\"side\":\"{s}\",\"qty\":\"{s}\",\"price\":\"{s}\",\"fee\":\"{s}\",\"decision_id\":\"{s}\"",
                 .{
                     stmt.columnText(0),
-                    stmt.columnText(1),
+                    side,
                     stmt.columnText(2),
                     stmt.columnText(3),
                     stmt.columnText(4),
                     stmt.columnText(5),
                 },
             ) catch return DbError.StepFailed;
+            if (fillVsMarkBps(side, parseF64(stmt.columnText(3)), mark_price)) |bps| {
+                w.print(",\"vs_now_bps\":{d:.0}", .{bps}) catch return DbError.StepFailed;
+            }
+            w.writeByte('}') catch return DbError.StepFailed;
             const piece = w.buffered();
             tmp_ptrs[n] = piece;
             off += piece.len;
@@ -1028,6 +1037,24 @@ fn parseF64(text: []const u8) f64 {
     if (text.len == 0) return 0;
     return std.fmt.parseFloat(f64, text) catch 0;
 }
+
+/// Signed bps a fill earned versus not trading, marked at `mark`. Null when
+/// either price is unusable or the side is unknown.
+fn fillVsMarkBps(side: []const u8, fill_price: f64, mark: f64) ?f64 {
+    if (!(fill_price > 0) or !(mark > 0) or !std.math.isFinite(mark)) return null;
+    const move = mark / fill_price - 1.0;
+    if (std.mem.eql(u8, side, "buy")) return move * 10_000.0;
+    if (std.mem.eql(u8, side, "sell")) return -move * 10_000.0;
+    return null;
+}
+
+/// Hourly bid mark and book split for timing attribution.
+pub const HourlyMark = struct {
+    ts_ms: i64,
+    price: f64,
+    btc_value: f64,
+    equity: f64,
+};
 
 pub const EquityRepo = struct {
     insert: Stmt,
@@ -1184,6 +1211,42 @@ pub const EquityRepo = struct {
             return w.buffered();
         }
         return DbError.NotFound;
+    }
+
+    /// Last 1m sample of each UTC hour at or after `since_ts`, oldest first,
+    /// for self-review timing attribution. Rows without a bid mark are
+    /// skipped. Floats for analytics only, as in `listPointsAsc`.
+    pub fn listHourlyMarksAsc(
+        self: *EquityRepo,
+        db: *Db,
+        since_ts: []const u8,
+        out: []HourlyMark,
+    ) DbError!usize {
+        _ = self;
+        if (out.len == 0) return 0;
+        // SQLite returns the bare columns from the MAX(ts) row of each group.
+        var stmt = try db.prepare(
+            \\SELECT MAX(ts), bid_price, btc_value, equity FROM equity_samples
+            \\WHERE interval = '1m' AND ts >= ?1 AND bid_price != ''
+            \\GROUP BY substr(ts, 1, 13)
+            \\ORDER BY 1 ASC LIMIT ?2
+        );
+        defer stmt.finalize();
+        try stmt.bindText(1, since_ts);
+        try stmt.bindInt(2, @intCast(out.len));
+        var n: usize = 0;
+        while (try stmt.step()) {
+            const ts_ms = clock.parseRfc3339Ms(stmt.columnText(0)) catch continue;
+            out[n] = .{
+                .ts_ms = ts_ms,
+                .price = parseF64(stmt.columnText(1)),
+                .btc_value = parseF64(stmt.columnText(2)),
+                .equity = parseF64(stmt.columnText(3)),
+            };
+            n += 1;
+            if (n == out.len) break;
+        }
+        return n;
     }
 
     /// Hourly-bucketed equity trail inside [ts_from, ts_to] (oldest first)
@@ -3956,13 +4019,21 @@ test "self-review queries: proposals, fills join, equity marks" {
 
     var fill_backing: [1024]u8 = undefined;
     var fill_ptrs: [4][]const u8 = undefined;
-    const fn_ = try fills.listCompactForContext(&db, &fill_backing, &fill_ptrs);
+    const fn_ = try fills.listCompactForContext(&db, &fill_backing, &fill_ptrs, 64640);
     try testing.expectEqual(@as(usize, 2), fn_);
     // Oldest first; each row carries side + decision_id from the joined order.
     try testing.expect(std.mem.indexOf(u8, fill_ptrs[0], "\"side\":\"sell\"") != null);
     try testing.expect(std.mem.indexOf(u8, fill_ptrs[0], "\"decision_id\":\"dec_a\"") != null);
     try testing.expect(std.mem.indexOf(u8, fill_ptrs[1], "\"side\":\"buy\"") != null);
     try testing.expect(std.mem.indexOf(u8, fill_ptrs[1], "\"decision_id\":\"dec_b\"") != null);
+    // Marked at 64640: the 63000 sell cost 260 bps, the 64000 buy earned 100.
+    try testing.expect(std.mem.indexOf(u8, fill_ptrs[0], "\"vs_now_bps\":-260") != null);
+    try testing.expect(std.mem.indexOf(u8, fill_ptrs[1], "\"vs_now_bps\":100") != null);
+    // No mark, no counterfactual.
+    _ = try fills.listCompactForContext(&db, &fill_backing, &fill_ptrs, 0);
+    try testing.expect(std.mem.indexOf(u8, fill_ptrs[0], "vs_now_bps") == null);
+    const parsed_fill = try std.json.parseFromSlice(std.json.Value, testing.allocator, fill_ptrs[1], .{});
+    parsed_fill.deinit();
 
     var equity = try EquityRepo.init(&db);
     defer equity.deinit();
@@ -3973,6 +4044,18 @@ test "self-review queries: proposals, fills join, equity marks" {
     const mark = try equity.equityMarkJson(&db, "1h", "2026-08-13T11:45:00.000Z", &mark_buf);
     try testing.expect(std.mem.indexOf(u8, mark, "\"ago\":\"1h\"") != null);
     try testing.expect(std.mem.indexOf(u8, mark, "\"equity\":\"99.7\"") != null);
+
+    // Hourly marks: last sample per hour, oldest first, unmarked rows skipped.
+    try equity.append(.{ .ts = "2026-08-13T12:10:00.000Z", .interval = "1m", .equity = "100", .hwm = "100", .drawdown = "0", .cash = "50", .btc_value = "50", .bid_price = "64000" });
+    try equity.append(.{ .ts = "2026-08-13T12:50:00.000Z", .interval = "1m", .equity = "101", .hwm = "101", .drawdown = "0", .cash = "50", .btc_value = "51", .bid_price = "65280" });
+    try equity.append(.{ .ts = "2026-08-13T13:05:00.000Z", .interval = "1m", .equity = "101", .hwm = "101", .drawdown = "0", .cash = "20", .btc_value = "81", .bid_price = "65300" });
+    var hourly: [8]HourlyMark = undefined;
+    const hn = try equity.listHourlyMarksAsc(&db, "2026-08-13T00:00:00.000Z", &hourly);
+    try testing.expectEqual(@as(usize, 2), hn);
+    try testing.expectApproxEqAbs(@as(f64, 65280), hourly[0].price, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 51), hourly[0].btc_value, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 81), hourly[1].btc_value, 1e-9);
+    try testing.expect(hourly[0].ts_ms < hourly[1].ts_ms);
     // Cutoff before any sample → NotFound.
     var mark_buf2: [128]u8 = undefined;
     try testing.expectError(DbError.NotFound, equity.equityMarkJson(&db, "7d", "2026-08-13T07:00:00.000Z", &mark_buf2));

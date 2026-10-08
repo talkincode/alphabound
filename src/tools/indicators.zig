@@ -104,13 +104,100 @@ pub fn formatHtfStructure(
     daily_newest_first: []const Candle,
     h4_newest_first: []const Candle,
 ) error{BufferTooSmall}![]const u8 {
+    return formatHtfStructureWithLong(buf, daily_newest_first, h4_newest_first, null);
+}
+
+/// `formatHtfStructure` plus a `1D_long` section computed from a longer daily
+/// history (`daily_long_newest_first`, up to `LONG_DAILY_MAX` bars). `null`
+/// omits the key; an empty or unusable series renders `"1D_long":null`.
+pub fn formatHtfStructureWithLong(
+    buf: []u8,
+    daily_newest_first: []const Candle,
+    h4_newest_first: []const Candle,
+    daily_long_newest_first: ?[]const Candle,
+) error{BufferTooSmall}![]const u8 {
     var w: std.Io.Writer = .fixed(buf);
     w.writeAll("{\"1D\":") catch return error.BufferTooSmall;
     writeBarStructure(&w, daily_newest_first, 20, 14, TREND_SLOPE_PCT_1D) catch return error.BufferTooSmall;
     w.writeAll(",\"4H\":") catch return error.BufferTooSmall;
     writeBarStructure(&w, h4_newest_first, 20, 14, TREND_SLOPE_PCT_4H) catch return error.BufferTooSmall;
+    if (daily_long_newest_first) |long| {
+        w.writeAll(",\"1D_long\":") catch return error.BufferTooSmall;
+        writeLongDailyStructure(&w, long) catch return error.BufferTooSmall;
+    }
     w.writeByte('}') catch return error.BufferTooSmall;
     return w.buffered();
+}
+
+/// Daily bars fetched for the multi-month view (one OKX request).
+pub const LONG_DAILY_MAX: usize = 200;
+
+/// Multi-month daily context: where the latest completed close sits against
+/// 50/100/200-day means, trailing returns, the 90-day range, distance from the
+/// window high, and 30-day realized volatility. Completed bars only; every
+/// field appears only when its full lookback exists. Measurements, not a
+/// policy — no regime label is derived here.
+fn writeLongDailyStructure(w: *std.Io.Writer, newest_first: []const Candle) !void {
+    if (newest_first.len == 0) {
+        try w.writeAll("null");
+        return;
+    }
+    const start: usize = if (market.candleConfirmed(newest_first[0]) == true) 0 else 1;
+    var end = start;
+    while (end < newest_first.len and end - start < LONG_DAILY_MAX and market.candleConfirmed(newest_first[end]) == true) : (end += 1) {}
+    const completed = newest_first[start..end];
+    const n = completed.len;
+    if (n < 2) {
+        try w.writeAll("null");
+        return;
+    }
+    var closes_buf: [LONG_DAILY_MAX]f64 = undefined;
+    for (0..n) |i| closes_buf[i] = completed[n - 1 - i].close.toF64Lossy(); // oldest first
+    const closes = closes_buf[0..n];
+    const close = closes[n - 1];
+    if (!(close > 0)) {
+        try w.writeAll("null");
+        return;
+    }
+    try w.print("{{\"bar\":\"1D\",\"indicator_basis\":\"completed\",\"completed_n\":{d},\"completed_close\":{d:.1}", .{ n, close });
+
+    for ([_]usize{ 50, 100, 200 }) |k| {
+        if (n < k) continue;
+        const sma = mean(closes[n - k ..]);
+        try w.print(",\"sma{d}\":{d:.1},\"close_vs_sma{d}_pct\":{d:.2}", .{ k, sma, k, (close / sma - 1.0) * 100.0 });
+    }
+    const slope_lookback: usize = 10;
+    if (n >= 50 + slope_lookback) {
+        const now = mean(closes[n - 50 ..]);
+        const prev = mean(closes[n - 50 - slope_lookback .. n - slope_lookback]);
+        if (prev > 0) try w.print(",\"sma50_slope10_pct\":{d:.2}", .{(now / prev - 1.0) * 100.0});
+    }
+    for ([_]usize{ 7, 30, 90, 180 }) |k| {
+        if (n <= k) continue;
+        const base = closes[n - 1 - k];
+        if (base > 0) try w.print(",\"ret_{d}d_pct\":{d:.2}", .{ k, (close / base - 1.0) * 100.0 });
+    }
+    const range_k: usize = 90;
+    if (n >= range_k) {
+        var hi: f64 = -std.math.inf(f64);
+        var lo: f64 = std.math.inf(f64);
+        for (completed[0..range_k]) |c| {
+            hi = @max(hi, c.high.toF64Lossy());
+            lo = @min(lo, c.low.toF64Lossy());
+        }
+        const width = hi - lo;
+        const pos = if (width > 0) (close - lo) / width else 0.5;
+        try w.print(",\"range90_high\":{d:.1},\"range90_low\":{d:.1},\"range90_pos\":{d:.2}", .{ hi, lo, pos });
+    }
+    var whi: f64 = -std.math.inf(f64);
+    var wlo: f64 = std.math.inf(f64);
+    for (completed) |c| {
+        whi = @max(whi, c.high.toF64Lossy());
+        wlo = @min(wlo, c.low.toF64Lossy());
+    }
+    if (whi > 0) try w.print(",\"window_high\":{d:.1},\"window_low\":{d:.1},\"off_window_high_pct\":{d:.2}", .{ whi, wlo, (close / whi - 1.0) * 100.0 });
+    if (n >= 31) try w.print(",\"realized_vol30_ann_pct\":{d:.1}", .{realizedVol(closes, 30, 365.0) * 100.0});
+    try w.writeByte('}');
 }
 
 /// A full-window breakout comparison. `wick_only_*` means an excursion
@@ -790,6 +877,43 @@ test "empty short and unknown confirmation series never fabricate structure" {
     try testing.expectEqual(@as(i64, 0), daily.get("completed_n").?.integer);
     try testing.expect(daily.get("sma20") == null);
     try testing.expect(daily.get("broke_prior_high") == null);
+}
+
+test "1D_long reports multi-month means, returns and range from completed bars only" {
+    // 120 completed daily bars rising 0.5%/day, plus a forming bar with an
+    // absurd wick that must not leak into any long-horizon field.
+    var candles: [121]Candle = undefined;
+    for (0..120) |i| {
+        const px = 50000.0 * std.math.pow(f64, 1.005, @as(f64, @floatFromInt(i)));
+        candles[120 - i] = mkCandle(px, px * 1.001, px * 0.999, px); // newest-first
+    }
+    candles[0] = mkCandle(90000, 200000, 1000, 90000);
+    candles[0].confirmed = false;
+
+    var buf: [8192]u8 = undefined;
+    const text = try formatHtfStructureWithLong(&buf, candles[0..45], &.{}, &candles);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, text, .{});
+    defer parsed.deinit();
+    const long = parsed.value.object.get("1D_long").?.object;
+    try testing.expectEqual(@as(i64, 120), long.get("completed_n").?.integer);
+    const last = 50000.0 * std.math.pow(f64, 1.005, 119.0);
+    try testing.expectApproxEqRel(last, long.get("completed_close").?.float, 1e-3);
+    // A steady uptrend closes above its 50/100-day means; 200 is unavailable.
+    try testing.expect(long.get("close_vs_sma50_pct").?.float > 0);
+    try testing.expect(long.get("close_vs_sma100_pct").?.float > 0);
+    try testing.expect(long.get("sma200") == null);
+    try testing.expect(long.get("sma50_slope10_pct").?.float > 0);
+    const ret30 = (std.math.pow(f64, 1.005, 30.0) - 1.0) * 100.0;
+    try testing.expectApproxEqAbs(ret30, long.get("ret_30d_pct").?.float, 0.02);
+    try testing.expect(long.get("ret_180d_pct") == null);
+    // Forming wick excluded: the window high is the last completed high.
+    try testing.expectApproxEqRel(last * 1.001, long.get("window_high").?.float, 1e-3);
+    try testing.expect(long.get("range90_pos").?.float > 0.95);
+    try testing.expect(long.get("realized_vol30_ann_pct") != null);
+
+    // Existing callers without a long series keep the original document.
+    try testing.expectEqualStrings("{\"1D\":null,\"4H\":null}", try formatHtfStructure(&buf, &.{}, &.{}));
+    try testing.expectEqualStrings("{\"1D\":null,\"4H\":null,\"1D_long\":null}", try formatHtfStructureWithLong(&buf, &.{}, &.{}, &.{}));
 }
 
 test "invalid regime inputs cannot manufacture trend evidence" {

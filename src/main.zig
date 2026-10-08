@@ -137,6 +137,44 @@ fn filterEvidenceLines(lines: [][]const u8, since_ms: i64, now_ms: i64) usize {
     return n;
 }
 
+/// Self-review timing attribution over 7d and 30d windows, clipped to the
+/// decision evidence cohort so another policy/mode never scores this one.
+/// Unavailable windows are reported as such, never filled in.
+fn collectAttribution(
+    db: *ab.storage.Db,
+    equity_repo: *ab.storage.EquityRepo,
+    now_ms: i64,
+    out: *[2]ab.attribution.Labelled,
+) usize {
+    const windows = [_]struct { label: []const u8, ms: i64 }{
+        .{ .label = "7d", .ms = 7 * 86_400_000 },
+        .{ .label = "30d", .ms = 30 * 86_400_000 },
+    };
+    const from_ms = @max(now_ms - windows[windows.len - 1].ms, decision_evidence_start_ms);
+    var ts_buf: [32]u8 = undefined;
+    const since = ab.clock.formatRfc3339Ms(from_ms, &ts_buf) catch return 0;
+    var marks: [31 * 24]ab.storage.HourlyMark = undefined;
+    const n = equity_repo.listHourlyMarksAsc(db, since, &marks) catch return 0;
+    var points: [marks.len]ab.attribution.Point = undefined;
+    var pn: usize = 0;
+    for (marks[0..n]) |m| {
+        if (m.ts_ms > now_ms or !(m.equity > 0)) continue;
+        points[pn] = .{ .ts_ms = m.ts_ms, .price = m.price, .btc_weight = m.btc_value / m.equity };
+        pn += 1;
+    }
+    for (windows, 0..) |win, i| {
+        const start_ms = now_ms - win.ms;
+        var first: usize = 0;
+        while (first < pn and points[first].ts_ms < start_ms) : (first += 1) {}
+        out[i] = .{
+            .label = win.label,
+            .clipped = decision_evidence_start_ms > start_ms,
+            .window = ab.attribution.compute(points[first..pn]),
+        };
+    }
+    return windows.len;
+}
+
 /// Best-effort persist of the BH baseline (alpha survives restarts).
 /// Failures only log — the in-memory baseline keeps working either way.
 fn persistShadowBaseline(kv: *ab.storage.KvRepo, snap: ab.shadow_bench.Snapshot) void {
@@ -2478,8 +2516,11 @@ fn collectMarketTools(
     // market.candles — wave-capable frames + computed 1D/4H structure.
     if (registry.find("market.candles")) |spec| {
         if (n >= obs_out.len) return n;
+        // 1D is fetched once with the long history; the compact rows and the
+        // 20-bar structure still use its newest 45 bars (`daily_rows`).
+        const daily_rows: usize = 45;
         const frame_specs = [_]struct { bar: []const u8, limit: usize }{
-            .{ .bar = "1D", .limit = 45 },
+            .{ .bar = "1D", .limit = ab.indicators.LONG_DAILY_MAX },
             // RSI14 needs 42 completed bars; leave room for the forming bar.
             .{ .bar = "4H", .limit = 45 },
             .{ .bar = "1H", .limit = 48 },
@@ -2487,6 +2528,8 @@ fn collectMarketTools(
             .{ .bar = "15m", .limit = 48 },
         };
         var frame_candles: [5][48]ab.okx_rest.Candle = undefined;
+        var daily_long: [ab.indicators.LONG_DAILY_MAX]ab.okx_rest.Candle = undefined;
+        var daily_long_n: usize = 0;
         var frames: [5]ab.market_tools.CandleFrame = undefined;
         var frames_n: usize = 0;
         var as_of: i64 = 0;
@@ -2497,6 +2540,7 @@ fn collectMarketTools(
         var daily_n: usize = 0;
         var h4_n: usize = 0;
         for (frame_specs, 0..) |fs, fi| {
+            const is_daily = fi == 0;
             var path_buf: [160]u8 = undefined;
             const path = std.fmt.bufPrint(
                 &path_buf,
@@ -2505,11 +2549,14 @@ fn collectMarketTools(
             ) catch continue;
             if (okx.getPublic(path)) |body| {
                 defer gpa.free(body);
-                if (ab.okx_rest.parseCandles(gpa, body, frame_candles[fi][0..fs.limit])) |count| {
+                const sink: []ab.okx_rest.Candle = if (is_daily) daily_long[0..] else frame_candles[fi][0..fs.limit];
+                if (ab.okx_rest.parseCandles(gpa, body, sink)) |fetched_n| {
                     const fetched_at = nowMs();
+                    const count = if (is_daily) @min(fetched_n, daily_rows) else fetched_n;
+                    if (is_daily) daily_long_n = fetched_n;
                     const frame = ab.market_tools.CandleFrame{
                         .bar = fs.bar,
-                        .candles = frame_candles[fi][0..count],
+                        .candles = sink[0..count],
                         .fetched_at_ms = fetched_at,
                     };
                     // Bar timestamps are opening times, not fetch times. A fresh
@@ -2547,12 +2594,15 @@ fn collectMarketTools(
             if (as_of == 0 or frame.fetched_at_ms < as_of) as_of = frame.fetched_at_ms;
         }
         frames_n = valid_frames;
-        var struct_buf: [4096]u8 = undefined;
+        // The long series shares the 1D frame's freshness verdict.
+        if (daily_n == 0) daily_long_n = 0;
+        var struct_buf: [6144]u8 = undefined;
         const structure = if (daily_n > 0 or h4_n > 0)
-            ab.indicators.formatHtfStructure(
+            ab.indicators.formatHtfStructureWithLong(
                 &struct_buf,
-                frame_candles[0][0..daily_n],
+                daily_long[0..daily_n],
                 if (h4_n > 0) frame_candles[1][0..h4_n] else &.{},
+                daily_long[0..daily_long_n],
             ) catch null
         else
             null;
@@ -3304,11 +3354,18 @@ fn runAgentDecision(
         break :blk nowMs() - last_ts < restart_guard_window_ms;
     };
 
-    var fill_backing: [2048]u8 = undefined;
-    var fill_ptrs: [6][]const u8 = undefined;
-    const fill_raw_n = fills_repo.listCompactForContext(db, &fill_backing, &fill_ptrs) catch 0;
+    var fill_backing: [4096]u8 = undefined;
+    var fill_ptrs: [ab.context.MAX_SELF_ITEMS][]const u8 = undefined;
+    const mark_px = ab.context.quotePrice(snap).toF64Lossy();
+    const fill_raw_n = fills_repo.listCompactForContext(db, &fill_backing, &fill_ptrs, mark_px) catch 0;
     const fill_n = filterEvidenceLines(fill_ptrs[0..fill_raw_n], decision_evidence_start_ms, nowMs());
     const recent_fills = fill_ptrs[0..fill_n];
+
+    // Timing attribution over cohort-local windows: did the weight changes
+    // earn more than holding the window's average weight?
+    var attr_items: [2]ab.attribution.Labelled = undefined;
+    const attr_n = collectAttribution(db, equity_repo, nowMs(), &attr_items);
+    const attribution = attr_items[0..attr_n];
 
     const eq_horizons = [_]struct { label: []const u8, ms: i64 }{
         .{ .label = "1h", .ms = 3_600_000 },
@@ -3365,6 +3422,7 @@ fn runAgentDecision(
         .recent_proposals = recent_proposals,
         .recent_fills = recent_fills,
         .equity_marks = equity_marks,
+        .attribution = attribution,
         .facts = review_facts,
         .intel = intel_rows,
         .max_drawdown = cfg.max_drawdown,
@@ -3490,11 +3548,13 @@ fn runAgentDecision(
             .recent_events = recent_events,
             .capital_flows = capital_flows,
             .memories = scored.items,
+            .prior_plan = prior_plan,
             .registry = registry,
             .tool_observations = all_obs[0 .. obs_n + 1],
             .recent_proposals = recent_proposals,
             .recent_fills = recent_fills,
             .equity_marks = equity_marks,
+            .attribution = attribution,
             .facts = review_facts,
             .intel = intel_rows,
             .max_drawdown = cfg.max_drawdown,
@@ -3502,6 +3562,7 @@ fn runAgentDecision(
             .now_ms = nowMs(),
             .min_size = instrument.min_size,
             .min_notional = instrument.min_notional,
+            .lot_size = instrument.lot_size,
         }) catch {
             std.debug.print("[agent] context render (tool round) failed\n", .{});
             break :tool_round;
