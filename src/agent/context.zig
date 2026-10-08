@@ -14,12 +14,14 @@ const state_mod = @import("../core/state.zig");
 const sm = @import("../risk/state_machine.zig");
 const mem_store = @import("../memory/store.zig");
 const tools_mod = @import("../tools/registry.zig");
+const attribution_mod = @import("attribution.zig");
 const Decimal = dec.Decimal;
 
 pub const MAX_EVENTS = 16;
 pub const MAX_CAPITAL_FLOWS = 8;
 pub const MAX_MEMORIES = 12;
-pub const MAX_SELF_ITEMS = 8;
+pub const MAX_SELF_ITEMS = 10;
+pub const MAX_ATTRIBUTION_WINDOWS = 4;
 pub const MAX_INTEL = 8;
 
 pub const Input = struct {
@@ -41,6 +43,8 @@ pub const Input = struct {
     recent_fills: []const []const u8 = &.{},
     /// Self-review: labelled equity marks at fixed horizons (JSON lines).
     equity_marks: []const []const u8 = &.{},
+    /// Self-review: measured value of the agent's own weight changes per window.
+    attribution: []const attribution_mod.Labelled = &.{},
     /// First-party facts (not verdicts): current weight, HOLD streak, BH gap.
     facts: ReviewFacts = .{},
     /// Ranked external intel JSON objects (untrusted). Empty when none.
@@ -219,7 +223,10 @@ fn writeContext(w: *std.Io.Writer, input: Input) !void {
     for (input.registry.all(), 0..) |spec, i| {
         if (i > 0) try w.writeByte(',');
         try w.print("{{\"name\":\"{s}\",\"source\":\"{s}\",\"max_age_ms\":{d},", .{ spec.name, spec.source, spec.max_age_ms });
-        try w.print("\"cost_usd\":\"{f}\",\"trust\":\"{f}\",\"schema\":\"{s}\"}}", .{ spec.cost_usd, spec.trust, spec.schema_note });
+        try w.print("\"cost_usd\":\"{f}\",\"trust\":\"{f}\",\"schema\":", .{ spec.cost_usd, spec.trust });
+        // Schema notes can quote JSON examples; escape them so the context stays valid JSON.
+        try std.json.Stringify.value(spec.schema_note, .{}, w);
+        try w.writeByte('}');
     }
     try w.writeAll("],");
 
@@ -252,7 +259,13 @@ fn writeContext(w: *std.Io.Writer, input: Input) !void {
         if (i > 0) try w.writeByte(',');
         try w.writeAll(m);
     }
-    try w.writeAll("],\"facts\":{");
+    try w.writeAll("],\"attribution\":{\"basis\":\"hourly marks; price-only, fees/slippage/capital flows excluded; timing_return = book_return - static_return (window average weight held constant)\",\"windows\":[");
+    const attr_n = @min(input.attribution.len, MAX_ATTRIBUTION_WINDOWS);
+    for (input.attribution[0..attr_n], 0..) |item, i| {
+        if (i > 0) try w.writeByte(',');
+        try attribution_mod.writeJson(w, item);
+    }
+    try w.writeAll("]},\"facts\":{");
     try writeReviewFacts(w, input);
     try w.writeAll("}},");
 
@@ -350,6 +363,7 @@ fn testInput(reg: *const tools_mod.Registry, mems: []const mem_store.Scored) Inp
         .recent_proposals = &.{"{\"decision_id\":\"dec_1\",\"action\":\"HOLD\",\"target\":\"0\",\"confidence\":\"0.8\",\"executed\":false,\"exec\":\"hold\"}"},
         .recent_fills = &.{"{\"ts\":\"2026-01-01T00:00:00Z\",\"side\":\"buy\",\"qty\":\"0.0001\",\"price\":\"64000\",\"fee\":\"0.01\",\"decision_id\":\"dec_0\"}"},
         .equity_marks = &.{"{\"ago\":\"24h\",\"ts\":\"2026-01-01T00:00:00Z\",\"equity\":\"100.5\"}"},
+        .attribution = &.{.{ .label = "7d", .clipped = true, .window = null }},
         .facts = .{
             .hold_streak = 6,
             .ms_since_last_fill = 86_400_000,
@@ -372,6 +386,14 @@ test "render is deterministic and structurally complete" {
         .source = "okx",
         .max_age_ms = 60_000,
         .schema_note = "ohlcv[]",
+    });
+    // Schema notes may quote JSON; the rendered context must still parse.
+    try reg.register(.{
+        .name = "market.indicators",
+        .domain = .market,
+        .source = "local-calc",
+        .max_age_ms = 120_000,
+        .schema_note = "reply {\"tool_requests\":[{\"name\":\"rsi\"}]}",
     });
 
     const mems = [_]mem_store.Scored{.{
@@ -416,6 +438,13 @@ test "render is deterministic and structurally complete" {
     try testing.expectEqual(@as(usize, 1), sr.get("fills").?.array.items.len);
     try testing.expectEqual(@as(usize, 1), sr.get("equity_marks").?.array.items.len);
     try testing.expectEqualStrings("24h", sr.get("equity_marks").?.array.items[0].object.get("ago").?.string);
+    const attr = sr.get("attribution").?.object;
+    try testing.expect(attr.get("basis") != null);
+    const windows = attr.get("windows").?.array.items;
+    try testing.expectEqual(@as(usize, 1), windows.len);
+    try testing.expectEqualStrings("7d", windows[0].object.get("label").?.string);
+    try testing.expect(!windows[0].object.get("available").?.bool);
+    try testing.expect(windows[0].object.get("timing_return") == null);
     const facts = sr.get("facts").?.object;
     try testing.expectEqual(@as(i64, 6), facts.get("hold_streak").?.integer);
     try testing.expectEqual(@as(i64, 86_400_000), facts.get("ms_since_last_fill").?.integer);

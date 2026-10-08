@@ -41,6 +41,7 @@
 2. Prompt：HOLD = 维持当前权重；thesis 有方向就必须 REBALANCE；连胜不是正确性证据
 3. **不做**：放松风险内核、强制加仓、抬高仓位上限
 4. Agent K 线：1D×45 / 4H×42 / 1H×48 / 30m×48 / 15m×48（紧凑数组）+ 本地计算的 1D/4H structure（SMA/range/前高突破）
+5. 决策周期与择时反馈（2026-10）：同一次 1D 请求取 200 根算 `structure.1D_long`（50/100/200 日均线、7/30/90/180 日收益、90 日区间）；`self_review.attribution` 给出 7d/30d 择时贡献（`timing_return`）；成交带 `vs_now_bps`。见 [STRATEGY_HORIZON_TIMING.md](STRATEGY_HORIZON_TIMING.md)
 
 ### P2 — Phase 5 L1 观察
 
