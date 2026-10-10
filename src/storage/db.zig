@@ -671,6 +671,15 @@ pub const OpenOrderRow = struct {
     created_ts: FixedStr(40) = .{},
 };
 
+/// Voluntary trading activity since a timestamp (guardrail inputs).
+pub const TradeActivity = struct {
+    /// Distinct agent decisions with at least one filled/partial order.
+    agent_decisions: u32 = 0,
+    /// Side of the most recent filled/partial order of any origin ("" if none).
+    last_side: FixedStr(8) = .{},
+    last_ts: FixedStr(40) = .{},
+};
+
 pub const OrdersRepo = struct {
     upsert_stmt: Stmt,
 
@@ -735,6 +744,34 @@ pub const OrdersRepo = struct {
             n += 1;
         }
         return n;
+    }
+
+    /// Executed-trade activity since `since_ts` (RFC3339). Operator (`dec_op_*`)
+    /// and flatten (`dec_exit_*`) decisions are not counted as agent decisions
+    /// but still define the most recent trade for the reverse-trade cooldown.
+    pub fn recentTradeActivity(db: *Db, since_ts: []const u8) DbError!TradeActivity {
+        var out = TradeActivity{};
+        var cnt = try db.prepare(
+            \\SELECT COUNT(DISTINCT decision_id) FROM orders
+            \\WHERE created_ts >= ?1 AND status IN ('FILLED','PARTIAL')
+            \\  AND substr(decision_id, 1, 7) <> 'dec_op_'
+            \\  AND substr(decision_id, 1, 9) <> 'dec_exit_'
+        );
+        defer cnt.finalize();
+        try cnt.bindText(1, since_ts);
+        if (try cnt.step()) out.agent_decisions = @intCast(@max(@as(i64, 0), cnt.columnInt(0)));
+        var last = try db.prepare(
+            \\SELECT side, created_ts FROM orders
+            \\WHERE created_ts >= ?1 AND status IN ('FILLED','PARTIAL')
+            \\ORDER BY created_ts DESC LIMIT 1
+        );
+        defer last.finalize();
+        try last.bindText(1, since_ts);
+        if (try last.step()) {
+            out.last_side.set(last.columnText(0));
+            out.last_ts.set(last.columnText(1));
+        }
+        return out;
     }
 
     /// Newest orders as JSON array (newest first by updated_ts).
@@ -1134,6 +1171,82 @@ pub const EquityRepo = struct {
         return w.buffered();
     }
 
+    /// Long-horizon equity curve, **oldest first**: 4h buckets for the last 14
+    /// days and daily buckets back to 300 days (≈370 rows; sized for the 128KiB
+    /// `EQUITY_LONG_BUFFER_BYTES` in web/cache.zig). Each row is the bucket's last
+    /// 1m sample plus the bucket's equity low/high, so a day's intraday drawdown
+    /// is visible without 1m rows. `bucket_ms` tells the consumer each row's width.
+    pub fn listLongJson(self: *EquityRepo, db: *Db, out: []u8, now_ms: i64) DbError![]const u8 {
+        _ = self;
+        const fine_ms: i64 = 14 * 24 * std.time.ms_per_hour;
+        const coarse_ms: i64 = 300 * 24 * std.time.ms_per_hour;
+        var lo_buf: [40]u8 = undefined;
+        var mid_buf: [40]u8 = undefined;
+        var hi_buf: [40]u8 = undefined;
+        const lo_ts = clock.formatRfc3339Ms(now_ms - coarse_ms, &lo_buf) catch return DbError.StepFailed;
+        const mid_ts = clock.formatRfc3339Ms(now_ms - fine_ms, &mid_buf) catch return DbError.StepFailed;
+        const hi_ts = clock.formatRfc3339Ms(now_ms + std.time.ms_per_hour, &hi_buf) catch return DbError.StepFailed;
+
+        var w: std.Io.Writer = .fixed(out);
+        w.writeAll("[") catch return DbError.StepFailed;
+        var first = true;
+        const tiers = [_]struct { sql: [:0]const u8, from: []const u8, to: []const u8, width_ms: i64 }{
+            .{
+                .sql =
+                \\WITH b AS (
+                \\  SELECT substr(ts, 1, 10) AS bk, MAX(ts) AS last_ts,
+                \\    MIN(CAST(equity AS REAL)) AS lo, MAX(CAST(equity AS REAL)) AS hi
+                \\  FROM equity_samples WHERE interval = '1m' AND ts >= ?1 AND ts < ?2 GROUP BY bk)
+                \\SELECT s.ts, s.equity, b.lo, b.hi, s.hwm, s.drawdown, s.bid_price, s.bh_equity, s.capital_flow
+                \\FROM b JOIN equity_samples s ON s.ts = b.last_ts AND s.interval = '1m' ORDER BY s.ts ASC
+                ,
+                .from = lo_ts,
+                .to = mid_ts,
+                .width_ms = 24 * std.time.ms_per_hour,
+            },
+            .{
+                .sql =
+                \\WITH b AS (
+                \\  SELECT substr(ts, 1, 10) || 'T' || printf('%02d', CAST(substr(ts, 12, 2) AS INTEGER) / 4 * 4) AS bk,
+                \\    MAX(ts) AS last_ts, MIN(CAST(equity AS REAL)) AS lo, MAX(CAST(equity AS REAL)) AS hi
+                \\  FROM equity_samples WHERE interval = '1m' AND ts >= ?1 AND ts < ?2 GROUP BY bk)
+                \\SELECT s.ts, s.equity, b.lo, b.hi, s.hwm, s.drawdown, s.bid_price, s.bh_equity, s.capital_flow
+                \\FROM b JOIN equity_samples s ON s.ts = b.last_ts AND s.interval = '1m' ORDER BY s.ts ASC
+                ,
+                .from = mid_ts,
+                .to = hi_ts,
+                .width_ms = 4 * std.time.ms_per_hour,
+            },
+        };
+        for (tiers) |t| {
+            var stmt = try db.prepare(t.sql);
+            defer stmt.finalize();
+            try stmt.bindText(1, t.from);
+            try stmt.bindText(2, t.to);
+            while (try stmt.step()) {
+                if (!first) w.writeAll(",") catch return DbError.StepFailed;
+                first = false;
+                w.print(
+                    "{{\"ts\":\"{s}\",\"bucket_ms\":{d},\"equity\":\"{s}\",\"low\":\"{d:.6}\",\"high\":\"{d:.6}\",\"hwm\":\"{s}\",\"drawdown\":\"{s}\",\"bid_price\":\"{s}\",\"bh_equity\":\"{s}\",\"capital_flow\":\"{s}\"}}",
+                    .{
+                        stmt.columnText(0),
+                        t.width_ms,
+                        stmt.columnText(1),
+                        stmt.columnFloat(2),
+                        stmt.columnFloat(3),
+                        stmt.columnText(4),
+                        stmt.columnText(5),
+                        stmt.columnText(6),
+                        stmt.columnText(7),
+                        stmt.columnText(8),
+                    },
+                ) catch return DbError.StepFailed;
+            }
+        }
+        w.writeAll("]") catch return DbError.StepFailed;
+        return w.buffered();
+    }
+
     /// Decode 1m samples at or after `since_ts` into `out`, **oldest first**,
     /// for 复盘 analytics (AB factor). Returns the number of points written;
     /// stops early when `out` is full.
@@ -1402,7 +1515,63 @@ pub const AgentRunsRepo = struct {
         w.writeAll("]") catch return DbError.StepFailed;
         return w.buffered();
     }
+
+    /// Newest non-`ok` agent runs (any age), newest first, each with an
+    /// `error_class` joined at query time from the failure event that shares its
+    /// run id (no schema change). Runs whose event was pruned or never written
+    /// fall back to a status-derived class. Rows are dropped, never truncated
+    /// mid-object, when `out` fills up.
+    pub fn listProblemsJson(self: *AgentRunsRepo, db: *Db, out: []u8, limit: i64) DbError![]const u8 {
+        _ = self;
+        var stmt = try db.prepare(
+            \\WITH f AS (
+            \\  SELECT json_extract(payload_json, '$.run_id') AS rid,
+            \\    COALESCE(json_extract(payload_json, '$.error'), json_extract(payload_json, '$.reason'), '') AS cls
+            \\  FROM events
+            \\  WHERE type IN ('AGENT_LLM_FAILED', 'AGENT_INVALID_OUTPUT', 'AGENT_INVALID_PROPOSAL')
+            \\)
+            \\SELECT r.run_id, r.status, r.model, r.started_ts, r.finished_ts, COALESCE(MAX(f.cls), '')
+            \\FROM agent_runs r LEFT JOIN f ON f.rid = r.run_id
+            \\WHERE r.status <> 'ok'
+            \\GROUP BY r.run_id
+            \\ORDER BY r.started_ts DESC LIMIT ?1
+        );
+        defer stmt.finalize();
+        try stmt.bindInt(1, limit);
+        var w: std.Io.Writer = .fixed(out);
+        w.writeAll("[") catch return DbError.StepFailed;
+        var row_buf: [512]u8 = undefined;
+        var i: usize = 0;
+        while (try stmt.step()) {
+            const status = stmt.columnText(1);
+            var cls = stmt.columnText(5);
+            if (cls.len == 0) cls = problemClassFallback(status);
+            var rw: std.Io.Writer = .fixed(&row_buf);
+            rw.print("{{\"run_id\":\"", .{}) catch continue;
+            writeJsonEscaped(&rw, stmt.columnText(0)) catch continue;
+            rw.writeAll("\",\"status\":\"") catch continue;
+            writeJsonEscaped(&rw, status) catch continue;
+            rw.writeAll("\",\"error_class\":\"") catch continue;
+            writeJsonEscaped(&rw, cls) catch continue;
+            rw.writeAll("\",\"model\":\"") catch continue;
+            writeJsonEscaped(&rw, stmt.columnText(2)) catch continue;
+            rw.print("\",\"started_ts\":\"{s}\",\"finished_ts\":\"{s}\"}}", .{ stmt.columnText(3), stmt.columnText(4) }) catch continue;
+            const row = rw.buffered();
+            if (w.end + row.len + 2 > out.len) break;
+            if (i > 0) w.writeAll(",") catch return DbError.StepFailed;
+            w.writeAll(row) catch return DbError.StepFailed;
+            i += 1;
+        }
+        w.writeAll("]") catch return DbError.StepFailed;
+        return w.buffered();
+    }
 };
+
+fn problemClassFallback(status: []const u8) []const u8 {
+    if (std.mem.eql(u8, status, "stale_proposal")) return "stale_proposal";
+    if (std.mem.eql(u8, status, "running")) return "unfinished";
+    return "unclassified";
+}
 
 pub const ToolCallRow = struct {
     run_id: []const u8,
@@ -3707,6 +3876,44 @@ test "audit chain queries trace orders to stamped decision events (AC-GO5)" {
     try testing.expectEqual(@as(i64, 1), try db.queryInt(q_orphan_fills)); // f_orphan
 }
 
+test "recentTradeActivity counts agent decisions and finds the last trade" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const path = try tmpDbPath(&tmp, &buf);
+    var db = try Db.open(path);
+    defer db.close();
+    var repo = try OrdersRepo.init(&db);
+    defer repo.deinit();
+
+    const rows = [_]struct { id: []const u8, dec: []const u8, side: []const u8, status: []const u8, ts: []const u8 }{
+        .{ .id = "o1", .dec = "dec_a", .side = "buy", .status = "FILLED", .ts = "2026-01-01T01:00:00.000Z" },
+        .{ .id = "o2", .dec = "dec_a", .side = "buy", .status = "FILLED", .ts = "2026-01-01T01:00:02.000Z" }, // same decision, second leg
+        .{ .id = "o3", .dec = "dec_b", .side = "sell", .status = "REJECTED", .ts = "2026-01-01T02:00:00.000Z" },
+        .{ .id = "o4", .dec = "dec_op_tw_1", .side = "sell", .status = "FILLED", .ts = "2026-01-01T03:00:00.000Z" },
+        .{ .id = "o5", .dec = "dec_c", .side = "sell", .status = "PARTIAL", .ts = "2026-01-01T04:00:00.000Z" },
+        .{ .id = "o6", .dec = "dec_old", .side = "buy", .status = "FILLED", .ts = "2025-12-30T04:00:00.000Z" }, // outside window
+    };
+    for (rows) |r| try repo.upsert(.{
+        .client_order_id = r.id,
+        .decision_id = r.dec,
+        .side = r.side,
+        .qty = "0.001",
+        .price = "100",
+        .status = r.status,
+        .created_ts = r.ts,
+        .updated_ts = r.ts,
+    });
+    const act = try OrdersRepo.recentTradeActivity(&db, "2026-01-01T00:00:00.000Z");
+    try testing.expectEqual(@as(u32, 2), act.agent_decisions); // dec_a + dec_c; no operator, no rejected
+    try testing.expectEqualStrings("sell", act.last_side.get());
+    try testing.expectEqualStrings("2026-01-01T04:00:00.000Z", act.last_ts.get());
+
+    const none = try OrdersRepo.recentTradeActivity(&db, "2026-02-01T00:00:00.000Z");
+    try testing.expectEqual(@as(u32, 0), none.agent_decisions);
+    try testing.expectEqual(@as(usize, 0), none.last_side.get().len);
+}
+
 test "orders upsert projection" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3911,6 +4118,124 @@ test "dashboard equity buffer holds the full 240-sample window" {
     defer parsed.deinit();
     try testing.expectEqual(@as(usize, 240), parsed.value.array.items.len);
     try testing.expect(json.len > 49_152); // would not fit the former 48KiB buffer
+}
+
+test "listProblemsJson joins failure classes and skips ok runs" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const path = try tmpDbPath(&tmp, &path_buf);
+    var db = try Db.open(path);
+    defer db.close();
+    var runs = try AgentRunsRepo.init(&db);
+    defer runs.deinit();
+    var events = try EventsRepo.init(&db);
+    defer events.deinit();
+
+    const specs = [_]struct { id: []const u8, status: []const u8, ts: []const u8 }{
+        .{ .id = "run_ok", .status = "ok", .ts = "2026-09-01T00:00:00.000Z" },
+        .{ .id = "run_llm", .status = "error_llm", .ts = "2026-09-02T00:00:00.000Z" },
+        .{ .id = "run_bad", .status = "invalid_proposal", .ts = "2026-09-03T00:00:00.000Z" },
+        .{ .id = "run_lost", .status = "error_llm", .ts = "2026-09-04T00:00:00.000Z" },
+        .{ .id = "run_stale", .status = "stale_proposal", .ts = "2026-09-05T00:00:00.000Z" },
+    };
+    for (specs) |sp| {
+        try runs.start(.{ .run_id = sp.id, .snapshot_version = 1, .model = "m", .prompt_hash = "h", .status = "running", .started_ts = sp.ts });
+        try runs.complete(sp.id, sp.status, "o", sp.ts);
+    }
+    try runs.start(.{ .run_id = "run_open", .snapshot_version = 1, .model = "m", .prompt_hash = "h", .status = "running", .started_ts = "2026-09-06T00:00:00.000Z" });
+    try events.append(.{
+        .event_id = "e1",
+        .ts = "2026-09-02T00:00:01.000Z",
+        .type = "AGENT_LLM_FAILED",
+        .source = "agent",
+        .severity = "WARN",
+        .correlation_id = "",
+        .state_version = 1,
+        .payload_json = "{\"run_id\":\"run_llm\",\"model\":\"m\",\"error\":\"timeout\",\"degraded\":false}",
+    });
+    try events.append(.{
+        .event_id = "e2",
+        .ts = "2026-09-03T00:00:01.000Z",
+        .type = "AGENT_INVALID_PROPOSAL",
+        .source = "agent",
+        .severity = "WARN",
+        .correlation_id = "",
+        .state_version = 1,
+        .payload_json = "{\"run_id\":\"run_bad\",\"reason\":\"MalformedJson\"}",
+    });
+
+    var out: [4096]u8 = undefined;
+    const json = try runs.listProblemsJson(&db, &out, 50);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    const items = parsed.value.array.items;
+    try testing.expectEqual(@as(usize, 5), items.len); // run_ok excluded
+    // Newest first, with joined / fallback classes.
+    try testing.expectEqualStrings("run_open", items[0].object.get("run_id").?.string);
+    try testing.expectEqualStrings("unfinished", items[0].object.get("error_class").?.string);
+    try testing.expectEqualStrings("stale_proposal", items[1].object.get("error_class").?.string);
+    try testing.expectEqualStrings("unclassified", items[2].object.get("error_class").?.string);
+    try testing.expectEqualStrings("MalformedJson", items[3].object.get("error_class").?.string);
+    try testing.expectEqualStrings("timeout", items[4].object.get("error_class").?.string);
+
+    // A full buffer drops whole rows instead of emitting broken JSON.
+    var tiny: [400]u8 = undefined;
+    const clipped = try runs.listProblemsJson(&db, &tiny, 50);
+    const p2 = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, clipped, .{});
+    defer p2.deinit();
+    try testing.expect(p2.value.array.items.len < 5);
+}
+
+test "listLongJson buckets by 4h then by day and fits the cache buffer" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const path = try tmpDbPath(&tmp, &path_buf);
+    var db = try Db.open(path);
+    defer db.close();
+    var repo = try EquityRepo.init(&db);
+    defer repo.deinit();
+
+    const now_ms: i64 = 1_790_000_000_000;
+    const day_ms: i64 = 24 * std.time.ms_per_hour;
+    // Densest case: one 1m sample per bucket across the whole horizon, with
+    // maximum-width values, plus a second sample in the newest 4h bucket.
+    var t = now_ms - 299 * day_ms;
+    while (t < now_ms - 10 * 60_000) : (t += if (t < now_ms - 14 * day_ms) day_ms else 4 * std.time.ms_per_hour) {
+        var ts_buf: [40]u8 = undefined;
+        const ts = try clock.formatRfc3339Ms(t, &ts_buf);
+        try repo.append(.{
+            .ts = ts,
+            .interval = "1m",
+            .equity = "12345678901234",
+            .hwm = "12345678901234",
+            .drawdown = "12345678901234",
+            .cash = "12345678901234",
+            .btc_value = "12345678901234",
+            .bid_price = "12345678901234",
+            .bh_equity = "12345678901234",
+            .capital_flow = "12345678901234",
+        });
+    }
+    var small_ts: [40]u8 = undefined;
+    try repo.append(.{ .ts = try clock.formatRfc3339Ms(now_ms - 60_000, &small_ts), .interval = "1m", .equity = "90", .hwm = "100", .drawdown = "0.1", .cash = "0", .btc_value = "90", .bid_price = "1", .bh_equity = "100" });
+    var one_s: [40]u8 = undefined;
+    try repo.append(.{ .ts = try clock.formatRfc3339Ms(now_ms - 30_000, &one_s), .interval = "1s", .equity = "1", .hwm = "1", .drawdown = "0", .cash = "0", .btc_value = "1" });
+
+    var out: [128 * 1024]u8 = undefined;
+    const json = try repo.listLongJson(&db, &out, now_ms);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    const items = parsed.value.array.items;
+    try testing.expect(items.len > 300 and items.len < 400);
+    try testing.expectEqual(@as(i64, 24 * std.time.ms_per_hour), items[0].object.get("bucket_ms").?.integer);
+    const last = items[items.len - 1].object;
+    try testing.expectEqual(@as(i64, 4 * std.time.ms_per_hour), last.get("bucket_ms").?.integer);
+    // 1s rows are ignored; the bucket low/high span the bucket's 1m samples.
+    try testing.expectEqualStrings("90", last.get("equity").?.string);
+    try testing.expect(std.mem.startsWith(u8, last.get("low").?.string, "90.0"));
+    try testing.expect(json.len < out.len);
 }
 
 test "memory recreated after index eviction continues durable versions" {

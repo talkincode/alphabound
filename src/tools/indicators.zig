@@ -14,6 +14,7 @@
 const std = @import("std");
 const okx_rest = @import("../exchange/okx/rest.zig");
 const market = @import("market.zig");
+const guardrails = @import("../risk/guardrails.zig");
 
 pub const Candle = okx_rest.Candle;
 
@@ -131,6 +132,22 @@ pub fn formatHtfStructureWithLong(
 
 /// Daily bars fetched for the multi-month view (one OKX request).
 pub const LONG_DAILY_MAX: usize = 200;
+
+/// Last completed daily close versus the 50-bar SMA, from newest-first candles.
+/// The forming bar is skipped and any unconfirmed/legacy row ends the run, so
+/// an unproven series yields an unknown trend (fail-closed for macro sells).
+pub fn dailyTrend(newest_first: []const Candle) guardrails.Trend {
+    if (newest_first.len == 0) return .{};
+    const start: usize = if (market.candleConfirmed(newest_first[0]) == true) 0 else 1;
+    var closes: [guardrails.TREND_MA_PERIOD]@TypeOf(newest_first[0].close) = undefined;
+    var n: usize = 0;
+    var i = start;
+    while (i < newest_first.len and n < closes.len and market.candleConfirmed(newest_first[i]) == true) : (i += 1) {
+        closes[n] = newest_first[i].close;
+        n += 1;
+    }
+    return guardrails.trendFromCloses(closes[0..n]);
+}
 
 /// Multi-month daily context: where the latest completed close sits against
 /// 50/100/200-day means, trailing returns, the 90-day range, distance from the
@@ -610,6 +627,22 @@ fn mkCandle(o: f64, h: f64, l: f64, c: f64) Candle {
 fn parseF(buf: []u8, v: f64) Decimal {
     const s = std.fmt.bufPrint(buf, "{d:.4}", .{v}) catch unreachable;
     return Decimal.parse(s) catch unreachable;
+}
+
+test "dailyTrend skips the forming bar and needs 50 confirmed closes" {
+    var series: [52]Candle = undefined;
+    for (&series, 0..) |*b, i| b.* = mkCandle(100, 100, 100, if (i == 0) 10 else 100);
+    series[0].confirmed = false; // forming bar must not leak into the SMA or the close
+    series[1] = mkCandle(90, 90, 90, 90);
+    const t = dailyTrend(&series);
+    try testing.expect(t.known);
+    try testing.expect(t.broken()); // 90 < SMA of 50 closes (one 90, 49 x 100)
+    try testing.expect(t.daily_close.eql(Decimal.parse("90") catch unreachable));
+
+    try testing.expect(!dailyTrend(series[0..50]).known); // forming bar + 49 completed
+    series[10].confirmed = null; // an unproven row ends the run
+    try testing.expect(!dailyTrend(&series).known);
+    try testing.expect(!dailyTrend(&.{}).known);
 }
 
 test "rsi on known series matches reference" {

@@ -8,7 +8,7 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { TOOLS, callTool, apiBase } from "./client.js";
+import { TOOLS, callTool, apiBase, inputSchemaFor } from "./client.js";
 
 const EMPTY_SCHEMA = { type: "object", properties: {}, additionalProperties: false };
 
@@ -21,7 +21,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: TOOLS.map((t) => ({
     name: t.name,
     description: t.description,
-    inputSchema: t.inputSchema || EMPTY_SCHEMA,
+    inputSchema: inputSchemaFor(t) || EMPTY_SCHEMA,
   })),
 }));
 

@@ -159,6 +159,14 @@ pub const StoreError = error{
 
 pub const MAX_MEMORIES = 1024;
 
+/// How long per-run episodes (`E_run_*`, `R_run_*`) and dated periodic-review
+/// copies stay in the in-process index. Their durable rows are never deleted.
+pub const EPHEMERAL_RETENTION_MS: i64 = 14 * 24 * 60 * 60 * 1000;
+
+pub fn isExpiredEphemeral(id: []const u8, created_ms: i64, now_ms: i64, max_age_ms: i64) bool {
+    return max_age_ms > 0 and isEphemeralId(id) and now_ms - created_ms > max_age_ms;
+}
+
 /// In-process memory index: latest version per memory_id. The SQLite
 /// `memories` table stays the durable append-only log; this index is rebuilt
 /// from it at boot (latest version per id) and mutated via applyOp.
@@ -404,6 +412,24 @@ pub const Store = struct {
                 continue;
             }
             break;
+        }
+        return dropped;
+    }
+
+    /// Drop per-run episodes / dated review copies older than `max_age_ms` from
+    /// the index. Index-only: the durable `memories` table keeps every version,
+    /// and protected, strategy and hand-written reflections are never touched.
+    /// Without this the index sits at the capacity limit with run noise, and a
+    /// reboot reloads newest-first so run noise crowds out older durable rows.
+    pub fn pruneExpiredEphemeral(self: *Store, now_ms: i64, max_age_ms: i64) usize {
+        var dropped: usize = 0;
+        var i: usize = 0;
+        while (i < self.items.items.len) {
+            const m = self.items.items[i];
+            if (isExpiredEphemeral(m.memory_id, m.created_ms, now_ms, max_age_ms)) {
+                _ = self.items.orderedRemove(i);
+                dropped += 1;
+            } else i += 1;
         }
         return dropped;
     }
@@ -1011,6 +1037,45 @@ test "ephemeral run copies evict before rolling PR_short; compact frees headroom
     try testing.expect(store.count() <= MAX_MEMORIES - 32);
     try testing.expect(store.find("PR_short") != null);
     try testing.expect(store.find("E_hold_streak") != null);
+}
+
+test "pruneExpiredEphemeral drops only expired run copies" {
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    const day: i64 = 24 * 60 * 60 * 1000;
+    const now: i64 = 100 * day;
+    const rows = [_]struct { id: []const u8, kind: Kind, age_days: i64 }{
+        .{ .id = "E_run_old", .kind = .episodic, .age_days = 20 },
+        .{ .id = "R_run_old", .kind = .reflection, .age_days = 15 },
+        .{ .id = "E_run_new", .kind = .episodic, .age_days = 1 },
+        .{ .id = "PR_short_20260824_1646", .kind = .reflection, .age_days = 30 },
+        .{ .id = "PR_short", .kind = .reflection, .age_days = 90 },
+        .{ .id = "E_hold_streak", .kind = .episodic, .age_days = 90 },
+        .{ .id = "R_btc_hold_target_tension", .kind = .reflection, .age_days = 90 },
+        .{ .id = "H_rule", .kind = .strategy, .age_days = 90 },
+    };
+    for (rows) |r| try store.load(.{
+        .memory_id = r.id,
+        .version = 1,
+        .kind = r.kind,
+        .status = .active,
+        .confidence = d("0.5"),
+        .evidence_count = 0,
+        .content_json = "{}",
+        .created_ms = now - r.age_days * day,
+    });
+    try testing.expectEqual(@as(usize, 3), store.pruneExpiredEphemeral(now, EPHEMERAL_RETENTION_MS));
+    try testing.expect(store.find("E_run_old") == null);
+    try testing.expect(store.find("R_run_old") == null);
+    try testing.expect(store.find("PR_short_20260824_1646") == null);
+    try testing.expect(store.find("E_run_new") != null);
+    try testing.expect(store.find("PR_short") != null);
+    try testing.expect(store.find("E_hold_streak") != null);
+    try testing.expect(store.find("R_btc_hold_target_tension") != null);
+    try testing.expect(store.find("H_rule") != null);
+    // Idempotent, and a non-positive retention disables pruning.
+    try testing.expectEqual(@as(usize, 0), store.pruneExpiredEphemeral(now, EPHEMERAL_RETENTION_MS));
+    try testing.expectEqual(@as(usize, 0), store.pruneExpiredEphemeral(now + 1000 * day, 0));
 }
 
 test "retrieve downranks ephemeral dated review copies" {

@@ -27,6 +27,13 @@ fn nowMs() i64 {
 
 pub const EQUITY_JSON_BUFFER_BYTES: usize = 64 * 1024;
 pub const EVENTS_JSON_BUFFER_BYTES: usize = 32 * 1024;
+/// Non-ok agent runs (newest 300, ~200 B each) for /api/v1/agent-runs filters.
+pub const AGENT_PROBLEMS_BUFFER_BYTES: usize = 65536;
+pub const AGENT_PROBLEMS_LIMIT: i64 = 300;
+/// Bucketed long-horizon equity (≈340 rows × ≤330 B, see EquityRepo.listLongJson).
+pub const EQUITY_LONG_BUFFER_BYTES: usize = 131072;
+const AGENT_PROBLEMS_REFRESH_MS: i64 = 30 * std.time.ms_per_s;
+const EQUITY_LONG_REFRESH_MS: i64 = 15 * std.time.ms_per_min;
 
 pub const WebState = struct {
     /// Seqlock: odd = write in progress. Writers (core loop and the slow
@@ -47,6 +54,13 @@ pub const WebState = struct {
     /// row sizes, with an adaptive fallback for unusually large values.
     equity_buf: [EQUITY_JSON_BUFFER_BYTES]u8 = undefined,
     equity_len: usize = 2,
+    agent_problems_buf: [AGENT_PROBLEMS_BUFFER_BYTES]u8 = undefined,
+    agent_problems_len: usize = 2,
+    equity_long_buf: [EQUITY_LONG_BUFFER_BYTES]u8 = undefined,
+    equity_long_len: usize = 2,
+    /// Core-loop only; throttle the two slow, history-wide queries.
+    agent_problems_refreshed_ms: i64 = 0,
+    equity_long_refreshed_ms: i64 = 0,
     /// Sized for the 40-row feed under typical event payloads; cache rendering
     /// reports truncation and retries at the largest fitting row count.
     events_buf: [EVENTS_JSON_BUFFER_BYTES]u8 = undefined,
@@ -109,6 +123,10 @@ pub const WebState = struct {
         self.agent_runs_len = 2;
         @memcpy(self.equity_buf[0..2], "[]");
         self.equity_len = 2;
+        @memcpy(self.agent_problems_buf[0..2], "[]");
+        self.agent_problems_len = 2;
+        @memcpy(self.equity_long_buf[0..2], "[]");
+        self.equity_long_len = 2;
         @memcpy(self.events_buf[0..2], "[]");
         self.events_len = 2;
         @memcpy(self.shadow_buf[0..2], "{}");
@@ -149,6 +167,8 @@ pub const WebState = struct {
         const Tls = struct {
             var agent: [24576]u8 = undefined;
             var equity: [EQUITY_JSON_BUFFER_BYTES]u8 = undefined;
+            var agent_problems: [AGENT_PROBLEMS_BUFFER_BYTES]u8 = undefined;
+            var equity_long: [EQUITY_LONG_BUFFER_BYTES]u8 = undefined;
             var events: [EVENTS_JSON_BUFFER_BYTES]u8 = undefined;
             var shadow: [512]u8 = undefined;
             var candles: [131072]u8 = undefined;
@@ -167,6 +187,8 @@ pub const WebState = struct {
             var config_hash: [71]u8 = undefined;
             var agent_len: usize = 2;
             var equity_len: usize = 2;
+            var agent_problems_len: usize = 2;
+            var equity_long_len: usize = 2;
             var events_len: usize = 2;
             var shadow_len: usize = 2;
             var candles_len: usize = 2;
@@ -194,6 +216,8 @@ pub const WebState = struct {
             const ready = self.ready;
             const al = self.agent_runs_len;
             const el = self.equity_len;
+            const apl = self.agent_problems_len;
+            const ell = self.equity_long_len;
             const vl = self.events_len;
             const sl = self.shadow_len;
             const cl = self.candles_len;
@@ -209,12 +233,14 @@ pub const WebState = struct {
             const stl = self.statistics_len;
             const il = self.intel_len;
             const sel = self.sentiment_len;
-            if (al > Tls.agent.len or el > Tls.equity.len or vl > Tls.events.len or sl > Tls.shadow.len or cl > Tls.candles.len or ml > Tls.memories.len or yl > Tls.system.len or dl > Tls.decisions.len or ol > Tls.orders.len or rl > Tls.review_chats.len or rcl > Tls.review_ctx.len or aul > Tls.audit.len or pdl > Tls.periodic.len or anl > Tls.analytics.len or stl > Tls.statistics.len or il > Tls.intel.len or sel > Tls.sentiment.len) {
+            if (al > Tls.agent.len or el > Tls.equity.len or apl > Tls.agent_problems.len or ell > Tls.equity_long.len or vl > Tls.events.len or sl > Tls.shadow.len or cl > Tls.candles.len or ml > Tls.memories.len or yl > Tls.system.len or dl > Tls.decisions.len or ol > Tls.orders.len or rl > Tls.review_chats.len or rcl > Tls.review_ctx.len or aul > Tls.audit.len or pdl > Tls.periodic.len or anl > Tls.analytics.len or stl > Tls.statistics.len or il > Tls.intel.len or sel > Tls.sentiment.len) {
                 std.atomic.spinLoopHint();
                 continue;
             }
             @memcpy(Tls.agent[0..al], self.agent_runs_buf[0..al]);
             @memcpy(Tls.equity[0..el], self.equity_buf[0..el]);
+            @memcpy(Tls.agent_problems[0..apl], self.agent_problems_buf[0..apl]);
+            @memcpy(Tls.equity_long[0..ell], self.equity_long_buf[0..ell]);
             @memcpy(Tls.events[0..vl], self.events_buf[0..vl]);
             @memcpy(Tls.shadow[0..sl], self.shadow_buf[0..sl]);
             @memcpy(Tls.candles[0..cl], self.candles_buf[0..cl]);
@@ -233,6 +259,8 @@ pub const WebState = struct {
             @memcpy(Tls.config_hash[0..], self.config_hash[0..]);
             Tls.agent_len = al;
             Tls.equity_len = el;
+            Tls.agent_problems_len = apl;
+            Tls.equity_long_len = ell;
             Tls.events_len = vl;
             Tls.shadow_len = sl;
             Tls.candles_len = cl;
@@ -257,6 +285,8 @@ pub const WebState = struct {
                     .config_hash = Tls.config_hash[0..],
                     .agent_runs_json = Tls.agent[0..Tls.agent_len],
                     .equity_json = Tls.equity[0..Tls.equity_len],
+                    .agent_problems_json = Tls.agent_problems[0..Tls.agent_problems_len],
+                    .equity_long_json = Tls.equity_long[0..Tls.equity_long_len],
                     .events_json = Tls.events[0..Tls.events_len],
                     .shadow_json = Tls.shadow[0..Tls.shadow_len],
                     .candles_json = Tls.candles[0..Tls.candles_len],
@@ -304,7 +334,7 @@ pub const WebState = struct {
         self.endWrite();
     }
 
-    pub fn setJson(self: *WebState, comptime which: enum { agent, equity, events, shadow, candles, memories, system, decisions, orders, review, review_ctx, audit, periodic, analytics, statistics, intel, sentiment }, src: []const u8) void {
+    pub fn setJson(self: *WebState, comptime which: enum { agent, agent_problems, equity, equity_long, events, shadow, candles, memories, system, decisions, orders, review, review_ctx, audit, periodic, analytics, statistics, intel, sentiment }, src: []const u8) void {
         self.beginWrite();
         switch (which) {
             .agent => {
@@ -316,6 +346,16 @@ pub const WebState = struct {
                 const n = @min(src.len, self.equity_buf.len);
                 @memcpy(self.equity_buf[0..n], src[0..n]);
                 self.equity_len = n;
+            },
+            .agent_problems => {
+                const n = @min(src.len, self.agent_problems_buf.len);
+                @memcpy(self.agent_problems_buf[0..n], src[0..n]);
+                self.agent_problems_len = n;
+            },
+            .equity_long => {
+                const n = @min(src.len, self.equity_long_buf.len);
+                @memcpy(self.equity_long_buf[0..n], src[0..n]);
+                self.equity_long_len = n;
             },
             .events => {
                 const n = @min(src.len, self.events_buf.len);
@@ -681,6 +721,35 @@ test "event dashboard cache reports byte-budget truncation" {
     try std.testing.expect(json.len <= EVENTS_JSON_BUFFER_BYTES);
 }
 
+/// History-wide blobs (all non-ok agent runs, long equity curve). Throttled:
+/// the underlying scans touch the whole table, unlike the recent-N lists.
+fn refreshSlowHistoryCaches(
+    ws: *WebState,
+    db: *storage.Db,
+    runs: *storage.AgentRunsRepo,
+    equity: *storage.EquityRepo,
+) void {
+    const now = nowMs();
+    if (now - ws.agent_problems_refreshed_ms >= AGENT_PROBLEMS_REFRESH_MS) {
+        ws.agent_problems_refreshed_ms = now;
+        var tmp: [AGENT_PROBLEMS_BUFFER_BYTES]u8 = undefined;
+        if (runs.listProblemsJson(db, &tmp, AGENT_PROBLEMS_LIMIT)) |j| {
+            ws.setJson(.agent_problems, j);
+        } else |err| {
+            std.debug.print("[cache] agent problems render failed: {t}\n", .{err});
+        }
+    }
+    if (now - ws.equity_long_refreshed_ms >= EQUITY_LONG_REFRESH_MS) {
+        ws.equity_long_refreshed_ms = now;
+        var tmp: [EQUITY_LONG_BUFFER_BYTES]u8 = undefined;
+        if (equity.listLongJson(db, &tmp, now)) |j| {
+            ws.setJson(.equity_long, j);
+        } else |err| {
+            std.debug.print("[cache] long equity render failed: {t}\n", .{err});
+        }
+    }
+}
+
 pub fn refreshWebCaches(
     ws: *WebState,
     db: *storage.Db,
@@ -724,6 +793,7 @@ pub fn refreshWebCaches(
             std.debug.print("[dashboard] equity json render failed (buffer/db)\n", .{});
         }
     }
+    refreshSlowHistoryCaches(ws, db, runs, equity);
     if (renderEventJson(events, db, &tmp_events, 40, .events)) |j| {
         ws.setJson(.events, j);
     }

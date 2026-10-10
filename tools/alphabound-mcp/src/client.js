@@ -82,6 +82,27 @@ export function listToolsPublic() {
   }));
 }
 
+/**
+ * Query string for a GET tool from its declared `query` params. Unknown keys are
+ * rejected (never forwarded). ':' stays literal: the daemon compares timestamp
+ * cursors verbatim and does not percent-decode query values.
+ */
+export function buildQuery(tool, args = {}) {
+  const allowed = Object.keys(tool.query || {});
+  const entries = Object.entries(args || {}).filter(([, v]) => v !== undefined && v !== null && v !== "");
+  if (!entries.length) return "";
+  for (const [k] of entries) {
+    if (!allowed.includes(k)) {
+      const err = new Error(`${tool.name}: unknown parameter "${k}"${allowed.length ? ` (allowed: ${allowed.join(", ")})` : " (takes no parameters)"}`);
+      err.code = "bad_param";
+      throw err;
+    }
+  }
+  return `?${entries
+    .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v)).replace(/%3A/gi, ":")}`)
+    .join("&")}`;
+}
+
 export async function callTool(name, args = {}, overrides = {}) {
   const tool = findTool(name);
   if (!tool) {
@@ -89,13 +110,14 @@ export async function callTool(name, args = {}, overrides = {}) {
     err.code = "unknown_tool";
     throw err;
   }
+  const path = tool.method === "POST" ? tool.path : `${tool.path}${buildQuery(tool, args)}`;
   const data =
     tool.method === "POST"
       ? await apiPost(tool.path, args || {}, overrides)
-      : await apiGet(tool.path, overrides);
+      : await apiGet(path, overrides);
   return {
     name: tool.name,
-    path: tool.path,
+    path,
     method: tool.method || "GET",
     base: apiBase(overrides),
     data,
@@ -179,16 +201,56 @@ export const INTEL_ENVELOPE_SCHEMA = {
   },
 };
 
+function inputSchemaFor(tool) {
+  if (tool.inputSchema) return tool.inputSchema;
+  if (tool.query) return { type: "object", properties: tool.query, additionalProperties: false };
+  return undefined;
+}
+
 export const TOOLS = [
   { name: "get_system", description: "Runtime system snapshot (mode, ready, agent stats)", path: "/api/v1/system", method: "GET" },
   { name: "get_state", description: "Portfolio state: equity, cash, btc, risk_mode, drawdown", path: "/api/v1/state", method: "GET" },
   { name: "get_shadow", description: "Buy-and-hold benchmark / alpha comparison", path: "/api/v1/shadow", method: "GET" },
   { name: "list_decisions", description: "Recent agent decisions with thesis/reasoning", path: "/api/v1/decisions", method: "GET" },
   { name: "list_orders", description: "Orders projection and recent fills", path: "/api/v1/orders", method: "GET" },
-  { name: "list_events", description: "Recent structured events", path: "/api/v1/events", method: "GET" },
+  {
+    name: "list_events",
+    description: "Recent structured events (newest ~40; optionally filtered by type / severity)",
+    path: "/api/v1/events",
+    method: "GET",
+    query: {
+      type: { type: "string", description: "Exact event type, e.g. EXEC_GUARDRAIL" },
+      exclude_type: { type: "string", description: "Event type to hide" },
+      severity: { type: "string", description: "INFO | WARN | CRITICAL" },
+    },
+  },
   { name: "list_memories", description: "Agent memory entries", path: "/api/v1/memories", method: "GET" },
-  { name: "list_agent_runs", description: "Agent run summaries", path: "/api/v1/agent-runs", method: "GET" },
-  { name: "query_equity", description: "Equity / HWM time series samples", path: "/api/v1/equity", method: "GET" },
+  {
+    name: "list_agent_runs",
+    description:
+      "Agent run summaries. No params: newest 50 runs. With status / error_class / before / limit: paged history of non-ok runs (newest ~300) with error_class and by_status / by_class counts; follow next_before for the next page. status=ok is answered from the newest 50 only.",
+    path: "/api/v1/agent-runs",
+    method: "GET",
+    query: {
+      status: { type: "string", description: "error | error_llm | invalid_proposal | invalid_output | stale_proposal | running | ok (a family name matches its _* variants)" },
+      error_class: { type: "string", description: "e.g. timeout, api_error, empty_content, http_failed, MalformedJson" },
+      before: { type: "string", description: "Cursor: started_ts (RFC3339) from the previous page's next_before" },
+      limit: { type: "integer", description: "Page size, 1-200 (default 50)" },
+    },
+  },
+  {
+    name: "query_equity",
+    description:
+      "Equity / HWM time series. No params: newest ~240 one-minute samples. window=long: bucketed curve (4h buckets for 14d, daily to ~300d; low/high per bucket), oldest first; from / to take RFC3339 prefixes such as 2026-09-09.",
+    path: "/api/v1/equity",
+    method: "GET",
+    query: {
+      window: { type: "string", enum: ["long"], description: "long = bucketed long-horizon curve" },
+      from: { type: "string", description: "Inclusive lower bound, RFC3339 prefix (long window)" },
+      to: { type: "string", description: "Inclusive upper bound, RFC3339 prefix (long window)" },
+      limit: { type: "integer", description: "Newest N rows of the selection (long window)" },
+    },
+  },
   { name: "get_candles", description: "Cached multi-timeframe BTC candles", path: "/api/v1/candles", method: "GET" },
   { name: "get_sentiment", description: "Fear & Greed daily curve (now/class/points)", path: "/api/v1/sentiment", method: "GET" },
   { name: "get_auth_status", description: "Whether API auth is required and passkey count", path: "/api/v1/auth/status", method: "GET" },
@@ -208,3 +270,5 @@ export const TOOLS = [
     inputSchema: INTEL_ENVELOPE_SCHEMA,
   },
 ];
+
+export { inputSchemaFor };

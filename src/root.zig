@@ -7,6 +7,7 @@ pub const risk_equity = @import("risk/equity.zig");
 pub const risk_state = @import("risk/state_machine.zig");
 pub const admission = @import("risk/admission.zig");
 pub const gate = @import("risk/gate.zig");
+pub const guardrails = @import("risk/guardrails.zig");
 pub const orders = @import("execution/orders.zig");
 pub const planner = @import("execution/planner.zig");
 pub const okx_trade = @import("execution/okx_trade.zig");

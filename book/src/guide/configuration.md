@@ -88,6 +88,13 @@ timeout_ms = 180000            # 复盘 LLM 超时，默认 180000，最小 3000
 | `slippage_rate` | decimal | `0.0005` | 退出滑点缓冲 |
 | `initial_capital` | decimal | `100` | shadow 模拟账户起始 USDT；须 `> 0` |
 | `min_trade_notional` | decimal | `0` | 每笔最低名义金额（USDT）。只**抬高**交易所 `min_notional`，不降低。低于此值的再平衡会 `plan_hold`；`0` = 仅用交易所下限 |
+| `guard_min_trade_equity_frac` | decimal | `0.05` | 收紧型护栏：自主决策的最小调仓名义额 = 权益 × 该比例（与 `min_trade_notional` 取大）。清仓与回撤 ≥ `guard_sell_exempt_drawdown` 的卖出只受绝对下限约束 |
+| `guard_daily_trade_cap` | u32 | `6` | 滚动 24h 内 agent 自主成交上限；`0` = 关 |
+| `guard_reverse_cooldown_ms` | int | `14400000` | 与上一笔方向相反的交易至少间隔多久；`0` = 关 |
+| `guard_macro_sell_trend_break` | bool | `false` | 宏观/新闻论点驱动的卖出，须最近已收盘日线低于 50D 均线；日线不足 50 根时拒绝（fail-closed）。回放中以更高回撤换收益，故默认关 |
+| `guard_sell_exempt_drawdown` | decimal | `0.01` | 账户低于 HWM 达到该比例后，卖出不再被冷却/日上限/宏观门拖慢 |
+
+> `guard_*` 只能**否决**（HOLD），不会放宽 HWM 回撤底线、退出预留或任何 fail-closed 检查；强制退出与 operator 通道豁免。缺省即生效，**无需写进生产配置**（旧二进制不认识这些键，写入会破坏回滚）。回测见 [BACKTEST.md](https://github.com/talkincode/alphabound/blob/main/docs/BACKTEST.md)。
 
 > 改 `max_drawdown` / 费率类参数 = **版本发布 + 人工确认**，不是运行中调参。
 
