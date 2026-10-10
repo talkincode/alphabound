@@ -126,6 +126,20 @@
 | AC-EX12 | 多连接写库不得因遗留的读语句固定快照而 `SQLITE_BUSY`(E2E 发现并修复) | Integration | P3 | ☑ `KvRepo.getChecked` 与 `applyCumulative` 读后复位;`a connection that read the kv store can still write …` |
 | AC-EX13 | 独立评审发现项:① 非本进程挂单(含无 clOrdId)只关闭**新增风险**(`foreign_pending`),**不得**阻断只减仓退出;cancel-all 对无 clOrdId 订单按 `ordId` 撤销并以场馆重新列表核验;② 下单回包中超时类/未识别 `sCode`(如 50004/50013/51149)视为 UNKNOWN 而非拒绝;③ 单次账本写失败导致的 `ledger_ok=false` 在后续成功写或恢复通过后自愈;④ cancel-all 之后执行 lane 重新对账,解除“恢复未完成”对 agent 的封锁 | Unit + Integration + E2E | P3 | ☑ `state.zig` `foreign_pending`;`risk/gate.zig` `exitView` 仅看本地账本;`rest.zig` `definitiveRejectionCode`/`parsePendingUnnamedOrdIds`;`demo_runner.zig` `recoverOrders`/`cancelAllVerified`;`exec_lane.zig` `runRecovery`;测试 `review: …`×5、`classifyPlaceResponse never turns a timeout-class sCode …`;E2E `foreign_order_exit` |
 
+## J. 策略迭代第一轮:回测、护栏与可观测性
+
+> 设计/结果见 [BACKTEST.md](BACKTEST.md)。护栏只收紧:HWM×0.9 回撤底线、退出预留、fail-closed 检查均未改动。
+
+| ID | 验收标准 | 验证方法 | 阶段 | 状态 |
+|---|---|---|---|---|
+| AC-ST1 | 离线回测确定性(同输入同输出),走生产准入 + 护栏 + 模拟成交(0.1% taker),输出收益 vs 持有/回撤/交易数/手续费/反复买卖 | Unit + 真实数据回放 | P3 | ☑ `zig build backtest`;`src/backtest.zig` 单测 |
+| AC-ST2 | 最小交易额 / 日上限 / 反向冷却只可否决(=HOLD),强制退出与 operator 通道豁免,不改 Risk Kernel 裁决 | Unit + 回测 | P3 | ☑ `src/risk/guardrails.zig` |
+| AC-ST3 | 宏观新闻驱动的卖出须日线收于 50D 下(opt-in,默认关) | Unit + 回测 | P3 | ◐ 已实现;回测显示以更高回撤换收益,故未默认开启 |
+| AC-ST4 | HOLD 时按实际持仓压测并告警(`HELD_EXPOSURE_ALERT`),仅告警不改执行 | Unit + Integration | P3 | ☑ `heldAlert` + `logHeldExposure` |
+| AC-ST5 | 重复下单回归:余额推送滞后时已确认成交不得再多开一腿 | Integration | P3 | ☑ `okx_trade.zig` "stale balance feed … triple-submit regression" |
+| AC-ST6 | agent-runs 可按状态/错误类分页,权益可查 300 天 | Unit + Integration | P3 | ☑ `/api/v1/agent-runs`、`/api/v1/equity?window=long`、MCP `--query` |
+| AC-ST7 | 临时记忆(`E_run_*`/`R_run_*`/`PR_short_*`/`PR_long_*`)超 14 天只从索引剔除,不碰策略/受保护/人工反思;启动加载同样跳过 | Unit | P3 | ☑ `Store.pruneExpiredEphemeral`、`MEMORY_PRUNED` 事件 |
+
 ## H. 阶段闸门汇总
 
 | 闸门 | 必须全绿的条目 |

@@ -143,4 +143,19 @@ pub fn build(b: *std.Build) void {
     const replay_tests = b.addTest(.{ .root_module = replay.root_module });
     const replay_test_run = b.addRunArtifact(replay_tests);
     test_step.dependOn(&replay_test_run.step);
+
+    const backtest = b.addExecutable(.{
+        .name = "alphabound-backtest",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/backtest.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const backtest_run = b.addRunArtifact(backtest);
+    if (b.args) |args| backtest_run.addArgs(args);
+    b.step("backtest", "Deterministic offline backtest: candles + decisions through risk, guardrails and simulated execution").dependOn(&backtest_run.step);
+    const backtest_tests = b.addTest(.{ .root_module = backtest.root_module });
+    const backtest_test_run = b.addRunArtifact(backtest_tests);
+    test_step.dependOn(&backtest_test_run.step);
 }

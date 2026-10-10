@@ -108,8 +108,8 @@ open http://127.0.0.1:18180/
 |---|---|
 | `GET /api/v1/state` | 组合快照：`risk_mode`、现金/BTC、bid、净值/HWM/DD、version、`config_hash`… |
 | `GET /api/v1/events` | 最近事件 JSON 数组 |
-| `GET /api/v1/agent-runs` | 最近 agent_runs（newest first） |
-| `GET /api/v1/equity` | 最近 equity_samples |
+| `GET /api/v1/agent-runs` | 最近 agent_runs（newest first）。带 `status`（`error` 匹配 `error_*` 家族）、`error_class`（`api_error`/`empty_content`/`http_failed`/`timeout`/…）、`before`（游标=上一页 `next_before`）或 `limit`（1–200）时返回 `{source,total_matching,by_status,by_class,items,returned,next_before}`，可翻到最近 300 条非 ok 记录；`status=ok` 只覆盖最近 50 条 |
+| `GET /api/v1/equity` | 最近 equity_samples。`window=long`：1m 样本分桶（近 14 天 4h 桶、更早按日桶，覆盖约 300 天，oldest first），可用 `from` / `to`（RFC3339 前缀，如 `2026-09-09`；`:` 不要百分号编码）与 `limit`（取最新 N 条）过滤 |
 | `GET /api/v1/shadow` | 实盘净值 vs 同起点 buy-and-hold |
 | `GET /api/v1/candles` | 多周期 K 线缓存 `bars.{1m,5m,15m,1H,4H,1D}` |
 | `GET /api/v1/memories` | 最新版本记忆 |

@@ -1749,7 +1749,25 @@ const ThinkLane = struct {
         restorePeriodicSchedule(&periodic_repo, &db, &review_sched);
         self.status.setReviewDueAt(review_sched.nextAt(.short), review_sched.nextAt(.long));
 
+        var last_memory_prune_ms: i64 = 0;
         while (!self.stop.load(.acquire)) {
+            // Index-only retention for per-run memory copies (durable rows stay).
+            const prune_now = nowMs();
+            if (prune_now - last_memory_prune_ms >= std.time.ms_per_hour) {
+                last_memory_prune_ms = prune_now;
+                const before = self.mem_store.count();
+                const pruned = self.mem_store.pruneExpiredEphemeral(prune_now, ab.memory.EPHEMERAL_RETENTION_MS);
+                if (pruned > 0) {
+                    self.mem_count.store(self.mem_store.count(), .release);
+                    var pbuf: [160]u8 = undefined;
+                    const payload = std.fmt.bufPrint(
+                        &pbuf,
+                        "{{\"pruned\":{d},\"index_before\":{d},\"index_after\":{d},\"capacity\":{d},\"retention_days\":{d}}}",
+                        .{ pruned, before, self.mem_store.count(), ab.memory.MAX_MEMORIES, @divTrunc(ab.memory.EPHEMERAL_RETENTION_MS, 24 * std.time.ms_per_hour) },
+                    ) catch "{\"pruned\":0}";
+                    logEventPayload(&events_repo, self.engine, "MEMORY_PRUNED", "memory", "INFO", cfg, payload);
+                }
+            }
             if (self.jobs.pop()) |job| {
                 self.busy.store(true, .release);
                 defer self.busy.store(false, .release);
@@ -2478,6 +2496,7 @@ fn collectMarketTools(
     tools_repo: *ab.storage.ToolCallsRepo,
     obs_bufs: *[5][32768]u8,
     obs_out: *[5][]const u8,
+    trend_out: *ab.guardrails.Trend,
 ) usize {
     var n: usize = 0;
 
@@ -2596,6 +2615,7 @@ fn collectMarketTools(
         frames_n = valid_frames;
         // The long series shares the 1D frame's freshness verdict.
         if (daily_n == 0) daily_long_n = 0;
+        trend_out.* = ab.indicators.dailyTrend(daily_long[0..daily_long_n]);
         var struct_buf: [6144]u8 = undefined;
         const structure = if (daily_n > 0 or h4_n > 0)
             ab.indicators.formatHtfStructureWithLong(
@@ -2938,6 +2958,82 @@ fn computeIndicatorObservation(
     return ab.market_tools.formatObservation(obs_buf[0..obs_buf.len], spec.name, rec, result.data_json) catch null;
 }
 
+/// Tighten-only veto of a voluntary agent rebalance (risk/guardrails.zig).
+/// Runs after Risk Kernel admission and never alters its verdict: a veto simply
+/// executes as HOLD. Forced exits (non-NORMAL risk mode, or a standing book that
+/// already fails the stress boundary) are exempt, and operator orders do not pass
+/// through here. If the trade history is unreadable the guard stays out of the
+/// way rather than inventing a block (the kernel and ledger gates still apply).
+fn agentGuardrailBlocks(
+    events_repo: *ab.storage.EventsRepo,
+    engine: *ab.state.Engine,
+    cfg: *const ab.config.Config,
+    db: *ab.storage.Db,
+    snap: ab.state.PortfolioState,
+    admitted: ab.gate.ShadowAdmission,
+    requested_weight: ab.decimal.Decimal,
+    thesis: []const []const u8,
+    trend: ab.guardrails.Trend,
+    now_ms: i64,
+) bool {
+    const approved = std.mem.eql(u8, admitted.verdict_txt, "APPROVE") or std.mem.eql(u8, admitted.verdict_txt, "REDUCE");
+    if (!approved) return false;
+    const held = ab.admission.heldExposure(
+        ab.gate.admissionView(snap, now_ms),
+        cfg.max_drawdown,
+        ab.gate.defaultStressParams(cfg),
+    ) catch return false;
+
+    var recent = ab.guardrails.Recent{};
+    var since_buf: [40]u8 = undefined;
+    if (ab.clock.formatRfc3339Ms(now_ms - ab.guardrails.day_ms, &since_buf)) |since| {
+        if (ab.storage.OrdersRepo.recentTradeActivity(db, since)) |act| {
+            recent.decisions_24h = act.agent_decisions;
+            const side = act.last_side.get();
+            if (side.len > 0) {
+                recent.last_side = if (std.mem.eql(u8, side, "buy")) .buy else .sell;
+                recent.last_ms = ab.clock.parseRfc3339Ms(act.last_ts.get()) catch 0;
+            }
+        } else |err| {
+            std.debug.print("[guardrail] trade history unavailable ({t}); not gating\n", .{err});
+        }
+    } else |_| {}
+
+    const verdict = ab.guardrails.evaluate(cfg.guardParams(), .{
+        .now_ms = now_ms,
+        .equity = snap.conservative_equity,
+        .drawdown = snap.drawdown,
+        .current_weight = held.weight,
+        .target_weight = admitted.admitted_weight,
+        .macro_driven = ab.guardrails.isMacroDriven(thesis),
+        .trend = trend,
+        .recent = recent,
+        .exempt = snap.risk_mode != .normal or held.breaches,
+    });
+    if (verdict == .allow) return false;
+
+    var cur_buf: [48]u8 = undefined;
+    var tgt_buf: [48]u8 = undefined;
+    var req_buf: [48]u8 = undefined;
+    var payload_buf: [384]u8 = undefined;
+    const payload = std.fmt.bufPrint(
+        &payload_buf,
+        "{{\"reason\":\"{s}\",\"current_weight\":\"{s}\",\"admitted_weight\":\"{s}\",\"requested_weight\":\"{s}\",\"agent_decisions_24h\":{d},\"trend_known\":{},\"trend_broken\":{}}}",
+        .{
+            verdict.text(),
+            decFmt(&cur_buf, held.weight),
+            decFmt(&tgt_buf, admitted.admitted_weight),
+            decFmt(&req_buf, requested_weight),
+            recent.decisions_24h,
+            trend.known,
+            trend.broken(),
+        },
+    ) catch "{\"reason\":\"guardrail\"}";
+    logEventPayload(events_repo, engine, "EXEC_GUARDRAIL", "execution", "INFO", cfg, payload);
+    std.debug.print("[guardrail] voluntary trade vetoed → HOLD ({s})\n", .{verdict.text()});
+    return true;
+}
+
 /// Record what a HOLD is actually holding.
 ///
 /// The admission that precedes this stressed `target_btc_weight`, which is 0 for
@@ -2964,25 +3060,33 @@ fn logHeldExposure(
         return;
     };
 
+    const alert = ab.guardrails.heldAlert(held.headroom, snap.conservative_equity);
     var w_buf: [48]u8 = undefined;
     var s_buf: [48]u8 = undefined;
     var f_buf: [48]u8 = undefined;
     var h_buf: [48]u8 = undefined;
-    var payload_buf: [320]u8 = undefined;
+    var payload_buf: [360]u8 = undefined;
     const payload = std.fmt.bufPrint(
         &payload_buf,
-        "{{\"reason\":\"action_hold\",\"held_btc_weight\":\"{s}\",\"held_stress_equity\":\"{s}\",\"floor\":\"{s}\",\"headroom\":\"{s}\",\"breaches\":{}}}",
+        "{{\"reason\":\"action_hold\",\"held_btc_weight\":\"{s}\",\"held_stress_equity\":\"{s}\",\"floor\":\"{s}\",\"headroom\":\"{s}\",\"breaches\":{},\"alert\":\"{s}\"}}",
         .{
             decFmt(&w_buf, held.weight),
             decFmt(&s_buf, held.stress_equity),
             decFmt(&f_buf, held.floor),
             decFmt(&h_buf, held.headroom),
             held.breaches,
+            alert.text(),
         },
     ) catch "{\"reason\":\"action_hold\"}";
 
-    const severity: []const u8 = if (held.breaches) "WARN" else "INFO";
+    const severity: []const u8 = if (alert != .ok) "WARN" else "INFO";
     logEventPayload(events_repo, engine, "EXEC_HOLD", "execution", severity, cfg, payload);
+    // A standing position that fails (or nearly fails) the shock test must be
+    // visible without scanning every HOLD row: dedicated, filterable event.
+    if (alert != .ok) {
+        logEventPayload(events_repo, engine, "HELD_EXPOSURE_ALERT", "risk", "WARN", cfg, payload);
+        std.debug.print("[risk] HOLD with {s} on the standing position (weight={s} headroom={s})\n", .{ alert.text(), decFmt(&w_buf, held.weight), decFmt(&h_buf, held.headroom) });
+    }
 }
 
 /// `{"verdict":"...","reason":"..."}` with the reason UTF-8-safely capped.
@@ -3292,7 +3396,8 @@ fn runAgentDecision(
 
     var obs_bufs: [5][32768]u8 = undefined;
     var obs_ptrs: [5][]const u8 = .{ "", "", "", "", "" };
-    const obs_n = collectMarketTools(gpa, okx, cfg, registry, run_id, tools_repo, &obs_bufs, &obs_ptrs);
+    var daily_trend: ab.guardrails.Trend = .{};
+    const obs_n = collectMarketTools(gpa, okx, cfg, registry, run_id, tools_repo, &obs_bufs, &obs_ptrs, &daily_trend);
     const observations = obs_ptrs[0..obs_n];
 
     // Retrieve long-term memories into the decision envelope (§4.5 / FR-07).
@@ -3756,6 +3861,11 @@ fn runAgentDecision(
         exec_note = "restart_guard";
         logEventPayload(events_repo, engine, "EXEC_HOLD", "execution", "WARN", cfg, "{\"reason\":\"restart_guard\",\"detail\":\"first decision after restart with a recent prior decision; rebalance deferred to next cycle\"}");
         std.debug.print("[agent] restart guard: REBALANCE deferred (first_run, prior decision <{d}m ago)\n", .{@divTrunc(restart_guard_window_ms, 60_000)});
+    } else if (ab.okx_trade.executionAllowed(cfg.mode.isTrading(), exec_venue_authorized) and
+        agentGuardrailBlocks(events_repo, engine, cfg, db, admit_snap, admission, prop.target_btc_weight, prop.thesis, daily_trend, admit_now))
+    {
+        exec_note = "guardrail_block";
+        applyReviewAfterBackoff(fb, prop.review_after, "guardrail");
     } else if (ab.okx_trade.executionAllowed(cfg.mode.isTrading(), exec_venue_authorized)) {
         // Orders are worked on the execution lane: this lane waits, the risk
         // loop does not. The lane admits again on its own fresh snapshot.
@@ -3815,6 +3925,7 @@ fn runAgentDecision(
     const noop_outcome = prop.action == .hold or
         std.mem.eql(u8, exec_note, "plan_hold") or
         std.mem.eql(u8, exec_note, "restart_guard") or
+        std.mem.eql(u8, exec_note, "guardrail_block") or
         std.mem.eql(u8, exec_note, "skipped_reject");
     fb.noteOutcome(!noop_outcome);
     std.debug.print(
@@ -3938,6 +4049,7 @@ fn completeRun(
 
 const MemLoadCtx = struct {
     store: *ab.memory.Store,
+    now_ms: i64,
 };
 
 fn loadMemCb(ctx: *anyopaque, row: ab.storage.MemoryRow) void {
@@ -3948,6 +4060,9 @@ fn loadMemCb(ctx: *anyopaque, row: ab.storage.MemoryRow) void {
     const conf_s = std.fmt.bufPrint(&conf_buf, "{d:.6}", .{row.confidence}) catch "0";
     const conf = ab.decimal.Decimal.parse(conf_s) catch ab.decimal.Decimal.zero;
     const created = ab.clock.parseRfc3339Ms(row.created_ts) catch 0;
+    // Rows come newest-first; skipping expired run copies keeps their slots
+    // for older durable reflections instead of silently truncating those.
+    if (ab.memory.isExpiredEphemeral(row.memory_id, created, self.now_ms, ab.memory.EPHEMERAL_RETENTION_MS)) return;
     self.store.load(.{
         .memory_id = row.memory_id,
         .version = @intCast(@max(row.version, 1)),
@@ -3961,7 +4076,7 @@ fn loadMemCb(ctx: *anyopaque, row: ab.storage.MemoryRow) void {
 }
 
 fn loadMemoriesFromDb(repo: *ab.storage.MemoriesRepo, db: *ab.storage.Db, store: *ab.memory.Store) void {
-    var ctx = MemLoadCtx{ .store = store };
+    var ctx = MemLoadCtx{ .store = store, .now_ms = nowMs() };
     repo.forEachLatest(db, &ctx, loadMemCb) catch |err| {
         std.debug.print("[boot] memories load failed: {t}\n", .{err});
     };

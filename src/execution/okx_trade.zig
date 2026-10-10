@@ -201,6 +201,37 @@ test "executionAllowed is trading-mode+authorized-venue only" {
     try testing.expect(!executionAllowed(false, false));
 }
 
+test "stale balance feed after a confirmed fill never earns another leg (triple-submit regression)" {
+    // Incident shape: one operator decision placed legs 0, 1 and 2 about two
+    // seconds apart because the post-fill balance refresh returned the stale,
+    // unchanged book, so the planner re-derived the same delta each time.
+    // Replanning is allowed only when the venue book moved in the trade
+    // direction; otherwise the runner projects the verified fill once and stops.
+    const pre = d("0.00007837");
+    var submitted: u16 = 0;
+    var leg: u16 = 0;
+    while (true) : (leg += 1) {
+        submitted += 1;
+        const stale_book_after_fill = pre; // refresh did not reflect the fill
+        if (!bookMoved(.buy, pre, stale_book_after_fill)) break;
+        if (!canPlaceAnotherLeg(leg)) break;
+    }
+    try testing.expectEqual(@as(u16, 1), submitted);
+
+    // A healthy feed lets the plan continue, but never past the leg cap.
+    var healthy: u16 = 0;
+    var book = pre;
+    leg = 0;
+    while (true) : (leg += 1) {
+        healthy += 1;
+        const after = try book.add(d("0.00007837"));
+        try testing.expect(bookMoved(.buy, book, after));
+        book = after;
+        if (!canPlaceAnotherLeg(leg)) break;
+    }
+    try testing.expectEqual(max_replan_legs, healthy);
+}
+
 test "residual plan policy and leg cap" {
     try testing.expect(wantsResidualPlan("partial"));
     try testing.expect(wantsResidualPlan("filled"));

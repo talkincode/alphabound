@@ -113,10 +113,10 @@ Clients must still present `ALPHABOUND_API_TOKEN` to the **daemon**; the MCP pro
 | `get_shadow` | `GET /api/v1/shadow` | |
 | `list_decisions` | `GET /api/v1/decisions` | |
 | `list_orders` | `GET /api/v1/orders` | |
-| `list_events` | `GET /api/v1/events` | |
+| `list_events` | `GET /api/v1/events` | optional `type`, `exclude_type`, `severity` |
 | `list_memories` | `GET /api/v1/memories` | |
-| `list_agent_runs` | `GET /api/v1/agent-runs` | |
-| `query_equity` | `GET /api/v1/equity` | |
+| `list_agent_runs` | `GET /api/v1/agent-runs` | optional `status`, `error_class`, `before`, `limit`: paged non-ok history with error classes (`--query "status=error&limit=20"`) |
+| `query_equity` | `GET /api/v1/equity` | `window=long` (+ `from`, `to`, `limit`): bucketed curve, 4h for 14d then daily to ~300d |
 | `get_candles` | `GET /api/v1/candles` | |
 | `get_sentiment` | `GET /api/v1/sentiment` | Fear & Greed daily curve |
 | `get_auth_status` | `GET /api/v1/auth/status` | |

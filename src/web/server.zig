@@ -55,7 +55,11 @@ pub const Context = struct {
     recent_events: []const []const u8 = &.{},
     /// Pre-rendered JSON arrays/objects filled by the core loop (no DB on web thread).
     agent_runs_json: []const u8 = "[]",
+    /// Newest non-ok agent runs with `error_class` (filterable history).
+    agent_problems_json: []const u8 = "[]",
     equity_json: []const u8 = "[]",
+    /// Bucketed long-horizon equity curve, oldest first (4h ≤14d, daily older).
+    equity_long_json: []const u8 = "[]",
     shadow_json: []const u8 = "{}",
     events_json: []const u8 = "[]",
     candles_json: []const u8 = "[]",
@@ -274,8 +278,19 @@ pub fn handleReq(buf: []u8, req: RequestInfo, ctx: Context) Response {
         if (ctx.recent_events.len > 0) return renderEvents(buf, ctx);
         return copyBody(buf, ctx.events_json);
     }
-    if (std.mem.eql(u8, path, "/api/v1/agent-runs")) return copyBody(buf, ctx.agent_runs_json);
-    if (std.mem.eql(u8, path, "/api/v1/equity")) return copyBody(buf, ctx.equity_json);
+    if (std.mem.eql(u8, path, "/api/v1/agent-runs")) {
+        const q = RunsQuery.fromTarget(req.target);
+        if (!q.active()) return copyBody(buf, ctx.agent_runs_json);
+        // `status=ok` lives only in the recent-50 blob; everything else is in
+        // the non-ok history blob.
+        const ok_only = if (q.status) |st| std.ascii.eqlIgnoreCase(st, "ok") else false;
+        return filterAgentRuns(buf, if (ok_only) ctx.agent_runs_json else ctx.agent_problems_json, if (ok_only) "recent" else "problems", q);
+    }
+    if (std.mem.eql(u8, path, "/api/v1/equity")) {
+        const q = EquityQuery.fromTarget(req.target);
+        if (!q.active()) return copyBody(buf, ctx.equity_json);
+        return filterEquityLong(buf, ctx.equity_long_json, q);
+    }
     if (std.mem.eql(u8, path, "/api/v1/shadow")) return copyBody(buf, ctx.shadow_json);
     if (std.mem.eql(u8, path, "/api/v1/candles")) return copyBody(buf, ctx.candles_json);
     if (std.mem.eql(u8, path, "/api/v1/memories")) return copyBody(buf, ctx.memories_json);
@@ -882,6 +897,264 @@ fn filterEventsJson(buf: []u8, src: []const u8, filter: EventFilter) Response {
     return .{ .status = .internal_server_error, .body = "{\"error\":\"render\"}" };
 }
 
+/// Iterates the top-level objects of a pre-rendered JSON array
+/// (string/escape-aware, like `filterEventsJson`).
+const ArrayObjIter = struct {
+    src: []const u8,
+    i: usize = 0,
+    depth: i32 = 0,
+    in_str: bool = false,
+    escaped: bool = false,
+    obj_start: ?usize = null,
+
+    fn next(self: *ArrayObjIter) ?[]const u8 {
+        while (self.i < self.src.len) : (self.i += 1) {
+            const ch = self.src[self.i];
+            if (self.in_str) {
+                if (self.escaped) {
+                    self.escaped = false;
+                } else if (ch == '\\') {
+                    self.escaped = true;
+                } else if (ch == '"') {
+                    self.in_str = false;
+                }
+                continue;
+            }
+            switch (ch) {
+                '"' => self.in_str = true,
+                '{' => {
+                    if (self.depth == 1 and self.obj_start == null) self.obj_start = self.i;
+                    self.depth += 1;
+                },
+                '[' => self.depth += 1,
+                '}', ']' => {
+                    self.depth -= 1;
+                    if (self.depth == 1) {
+                        if (self.obj_start) |st| {
+                            self.obj_start = null;
+                            self.i += 1;
+                            return self.src[st..self.i];
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+        return null;
+    }
+};
+
+fn queryParam(target: []const u8, key: []const u8) ?[]const u8 {
+    const qpos = std.mem.indexOfScalar(u8, target, '?') orelse return null;
+    var it = std.mem.splitScalar(u8, target[qpos + 1 ..], '&');
+    while (it.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        if (!std.mem.eql(u8, pair[0..eq], key)) continue;
+        const val = pair[eq + 1 ..];
+        if (val.len == 0 or val.len > 64) return null;
+        return val;
+    }
+    return null;
+}
+
+const runs_page_default: usize = 50;
+const runs_page_max: usize = 200;
+
+/// /api/v1/agent-runs filters: ?status= (exact, or family prefix `error` →
+/// `error_*`), ?error_class=, ?before=<started_ts cursor>, ?limit=.
+const RunsQuery = struct {
+    status: ?[]const u8 = null,
+    error_class: ?[]const u8 = null,
+    before: ?[]const u8 = null,
+    limit: usize = runs_page_default,
+    paged: bool = false,
+
+    fn active(self: RunsQuery) bool {
+        return self.status != null or self.error_class != null or self.before != null or self.paged;
+    }
+
+    fn fromTarget(target: []const u8) RunsQuery {
+        var q = RunsQuery{
+            .status = queryParam(target, "status"),
+            .error_class = queryParam(target, "error_class"),
+            .before = queryParam(target, "before"),
+        };
+        if (queryParam(target, "limit")) |raw| {
+            if (std.fmt.parseInt(usize, raw, 10)) |n| {
+                q.limit = std.math.clamp(n, 1, runs_page_max);
+                q.paged = true;
+            } else |_| {}
+        }
+        return q;
+    }
+
+    fn matches(self: RunsQuery, obj: []const u8) bool {
+        if (self.status) |want| {
+            const got = topLevelString(obj, "status") orelse return false;
+            const exact = std.ascii.eqlIgnoreCase(got, want);
+            const family = got.len > want.len and got[want.len] == '_' and std.ascii.eqlIgnoreCase(got[0..want.len], want);
+            if (!exact and !family) return false;
+        }
+        if (self.error_class) |want| {
+            const got = topLevelString(obj, "error_class") orelse return false;
+            if (!std.ascii.eqlIgnoreCase(got, want)) return false;
+        }
+        return true;
+    }
+};
+
+/// Tiny fixed-capacity string→count tally for the by_status / by_class summaries.
+const Tally = struct {
+    const cap = 16;
+    keys: [cap][]const u8 = undefined,
+    counts: [cap]usize = @splat(0),
+    n: usize = 0,
+    other: usize = 0,
+
+    fn add(self: *Tally, key: []const u8) void {
+        for (self.keys[0..self.n], 0..) |k, i| {
+            if (std.mem.eql(u8, k, key)) {
+                self.counts[i] += 1;
+                return;
+            }
+        }
+        if (self.n < cap) {
+            self.keys[self.n] = key;
+            self.counts[self.n] = 1;
+            self.n += 1;
+        } else self.other += 1;
+    }
+
+    fn write(self: *const Tally, w: *std.Io.Writer) error{WriteFailed}!void {
+        try w.writeAll("{");
+        for (self.keys[0..self.n], 0..) |k, i| {
+            if (i > 0) try w.writeAll(",");
+            try w.print("\"{s}\":{d}", .{ k, self.counts[i] });
+        }
+        if (self.other > 0) {
+            if (self.n > 0) try w.writeAll(",");
+            try w.print("\"_other\":{d}", .{self.other});
+        }
+        try w.writeAll("}");
+    }
+};
+
+/// Page the pre-rendered agent-run history through the query. Items are newest
+/// first; `next_before` is the cursor for the next page (null when exhausted).
+/// Counts cover every matching row regardless of `before`/`limit`.
+fn filterAgentRuns(buf: []u8, src: []const u8, source: []const u8, q: RunsQuery) Response {
+    var by_status = Tally{};
+    var by_class = Tally{};
+    var total: usize = 0;
+    var it = ArrayObjIter{ .src = src };
+    while (it.next()) |obj| {
+        if (!q.matches(obj)) continue;
+        total += 1;
+        by_status.add(topLevelString(obj, "status") orelse "");
+        if (topLevelString(obj, "error_class")) |c| by_class.add(c);
+    }
+
+    var w: std.Io.Writer = .fixed(buf);
+    render: {
+        w.print("{{\"source\":\"{s}\",\"total_matching\":{d},\"by_status\":", .{ source, total }) catch break :render;
+        by_status.write(&w) catch break :render;
+        w.writeAll(",\"by_class\":") catch break :render;
+        by_class.write(&w) catch break :render;
+        w.writeAll(",\"items\":[") catch break :render;
+
+        var returned: usize = 0;
+        var last_ts: []const u8 = "";
+        var more = false;
+        var it2 = ArrayObjIter{ .src = src };
+        while (it2.next()) |obj| {
+            if (!q.matches(obj)) continue;
+            const ts = topLevelString(obj, "started_ts") orelse "";
+            if (q.before) |b| {
+                if (std.mem.order(u8, ts, b) != .lt) continue;
+            }
+            if (returned >= q.limit) {
+                more = true;
+                break;
+            }
+            if (returned > 0) w.writeAll(",") catch break :render;
+            w.writeAll(obj) catch break :render;
+            returned += 1;
+            last_ts = ts;
+        }
+        w.print("],\"returned\":{d},\"next_before\":", .{returned}) catch break :render;
+        if (more) {
+            w.print("\"{s}\"", .{last_ts}) catch break :render;
+        } else {
+            w.writeAll("null") catch break :render;
+        }
+        w.writeAll("}") catch break :render;
+        return .{ .status = .ok, .body = w.buffered() };
+    }
+    return .{ .status = .internal_server_error, .body = "{\"error\":\"render\"}" };
+}
+
+/// /api/v1/equity long-horizon view: ?window=long[&from=<RFC3339 prefix>&to=<prefix>&limit=N].
+/// `from`/`to` are inclusive date(-time) prefixes, e.g. `2026-09-09`.
+const EquityQuery = struct {
+    long: bool = false,
+    from: ?[]const u8 = null,
+    to: ?[]const u8 = null,
+    limit: usize = 0,
+
+    fn active(self: EquityQuery) bool {
+        return self.long or self.from != null or self.to != null or self.limit > 0;
+    }
+
+    fn fromTarget(target: []const u8) EquityQuery {
+        var q = EquityQuery{ .from = queryParam(target, "from"), .to = queryParam(target, "to") };
+        if (queryParam(target, "window")) |wnd| q.long = std.ascii.eqlIgnoreCase(wnd, "long");
+        if (queryParam(target, "limit")) |raw| {
+            q.limit = std.fmt.parseInt(usize, raw, 10) catch 0;
+        }
+        return q;
+    }
+
+    fn inRange(self: EquityQuery, ts: []const u8) bool {
+        if (self.from) |f| {
+            if (std.mem.order(u8, ts[0..@min(ts.len, f.len)], f) == .lt) return false;
+        }
+        if (self.to) |t| {
+            if (std.mem.order(u8, ts[0..@min(ts.len, t.len)], t) == .gt) return false;
+        }
+        return true;
+    }
+};
+
+/// Serve the bucketed long-horizon equity rows (oldest first) within the
+/// requested range; with `limit`, only the newest N matching rows.
+fn filterEquityLong(buf: []u8, src: []const u8, q: EquityQuery) Response {
+    var matched: usize = 0;
+    var it = ArrayObjIter{ .src = src };
+    while (it.next()) |obj| {
+        if (q.inRange(topLevelString(obj, "ts") orelse "")) matched += 1;
+    }
+    const skip = if (q.limit > 0 and matched > q.limit) matched - q.limit else 0;
+
+    var w: std.Io.Writer = .fixed(buf);
+    render: {
+        w.writeAll("[") catch break :render;
+        var seen: usize = 0;
+        var wrote = false;
+        var it2 = ArrayObjIter{ .src = src };
+        while (it2.next()) |obj| {
+            if (!q.inRange(topLevelString(obj, "ts") orelse "")) continue;
+            seen += 1;
+            if (seen <= skip) continue;
+            if (wrote) w.writeAll(",") catch break :render;
+            w.writeAll(obj) catch break :render;
+            wrote = true;
+        }
+        w.writeAll("]") catch break :render;
+        return .{ .status = .ok, .body = w.buffered() };
+    }
+    return .{ .status = .internal_server_error, .body = "{\"error\":\"render\"}" };
+}
+
 /// Copy a pre-rendered JSON blob into the per-request body buffer so the
 /// seqlock snapshot need not remain valid across the full socket write.
 fn copyBody(buf: []u8, src: []const u8) Response {
@@ -1326,6 +1599,82 @@ test "agent-runs equity shadow endpoints serve context blobs" {
     try testing.expectEqualStrings("[{\"id\":\"intel_x\"}]", handle(&buf, .GET, "/api/v1/intel", ctx).body);
     ctx.sentiment_json = "{\"now\":20}";
     try testing.expectEqualStrings("{\"now\":20}", handle(&buf, .GET, "/api/v1/sentiment", ctx).body);
+}
+
+const test_problem_runs =
+    "[{\"run_id\":\"r5\",\"status\":\"error_llm\",\"error_class\":\"timeout\",\"model\":\"m\",\"started_ts\":\"2026-09-05T00:00:00.000Z\",\"finished_ts\":\"\"}," ++
+    "{\"run_id\":\"r4\",\"status\":\"invalid_proposal\",\"error_class\":\"MalformedJson\",\"model\":\"m\",\"started_ts\":\"2026-09-04T00:00:00.000Z\",\"finished_ts\":\"\"}," ++
+    "{\"run_id\":\"r3\",\"status\":\"error_llm\",\"error_class\":\"api_error\",\"model\":\"m\",\"started_ts\":\"2026-09-03T00:00:00.000Z\",\"finished_ts\":\"\"}," ++
+    "{\"run_id\":\"r2\",\"status\":\"error_llm\",\"error_class\":\"timeout\",\"model\":\"m\",\"started_ts\":\"2026-09-02T00:00:00.000Z\",\"finished_ts\":\"\"}," ++
+    "{\"run_id\":\"r1\",\"status\":\"running\",\"error_class\":\"unfinished\",\"model\":\"m\",\"started_ts\":\"2026-09-01T00:00:00.000Z\",\"finished_ts\":\"\"}]";
+
+test "agent-runs status / error_class filters, counts and cursor paging" {
+    var buf: [8192]u8 = undefined;
+    var ctx = testCtx();
+    ctx.agent_runs_json = "[{\"run_id\":\"ok1\",\"status\":\"ok\",\"started_ts\":\"2026-09-06T00:00:00.000Z\"}]";
+    ctx.agent_problems_json = test_problem_runs;
+
+    // Unfiltered request stays the recent-50 blob.
+    try testing.expectEqualStrings(ctx.agent_runs_json, handle(&buf, .GET, "/api/v1/agent-runs", ctx).body);
+
+    // Family prefix: `error` matches `error_llm` only.
+    const err = handle(&buf, .GET, "/api/v1/agent-runs?status=error", ctx);
+    try testing.expect(std.mem.indexOf(u8, err.body, "\"total_matching\":3") != null);
+    try testing.expect(std.mem.indexOf(u8, err.body, "\"by_class\":{\"timeout\":2,\"api_error\":1}") != null);
+    try testing.expect(std.mem.indexOf(u8, err.body, "r4") == null);
+    try testing.expect(std.mem.indexOf(u8, err.body, "\"next_before\":null") != null);
+
+    // Class filter across statuses.
+    const cls = handle(&buf, .GET, "/api/v1/agent-runs?error_class=timeout", ctx);
+    try testing.expect(std.mem.indexOf(u8, cls.body, "\"total_matching\":2") != null);
+
+    // Cursor paging: limit 2 → next_before is the last returned started_ts.
+    const page1 = handle(&buf, .GET, "/api/v1/agent-runs?limit=2", ctx);
+    try testing.expect(std.mem.indexOf(u8, page1.body, "\"returned\":2") != null);
+    try testing.expect(std.mem.indexOf(u8, page1.body, "\"next_before\":\"2026-09-04T00:00:00.000Z\"") != null);
+    try testing.expect(std.mem.indexOf(u8, page1.body, "r5") != null and std.mem.indexOf(u8, page1.body, "r3") == null);
+    const page2 = handle(&buf, .GET, "/api/v1/agent-runs?limit=2&before=2026-09-04T00:00:00.000Z", ctx);
+    try testing.expect(std.mem.indexOf(u8, page2.body, "r3") != null and std.mem.indexOf(u8, page2.body, "r2") != null);
+    try testing.expect(std.mem.indexOf(u8, page2.body, "r4") == null);
+    try testing.expect(std.mem.indexOf(u8, page2.body, "\"next_before\":\"2026-09-02T00:00:00.000Z\"") != null);
+    const page3 = handle(&buf, .GET, "/api/v1/agent-runs?limit=2&before=2026-09-02T00:00:00.000Z", ctx);
+    try testing.expect(std.mem.indexOf(u8, page3.body, "\"returned\":1") != null);
+    try testing.expect(std.mem.indexOf(u8, page3.body, "\"next_before\":null") != null);
+
+    // status=ok is answered from the recent blob, not the problems blob.
+    const ok = handle(&buf, .GET, "/api/v1/agent-runs?status=ok", ctx);
+    try testing.expect(std.mem.indexOf(u8, ok.body, "\"source\":\"recent\"") != null);
+    try testing.expect(std.mem.indexOf(u8, ok.body, "ok1") != null);
+
+    // Oversized limit is clamped; no match yields an empty page, not an error.
+    const none = handle(&buf, .GET, "/api/v1/agent-runs?status=nope&limit=9999", ctx);
+    try testing.expectEqual(std.http.Status.ok, none.status);
+    try testing.expect(std.mem.indexOf(u8, none.body, "\"items\":[]") != null);
+}
+
+test "equity long window filters by date prefix and limit" {
+    var buf: [4096]u8 = undefined;
+    var ctx = testCtx();
+    ctx.equity_json = "[{\"equity\":\"100\"}]";
+    ctx.equity_long_json =
+        "[{\"ts\":\"2026-09-08T20:00:00.000Z\",\"bucket_ms\":14400000,\"equity\":\"1\"}," ++
+        "{\"ts\":\"2026-09-09T20:00:00.000Z\",\"bucket_ms\":14400000,\"equity\":\"2\"}," ++
+        "{\"ts\":\"2026-09-10T20:00:00.000Z\",\"bucket_ms\":14400000,\"equity\":\"3\"}," ++
+        "{\"ts\":\"2026-09-15T08:00:00.000Z\",\"bucket_ms\":14400000,\"equity\":\"4\"}]";
+
+    try testing.expectEqualStrings("[{\"equity\":\"100\"}]", handle(&buf, .GET, "/api/v1/equity", ctx).body);
+    try testing.expectEqualStrings(ctx.equity_long_json, handle(&buf, .GET, "/api/v1/equity?window=long", ctx).body);
+
+    const ranged = handle(&buf, .GET, "/api/v1/equity?window=long&from=2026-09-09&to=2026-09-10", ctx);
+    try testing.expect(std.mem.indexOf(u8, ranged.body, "\"equity\":\"1\"") == null);
+    try testing.expect(std.mem.indexOf(u8, ranged.body, "\"equity\":\"2\"") != null);
+    try testing.expect(std.mem.indexOf(u8, ranged.body, "\"equity\":\"3\"") != null);
+    try testing.expect(std.mem.indexOf(u8, ranged.body, "\"equity\":\"4\"") == null);
+
+    const newest = handle(&buf, .GET, "/api/v1/equity?window=long&limit=2", ctx);
+    try testing.expect(std.mem.indexOf(u8, newest.body, "\"equity\":\"3\"") != null);
+    try testing.expect(std.mem.indexOf(u8, newest.body, "\"equity\":\"4\"") != null);
+    try testing.expect(std.mem.indexOf(u8, newest.body, "\"equity\":\"2\"") == null);
 }
 
 test "review POST enqueues into inbox; validation and limits enforced" {

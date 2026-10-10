@@ -21,6 +21,9 @@ Call options:
   --token <str>   Override token (prefer env; do not commit / log)
   --json <body>   POST JSON body (submit_intel)
   --file <path>   POST JSON body from file
+  --query <k=v&k=v>  Query params for GET tools that take them, e.g.
+                  list_agent_runs --query "status=error&limit=20"
+                  query_equity --query "window=long&from=2026-09-01"
   --meta          Include name/path/method/base envelope
 
 Install options:
@@ -110,6 +113,7 @@ export function dispatch(argv) {
     const token = takeFlag(args, "--token");
     const json = takeFlag(args, "--json");
     const file = takeFlag(args, "--file");
+    const query = takeFlag(args, "--query");
     const meta = hasFlag(args, "--meta");
 
     if (args[0] === "tools" || args[0] === "list-tools") {
@@ -138,10 +142,10 @@ export function dispatch(argv) {
       if (args.length) {
         return { kind: "error", error: `unknown args: ${args.join(" ")}` };
       }
-      return { kind: "call", name, base, token, json, file, meta };
+      return { kind: "call", name, base, token, json, file, query, meta };
     }
 
-    if (base || token || json || file || meta) {
+    if (base || token || json || file || query || meta) {
       return { kind: "error", error: "tool flags require a tool name (see --help)" };
     }
     if (args.length) {
@@ -156,7 +160,10 @@ export function dispatch(argv) {
 function loadPayload(action) {
   const tool = findTool(action.name);
   if (!tool) throw new Error(`unknown tool: ${action.name}`);
-  if (tool.method !== "POST") return {};
+  if (tool.method !== "POST") {
+    if (!action.query) return {};
+    return Object.fromEntries(new URLSearchParams(action.query));
+  }
   if (action.json && action.file) {
     throw new Error("use either --json or --file, not both");
   }

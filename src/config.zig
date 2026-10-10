@@ -7,6 +7,7 @@
 const std = @import("std");
 const dec = @import("core/decimal.zig");
 const scheduler = @import("core/scheduler.zig");
+const guardrails = @import("risk/guardrails.zig");
 const Decimal = dec.Decimal;
 
 pub const Mode = enum {
@@ -52,6 +53,14 @@ pub const Config = struct {
     /// trade (e.g. 0.01 = 1%). Suppresses chains of tiny fee-eroding
     /// rebalances. 0 disables. Residual replans are exempt.
     min_rebalance_weight_delta: Decimal = Decimal.zero,
+    /// Voluntary-trade guardrails (tighten-only; see risk/guardrails.zig). The
+    /// defaults carry the shipped behaviour, so the production file needs no
+    /// new keys. Forced risk exits and operator orders are never gated.
+    guard_min_trade_equity_frac: Decimal = guardrails.Params.default_min_trade_equity_frac,
+    guard_daily_trade_cap: u32 = guardrails.Params.default_daily_trade_cap,
+    guard_reverse_cooldown_ms: i64 = guardrails.Params.default_reverse_cooldown_ms,
+    guard_macro_sell_trend_break: bool = false,
+    guard_sell_exempt_drawdown: Decimal = guardrails.Params.default_sell_exempt_drawdown,
     // [agent]
     agent_provider: []const u8 = "openai",
     agent_model: []const u8 = "gpt-4o-mini",
@@ -147,6 +156,17 @@ pub const Config = struct {
     }
 
     /// Host component of web_bind (`127.0.0.1` or `0.0.0.0`).
+    pub fn guardParams(self: *const Config) guardrails.Params {
+        return .{
+            .min_trade_notional = self.min_trade_notional,
+            .min_trade_equity_frac = self.guard_min_trade_equity_frac,
+            .daily_trade_cap = self.guard_daily_trade_cap,
+            .reverse_cooldown_ms = self.guard_reverse_cooldown_ms,
+            .macro_sell_requires_trend_break = self.guard_macro_sell_trend_break,
+            .sell_exempt_drawdown = self.guard_sell_exempt_drawdown,
+        };
+    }
+
     pub fn webHost(self: *const Config) []const u8 {
         const colon = std.mem.lastIndexOfScalar(u8, self.web_bind, ':') orelse return "127.0.0.1";
         return self.web_bind[0..colon];
@@ -288,6 +308,20 @@ fn applyKey(a: std.mem.Allocator, cfg: *Config, section: []const u8, key: []cons
             if (cfg.min_rebalance_weight_delta.isNegative()) return error.InvalidValue;
             // Above 0.5 the band would mute nearly all rebalances — reject as misconfig.
             if (cfg.min_rebalance_weight_delta.gt(Decimal.parse("0.5") catch unreachable)) return error.InvalidValue;
+        } else if (std.mem.eql(u8, key, "guard_min_trade_equity_frac")) {
+            cfg.guard_min_trade_equity_frac = Decimal.parse(val) catch return error.InvalidValue;
+            if (cfg.guard_min_trade_equity_frac.isNegative()) return error.InvalidValue;
+            if (cfg.guard_min_trade_equity_frac.gt(Decimal.parse("0.5") catch unreachable)) return error.InvalidValue;
+        } else if (std.mem.eql(u8, key, "guard_daily_trade_cap")) {
+            cfg.guard_daily_trade_cap = parseInt(u32, val) catch return error.InvalidValue;
+        } else if (std.mem.eql(u8, key, "guard_reverse_cooldown_ms")) {
+            cfg.guard_reverse_cooldown_ms = parseInt(i64, val) catch return error.InvalidValue;
+            if (cfg.guard_reverse_cooldown_ms < 0 or cfg.guard_reverse_cooldown_ms > 24 * 3_600_000) return error.InvalidValue;
+        } else if (std.mem.eql(u8, key, "guard_macro_sell_trend_break")) {
+            cfg.guard_macro_sell_trend_break = try parseBool(val);
+        } else if (std.mem.eql(u8, key, "guard_sell_exempt_drawdown")) {
+            cfg.guard_sell_exempt_drawdown = Decimal.parse(val) catch return error.InvalidValue;
+            if (cfg.guard_sell_exempt_drawdown.isNegative()) return error.InvalidValue;
         } else return error.UnknownKey;
     } else if (std.mem.eql(u8, section, "agent")) {
         if (std.mem.eql(u8, key, "provider")) {
@@ -582,6 +616,35 @@ test "min_rebalance_weight_delta parses with range validation" {
         \\[risk]
         \\min_rebalance_weight_delta = 0.6
     ));
+}
+
+test "guardrail keys default to the shipped tighten-only behaviour and validate" {
+    var cfg = try parse(testing.allocator, "[risk]\n");
+    defer cfg.deinit();
+    const p = cfg.guardParams();
+    try testing.expect(p.min_trade_equity_frac.eql(Decimal.parse("0.05") catch unreachable));
+    try testing.expectEqual(@as(u32, 6), p.daily_trade_cap);
+    try testing.expectEqual(@as(i64, 4 * 3_600_000), p.reverse_cooldown_ms);
+    try testing.expect(!p.macro_sell_requires_trend_break);
+    try testing.expect(p.sell_exempt_drawdown.eql(Decimal.parse("0.01") catch unreachable));
+
+    var tuned = try parse(testing.allocator,
+        \\[risk]
+        \\min_trade_notional = 12
+        \\guard_min_trade_equity_frac = 0.02
+        \\guard_daily_trade_cap = 0
+        \\guard_reverse_cooldown_ms = 3600000
+        \\guard_macro_sell_trend_break = true
+    );
+    defer tuned.deinit();
+    const tp = tuned.guardParams();
+    try testing.expect(tp.min_trade_notional.eql(Decimal.fromInt(12)));
+    try testing.expectEqual(@as(u32, 0), tp.daily_trade_cap);
+    try testing.expect(tp.macro_sell_requires_trend_break);
+
+    try testing.expectError(error.InvalidValue, parse(testing.allocator, "[risk]\nguard_min_trade_equity_frac = 0.9\n"));
+    try testing.expectError(error.InvalidValue, parse(testing.allocator, "[risk]\nguard_reverse_cooldown_ms = -1\n"));
+    try testing.expectError(error.InvalidValue, parse(testing.allocator, "[risk]\nguard_daily_trade_cap = -3\n"));
 }
 
 test "container bind 0.0.0.0 is allowed" {

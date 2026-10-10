@@ -88,7 +88,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && m) {
       const tool = TOOLS.find((t) => t.name === m[1]);
       if (!tool) return send(res, 404, { error: "unknown_tool" });
-      const payload = tool.method === "POST" ? await readJson(req) : {};
+      const payload = tool.method === "POST" ? await readJson(req) : Object.fromEntries(url.searchParams);
       const result = await callTool(tool.name, payload);
       return send(res, 200, {
         name: result.name,

@@ -43,6 +43,12 @@
 4. Agent K 线：1D×45 / 4H×42 / 1H×48 / 30m×48 / 15m×48（紧凑数组）+ 本地计算的 1D/4H structure（SMA/range/前高突破）
 5. 决策周期与择时反馈（2026-10）：同一次 1D 请求取 200 根算 `structure.1D_long`（50/100/200 日均线、7/30/90/180 日收益、90 日区间）；`self_review.attribution` 给出 7d/30d 择时贡献（`timing_return`）；成交带 `vs_now_bps`。见 [STRATEGY_HORIZON_TIMING.md](STRATEGY_HORIZON_TIMING.md)
 
+### P1.6 — 策略迭代（2026-10）
+
+1. ✅ `zig build backtest` 离线回测（[BACKTEST.md](BACKTEST.md)）；护栏默认值来自 8–10 月回放：回撤不升、交易数/手续费下降、收益持平  
+2. 观察 `EXEC_GUARDRAIL` / `HELD_EXPOSURE_ALERT` / `MEMORY_PRUNED` 事件；宏观卖出门默认关，需在更多行情上复核后再开  
+3. 后续：用多段行情复核 5% 最小调仓；agent-run 错误按 `api_error`/`empty_content`/`http_failed`/`timeout` 分类跟踪  
+
 ### P2 — Phase 5 L1 观察
 
 1. 部署后 7 日：derivatives≈ticker；REBALANCE citation≥30%（`tool-value-report.sh`）  

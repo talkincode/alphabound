@@ -38,7 +38,7 @@ function startMockApi() {
     }
     if (req.method === "GET" && url.pathname.startsWith("/api/v1/")) {
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ path: url.pathname, ok: true }));
+      res.end(JSON.stringify({ path: url.pathname, search: url.search, ok: true }));
       return;
     }
     res.writeHead(404, { "content-type": "application/json" });
@@ -211,6 +211,44 @@ describe("CLI HTTP + env token", () => {
     assert.equal(r.code, 0, r.err);
     assert.equal(JSON.parse(r.out).ok, true);
     assert.equal(mock.posts.at(-1).id, "intel_cli_test");
+  });
+
+  it("forwards whitelisted query params and keeps cursor colons literal", async () => {
+    const env = { ALPHABOUND_API_BASE: mock.base, ALPHABOUND_API_TOKEN: TOKEN };
+    const runs = await captureCli(
+      ["list_agent_runs", "--query", "status=error&limit=20&before=2026-09-04T00:00:00.000Z"],
+      env,
+    );
+    assert.equal(runs.code, 0, runs.err);
+    const body = JSON.parse(runs.out);
+    assert.equal(body.path, "/api/v1/agent-runs");
+    assert.equal(body.search, "?status=error&limit=20&before=2026-09-04T00:00:00.000Z");
+
+    const eq = await captureCli(["query_equity", "--query", "window=long&from=2026-09-01"], env);
+    assert.equal(eq.code, 0, eq.err);
+    assert.equal(JSON.parse(eq.out).search, "?window=long&from=2026-09-01");
+
+    const none = await captureCli(["list_agent_runs"], env);
+    assert.equal(JSON.parse(none.out).search, "");
+  });
+
+  it("rejects unknown query params instead of forwarding them", async () => {
+    const env = { ALPHABOUND_API_BASE: mock.base, ALPHABOUND_API_TOKEN: TOKEN };
+    const bad = await captureCli(["list_agent_runs", "--query", "status=error&sql=1"], env);
+    assert.equal(bad.code, 1);
+    assert.match(JSON.parse(bad.err).error, /unknown parameter "sql"/);
+    const noParams = await captureCli(["get_system", "--query", "x=1"], env);
+    assert.equal(noParams.code, 1);
+    assert.match(JSON.parse(noParams.err).error, /takes no parameters/);
+  });
+
+  it("advertises query params as MCP input schemas", () => {
+    for (const name of ["list_events", "list_agent_runs", "query_equity"]) {
+      const t = TOOLS.find((x) => x.name === name);
+      assert.ok(t.query && Object.keys(t.query).length > 0, name);
+    }
+    assert.ok("error_class" in TOOLS.find((x) => x.name === "list_agent_runs").query);
+    assert.ok("window" in TOOLS.find((x) => x.name === "query_equity").query);
   });
 
   it("invokes every GET MCP tool against the mock API", async () => {

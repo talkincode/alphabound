@@ -44,6 +44,8 @@ The oldest minute-extrema bucket is retained in full, so the window can extend
 0–59,999 milliseconds beyond 15 minutes.
 
 This is **policy-fixed scheduling replay, not a causal trading or PnL backtest**.
+For a return / drawdown / fee comparison of decision policies, see
+[BACKTEST.md](BACKTEST.md) (`zig build backtest`), which has its own stated limits.
 Actual decisions would alter future state. One-minute samples cannot establish
 exact tick-level trigger timing or reconstruct intervening price extrema.
 
