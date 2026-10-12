@@ -1470,12 +1470,15 @@ pub fn main(init: std.process.Init) !u8 {
         // While FLATTENING/HALTED, skip agent so it cannot fight the exit path.
         // Adopt a newly active parameter version only between decisions.
         if (!think.isBusy() and think.jobs.depth() == 0) {
-            if (ab.params_store.loadActive(&db)) |snap| {
+            // loadActive is Error!?Snapshot: a missing row or a read error
+            // leaves the scheduler on the version already in force.
+            const loaded = ab.params_store.loadActive(&db) catch null;
+            if (loaded) |snap| {
                 if (snap.version_id != live_param_version) {
                     live_param_version = snap.version_id;
                     ab.params.adoptScheduler(&agent_sched, snap.params);
                 }
-            } else |_| {}
+            }
         }
 
         if (advisoryDecisionAllowed(admin_paused, engine.snapshot().risk_mode)) {
@@ -1803,7 +1806,7 @@ const ThinkLane = struct {
                 // One snapshot for this decision, including a stale redo.
                 // A version applied while the model is running is picked up
                 // by the next job, not this one.
-                const decision_params = ab.params_store.loadActive(&db) catch self.params;
+                const decision_params = ab.params_store.loadActive(&db) catch null orelse self.params;
                 if (llm_client) |*client| {
                     var attempt: u8 = 0;
                     var reason: []const u8 = job.reason[0..job.reason_len];
