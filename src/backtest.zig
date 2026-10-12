@@ -110,6 +110,23 @@ pub fn run(
     decisions: []const Decision,
     flows: []const Flow,
 ) !Result {
+    return runWithIndex(gpa, c, name, params, bars, daily, decisions, flows, null);
+}
+
+/// Same replay as `run`. When `index_out` is long enough, bar `i` receives the
+/// flow-adjusted growth index (1.0 at the start). Callers use it to reconcile
+/// a paper path with the recorded equity curve. `max_drawdown` is unchanged.
+pub fn runWithIndex(
+    gpa: std.mem.Allocator,
+    c: SimConfig,
+    name: []const u8,
+    params: guard.Params,
+    bars: []const Bar,
+    daily: []const DailyBar,
+    decisions: []const Decision,
+    flows: []const Flow,
+    index_out: ?[]f64,
+) !Result {
     var res = Result{ .policy = name };
     if (bars.len < 2) return error.NotEnoughBars;
 
@@ -130,6 +147,7 @@ pub fn run(
     defer agent_ts.deinit(gpa);
     const trend_period = trendPeriodOf(c);
     var closes_buf: [200]Decimal = undefined;
+    var bar_i: usize = 0;
 
     const stress = admission.StressParams{
         .price_shock = c.price_shock,
@@ -274,6 +292,10 @@ pub fn run(
                 pending_flatten = true;
             }
         }
+        if (index_out) |buf| {
+            if (bar_i < buf.len) buf[bar_i] = index;
+        }
+        bar_i += 1;
     }
 
     const last = bars[bars.len - 1];

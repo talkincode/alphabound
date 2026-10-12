@@ -121,6 +121,7 @@ open http://127.0.0.1:18180/
 | `GET /api/v1/review/context` | 最近一次请求的复盘事件窗口 `{decision_id, from, to, events}` |
 | `GET /api/v1/review/analytics` | AB 因子复盘分析（实验性）：成分指标曲线 + IC 表，见下 |
 | `GET /api/v1/review/periodic` | 定期复盘报告（newest first，含窗口事实与模型结论） |
+| `GET /api/v1/review/strategy` | 策略参数复盘报告（newest first）。`?id=` 取一份 `alphabound.strategy_review.v1`。只读，不下单 |
 | `GET /api/v1/audit` | 定时审计报告（newest first，含完整 findings 与 stats） |
 | `GET /api/v1/intel` | 外部签名情报历史（无 signature/nonce；含 grade/score/expired） |
 | `GET /api/v1/sentiment` | 恐惧贪婪指数日频曲线：`now` / `class` / `as_of_ms` / `points[{t,v}]`（oldest first；class 由数值重推导） |
@@ -131,9 +132,12 @@ open http://127.0.0.1:18180/
 | `POST /api/v1/params/backtest` | 对候选过滤层参数跑回测门槛，返回报告 id 与通过/失败。可传 `params`，或传已有 `version_id`。省略 `candles`/`decisions` 时读本机库里的 15m 行情与已记录再平衡；两者必须成对出现。工作线程重放，不进入交易循环，不下单 |
 | `GET /api/v1/params/backtest?id=` | 读取一份已入库的 `alphabound.backtest_ref.v1` 报告 |
 | `POST /api/v1/params/rollback` | 回到指定历史版本。不受幅度和 24h 限制，仍须在绝对边界内。新版本在下一次决策开始时生效，不打断进行中的决策或下单 |
+| `POST /api/v1/review/strategy` | 把一轮策略参数复盘放进后台车道（202）。请求线程不跑重放。是否改参数由 daemon 按 `strategy_mode` 与实盘条件决定，来源记为 `review` |
 | `POST /api/v1/intel` | 推送 `alphabound.intel.v1` 信封（需 `ALPHABOUND_INTEL_HMAC`） |
 
 参数写入（propose / apply / rollback）只改过滤层参数，不下单。审计记录来源（`manual` / `mcp` / `review`）、操作者、原因和前后值。`max_drawdown` 仍是编译期 `0.10`。配置文件里的 `guard_*` 与 `event_price_move` / `event_drawdown_step` / `event_price_drift` 仅首次初始化使用，之后通过参数库/MCP 调整；和 active 不一致时启动只打 WARN，不覆盖。回测门槛只重放已经记下的决策，不调用 LLM，也不能说明模型在新参数下会提出什么；调度类旋钮不改变这次重放。规则与局限见 [BACKTEST.md](https://github.com/talkincode/alphabound/blob/main/docs/BACKTEST.md)。
+
+策略参数复盘与 LLM 定期复盘是两条通道。前者只动过滤层参数库，规则见 [STRATEGY_REVIEW.md](https://github.com/talkincode/alphabound/blob/main/docs/STRATEGY_REVIEW.md)。`max_drawdown` 仍是 `0.10`。
 
 协议、TTL、HMAC 与评分见 [投资情报协议](intel.md)。`POST` 在核心环落库前只入 mailbox（202 Accepted）。未配置 HMAC 时 ingest 返回 503，GET 历史仍可用。
 
@@ -250,8 +254,11 @@ Dashboard「统计」页的数据源，含两个子页：**资产与交易**、*
 | POST | `/api/v1/review/chat` | `{"decision_id","anchor_ts","message"}` | 复盘提问（≤1500B）；回复落库后出现在 `GET /api/v1/review/chats` |
 | POST | `/api/v1/review/summarize` | `{"decision_id"}` | 将对话压缩为一条低置信度 reflection 记忆（`HR_<decision_id>`） |
 | POST | `/api/v1/review/periodic` | `{"cycle":"short"\|"long"}` | 手动加跑一次定期复盘；结果进 `GET /api/v1/review/periodic` |
+| POST | `/api/v1/review/strategy` | 空 body | 排队一轮策略参数复盘；结果进 `GET /api/v1/review/strategy`。需管理鉴权。车道忙时 409，未接线时 503 |
 
 限制：队列深度 4（满载 429）；同决策同类请求去重（409）；每决策对话上限 40 轮；每次提问至多一轮工具请求（≤6 个，均为只读）；LLM 未配置时提问仍会保存并得到降级答复。审计事件：`REVIEW_CHAT_OK/FAILED`（含 `tools` 计数）、`REVIEW_SUMMARY_OK`、`PERIODIC_REVIEW`。手动定期复盘同样会推进调度游标（下一次自动运行相应顺延）。
+
+`/api/v1/review/strategy` 不进这个邮箱。后台车道写 `strategy_reviews`，并可能经已有的参数写入改过滤层（来源 `review`）。它不下单，也不占用交易循环。
 
 ### `GET /api/v1/review/analytics`（AB 因子，实验性）
 

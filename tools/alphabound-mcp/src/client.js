@@ -394,6 +394,36 @@ export const TOOLS = [
     },
   },
   {
+    name: "list_reviews",
+    description:
+      "List recent strategy-review reports (newest first): data range, regime, candidate backtests, and whether the round applied, proposed, or rolled back. Read-only. Does not place orders and does not change parameters. max_drawdown stays 0.10. This is the filter-parameter review, not the LLM periodic review.",
+    path: "/api/v1/review/strategy",
+    method: "GET",
+  },
+  {
+    name: "get_review",
+    description:
+      "Fetch one alphabound.strategy_review.v1 report by id. Read-only. Does not place orders or change parameters. max_drawdown stays 0.10.",
+    path: "/api/v1/review/strategy",
+    method: "GET",
+    query: {
+      id: { type: "string", description: "Review id (sr_...)" },
+    },
+  },
+  {
+    name: "run_strategy_review",
+    description:
+      "Queue one strategy-review round on the daemon's background lane. Returns immediately; it does not run inside the trading loop and does not place orders. The daemon replays history, reconciles the equity curve, scores a small neighborhood with the backtest gate, and may apply_params with source=review only when strategy_mode is auto, live drawdown is under 5%, risk mode is NORMAL, and the 24h apply limit is open. Otherwise it stores a proposal or a safe-failure report and leaves the active version unchanged. A 72h observation window blocks further applies and can roll back. strategy_mode auto (default) | propose_only | off. max_drawdown stays 0.10.",
+    path: "/api/v1/review/strategy",
+    method: "POST",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: [],
+      properties: {},
+    },
+  },
+  {
     name: "rollback_params",
     description:
       "Copy a historical parameter version forward as the new active version. Not limited by the 20% step or the 24h apply gate, but the restored values must still sit inside the absolute bounds. Cannot target a pending or rejected row. expected_active_version must match. Does not place orders and does not change max_drawdown (locked at 0.10). Use this to undo a bad apply. The restored set takes effect on the next decision, not during one that is already running. Requires the dashboard admin token.",

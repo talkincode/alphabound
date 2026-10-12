@@ -41,6 +41,9 @@ llm_reflection = true
 short_interval_ms = 28800000   # 小周期 8 小时（小时级；4h=14400000，最小 600000）；0 = 关闭
 long_interval_ms = 604800000   # 大周期 7 天（最小 3600000）；0 = 关闭
 # timeout_ms = 180000           # 复盘 LLM 超时，独立于 decision_timeout_ms，不受其封顶（最小 30000）
+# 策略参数复盘。默认 auto + 每日。旧二进制不认识这两个键，保持注释。
+# strategy_mode = "auto"          # auto | propose_only | off
+# strategy_interval_ms = 86400000 # 0 = 不定时；最小 3600000
 
 [storage]
 path = "var/trading.db"

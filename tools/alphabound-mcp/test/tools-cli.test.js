@@ -32,6 +32,11 @@ function startMockApi() {
       res.end(JSON.stringify({ ok: true, id: payload.id || "intel_1" }));
       return;
     }
+    if (req.method === "POST" && url.pathname === "/api/v1/review/strategy") {
+      res.writeHead(202, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, queued: true }));
+      return;
+    }
     if (req.method === "POST" && url.pathname.startsWith("/api/v1/params/")) {
       const chunks = [];
       for await (const c of req) chunks.push(c);
@@ -278,6 +283,32 @@ describe("CLI HTTP + env token", () => {
     const apply = TOOLS.find((x) => x.name === "apply_params");
     assert.match(apply.description, /24h old/);
     assert.match(apply.inputSchema.properties.backtest_summary.description, /run_backtest/);
+  });
+
+  it("advertises the strategy review without an order path", async () => {
+    const list = TOOLS.find((x) => x.name === "list_reviews");
+    const get = TOOLS.find((x) => x.name === "get_review");
+    const run = TOOLS.find((x) => x.name === "run_strategy_review");
+    assert.equal(list.method, "GET");
+    assert.equal(list.path, "/api/v1/review/strategy");
+    assert.equal(get.method, "GET");
+    assert.equal(get.path, "/api/v1/review/strategy");
+    assert.ok(get.query && "id" in get.query);
+    assert.equal(run.method, "POST");
+    assert.equal(run.path, "/api/v1/review/strategy");
+    assert.equal(run.forceSource, undefined);
+    for (const t of [list, get, run]) {
+      assert.match(t.description, /does not place orders/i);
+      assert.match(t.description, /max_drawdown/);
+      assert.equal(/place_order|flatten|resume/.test(t.path), false);
+    }
+    const env = { ALPHABOUND_API_BASE: mock.base, ALPHABOUND_API_TOKEN: TOKEN };
+    const queued = await captureCli(["run_strategy_review"], env);
+    assert.equal(queued.code, 0, queued.err);
+    assert.equal(JSON.parse(queued.out).queued, true);
+    const one = await captureCli(["get_review", "--query", "id=sr_1_1"], env);
+    assert.equal(one.code, 0, one.err);
+    assert.equal(JSON.parse(one.out).search, "?id=sr_1_1");
   });
 
   it("advertises parameter writes with the hard bounds and no order path", () => {
