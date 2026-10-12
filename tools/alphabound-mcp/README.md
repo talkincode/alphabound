@@ -123,9 +123,11 @@ Clients must still present `ALPHABOUND_API_TOKEN` to the **daemon**; the MCP pro
 | `get_params` | `GET /api/v1/params` | active filter-layer parameter version (read-only) |
 | `list_param_versions` | `GET /api/v1/params/versions` | version history, newest first (read-only) |
 | `propose_params` | `POST /api/v1/params/propose` | pending version + validate. Not an order. 20% / 24h / one-way gates. `max_drawdown` rejected |
-| `apply_params` | `POST /api/v1/params/apply` | activate a pending version. Optimistic concurrency. Backtest ref required unless the daemon switch is on |
+| `apply_params` | `POST /api/v1/params/apply` | activate a pending version. Optimistic concurrency. `backtest_summary` must name a stored passing report for these exact parameters, still on the active baseline, at most 24h old. `params_allow_unbacked_apply` (default off) skips that lookup |
+| `run_backtest` | `POST /api/v1/params/backtest` | score candidate filter params on recorded decisions. Returns the report id and pass/fail. Not an order. Replay runs off the trading loop |
+| `get_backtest` | `GET /api/v1/params/backtest?id=` | read one stored `alphabound.backtest_ref.v1` report |
 | `rollback_params` | `POST /api/v1/params/rollback` | restore a historical version inside absolute bounds. Not an order |
 | `list_intel` | `GET /api/v1/intel` | history; no signature/nonce |
 | `submit_intel` | `POST /api/v1/intel` | pre-signed envelope only |
 
-No order placement, flatten, resume, or secret readout. propose_params / apply_params / rollback_params change filter parameters only, require the same admin token, and record source=mcp.
+No order placement, flatten, resume, or secret readout. propose_params / apply_params / rollback_params change filter parameters only, require the same admin token, and record source=mcp. `run_backtest` does not change the active version and does not place orders. It replays decisions that were already recorded; it does not call the LLM and cannot say what the model would have proposed. Copy the report's `backtest_summary` into `apply_params`. See `docs/BACKTEST.md`.

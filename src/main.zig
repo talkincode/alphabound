@@ -491,11 +491,20 @@ pub fn main(init: std.process.Init) !u8 {
     defer db.close();
 
     // Active filter-layer parameters. Missing row → v1 from this config file.
+    // A later edit of those file keys does not overwrite the active row.
     // A corrupt active row refuses boot rather than trading on a guessed set.
     const param_snap = ab.params_store.ensureActive(&db, &cfg, nowMs()) catch |err| {
         std.debug.print("[boot] FATAL dynamic params: {t}\n", .{err});
         return 1;
     };
+    var drift_buf: [256]u8 = undefined;
+    const drift = ab.params.configDrift(param_snap.params, &cfg, &drift_buf);
+    if (drift.len > 0) {
+        std.debug.print(
+            "[boot] WARN dynamic params: config differs from active version {d} and was not applied. fields={s}. Those file keys only bootstrap the first version. Change the live set with propose/apply or rollback.\n",
+            .{ param_snap.version_id, drift },
+        );
+    }
 
     if (cli.agent_stats) {
         printAgentStats(&db);
@@ -726,6 +735,7 @@ pub fn main(init: std.process.Init) !u8 {
     // the only writer of trading state; these calls never place an order.
     web_state.param_db_path = db_path;
     web_state.param_allow_unbacked_apply = cfg.params_allow_unbacked_apply;
+    web_state.param_min_trade_notional = cfg.min_trade_notional;
 
     // ---- Web API thread (loopback only, §6.4) -----------------------------
     const web_thread = std.Thread.spawn(.{}, webThreadMain, .{ io, cfg.webHost(), cfg.webPort(), &web_state }) catch |err| {

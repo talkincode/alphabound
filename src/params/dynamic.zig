@@ -187,6 +187,32 @@ pub fn fromConfig(cfg: *const config.Config) Params {
     };
 }
 
+/// Config keys that seed the first parameter version and nothing after it.
+/// `position_cap`, `price_shock`, `exit_reserve`, `trend_ma_period`, and the
+/// volatility window/gap live only in the parameter store, so they are not
+/// compared here. An empty result means the bootstrap fields match `active`.
+/// This does not write the database.
+pub fn configDrift(active: Params, cfg: *const config.Config, buf: []u8) []const u8 {
+    const file = fromConfig(cfg);
+    var w: std.Io.Writer = .fixed(buf);
+    var n: usize = 0;
+    if (!active.min_trade_equity_frac.eql(file.min_trade_equity_frac)) appendDrift(&w, &n, "guard_min_trade_equity_frac");
+    if (active.daily_trade_cap != file.daily_trade_cap) appendDrift(&w, &n, "guard_daily_trade_cap");
+    if (active.reverse_cooldown_ms != file.reverse_cooldown_ms) appendDrift(&w, &n, "guard_reverse_cooldown_ms");
+    if (active.macro_sell_requires_trend_break != file.macro_sell_requires_trend_break) appendDrift(&w, &n, "guard_macro_sell_trend_break");
+    if (!active.sell_exempt_drawdown.eql(file.sell_exempt_drawdown)) appendDrift(&w, &n, "guard_sell_exempt_drawdown");
+    if (!active.event_price_move.eql(file.event_price_move)) appendDrift(&w, &n, "event_price_move");
+    if (!active.event_drawdown_step.eql(file.event_drawdown_step)) appendDrift(&w, &n, "event_drawdown_step");
+    if (!active.event_price_drift.eql(file.event_price_drift)) appendDrift(&w, &n, "event_price_drift");
+    return w.buffered();
+}
+
+fn appendDrift(w: *std.Io.Writer, n: *usize, name: []const u8) void {
+    if (n.* > 0) w.writeByte(',') catch return;
+    w.writeAll(name) catch return;
+    n.* += 1;
+}
+
 pub fn stressOf(cfg: *const config.Config, p: Params) admission.StressParams {
     var s = gate.defaultStressParams(cfg);
     s.price_shock = p.price_shock;
@@ -403,12 +429,12 @@ pub const BacktestRefError = error{
     BadId,
 };
 
-/// Shape check for a passing backtest reference. Phase 3 replaces the body
-/// of this function with a lookup of a real backtest run; callers stay put.
-/// Empty input is `Missing`. A present reference must be
-/// `alphabound.backtest_ref.v1` with a non-empty id and `passed: true`.
-/// Optional `digest` (string) and `as_of_ms` (integer) are accepted and not
-/// verified yet. Any other key is rejected so the interface stays explicit.
+/// Shape check for a passing backtest reference. Existence, the pass bit,
+/// parameter equality and the 24h expiry are checked by `gate.validateStoredRef`
+/// against `backtest_reports`. Empty input is `Missing`. A present reference
+/// must be `alphabound.backtest_ref.v1` with a non-empty id and `passed: true`.
+/// Optional `digest` (string) and `as_of_ms` (integer) are accepted here and
+/// compared to the stored row by the lookup. Any other key is rejected.
 pub fn validateBacktestRef(gpa: std.mem.Allocator, raw: []const u8) BacktestRefError!void {
     if (raw.len == 0) return error.Missing;
     if (raw.len > 1024) return error.Malformed;
@@ -593,6 +619,40 @@ test "defaults match shipped config, guardrails, stress and scheduler constants"
     try testing.expect(p.position_cap.eql(Decimal.one));
     try testing.expect(p.applyPositionCap(d("0.9")).eql(d("0.9")));
     try testing.expect(p.applyPositionCap(d("1.5")).eql(d("1.5")));
+}
+
+test "config drift names bootstrap fields and leaves the active row alone" {
+    var matched = try config.parse(testing.allocator,
+        \\[risk]
+        \\guard_daily_trade_cap = 4
+        \\[agent]
+        \\event_price_move = 0.008
+    );
+    defer matched.deinit();
+    var active = fromConfig(&matched);
+    active.position_cap = d("0.8");
+    active.price_shock = d("0.08");
+    active.exit_reserve = d("1.00");
+    active.trend_ma_period = 80;
+    active.volatility_window_ms = 600_000;
+    active.volatility_gap_ms = 60_000;
+    var quiet: [128]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), configDrift(active, &matched, &quiet).len);
+
+    var edited = try config.parse(testing.allocator,
+        \\[risk]
+        \\guard_daily_trade_cap = 8
+        \\guard_macro_sell_trend_break = true
+        \\[agent]
+        \\event_price_move = 0.004
+        \\event_price_drift = 0.03
+    );
+    defer edited.deinit();
+    var buf: [256]u8 = undefined;
+    try testing.expectEqualStrings(
+        "guard_daily_trade_cap,guard_macro_sell_trend_break,event_price_move,event_price_drift",
+        configDrift(active, &edited, &buf),
+    );
 }
 
 test "fromConfig copies the file and json round-trips" {

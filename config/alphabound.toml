@@ -21,6 +21,10 @@ taker_fee_rate = 0.001         # 保守估值用 taker 费率
 slippage_rate = 0.0005         # 保守估值滑点缓冲
 initial_capital = 100.0        # shadow 模式模拟起始资金 (USDT)
 # min_trade_notional = 10      # 每笔最低 USDT；低于此值的再平衡 plan_hold（0 = 仅用交易所下限）
+# guard_min_trade_equity_frac / guard_daily_trade_cap / guard_reverse_cooldown_ms /
+# guard_macro_sell_trend_break / guard_sell_exempt_drawdown：
+# 仅首次初始化使用，之后通过参数库/MCP 调整（propose/apply 或 rollback）。
+# 已有 active 版本时改这里不会覆盖。
 
 [agent]
 provider = "configured-adapter"
@@ -31,6 +35,8 @@ decision_interval_ms = 60000        # 开发环境快速迭代;生产建议 9000
 decision_interval_quiet_ms = 0      # 静默时段间隔;0 = 同 base
 decision_min_interval_ms = 30000    # 任意两次决策的硬性冷却下限
 active_hours_utc = ""               # UTC 活跃时段如 "13-21";空 = 全天 base
+# event_price_move / event_drawdown_step / event_price_drift：
+# 仅首次初始化使用，之后通过参数库/MCP 调整。
 event_price_move = 0.005            # 距上次决策价格偏离 ≥0.5% 提前触发
 event_drawdown_step = 0.01          # 回撤加深 ≥1% 提前触发
 event_price_drift = 0.02            # 相对上次成交价累计偏离 ≥2% 触发(跨多次 HOLD 累计,不受空转退避影响;0 = 关闭)

@@ -88,13 +88,13 @@ timeout_ms = 180000            # 复盘 LLM 超时，默认 180000，最小 3000
 | `slippage_rate` | decimal | `0.0005` | 退出滑点缓冲 |
 | `initial_capital` | decimal | `100` | shadow 模拟账户起始 USDT；须 `> 0` |
 | `min_trade_notional` | decimal | `0` | 每笔最低名义金额（USDT）。只**抬高**交易所 `min_notional`，不降低。低于此值的再平衡会 `plan_hold`；`0` = 仅用交易所下限 |
-| `guard_min_trade_equity_frac` | decimal | `0.05` | 收紧型护栏：自主决策的最小调仓名义额 = 权益 × 该比例（与 `min_trade_notional` 取大）。清仓与回撤 ≥ `guard_sell_exempt_drawdown` 的卖出只受绝对下限约束 |
-| `guard_daily_trade_cap` | u32 | `6` | 滚动 24h 内 agent 自主成交上限；`0` = 关 |
-| `guard_reverse_cooldown_ms` | int | `14400000` | 与上一笔方向相反的交易至少间隔多久；`0` = 关 |
-| `guard_macro_sell_trend_break` | bool | `false` | 宏观/新闻论点驱动的卖出，须最近已收盘日线低于 50D 均线；日线不足 50 根时拒绝（fail-closed）。回放中以更高回撤换收益，故默认关 |
-| `guard_sell_exempt_drawdown` | decimal | `0.01` | 账户低于 HWM 达到该比例后，卖出不再被冷却/日上限/宏观门拖慢 |
+| `guard_min_trade_equity_frac` | decimal | `0.05` | 收紧型护栏：自主决策的最小调仓名义额 = 权益 × 该比例（与 `min_trade_notional` 取大）。清仓与回撤 ≥ `guard_sell_exempt_drawdown` 的卖出只受绝对下限约束。仅首次初始化使用，之后通过参数库/MCP 调整 |
+| `guard_daily_trade_cap` | u32 | `6` | 滚动 24h 内 agent 自主成交上限；`0` = 关。仅首次初始化使用，之后通过参数库/MCP 调整 |
+| `guard_reverse_cooldown_ms` | int | `14400000` | 与上一笔方向相反的交易至少间隔多久；`0` = 关。仅首次初始化使用，之后通过参数库/MCP 调整 |
+| `guard_macro_sell_trend_break` | bool | `false` | 宏观/新闻论点驱动的卖出，须最近已收盘日线低于 50D 均线；日线不足 50 根时拒绝（fail-closed）。回放中以更高回撤换收益，故默认关。仅首次初始化使用，之后通过参数库/MCP 调整 |
+| `guard_sell_exempt_drawdown` | decimal | `0.01` | 账户低于 HWM 达到该比例后，卖出不再被冷却/日上限/宏观门拖慢。仅首次初始化使用，之后通过参数库/MCP 调整 |
 
-> `guard_*` 只能**否决**（HOLD），不会放宽 HWM 回撤底线、退出预留或任何 fail-closed 检查；强制退出与 operator 通道豁免。缺省即生效，**无需写进生产配置**（旧二进制不认识这些键，写入会破坏回滚）。回测见 [BACKTEST.md](https://github.com/talkincode/alphabound/blob/main/docs/BACKTEST.md)。
+> `guard_*` 只能**否决**（HOLD），不会放宽 HWM 回撤底线、退出预留或任何 fail-closed 检查；强制退出与 operator 通道豁免。这些键**仅首次初始化使用，之后通过参数库/MCP 调整**（`propose` / `apply` 或 `rollback`）。库里已有 active 版本时，改配置文件不会覆盖；启动时若和 active 不一致会打 WARN，并列出差异字段。缺省即是出厂默认值，**无需写进生产配置**（旧二进制不认识这些键，写入会破坏回滚）。`min_trade_notional` 与 `max_drawdown` 仍直接读配置，不进参数库。回测见 [BACKTEST.md](https://github.com/talkincode/alphabound/blob/main/docs/BACKTEST.md)。
 
 > 改 `max_drawdown` / 费率类参数 = **版本发布 + 人工确认**，不是运行中调参。
 
@@ -112,8 +112,9 @@ timeout_ms = 180000            # 复盘 LLM 超时，默认 180000，最小 3000
 | `decision_interval_quiet_ms` | u32 | `0` | 静默时段间隔；0 = 同基础间隔 |
 | `decision_min_interval_ms` | u32 | `120000` | 任意两次决策的硬性冷却下限（事件触发也受限） |
 | `active_hours_utc` | string | `""` | UTC 活跃时段 `"start-end"`（end 不含，可跨 0 点如 `"22-4"`）；空 = 全天基础间隔 |
-| `event_price_move` | decimal | `0.005` | 距上次决策价格偏离 ≥ 该比例提前触发；0 关闭 |
-| `event_drawdown_step` | decimal | `0.01` | 回撤较上次决策加深 ≥ 该比例提前触发；0 关闭 |
+| `event_price_move` | decimal | `0.005` | 距上次决策价格偏离 ≥ 该比例提前触发；0 关闭。仅首次初始化使用，之后通过参数库/MCP 调整 |
+| `event_drawdown_step` | decimal | `0.01` | 回撤较上次决策加深 ≥ 该比例提前触发；0 关闭。仅首次初始化使用，之后通过参数库/MCP 调整 |
+| `event_price_drift` | decimal | `0.02` | 相对上次成交价累计偏离 ≥ 该比例提前触发（跨多次 HOLD，不受空转退避影响）；0 关闭。仅首次初始化使用，之后通过参数库/MCP 调整 |
 | `volatility_enter` | decimal | `0` | 约 15 分钟 `(最高−最低)/最低` ≥ 该比例进入高波动档，放宽 HOLD 等待；0 关闭 |
 | `volatility_exit` | decimal | `0.006` | 振幅 ≤ 该比例且持续 `volatility_exit_hold_ms` 才退出高波动档 |
 | `volatility_interval_ms` | u32 | `180000` | 高波动档的复查间隔；仍受 `decision_min_interval_ms` 约束 |

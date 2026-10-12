@@ -16,6 +16,7 @@ const db = @import("../storage/db.zig");
 const clock = @import("../core/clock.zig");
 const dynamic = @import("dynamic.zig");
 const store = @import("store.zig");
+const gate = @import("gate.zig");
 
 pub const WriteError = store.StoreError || error{ResponseTooSmall};
 
@@ -225,12 +226,22 @@ fn apply(
             return respond(out, .backtest_required, .apply, version_id, active.version_id, .{ .field = "backtest_summary" }, "[]");
         }
     } else {
-        dynamic.validateBacktestRef(std.heap.page_allocator, backtest) catch {
+        gate.validateStoredRef(database, backtest, row.json, active.version_id, now_ms) catch |err| {
+            switch (err) {
+                error.PrepareFailed => return error.PrepareFailed,
+                error.BindFailed => return error.BindFailed,
+                error.StepFailed => return error.StepFailed,
+                error.Busy => return error.Busy,
+                error.OpenFailed => return error.OpenFailed,
+                error.ExecFailed => return error.ExecFailed,
+                error.NotFound => return error.NotFound,
+                else => {},
+            }
             var detail_buf: [8192]u8 = undefined;
-            const detail = try writeDetail(&detail_buf, meta, "backtest_rejected", active.version_id, version_id, .{ .field = "backtest_summary" }, before, row.json, null);
+            const detail = try writeDetail(&detail_buf, meta, "backtest_rejected", active.version_id, version_id, .{ .field = gate.refField(err) }, before, row.json, null);
             try insertAudit(database, ts, version_id, "apply", meta.source, detail);
             try tx.commit();
-            return respond(out, .backtest_rejected, .apply, version_id, active.version_id, .{ .field = "backtest_summary" }, "[]");
+            return respond(out, .backtest_rejected, .apply, version_id, active.version_id, .{ .field = gate.refField(err) }, "[]");
         };
     }
     const last = try lastApplyMs(database);
@@ -543,6 +554,20 @@ const t0: i64 = 1_700_000_000_000;
 const day_ms = dynamic.day_ms;
 const backtest_ok = "{\"schema\":\"alphabound.backtest_ref.v1\",\"id\":\"bt_ok\",\"passed\":true}";
 
+fn seedReport(database: *db.Db, params_json: []const u8, as_of_ms: i64, baseline_version: i64) !void {
+    var stmt = try database.prepare(
+        \\INSERT INTO backtest_reports (
+        \\  id, created_ts, as_of_ms, passed, params_json, baseline_json,
+        \\  baseline_version_id, range_hash, digest, report_json
+        \\) VALUES ('bt_ok', '2023-11-14T22:13:20.000Z', ?1, 1, ?2, '{}', ?3, 'abc', 'abc', '{}')
+    );
+    defer stmt.finalize();
+    try stmt.bindInt(1, as_of_ms);
+    try stmt.bindText(2, params_json);
+    try stmt.bindInt(3, baseline_version);
+    _ = try stmt.stepCritical();
+}
+
 fn bootDb() !struct { db: db.Db, cfg: config.Config } {
     var database = try db.Db.open(":memory:");
     errdefer database.close();
@@ -621,6 +646,7 @@ test "propose rejects bounds, step, direction, 24h and a locked drawdown field" 
     var up = raised;
     up.position_cap = d("0.9");
     // Apply the lower cap first so a later raise is a real loosening.
+    try seedReport(&env.db, down_json, t0 + day_ms, 1);
     var abuf: [1024]u8 = undefined;
     const apply_down = try applyBody(&abuf, pending_id, 1, backtest_ok);
     const applied = try call(&env.db, false, t0 + day_ms, .apply, apply_down, &out);
@@ -686,6 +712,7 @@ test "apply enforces optimistic concurrency, 24h, backtest ref and audit" {
     try testing.expect(std.mem.indexOf(u8, conflict.body, "\"code\":\"conflict\"") != null);
 
     const soon = try applyBody(&abuf, id2, id, backtest_ok);
+    try seedReport(&env.db, cool_json, t0 + day_ms, id);
     const too_soon = try call(&env.db, false, t0 + day_ms + 10, .apply, soon, &out);
     try testing.expectEqual(OpStatus.rejected, too_soon.status);
     try testing.expect(std.mem.indexOf(u8, too_soon.body, "\"too_soon\"") != null);
@@ -719,6 +746,7 @@ test "rollback ignores step and 24h, keeps absolute bounds, and the next decisio
     const cap_body = try proposeBody(&body, cap_json);
     _ = try call(&env.db, false, t0 + day_ms, .propose, cap_body, &out);
     const pending_id = try env.db.queryInt("SELECT id FROM param_versions WHERE status = 'pending'");
+    try seedReport(&env.db, cap_json, t0 + day_ms, held.version_id);
     const apply_body = try applyBody(&abuf, pending_id, held.version_id, backtest_ok);
     const applied = try call(&env.db, false, t0 + day_ms, .apply, apply_body, &out);
     try testing.expectEqual(OpStatus.ok, applied.status);
