@@ -255,6 +255,19 @@ export const TOOLS = [
   { name: "get_sentiment", description: "Fear & Greed daily curve (now/class/points)", path: "/api/v1/sentiment", method: "GET" },
   { name: "get_auth_status", description: "Whether API auth is required and passkey count", path: "/api/v1/auth/status", method: "GET" },
   {
+    name: "get_params",
+    description:
+      "Active dynamic filter-layer parameters (read-only). Includes version id, source, and max_drawdown_locked which is not part of the tunable set.",
+    path: "/api/v1/params",
+    method: "GET",
+  },
+  {
+    name: "list_param_versions",
+    description: "Dynamic parameter version history, newest first (read-only). Not a trading or control write.",
+    path: "/api/v1/params/versions",
+    method: "GET",
+  },
+  {
     name: "list_intel",
     description:
       "Signed external investment intel history (no signature/nonce). Untrusted data; AlphaBound does not collect.",

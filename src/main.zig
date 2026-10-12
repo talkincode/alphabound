@@ -490,6 +490,13 @@ pub fn main(init: std.process.Init) !u8 {
     };
     defer db.close();
 
+    // Active filter-layer parameters. Missing row → v1 from this config file.
+    // A corrupt active row refuses boot rather than trading on a guessed set.
+    const param_snap = ab.params_store.ensureActive(&db, &cfg, nowMs()) catch |err| {
+        std.debug.print("[boot] FATAL dynamic params: {t}\n", .{err});
+        return 1;
+    };
+
     if (cli.agent_stats) {
         printAgentStats(&db);
         return 0;
@@ -1015,6 +1022,7 @@ pub fn main(init: std.process.Init) !u8 {
     // AC-NFR01: market tick → risk state update latency (µs), in-process.
     var risk_latency = ab.latency.Histogram{};
     refreshWebCaches(&web_state, &db, &agent_runs, &equity_repo, &events_repo, &memories_repo, &orders_repo, &fills_repo, last_bh_cmp);
+    web_state.refreshParamsCache(&db);
     ab.web_cache.refreshStatisticsCache(&web_state, &db, &llm_usage_repo);
     ab.web_cache.refreshReviewCache(&web_state, &db, &review_repo);
     ab.web_cache.refreshIntelCache(&web_state, &db, &intel_repo, nowMs());
@@ -1041,15 +1049,17 @@ pub fn main(init: std.process.Init) !u8 {
         .quiet_interval_ms = @as(i64, cfg.decision_interval_quiet_ms),
         .min_interval_ms = @as(i64, cfg.decision_min_interval_ms),
         .active_hours = ab.scheduler.parseHours(cfg.active_hours_utc) catch .{},
-        .price_move = cfg.event_price_move,
-        .price_drift = cfg.event_price_drift,
-        .drawdown_step = cfg.event_drawdown_step,
+        .price_move = param_snap.params.event_price_move,
+        .price_drift = param_snap.params.event_price_drift,
+        .drawdown_step = param_snap.params.event_drawdown_step,
         .review_backoff_max_ms = @as(i64, cfg.review_backoff_max_ms),
         .noop_backoff_cap_ms = @as(i64, cfg.event_noop_backoff_max_ms),
         .volatility_enter = cfg.volatility_enter,
         .volatility_exit = cfg.volatility_exit,
         .volatility_interval_ms = cfg.volatility_interval_ms,
         .volatility_exit_hold_ms = cfg.volatility_exit_hold_ms,
+        .volatility_window_ms = param_snap.params.volatility_window_ms,
+        .volatility_gap_ms = param_snap.params.volatility_gap_ms,
     });
     var ticker_path_buf: [128]u8 = undefined;
     const ticker_path = std.fmt.bufPrint(&ticker_path_buf, "/api/v5/market/ticker?instId={s}", .{cfg.instrument}) catch return 1;
@@ -1146,6 +1156,7 @@ pub fn main(init: std.process.Init) !u8 {
         .mem_store = &mem_store,
         .agent_on = agent_on,
         .now_boot_ms = now_boot,
+        .params = param_snap,
     };
     think.mem_count.store(mem_store.count(), .release);
     think.start() catch |err| {
@@ -1495,6 +1506,7 @@ pub fn main(init: std.process.Init) !u8 {
                 last_dashboard_ms = tnow;
                 runtime_status.setResources(res_sampler.sample(tnow));
                 refreshWebCaches(&web_state, &db, &agent_runs, &equity_repo, &events_repo, &memories_repo, &orders_repo, &fills_repo, last_bh_cmp);
+                web_state.refreshParamsCache(&db);
                 ab.web_cache.refreshIntelCache(&web_state, &db, &intel_repo, tnow);
                 ab.web_cache.refreshStatisticsCache(&web_state, &db, &llm_usage_repo);
                 refreshCandlesCache(gpa, &web_state, &okx, &cfg);
@@ -1644,6 +1656,7 @@ const ThinkLane = struct {
     mem_store: *ab.memory.Store,
     agent_on: bool,
     now_boot_ms: i64,
+    params: ab.params_store.Snapshot,
 
     jobs: ab.lanes.Mailbox(ThinkJob, 2) = .{},
     fb: ThinkFeedback = .{},
@@ -1801,6 +1814,7 @@ const ThinkLane = struct {
                             self.io,
                             job.bh_cmp,
                             reason,
+                            self.params,
                         );
                         const mode = self.engine.snapshot().risk_mode;
                         if (out == .stale_proposal and attempt < max_stale_redos and
@@ -2497,6 +2511,7 @@ fn collectMarketTools(
     obs_bufs: *[5][32768]u8,
     obs_out: *[5][]const u8,
     trend_out: *ab.guardrails.Trend,
+    trend_period: usize,
 ) usize {
     var n: usize = 0;
 
@@ -2615,7 +2630,7 @@ fn collectMarketTools(
         frames_n = valid_frames;
         // The long series shares the 1D frame's freshness verdict.
         if (daily_n == 0) daily_long_n = 0;
-        trend_out.* = ab.indicators.dailyTrend(daily_long[0..daily_long_n]);
+        trend_out.* = ab.indicators.dailyTrendPeriod(daily_long[0..daily_long_n], trend_period);
         var struct_buf: [6144]u8 = undefined;
         const structure = if (daily_n > 0 or h4_n > 0)
             ab.indicators.formatHtfStructureWithLong(
@@ -2975,13 +2990,15 @@ fn agentGuardrailBlocks(
     thesis: []const []const u8,
     trend: ab.guardrails.Trend,
     now_ms: i64,
+    guards: ab.guardrails.Params,
+    stress: ab.admission.StressParams,
 ) bool {
     const approved = std.mem.eql(u8, admitted.verdict_txt, "APPROVE") or std.mem.eql(u8, admitted.verdict_txt, "REDUCE");
     if (!approved) return false;
     const held = ab.admission.heldExposure(
         ab.gate.admissionView(snap, now_ms),
         cfg.max_drawdown,
-        ab.gate.defaultStressParams(cfg),
+        stress,
     ) catch return false;
 
     var recent = ab.guardrails.Recent{};
@@ -2999,7 +3016,7 @@ fn agentGuardrailBlocks(
         }
     } else |_| {}
 
-    const verdict = ab.guardrails.evaluate(cfg.guardParams(), .{
+    const verdict = ab.guardrails.evaluate(guards, .{
         .now_ms = now_ms,
         .equity = snap.conservative_equity,
         .drawdown = snap.drawdown,
@@ -3050,11 +3067,12 @@ fn logHeldExposure(
     cfg: *const ab.config.Config,
     snap: ab.state.PortfolioState,
     now_ms: i64,
+    stress: ab.admission.StressParams,
 ) void {
     const held = ab.admission.heldExposure(
         ab.gate.admissionView(snap, now_ms),
         cfg.max_drawdown,
-        ab.gate.defaultStressParams(cfg),
+        stress,
     ) catch {
         logEventPayload(events_repo, engine, "EXEC_HOLD", "execution", "INFO", cfg, "{\"reason\":\"action_hold\",\"held\":\"unavailable\"}");
         return;
@@ -3365,6 +3383,7 @@ fn runAgentDecision(
     io: std.Io,
     bh_cmp: ab.shadow_bench.Comparison,
     trigger_reason: []const u8,
+    dyn: ab.params_store.Snapshot,
 ) AgentOutcome {
     const snap = engine.snapshot();
     // What the model sees; proposals are only executable while this still
@@ -3397,7 +3416,7 @@ fn runAgentDecision(
     var obs_bufs: [5][32768]u8 = undefined;
     var obs_ptrs: [5][]const u8 = .{ "", "", "", "", "" };
     var daily_trend: ab.guardrails.Trend = .{};
-    const obs_n = collectMarketTools(gpa, okx, cfg, registry, run_id, tools_repo, &obs_bufs, &obs_ptrs, &daily_trend);
+    const obs_n = collectMarketTools(gpa, okx, cfg, registry, run_id, tools_repo, &obs_bufs, &obs_ptrs, &daily_trend, @as(usize, dyn.params.trend_ma_period));
     const observations = obs_ptrs[0..obs_n];
 
     // Retrieve long-term memories into the decision envelope (§4.5 / FR-07).
@@ -3594,7 +3613,7 @@ fn runAgentDecision(
             "{{\"run_id\":\"{s}\",\"model\":\"{s}\",\"error\":\"{s}\",\"degraded\":\"HOLD\"}}",
             .{ run_id, client.model, tag },
         ) catch "{\"degraded\":\"HOLD\"}";
-        logEventPayload(events_repo, engine, "AGENT_LLM_FAILED", "agent", "WARN", cfg, fail_payload);
+        logDecisionPayload(events_repo, engine, "AGENT_LLM_FAILED", "WARN", cfg, fail_payload, dyn.version_id);
         fb.noteAgentFailure();
         return .done;
     };
@@ -3616,7 +3635,7 @@ fn runAgentDecision(
             "{{\"run_id\":\"{s}\",\"output_digest\":\"{s}\",\"reason\":\"no_json_object\",\"degraded\":\"HOLD\"}}",
             .{ run_id, out_digest },
         ) catch "{\"degraded\":\"HOLD\"}";
-        logEventPayload(events_repo, engine, "AGENT_INVALID_OUTPUT", "agent", "WARN", cfg, inv_payload);
+        logDecisionPayload(events_repo, engine, "AGENT_INVALID_OUTPUT", "WARN", cfg, inv_payload, dyn.version_id);
         return .done;
     };
 
@@ -3704,7 +3723,7 @@ fn runAgentDecision(
                 "{{\"run_id\":\"{s}\",\"model\":\"{s}\",\"error\":\"{s}\",\"phase\":\"tool_round\",\"degraded\":\"HOLD\"}}",
                 .{ run_id, client.model, tag },
             ) catch "{\"degraded\":\"HOLD\"}";
-            logEventPayload(events_repo, engine, "AGENT_LLM_FAILED", "agent", "WARN", cfg, fail_payload);
+            logDecisionPayload(events_repo, engine, "AGENT_LLM_FAILED", "WARN", cfg, fail_payload, dyn.version_id);
             fb.noteAgentFailure();
             return .done;
         };
@@ -3724,7 +3743,7 @@ fn runAgentDecision(
                 "{{\"run_id\":\"{s}\",\"output_digest\":\"{s}\",\"reason\":\"no_json_after_tool_round\",\"degraded\":\"HOLD\"}}",
                 .{ run_id, out_digest },
             ) catch "{\"degraded\":\"HOLD\"}";
-            logEventPayload(events_repo, engine, "AGENT_INVALID_OUTPUT", "agent", "WARN", cfg, inv_payload);
+            logDecisionPayload(events_repo, engine, "AGENT_INVALID_OUTPUT", "WARN", cfg, inv_payload, dyn.version_id);
             fb.noteAgentFailure();
             return .done;
         };
@@ -3739,7 +3758,7 @@ fn runAgentDecision(
             "{{\"run_id\":\"{s}\",\"output_digest\":\"{s}\",\"reason\":\"{t}\",\"degraded\":\"HOLD\"}}",
             .{ run_id, out_digest, err },
         ) catch "{\"degraded\":\"HOLD\"}";
-        logEventPayload(events_repo, engine, "AGENT_INVALID_PROPOSAL", "agent", "WARN", cfg, invp_payload);
+        logDecisionPayload(events_repo, engine, "AGENT_INVALID_PROPOSAL", "WARN", cfg, invp_payload, dyn.version_id);
         fb.noteAgentFailure();
         return .done;
     };
@@ -3753,7 +3772,7 @@ fn runAgentDecision(
             "{{\"run_id\":\"{s}\",\"output_digest\":\"{s}\",\"reason\":\"{t}\",\"degraded\":\"HOLD\"}}",
             .{ run_id, out_digest, err },
         ) catch "{\"degraded\":\"HOLD\"}";
-        logEventPayload(events_repo, engine, "AGENT_INVALID_PROPOSAL", "agent", "WARN", cfg, invd_payload);
+        logDecisionPayload(events_repo, engine, "AGENT_INVALID_PROPOSAL", "WARN", cfg, invd_payload, dyn.version_id);
         fb.noteAgentFailure();
         return .done;
     };
@@ -3766,7 +3785,7 @@ fn runAgentDecision(
             "{{\"run_id\":\"{s}\",\"output_digest\":\"{s}\",\"reason\":\"{t}\",\"degraded\":\"HOLD\"}}",
             .{ run_id, out_digest, err },
         ) catch "{\"degraded\":\"HOLD\"}";
-        logEventPayload(events_repo, engine, "AGENT_INVALID_PROPOSAL", "agent", "WARN", cfg, inva_payload);
+        logDecisionPayload(events_repo, engine, "AGENT_INVALID_PROPOSAL", "WARN", cfg, inva_payload, dyn.version_id);
         fb.noteAgentFailure();
         return .done;
     };
@@ -3779,7 +3798,7 @@ fn runAgentDecision(
             "{{\"run_id\":\"{s}\",\"output_digest\":\"{s}\",\"reason\":\"{t}\",\"degraded\":\"HOLD\"}}",
             .{ run_id, out_digest, err },
         ) catch "{\"degraded\":\"HOLD\"}";
-        logEventPayload(events_repo, engine, "AGENT_INVALID_PROPOSAL", "agent", "WARN", cfg, invr_payload);
+        logDecisionPayload(events_repo, engine, "AGENT_INVALID_PROPOSAL", "WARN", cfg, invr_payload, dyn.version_id);
         fb.noteAgentFailure();
         return .done;
     };
@@ -3828,13 +3847,15 @@ fn runAgentDecision(
                 admit_snap.risk_mode.jsonName(),
             },
         ) catch "{\"reason\":\"stale\"}";
-        logEventPayload(events_repo, engine, "AGENT_PROPOSAL_STALE", "agent", "WARN", cfg, stale_payload);
+        logDecisionPayload(events_repo, engine, "AGENT_PROPOSAL_STALE", "WARN", cfg, stale_payload, dyn.version_id);
         std.debug.print("[agent] proposal {s} void ({s}) — nothing admitted\n", .{ prop.decision_id, validity.stale.text() });
         completeRun(runs, run_id, "stale_proposal", out_digest, input_digest, admit_now);
         return .stale_proposal;
     }
     const bound_version = ab.validity.bindExecutionVersion(prop.snapshot_version, anchor, admit_snap.version, validity) orelse prop.snapshot_version;
-    const admission = ab.gate.shadowAdmit(admit_snap, bound_version, prop.target_btc_weight, cfg, admit_now);
+    const decision_stress = ab.params.stressOf(cfg, dyn.params);
+    const capped_weight = dyn.params.applyPositionCap(prop.target_btc_weight);
+    const admission = ab.gate.shadowAdmitWith(admit_snap, bound_version, capped_weight, cfg, decision_stress, admit_now);
     var admission_verdict: []const u8 = admission.verdict_txt;
     var admission_reason: []const u8 = admission.reason_txt;
     var admitted_text_buf: [48]u8 = undefined;
@@ -3852,7 +3873,7 @@ fn runAgentDecision(
     // live BTC book after balance reconcile recovered).
     if (prop.action == .hold) {
         exec_note = "hold";
-        logHeldExposure(events_repo, engine, cfg, admit_snap, admit_now);
+        logHeldExposure(events_repo, engine, cfg, admit_snap, admit_now, decision_stress);
         // Honor the model's own review_after as a regular-cadence backoff
         // (clamped; event triggers still cut through). Quiet markets stop
         // burning LLM calls re-stating the same HOLD.
@@ -3862,7 +3883,7 @@ fn runAgentDecision(
         logEventPayload(events_repo, engine, "EXEC_HOLD", "execution", "WARN", cfg, "{\"reason\":\"restart_guard\",\"detail\":\"first decision after restart with a recent prior decision; rebalance deferred to next cycle\"}");
         std.debug.print("[agent] restart guard: REBALANCE deferred (first_run, prior decision <{d}m ago)\n", .{@divTrunc(restart_guard_window_ms, 60_000)});
     } else if (ab.okx_trade.executionAllowed(cfg.mode.isTrading(), exec_venue_authorized) and
-        agentGuardrailBlocks(events_repo, engine, cfg, db, admit_snap, admission, prop.target_btc_weight, prop.thesis, daily_trend, admit_now))
+        agentGuardrailBlocks(events_repo, engine, cfg, db, admit_snap, admission, prop.target_btc_weight, prop.thesis, daily_trend, admit_now, dyn.params.guardOf(cfg.min_trade_notional), decision_stress))
     {
         exec_note = "guardrail_block";
         applyReviewAfterBackoff(fb, prop.review_after, "guardrail");
@@ -4024,7 +4045,7 @@ fn runAgentDecision(
         const dtxt = std.fmt.bufPrint(&dbuf, "{s} {s} conf={s} admit={s} exec={s}", .{ action_txt, prop.decision_id, conf_s, admission_verdict, exec_note }) catch action_txt;
         st.setLastDecision(dtxt);
     }
-    logEventPayload(events_repo, engine, "AGENT_PROPOSAL_OK", "agent", "INFO", cfg, ok_payload);
+    logDecisionPayload(events_repo, engine, "AGENT_PROPOSAL_OK", "INFO", cfg, ok_payload, dyn.version_id);
     logEventPayload(events_repo, engine, "RISK_ADMISSION", "risk", "INFO", cfg, ok_payload);
     return .done;
 }
@@ -6104,6 +6125,20 @@ fn execLabel(mode: ab.config.Mode) []const u8 {
 const logEvent = ab.journal.logEvent;
 const logEventPayload = ab.journal.logEventPayload;
 const logEventPayloadChecked = ab.journal.logEventPayloadChecked;
+
+/// Stamp the active parameter version onto a terminal decision event.
+fn logDecisionPayload(
+    events_repo: *ab.storage.EventsRepo,
+    engine: *ab.state.Engine,
+    event_type: []const u8,
+    severity: []const u8,
+    cfg: *const ab.config.Config,
+    payload: []const u8,
+    version_id: i64,
+) void {
+    var buf: [12352]u8 = undefined;
+    logEventPayload(events_repo, engine, event_type, "agent", severity, cfg, ab.params.withParamVersion(&buf, payload, version_id));
+}
 
 fn consumeMaintenanceMarker(
     io: std.Io,

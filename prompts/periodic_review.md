@@ -48,8 +48,8 @@
 {
   "cycle": "short",
   "summary": "≤200 字，中文，陈述本窗口发生了什么以及最值得记住的一点",
-  "findings": ["事实性观察，最多 8 条，每条 ≤200 字"],
-  "lessons": ["可复用的教训，最多 8 条"],
+  "findings": ["事实性观察，最多 8 条，每条 ≤200 字；超出的条目和超长文本会被截断保留，不会整份作废"],
+  "lessons": ["可复用的教训，最多 8 条；同样只保留前 8 条"],
   "risks": ["本结论的不确定性 / 样本局限，可省略"],
   "memory_ops": [
     { "op": "UPDATE", "memory_id": "H_example", "confidence_delta": -0.02, "evidence_increment": 1 },
