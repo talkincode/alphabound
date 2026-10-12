@@ -25,6 +25,7 @@ pub const llm_usage = @import("observability/llm_usage.zig");
 pub const config = @import("config.zig");
 pub const params = @import("params/dynamic.zig");
 pub const params_store = @import("params/store.zig");
+pub const params_write = @import("params/write.zig");
 pub const state = @import("core/state.zig");
 pub const lanes = @import("core/lanes.zig");
 pub const storage = @import("storage/db.zig");

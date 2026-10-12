@@ -61,6 +61,10 @@ pub const Config = struct {
     guard_reverse_cooldown_ms: i64 = guardrails.Params.default_reverse_cooldown_ms,
     guard_macro_sell_trend_break: bool = false,
     guard_sell_exempt_drawdown: Decimal = guardrails.Params.default_sell_exempt_drawdown,
+    /// When false (default), `apply_params` requires a passing backtest
+    /// reference. True allows a manual apply with no reference. Production
+    /// leaves this false. It does not open an order path.
+    params_allow_unbacked_apply: bool = false,
     // [agent]
     agent_provider: []const u8 = "openai",
     agent_model: []const u8 = "gpt-4o-mini",
@@ -322,6 +326,8 @@ fn applyKey(a: std.mem.Allocator, cfg: *Config, section: []const u8, key: []cons
         } else if (std.mem.eql(u8, key, "guard_sell_exempt_drawdown")) {
             cfg.guard_sell_exempt_drawdown = Decimal.parse(val) catch return error.InvalidValue;
             if (cfg.guard_sell_exempt_drawdown.isNegative()) return error.InvalidValue;
+        } else if (std.mem.eql(u8, key, "params_allow_unbacked_apply")) {
+            cfg.params_allow_unbacked_apply = try parseBool(val);
         } else return error.UnknownKey;
     } else if (std.mem.eql(u8, section, "agent")) {
         if (std.mem.eql(u8, key, "provider")) {
@@ -627,6 +633,7 @@ test "guardrail keys default to the shipped tighten-only behaviour and validate"
     try testing.expectEqual(@as(i64, 4 * 3_600_000), p.reverse_cooldown_ms);
     try testing.expect(!p.macro_sell_requires_trend_break);
     try testing.expect(p.sell_exempt_drawdown.eql(Decimal.parse("0.01") catch unreachable));
+    try testing.expect(!cfg.params_allow_unbacked_apply);
 
     var tuned = try parse(testing.allocator,
         \\[risk]

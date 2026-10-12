@@ -1,7 +1,8 @@
 //! Persist the dynamic-parameter version chain.
 //!
-//! Phase 1 only inserts a bootstrap row when no `active` version exists, and
-//! reads it back. The audit table is append-only. There is no mutation API.
+//! Bootstrap inserts v1 when no `active` row exists. Later writes (propose,
+//! apply, rollback) live in `write.zig` and append to the same tables. The
+//! audit table stays append-only. Nothing here places an order.
 
 const std = @import("std");
 const db = @import("../storage/db.zig");
@@ -60,7 +61,7 @@ pub fn ensureActive(database: *db.Db, cfg: *const config.Config, now_ms: i64) St
     };
 }
 
-fn loadActive(database: *db.Db) StoreError!?Snapshot {
+pub fn loadActive(database: *db.Db) StoreError!?Snapshot {
     var stmt = try database.prepare(
         \\SELECT id, created_ts, params_json FROM param_versions WHERE status = 'active' LIMIT 1
     );

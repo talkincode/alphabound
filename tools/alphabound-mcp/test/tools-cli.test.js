@@ -12,6 +12,7 @@ const FORBIDDEN = "place_order,flatten,resume,target-weight,secrets";
 
 function startMockApi() {
   const posts = [];
+  const paramPosts = [];
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url || "/", "http://127.0.0.1");
     const auth = req.headers.authorization || "";
@@ -29,6 +30,15 @@ function startMockApi() {
       posts.push(payload);
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ ok: true, id: payload.id || "intel_1" }));
+      return;
+    }
+    if (req.method === "POST" && url.pathname.startsWith("/api/v1/params/")) {
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      const payload = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+      paramPosts.push({ path: url.pathname, payload });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, code: "ok", path: url.pathname }));
       return;
     }
     if (req.method === "GET" && url.pathname === "/api/v1/system") {
@@ -50,6 +60,7 @@ function startMockApi() {
       resolve({
         server,
         posts,
+        paramPosts,
         base: `http://127.0.0.1:${port}`,
       });
     });
@@ -249,6 +260,89 @@ describe("CLI HTTP + env token", () => {
     }
     assert.ok("error_class" in TOOLS.find((x) => x.name === "list_agent_runs").query);
     assert.ok("window" in TOOLS.find((x) => x.name === "query_equity").query);
+  });
+
+  it("advertises parameter writes with the hard bounds and no order path", () => {
+    for (const name of ["propose_params", "apply_params", "rollback_params"]) {
+      const t = TOOLS.find((x) => x.name === name);
+      assert.ok(t, name);
+      assert.equal(t.method, "POST");
+      assert.equal(t.forceSource, "mcp");
+      assert.match(t.description, /20%/);
+      assert.match(t.description, /24h/);
+      assert.match(t.description, /max_drawdown/);
+      assert.match(t.description, /0\.10/);
+      assert.match(t.description, /does not place orders/i);
+      assert.equal(/place_order|flatten|resume/.test(t.path), false);
+    }
+  });
+
+  it("forces source=mcp and forwards parameter write bodies", async () => {
+    const env = { ALPHABOUND_API_BASE: mock.base, ALPHABOUND_API_TOKEN: TOKEN };
+    const proposed = await captureCli(
+      [
+        "propose_params",
+        "--json",
+        JSON.stringify({
+          source: "manual",
+          operator: "ops",
+          reason: "tighten",
+          params: { daily_trade_cap: 7 },
+        }),
+      ],
+      env,
+    );
+    assert.equal(proposed.code, 0, proposed.err);
+    const propose = mock.paramPosts.at(-1);
+    assert.equal(propose.path, "/api/v1/params/propose");
+    assert.equal(propose.payload.source, "mcp");
+    assert.equal(propose.payload.operator, "ops");
+    assert.equal(propose.payload.params.daily_trade_cap, 7);
+
+    const applied = await captureCli(
+      [
+        "apply_params",
+        "--json",
+        JSON.stringify({
+          source: "review",
+          operator: "ops",
+          reason: "apply",
+          version_id: 2,
+          expected_active_version: 1,
+          backtest_summary: "{\"schema\":\"alphabound.backtest_ref.v1\",\"id\":\"bt_ok\",\"passed\":true}",
+        }),
+      ],
+      env,
+    );
+    assert.equal(applied.code, 0, applied.err);
+    const apply = mock.paramPosts.at(-1);
+    assert.equal(apply.path, "/api/v1/params/apply");
+    assert.equal(apply.payload.source, "mcp");
+    assert.equal(apply.payload.version_id, 2);
+
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ab-params-"));
+    const file = path.join(dir, "rollback.json");
+    fs.writeFileSync(
+      file,
+      JSON.stringify({ source: "manual", operator: "ops", reason: "undo", version_id: 1, expected_active_version: 2 }),
+    );
+    const rolled = await captureCli(["rollback_params", "--file", file], env);
+    fs.rmSync(dir, { recursive: true, force: true });
+    assert.equal(rolled.code, 0, rolled.err);
+    const rollback = mock.paramPosts.at(-1);
+    assert.equal(rollback.path, "/api/v1/params/rollback");
+    assert.equal(rollback.payload.source, "mcp");
+    assert.equal(rollback.payload.version_id, 1);
+  });
+
+  it("refuses parameter writes without the admin token", async () => {
+    const r = await captureCli(["propose_params", "--json", "{\"operator\":\"ops\",\"reason\":\"x\",\"params\":{}}"], {
+      ALPHABOUND_API_BASE: mock.base,
+      ALPHABOUND_API_TOKEN: null,
+      DASHBOARD_API_TOKEN: null,
+    });
+    assert.equal(r.code, 1);
+    assert.match(r.err, /401|unauthorized/i);
   });
 
   it("invokes every GET MCP tool against the mock API", async () => {

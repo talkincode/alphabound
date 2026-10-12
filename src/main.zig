@@ -722,6 +722,11 @@ pub fn main(init: std.process.Init) !u8 {
     // the risk loop never calls the model.
     const agent_on = cfg.agent_enabled and llm_env != null;
 
+    // Parameter writes open this path on the web thread. The risk loop stays
+    // the only writer of trading state; these calls never place an order.
+    web_state.param_db_path = db_path;
+    web_state.param_allow_unbacked_apply = cfg.params_allow_unbacked_apply;
+
     // ---- Web API thread (loopback only, §6.4) -----------------------------
     const web_thread = std.Thread.spawn(.{}, webThreadMain, .{ io, cfg.webHost(), cfg.webPort(), &web_state }) catch |err| {
         std.debug.print("[boot] FATAL web listen: {t}\n", .{err});
@@ -1061,6 +1066,7 @@ pub fn main(init: std.process.Init) !u8 {
         .volatility_window_ms = param_snap.params.volatility_window_ms,
         .volatility_gap_ms = param_snap.params.volatility_gap_ms,
     });
+    var live_param_version: i64 = param_snap.version_id;
     var ticker_path_buf: [128]u8 = undefined;
     const ticker_path = std.fmt.bufPrint(&ticker_path_buf, "/api/v5/market/ticker?instId={s}", .{cfg.instrument}) catch return 1;
     // Gate 1: periodic private REST reconcile; private WS is boot probe + optional re-probe.
@@ -1462,6 +1468,19 @@ pub fn main(init: std.process.Init) !u8 {
         // Slow agent loop: proposals always risk-admitted; trading modes may execute.
         // Paused: keep risk/market/reconcile; skip agent decisions.
         // While FLATTENING/HALTED, skip agent so it cannot fight the exit path.
+        // Adopt a newly active parameter version only between decisions.
+        if (!think.isBusy() and think.jobs.depth() == 0) {
+            // loadActive is Error!?Snapshot: a missing row or a read error
+            // leaves the scheduler on the version already in force.
+            const loaded = ab.params_store.loadActive(&db) catch null;
+            if (loaded) |snap| {
+                if (snap.version_id != live_param_version) {
+                    live_param_version = snap.version_id;
+                    ab.params.adoptScheduler(&agent_sched, snap.params);
+                }
+            }
+        }
+
         if (advisoryDecisionAllowed(admin_paused, engine.snapshot().risk_mode)) {
             // One decision in flight at a time; the model runs on the thinking
             // lane, so this loop never waits for it. Not firing while the lane
@@ -1784,6 +1803,10 @@ const ThinkLane = struct {
             if (self.jobs.pop()) |job| {
                 self.busy.store(true, .release);
                 defer self.busy.store(false, .release);
+                // One snapshot for this decision, including a stale redo.
+                // A version applied while the model is running is picked up
+                // by the next job, not this one.
+                const decision_params = ab.params_store.loadActive(&db) catch null orelse self.params;
                 if (llm_client) |*client| {
                     var attempt: u8 = 0;
                     var reason: []const u8 = job.reason[0..job.reason_len];
@@ -1814,7 +1837,7 @@ const ThinkLane = struct {
                             self.io,
                             job.bh_cmp,
                             reason,
-                            self.params,
+                            decision_params,
                         );
                         const mode = self.engine.snapshot().risk_mode;
                         if (out == .stale_proposal and attempt < max_stale_redos and
@@ -3395,8 +3418,10 @@ fn runAgentDecision(
     var started_buf: [32]u8 = undefined;
     const started_ts = ab.clock.formatRfc3339Ms(nowMs(), &started_buf) catch return .done;
 
+    var system_prompt_buf: [24 * 1024]u8 = undefined;
+    const system_prompt = ab.params.renderSystemPrompt(&system_prompt_buf, default_system_prompt, dyn.params);
     var prompt_hash_buf: [64]u8 = undefined;
-    ab.context.digest(default_system_prompt, &prompt_hash_buf);
+    ab.context.digest(system_prompt, &prompt_hash_buf);
     const prompt_hash: []const u8 = &prompt_hash_buf;
 
     // Start run early so tool_calls FK can reference run_id.
@@ -3592,7 +3617,7 @@ fn runAgentDecision(
         "proposal",
         run_id,
         "",
-        default_system_prompt,
+        system_prompt,
         user_msg,
     ) catch |err| {
         const tag: []const u8 = switch (err) {
@@ -3702,7 +3727,7 @@ fn runAgentDecision(
             "proposal_tool_round",
             run_id,
             "",
-            default_system_prompt,
+            system_prompt,
             user_msg2,
         ) catch |err| {
             const tag: []const u8 = switch (err) {
@@ -6506,6 +6531,18 @@ test "periodicReviewTimeoutMs never shrinks below the configured base regardless
     const effective = periodicReviewTimeoutMs(review_base_ms, 12_000);
     try std.testing.expect(effective > tight_decision_timeout_ms);
     try std.testing.expectEqual(review_base_ms, @min(effective, review_base_ms));
+}
+
+test "default params leave the system prompt bytes unchanged" {
+    var buf: [24 * 1024]u8 = undefined;
+    const same = ab.params.renderSystemPrompt(&buf, default_system_prompt, .{});
+    try std.testing.expectEqual(default_system_prompt.ptr, same.ptr);
+    var lowered = ab.params.Params{};
+    lowered.position_cap = ab.decimal.Decimal.parse("0.8") catch unreachable;
+    const rendered = ab.params.renderSystemPrompt(&buf, default_system_prompt, lowered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "target.btc` in [0, 0.8]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "target.btc` in [0, 1]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "target.btc` in [0, 1]") != null);
 }
 
 test "jsonStringArrayLimited escapes and caps" {

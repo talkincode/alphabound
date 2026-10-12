@@ -1,6 +1,7 @@
 /**
- * stdio MCP server — AlphaBound analytics plus signed intel ingest.
- * Trading control (orders / flatten / secrets) is never exposed.
+ * stdio MCP server — AlphaBound analytics, signed intel ingest, and
+ * filter-parameter writes. Trading control (orders / flatten / secrets)
+ * is never exposed. Parameter writes still cannot place an order.
  */
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";

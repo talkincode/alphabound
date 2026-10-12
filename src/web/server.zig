@@ -10,6 +10,11 @@ const auth = @import("auth.zig");
 const review = @import("review.zig");
 const intel = @import("../intel/protocol.zig");
 const intel_inbox = @import("../intel/inbox.zig");
+const db = @import("../storage/db.zig");
+const params_write = @import("../params/write.zig");
+const params_store = @import("../params/store.zig");
+const params_dynamic = @import("../params/dynamic.zig");
+const app_config = @import("../config.zig");
 
 const favicon_svg: []const u8 = @embedFile("favicon_svg");
 const favicon_ico: []const u8 = @embedFile("favicon_ico");
@@ -86,6 +91,11 @@ pub const Context = struct {
     params_json: []const u8 = "{}",
     /// Parameter version history, newest first. Read-only.
     param_versions_json: []const u8 = "[]",
+    /// DB path for parameter writes. Empty = writes unavailable.
+    /// Writes use a short-lived connection and never touch orders.
+    param_db_path: [:0]const u8 = "",
+    /// Production default is false: apply requires a passing backtest ref.
+    param_allow_unbacked_apply: bool = false,
     /// Intel ingest mailbox; null = ingest unavailable.
     intel_inbox: ?*intel_inbox.Inbox = null,
     /// HMAC key for alphabound.intel.v1; empty = ingest disabled.
@@ -271,6 +281,9 @@ pub fn handleReq(buf: []u8, req: RequestInfo, ctx: Context) Response {
     if (method == .POST and std.mem.eql(u8, path, "/api/v1/intel")) {
         return handleIntelPost(buf, req, ctx);
     }
+    if (method == .POST and std.mem.startsWith(u8, path, "/api/v1/params/")) {
+        return handleParamPost(buf, req, path, ctx);
+    }
 
     if (method != .GET) {
         return .{ .status = .method_not_allowed, .body = "{\"error\":\"method not allowed\"}" };
@@ -398,6 +411,42 @@ fn handleIntelPost(buf: []u8, req: RequestInfo, ctx: Context) Response {
         .{ item.id(), item.dedupKey() },
     ) catch return .{ .status = .accepted, .body = "{\"ok\":true,\"queued\":true}" };
     return .{ .status = .accepted, .body = body };
+}
+
+fn handleParamPost(buf: []u8, req: RequestInfo, path: []const u8, ctx: Context) Response {
+    if (!ctx.auth_cfg.required()) {
+        return .{ .status = .unauthorized, .body = "{\"error\":\"auth_required\"}" };
+    }
+    const action: params_write.Action = if (std.mem.eql(u8, path, "/api/v1/params/propose"))
+        .propose
+    else if (std.mem.eql(u8, path, "/api/v1/params/apply"))
+        .apply
+    else if (std.mem.eql(u8, path, "/api/v1/params/rollback"))
+        .rollback
+    else
+        return .{ .status = .not_found, .body = "{\"error\":\"not found\"}" };
+    if (ctx.param_db_path.len == 0) {
+        return .{ .status = .service_unavailable, .body = "{\"error\":\"params_unavailable\"}" };
+    }
+    var database = db.Db.open(ctx.param_db_path) catch {
+        return .{ .status = .service_unavailable, .body = "{\"error\":\"params_unavailable\"}" };
+    };
+    defer database.close();
+    const now = if (req.now_ms == 0) clock.SystemClock.clock().wallMs() else req.now_ms;
+    const result = params_write.writeApi(&database, ctx.param_allow_unbacked_apply, now, action, req.body, buf) catch {
+        return .{ .status = .internal_server_error, .body = "{\"error\":\"params_write_failed\"}" };
+    };
+    return .{ .status = paramHttpStatus(result.status), .body = result.body };
+}
+
+fn paramHttpStatus(status: params_write.OpStatus) std.http.Status {
+    return switch (status) {
+        .ok, .unchanged => .ok,
+        .rejected, .backtest_required, .backtest_rejected => .unprocessable_entity,
+        .conflict, .bad_version => .conflict,
+        .not_found => .not_found,
+        .bad_request => .bad_request,
+    };
 }
 
 fn jsonGetString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
@@ -2098,4 +2147,72 @@ test "auth fail guard locks login after repeated bad tokens" {
         }, ctx);
     }
     try testing.expect(guard2.lockedSeconds("203.0.113.1", now + 2000) > 0);
+}
+
+test "param writes require the admin token and never accept max_drawdown" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [512]u8 = undefined;
+    const n = try tmp.dir.realPath(std.testing.io, &dir_buf);
+    var path_buf: [640:0]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "{s}/params.db", .{dir_buf[0..n]});
+    var database = try db.Db.open(path);
+    defer database.close();
+    var cfg = try app_config.parse(std.testing.allocator, "");
+    defer cfg.deinit();
+    _ = try params_store.ensureActive(&database, &cfg, 1_700_000_000_000);
+
+    var ctx = testCtx();
+    ctx.param_db_path = path;
+    var buf: [8192]u8 = undefined;
+    const open_mode = handleReq(&buf, .{
+        .method = .POST,
+        .target = "/api/v1/params/propose",
+        .body = "{}",
+        .now_ms = 1_700_000_000_000,
+    }, ctx);
+    try testing.expectEqual(std.http.Status.unauthorized, open_mode.status);
+
+    ctx.auth_cfg = .{ .api_token = "test-token-not-a-secret-value" };
+    const denied = handleReq(&buf, .{
+        .method = .POST,
+        .target = "/api/v1/params/propose",
+        .body = "{}",
+        .now_ms = 1_700_000_000_000,
+    }, ctx);
+    try testing.expectEqual(std.http.Status.unauthorized, denied.status);
+    try testing.expectEqual(std.http.Status.method_not_allowed, handleReq(&buf, .{
+        .method = .POST,
+        .target = "/api/v1/params",
+        .x_api_token = "test-token-not-a-secret-value",
+        .now_ms = 1_700_000_000_000,
+    }, ctx).status);
+
+    var p = params_dynamic.Params{};
+    p.daily_trade_cap = 7;
+    var pbuf: [1024]u8 = undefined;
+    var pw: std.Io.Writer = .fixed(&pbuf);
+    try p.writeJson(&pw);
+    var body: [2048]u8 = undefined;
+    const req_body = try std.fmt.bufPrint(&body, "{{\"source\":\"manual\",\"operator\":\"ops\",\"reason\":\"cap\",\"params\":{s}}}", .{pw.buffered()});
+    const ok = handleReq(&buf, .{
+        .method = .POST,
+        .target = "/api/v1/params/propose",
+        .x_api_token = "test-token-not-a-secret-value",
+        .body = req_body,
+        .now_ms = 1_700_000_000_000 + params_dynamic.day_ms,
+    }, ctx);
+    try testing.expectEqual(std.http.Status.ok, ok.status);
+    try testing.expect(std.mem.indexOf(u8, ok.body, "\"code\":\"ok\"") != null);
+
+    const locked = handleReq(&buf, .{
+        .method = .POST,
+        .target = "/api/v1/params/propose",
+        .x_api_token = "test-token-not-a-secret-value",
+        .body = "{\"source\":\"manual\",\"operator\":\"ops\",\"reason\":\"no\",\"max_drawdown\":\"0.2\"}",
+        .now_ms = 1_700_000_000_000 + params_dynamic.day_ms,
+    }, ctx);
+    try testing.expectEqual(std.http.Status.unprocessable_entity, locked.status);
+    try testing.expect(std.mem.indexOf(u8, locked.body, "\"field\":\"max_drawdown\"") != null);
+    try testing.expectEqual(@as(i64, 0), try database.queryInt("SELECT COUNT(*) FROM orders"));
 }
