@@ -165,6 +165,10 @@ pub const Params = struct {
     volatility_exit: Decimal = Decimal.fromRaw(600_000),
     volatility_interval_ms: i64 = 180_000,
     volatility_exit_hold_ms: i64 = 900_000,
+    /// 0 keeps the compiled 15-minute window. The daemon sets the active version.
+    volatility_window_ms: i64 = 0,
+    /// 0 keeps the compiled 90-second gap.
+    volatility_gap_ms: i64 = 0,
 
     pub fn effectiveInterval(self: Params, hour: u8) i64 {
         if (self.active_hours.contains(hour)) return self.base_interval_ms;
@@ -220,6 +224,14 @@ pub const Scheduler = struct {
         return .{ .params = params };
     }
 
+    fn windowMs(self: *const Scheduler) i64 {
+        return if (self.params.volatility_window_ms > 0) self.params.volatility_window_ms else volatility_window_ms;
+    }
+
+    fn gapMs(self: *const Scheduler) i64 {
+        return if (self.params.volatility_gap_ms > 0) self.params.volatility_gap_ms else volatility_max_gap_ms;
+    }
+
     fn resetPrices(self: *Scheduler) void {
         self.price_buckets = [_]PriceBucket{.{}} ** 16;
         self.price_start_ms = null;
@@ -243,7 +255,7 @@ pub const Scheduler = struct {
                 self.resetPrices();
                 return;
             }
-            if (now_ms - last > volatility_max_gap_ms) self.resetPrices();
+            if (now_ms - last > self.gapMs()) self.resetPrices();
         }
         if (self.price_start_ms == null) self.price_start_ms = now_ms;
         self.price_last_ms = now_ms;
@@ -255,11 +267,12 @@ pub const Scheduler = struct {
             if (bid.lt(bucket.low)) bucket.low = bid;
             if (bid.gt(bucket.high)) bucket.high = bid;
         }
-        if (now_ms - self.price_start_ms.? < volatility_window_ms) return;
+        if (now_ms - self.price_start_ms.? < self.windowMs()) return;
         var low = bid;
         var high = bid;
+        const window_minutes = @divFloor(self.windowMs(), 60_000);
         for (self.price_buckets) |b| {
-            if (b.minute < minute - @divExact(volatility_window_ms, 60_000) or b.minute > minute) continue;
+            if (b.minute < minute - window_minutes or b.minute > minute) continue;
             if (b.low.lt(low)) low = b.low;
             if (b.high.gt(high)) high = b.high;
         }
@@ -293,7 +306,7 @@ pub const Scheduler = struct {
     pub fn volatilityStatus(self: *const Scheduler, now_ms: i64) VolatilityStatus {
         if (!self.params.volatility_enter.gt(Decimal.zero)) return .{};
         const last = self.price_last_ms orelse return .{};
-        if (now_ms < last or now_ms - last > volatility_max_gap_ms) return .{};
+        if (now_ms < last or now_ms - last > self.gapMs()) return .{};
         return self.volatility_state;
     }
 
@@ -950,6 +963,18 @@ test "price_drift accumulates across HOLDs and bypasses the no-op backoff" {
         _ = s.deferAfterHold(t, 8 * 3_600_000);
     }
     return error.TestExpectedDriftFire;
+}
+
+test "volatility window and gap default to the compiled constants" {
+    const unset = Scheduler.init(.{});
+    try testing.expectEqual(volatility_window_ms, unset.windowMs());
+    try testing.expectEqual(volatility_max_gap_ms, unset.gapMs());
+    const set = Scheduler.init(.{
+        .volatility_window_ms = volatility_window_ms,
+        .volatility_gap_ms = volatility_max_gap_ms,
+    });
+    try testing.expectEqual(volatility_window_ms, set.windowMs());
+    try testing.expectEqual(volatility_max_gap_ms, set.gapMs());
 }
 
 test "a traded decision re-anchors price_drift at its price" {

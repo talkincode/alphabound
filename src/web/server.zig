@@ -82,6 +82,10 @@ pub const Context = struct {
     intel_json: []const u8 = "[]",
     /// Fear & Greed daily curve (`now` + chronological `points`).
     sentiment_json: []const u8 = "{}",
+    /// Active dynamic-parameter version. Read-only.
+    params_json: []const u8 = "{}",
+    /// Parameter version history, newest first. Read-only.
+    param_versions_json: []const u8 = "[]",
     /// Intel ingest mailbox; null = ingest unavailable.
     intel_inbox: ?*intel_inbox.Inbox = null,
     /// HMAC key for alphabound.intel.v1; empty = ingest disabled.
@@ -305,6 +309,8 @@ pub fn handleReq(buf: []u8, req: RequestInfo, ctx: Context) Response {
     if (std.mem.eql(u8, path, "/api/v1/statistics")) return copyBody(buf, ctx.statistics_json);
     if (std.mem.eql(u8, path, "/api/v1/intel")) return copyBody(buf, ctx.intel_json);
     if (std.mem.eql(u8, path, "/api/v1/sentiment")) return copyBody(buf, ctx.sentiment_json);
+    if (std.mem.eql(u8, path, "/api/v1/params/versions")) return copyBody(buf, ctx.param_versions_json);
+    if (std.mem.eql(u8, path, "/api/v1/params")) return copyBody(buf, ctx.params_json);
     return .{ .status = .not_found, .body = "{\"error\":\"not found\"}" };
 }
 
@@ -1588,6 +1594,11 @@ test "agent-runs equity shadow endpoints serve context blobs" {
     try testing.expectEqualStrings("[{\"memory_id\":\"m1\"}]", handle(&buf, .GET, "/api/v1/memories", ctx).body);
     try testing.expectEqualStrings("{\"ready\":true}", handle(&buf, .GET, "/api/v1/system", ctx).body);
     try testing.expectEqualStrings("[{\"type\":\"AGENT_PROPOSAL_OK\"}]", handle(&buf, .GET, "/api/v1/decisions", ctx).body);
+    ctx.params_json = "{\"version_id\":1,\"source\":\"bootstrap\"}";
+    ctx.param_versions_json = "[{\"id\":1,\"status\":\"active\"}]";
+    try testing.expectEqualStrings("{\"version_id\":1,\"source\":\"bootstrap\"}", handle(&buf, .GET, "/api/v1/params", ctx).body);
+    try testing.expectEqualStrings("[{\"id\":1,\"status\":\"active\"}]", handle(&buf, .GET, "/api/v1/params/versions", ctx).body);
+    try testing.expectEqual(std.http.Status.method_not_allowed, handle(&buf, .POST, "/api/v1/params", ctx).status);
     try testing.expectEqualStrings("{\"orders\":[{\"status\":\"FILLED\"}],\"fills\":[]}", handle(&buf, .GET, "/api/v1/orders", ctx).body);
     try testing.expectEqualStrings("[{\"role\":\"user\"}]", handle(&buf, .GET, "/api/v1/review/chats", ctx).body);
     try testing.expectEqualStrings("{\"decision_id\":\"dec_1\"}", handle(&buf, .GET, "/api/v1/review/context", ctx).body);

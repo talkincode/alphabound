@@ -124,6 +124,8 @@ open http://127.0.0.1:18180/
 | `GET /api/v1/audit` | 定时审计报告（newest first，含完整 findings 与 stats） |
 | `GET /api/v1/intel` | 外部签名情报历史（无 signature/nonce；含 grade/score/expired） |
 | `GET /api/v1/sentiment` | 恐惧贪婪指数日频曲线：`now` / `class` / `as_of_ms` / `points[{t,v}]`（oldest first；class 由数值重推导） |
+| `GET /api/v1/params` | 当前生效的过滤层动态参数版本（只读）。含 `version_id`、`source`、`params`，以及不在参数集里的 `max_drawdown_locked`（固定 `0.10`） |
+| `GET /api/v1/params/versions` | 参数版本历史（newest first，只读）。无写入接口 |
 | `POST /api/v1/intel` | 推送 `alphabound.intel.v1` 信封（需 `ALPHABOUND_INTEL_HMAC`） |
 
 协议、TTL、HMAC 与评分见 [投资情报协议](intel.md)。`POST` 在核心环落库前只入 mailbox（202 Accepted）。未配置 HMAC 时 ingest 返回 503，GET 历史仍可用。

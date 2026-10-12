@@ -31,6 +31,7 @@ const migration_0007: [:0]const u8 = @embedFile("migration_0007");
 const migration_0008: [:0]const u8 = @embedFile("migration_0008");
 const migration_0009: [:0]const u8 = @embedFile("migration_0009");
 const migration_0010: [:0]const u8 = @embedFile("migration_0010");
+const migration_0011: [:0]const u8 = @embedFile("migration_0011");
 const intel = @import("../intel/protocol.zig");
 
 /// Ordered list of migrations; user_version tracks the applied count.
@@ -45,6 +46,7 @@ const migrations = [_][:0]const u8{
     migration_0008,
     migration_0009,
     migration_0010,
+    migration_0011,
 };
 
 /// Expected user_version for a fully migrated database (restore drills).
@@ -214,6 +216,10 @@ pub const Stmt = struct {
 
     pub fn columnInt(self: *Stmt, idx: c_int) i64 {
         return c.sqlite3_column_int64(self.handle, idx);
+    }
+
+    pub fn columnIsNull(self: *Stmt, idx: c_int) bool {
+        return c.sqlite3_column_type(self.handle, idx) == c.SQLITE_NULL;
     }
 
     pub fn columnFloat(self: *Stmt, idx: c_int) f64 {

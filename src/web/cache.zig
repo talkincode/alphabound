@@ -20,6 +20,7 @@ const intel_inbox = @import("../intel/inbox.zig");
 const analytics = @import("../analytics/ab_factor.zig");
 const external = @import("../tools/external.zig");
 const scheduler = @import("../core/scheduler.zig");
+const params_store = @import("../params/store.zig");
 
 fn nowMs() i64 {
     return clock.SystemClock.clock().wallMs();
@@ -108,6 +109,12 @@ pub const WebState = struct {
     /// Fear & Greed daily curve (alternative.me; ~90 points).
     sentiment_buf: [8192]u8 = undefined,
     sentiment_len: usize = 2,
+    /// Active dynamic-parameter version (read-only).
+    params_buf: [4096]u8 = undefined,
+    params_len: usize = 2,
+    /// Recent parameter versions, newest first.
+    param_versions_buf: [16384]u8 = undefined,
+    param_versions_len: usize = 2,
     intel_inbox: ?*intel_inbox.Inbox = null,
     intel_hmac: []const u8 = "",
     /// Dashboard / MCP auth (optional; empty token = open).
@@ -158,6 +165,21 @@ pub const WebState = struct {
         self.intel_len = 2;
         @memcpy(self.sentiment_buf[0..2], "{}");
         self.sentiment_len = 2;
+        @memcpy(self.params_buf[0..2], "{}");
+        self.params_len = 2;
+        @memcpy(self.param_versions_buf[0..2], "[]");
+        self.param_versions_len = 2;
+    }
+
+    pub fn refreshParamsCache(self: *WebState, database: *storage.Db) void {
+        var active_buf: [4096]u8 = undefined;
+        if (params_store.writeActiveJson(database, &active_buf)) |body| {
+            self.setJson(.params, body);
+        } else |_| {}
+        var versions_buf: [16384]u8 = undefined;
+        if (params_store.writeVersionsJson(database, &versions_buf)) |body| {
+            self.setJson(.param_versions, body);
+        } else |_| {}
     }
 
     pub fn contextFn(userdata: ?*anyopaque) web.Context {
@@ -184,6 +206,8 @@ pub const WebState = struct {
             var statistics: [98304]u8 = undefined;
             var intel: [49152]u8 = undefined;
             var sentiment: [8192]u8 = undefined;
+            var params: [4096]u8 = undefined;
+            var param_versions: [16384]u8 = undefined;
             var config_hash: [71]u8 = undefined;
             var agent_len: usize = 2;
             var equity_len: usize = 2;
@@ -204,6 +228,8 @@ pub const WebState = struct {
             var statistics_len: usize = 2;
             var intel_len: usize = 2;
             var sentiment_len: usize = 2;
+            var params_len: usize = 2;
+            var param_versions_len: usize = 2;
         };
         const self: *WebState = @ptrCast(@alignCast(userdata.?));
         while (true) {
@@ -233,7 +259,9 @@ pub const WebState = struct {
             const stl = self.statistics_len;
             const il = self.intel_len;
             const sel = self.sentiment_len;
-            if (al > Tls.agent.len or el > Tls.equity.len or apl > Tls.agent_problems.len or ell > Tls.equity_long.len or vl > Tls.events.len or sl > Tls.shadow.len or cl > Tls.candles.len or ml > Tls.memories.len or yl > Tls.system.len or dl > Tls.decisions.len or ol > Tls.orders.len or rl > Tls.review_chats.len or rcl > Tls.review_ctx.len or aul > Tls.audit.len or pdl > Tls.periodic.len or anl > Tls.analytics.len or stl > Tls.statistics.len or il > Tls.intel.len or sel > Tls.sentiment.len) {
+            const pal = self.params_len;
+            const pvl = self.param_versions_len;
+            if (al > Tls.agent.len or el > Tls.equity.len or apl > Tls.agent_problems.len or ell > Tls.equity_long.len or vl > Tls.events.len or sl > Tls.shadow.len or cl > Tls.candles.len or ml > Tls.memories.len or yl > Tls.system.len or dl > Tls.decisions.len or ol > Tls.orders.len or rl > Tls.review_chats.len or rcl > Tls.review_ctx.len or aul > Tls.audit.len or pdl > Tls.periodic.len or anl > Tls.analytics.len or stl > Tls.statistics.len or il > Tls.intel.len or sel > Tls.sentiment.len or pal > Tls.params.len or pvl > Tls.param_versions.len) {
                 std.atomic.spinLoopHint();
                 continue;
             }
@@ -256,6 +284,8 @@ pub const WebState = struct {
             @memcpy(Tls.statistics[0..stl], self.statistics_buf[0..stl]);
             @memcpy(Tls.intel[0..il], self.intel_buf[0..il]);
             @memcpy(Tls.sentiment[0..sel], self.sentiment_buf[0..sel]);
+            @memcpy(Tls.params[0..pal], self.params_buf[0..pal]);
+            @memcpy(Tls.param_versions[0..pvl], self.param_versions_buf[0..pvl]);
             @memcpy(Tls.config_hash[0..], self.config_hash[0..]);
             Tls.agent_len = al;
             Tls.equity_len = el;
@@ -276,6 +306,8 @@ pub const WebState = struct {
             Tls.statistics_len = stl;
             Tls.intel_len = il;
             Tls.sentiment_len = sel;
+            Tls.params_len = pal;
+            Tls.param_versions_len = pvl;
             const s2 = self.seq.load(.acquire);
             if (s1 == s2) {
                 return .{
@@ -303,6 +335,8 @@ pub const WebState = struct {
                     .statistics_json = Tls.statistics[0..Tls.statistics_len],
                     .intel_json = Tls.intel[0..Tls.intel_len],
                     .sentiment_json = Tls.sentiment[0..Tls.sentiment_len],
+                    .params_json = Tls.params[0..Tls.params_len],
+                    .param_versions_json = Tls.param_versions[0..Tls.param_versions_len],
                     .intel_inbox = self.intel_inbox,
                     .intel_hmac = self.intel_hmac,
                     .index_html = self.index_html,
@@ -334,7 +368,7 @@ pub const WebState = struct {
         self.endWrite();
     }
 
-    pub fn setJson(self: *WebState, comptime which: enum { agent, agent_problems, equity, equity_long, events, shadow, candles, memories, system, decisions, orders, review, review_ctx, audit, periodic, analytics, statistics, intel, sentiment }, src: []const u8) void {
+    pub fn setJson(self: *WebState, comptime which: enum { agent, agent_problems, equity, equity_long, events, shadow, candles, memories, system, decisions, orders, review, review_ctx, audit, periodic, analytics, statistics, intel, sentiment, params, param_versions }, src: []const u8) void {
         self.beginWrite();
         switch (which) {
             .agent => {
@@ -431,6 +465,16 @@ pub const WebState = struct {
                 const n = @min(src.len, self.sentiment_buf.len);
                 @memcpy(self.sentiment_buf[0..n], src[0..n]);
                 self.sentiment_len = n;
+            },
+            .params => {
+                const n = @min(src.len, self.params_buf.len);
+                @memcpy(self.params_buf[0..n], src[0..n]);
+                self.params_len = n;
+            },
+            .param_versions => {
+                const n = @min(src.len, self.param_versions_buf.len);
+                @memcpy(self.param_versions_buf[0..n], src[0..n]);
+                self.param_versions_len = n;
             },
         }
         self.endWrite();

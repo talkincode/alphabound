@@ -56,12 +56,25 @@ pub fn shadowAdmit(
     cfg: *const config.Config,
     now_ms: i64,
 ) ShadowAdmission {
+    return shadowAdmitWith(snap, proposal_snapshot_version, target_btc_weight, cfg, defaultStressParams(cfg), now_ms);
+}
+
+/// Agent decision path: same kernel, with the active version's shock and reserve.
+/// At the shipped defaults this is identical to `shadowAdmit`.
+pub fn shadowAdmitWith(
+    snap: state.PortfolioState,
+    proposal_snapshot_version: u64,
+    target_btc_weight: Decimal,
+    cfg: *const config.Config,
+    stress: admission.StressParams,
+    now_ms: i64,
+) ShadowAdmission {
     const view = admissionView(snap, now_ms);
     const prop = admission.ProposalView{
         .snapshot_version = proposal_snapshot_version,
         .target_btc_weight = target_btc_weight,
     };
-    const result = admission.admit(view, prop, cfg.max_drawdown, defaultStressParams(cfg)) catch {
+    const result = admission.admit(view, prop, cfg.max_drawdown, stress) catch {
         return .{
             .verdict_txt = "ERROR",
             .reason_txt = "admission_math_error",

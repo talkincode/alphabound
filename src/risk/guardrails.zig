@@ -61,13 +61,19 @@ pub const Trend = struct {
 /// Build a Trend from completed daily closes, newest first. Needs
 /// `TREND_MA_PERIOD` bars; otherwise `known` stays false (fail-closed for macro sells).
 pub fn trendFromCloses(closes_newest_first: []const Decimal) Trend {
-    if (closes_newest_first.len < TREND_MA_PERIOD) return .{};
+    return trendFromClosesPeriod(closes_newest_first, TREND_MA_PERIOD);
+}
+
+/// Same as `trendFromCloses` for an explicit period. A period the series cannot
+/// fill stays unknown (fail-closed for macro sells).
+pub fn trendFromClosesPeriod(closes_newest_first: []const Decimal, period: usize) Trend {
+    if (period == 0 or closes_newest_first.len < period) return .{};
     var sum: i128 = 0;
-    for (closes_newest_first[0..TREND_MA_PERIOD]) |c| sum += c.raw;
+    for (closes_newest_first[0..period]) |c| sum += c.raw;
     return .{
         .known = true,
         .daily_close = closes_newest_first[0],
-        .sma = Decimal.fromRaw(@divTrunc(sum, @as(i128, TREND_MA_PERIOD))),
+        .sma = Decimal.fromRaw(@divTrunc(sum, @as(i128, @intCast(period)))),
     };
 }
 

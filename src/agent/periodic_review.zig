@@ -265,9 +265,11 @@ pub fn parse(gpa: std.mem.Allocator, raw: []const u8, expect: Cycle) ParseError!
 
     const summary_v = obj.get("summary") orelse return error.MissingField;
     if (summary_v != .string) return error.WrongType;
-    if (summary_v.string.len > MAX_SUMMARY_LEN) return error.StringTooLong;
-    const summary = std.mem.trim(u8, summary_v.string, " \t\r\n");
-    if (summary.len == 0) return error.SummaryEmpty;
+    const summary_trim = std.mem.trim(u8, summary_v.string, " \t\r\n");
+    if (summary_trim.len == 0) return error.SummaryEmpty;
+    // Over-long prose is clipped to the cap instead of voiding the document.
+    const summary = utf8Prefix(summary_trim, MAX_SUMMARY_LEN);
+    if (summary.len == 0) return error.StringTooLong;
 
     const findings = try stringList(a, obj, "findings");
     const lessons = try stringList(a, obj, "lessons");
@@ -305,14 +307,24 @@ fn stringListOptional(a: std.mem.Allocator, obj: std.json.ObjectMap, key: []cons
 
 fn listFromValue(a: std.mem.Allocator, v: std.json.Value) ParseError![][]const u8 {
     if (v != .array) return error.WrongType;
-    if (v.array.items.len > MAX_LIST_ITEMS) return error.ListTooLong;
-    var out = a.alloc([]const u8, v.array.items.len) catch return error.OutOfMemory;
-    for (v.array.items, 0..) |item, i| {
+    // Keep the cap. Extra items are dropped so a verbose model does not
+    // degrade the whole review; each kept item is still type-checked.
+    const n = @min(v.array.items.len, MAX_LIST_ITEMS);
+    var out = a.alloc([]const u8, n) catch return error.OutOfMemory;
+    for (v.array.items[0..n], 0..) |item, i| {
         if (item != .string) return error.WrongType;
-        if (item.string.len > MAX_STRING_LEN) return error.StringTooLong;
-        out[i] = a.dupe(u8, item.string) catch return error.OutOfMemory;
+        const clipped = utf8Prefix(item.string, MAX_STRING_LEN);
+        if (clipped.len == 0) return error.StringTooLong;
+        out[i] = a.dupe(u8, clipped) catch return error.OutOfMemory;
     }
     return out;
+}
+
+fn utf8Prefix(s: []const u8, max_len: usize) []const u8 {
+    if (s.len <= max_len) return s;
+    var end = max_len;
+    while (end > 0 and (s[end] & 0xc0) == 0x80) end -= 1;
+    return s[0..end];
 }
 
 // ---------------------------------------------------------------------------
@@ -508,17 +520,47 @@ test "malformed periodic reviews are rejected fail-closed" {
             .err = error.MemoryIdInvalid,
         },
         .{
-            .raw =
-            \\{"cycle":"short","summary":"s","findings":["a","b","c","d","e","f","g","h","i"],
-            \\ "lessons":[],"memory_ops":[]}
-            ,
+            .raw = "{\"cycle\":\"short\",\"summary\":\"s\",\"findings\":[1],\"lessons\":[],\"memory_ops\":[]}",
             .expect = .short,
-            .err = error.ListTooLong,
+            .err = error.WrongType,
         },
     };
     for (cases) |case| {
         try testing.expectError(case.err, parse(testing.allocator, case.raw, case.expect));
     }
+}
+
+test "oversized narrative lists and strings are truncated, not rejected" {
+    var long_item: [MAX_STRING_LEN + 8]u8 = undefined;
+    @memset(&long_item, 'a');
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try w.writeAll("{\"cycle\":\"short\",\"summary\":\"s\",\"findings\":[");
+    for (0..MAX_LIST_ITEMS + 3) |i| {
+        if (i > 0) try w.writeByte(',');
+        if (i == 0) {
+            try w.print("\"{s}\"", .{long_item});
+        } else {
+            try w.print("\"f{d}\"", .{i});
+        }
+    }
+    // The item past the cap is not a string. Truncation must ignore it.
+    try w.writeAll(",1],\"lessons\":[\"only\"],\"risks\":[\"r\"],\"memory_ops\":[]}");
+    var d = try parse(testing.allocator, w.buffered(), .short);
+    defer d.deinit();
+    try testing.expectEqual(MAX_LIST_ITEMS, d.findings.len);
+    try testing.expectEqual(MAX_STRING_LEN, d.findings[0].len);
+    try testing.expectEqualStrings("f1", d.findings[1]);
+    try testing.expectEqual(@as(usize, 1), d.lessons.len);
+    try testing.expectEqual(@as(usize, 0), d.memory_ops.len);
+
+    var summary: [MAX_SUMMARY_LEN + 4]u8 = undefined;
+    @memset(&summary, 'b');
+    var sbuf: [MAX_SUMMARY_LEN + 128]u8 = undefined;
+    const raw = std.fmt.bufPrint(&sbuf, "{{\"cycle\":\"long\",\"summary\":\"{s}\",\"findings\":[],\"lessons\":[],\"memory_ops\":[]}}", .{summary}) catch unreachable;
+    var doc = try parse(testing.allocator, raw, .long);
+    defer doc.deinit();
+    try testing.expectEqual(MAX_SUMMARY_LEN, doc.summary.len);
 }
 
 test "too many memory ops are rejected" {

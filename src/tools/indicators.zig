@@ -137,16 +137,22 @@ pub const LONG_DAILY_MAX: usize = 200;
 /// The forming bar is skipped and any unconfirmed/legacy row ends the run, so
 /// an unproven series yields an unknown trend (fail-closed for macro sells).
 pub fn dailyTrend(newest_first: []const Candle) guardrails.Trend {
-    if (newest_first.len == 0) return .{};
+    return dailyTrendPeriod(newest_first, guardrails.TREND_MA_PERIOD);
+}
+
+/// Daily trend against `period` completed closes. The shipped call is 50.
+/// Periods outside 1..=200 stay unknown rather than reading past the buffer.
+pub fn dailyTrendPeriod(newest_first: []const Candle, period: usize) guardrails.Trend {
+    if (newest_first.len == 0 or period == 0 or period > 200) return .{};
     const start: usize = if (market.candleConfirmed(newest_first[0]) == true) 0 else 1;
-    var closes: [guardrails.TREND_MA_PERIOD]@TypeOf(newest_first[0].close) = undefined;
+    var closes: [200]@TypeOf(newest_first[0].close) = undefined;
     var n: usize = 0;
     var i = start;
-    while (i < newest_first.len and n < closes.len and market.candleConfirmed(newest_first[i]) == true) : (i += 1) {
+    while (i < newest_first.len and n < period and market.candleConfirmed(newest_first[i]) == true) : (i += 1) {
         closes[n] = newest_first[i].close;
         n += 1;
     }
-    return guardrails.trendFromCloses(closes[0..n]);
+    return guardrails.trendFromClosesPeriod(closes[0..n], period);
 }
 
 /// Multi-month daily context: where the latest completed close sits against
