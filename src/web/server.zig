@@ -11,9 +11,11 @@ const review = @import("review.zig");
 const intel = @import("../intel/protocol.zig");
 const intel_inbox = @import("../intel/inbox.zig");
 const db = @import("../storage/db.zig");
+const dec = @import("../core/decimal.zig");
 const params_write = @import("../params/write.zig");
 const params_store = @import("../params/store.zig");
 const params_dynamic = @import("../params/dynamic.zig");
+const params_backtest = @import("../params/backtest_api.zig");
 const app_config = @import("../config.zig");
 
 const favicon_svg: []const u8 = @embedFile("favicon_svg");
@@ -96,6 +98,9 @@ pub const Context = struct {
     param_db_path: [:0]const u8 = "",
     /// Production default is false: apply requires a passing backtest ref.
     param_allow_unbacked_apply: bool = false,
+    /// Absolute notional floor copied from config. The backtest gate uses it
+    /// for both sides. The trading loop does not read this field.
+    param_min_trade_notional: dec.Decimal = dec.Decimal.zero,
     /// Intel ingest mailbox; null = ingest unavailable.
     intel_inbox: ?*intel_inbox.Inbox = null,
     /// HMAC key for alphabound.intel.v1; empty = ingest disabled.
@@ -282,6 +287,7 @@ pub fn handleReq(buf: []u8, req: RequestInfo, ctx: Context) Response {
         return handleIntelPost(buf, req, ctx);
     }
     if (method == .POST and std.mem.startsWith(u8, path, "/api/v1/params/")) {
+        if (std.mem.eql(u8, path, "/api/v1/params/backtest")) return handleBacktestPost(buf, req, ctx);
         return handleParamPost(buf, req, path, ctx);
     }
 
@@ -322,6 +328,7 @@ pub fn handleReq(buf: []u8, req: RequestInfo, ctx: Context) Response {
     if (std.mem.eql(u8, path, "/api/v1/statistics")) return copyBody(buf, ctx.statistics_json);
     if (std.mem.eql(u8, path, "/api/v1/intel")) return copyBody(buf, ctx.intel_json);
     if (std.mem.eql(u8, path, "/api/v1/sentiment")) return copyBody(buf, ctx.sentiment_json);
+    if (std.mem.eql(u8, path, "/api/v1/params/backtest")) return handleBacktestGet(buf, req, ctx);
     if (std.mem.eql(u8, path, "/api/v1/params/versions")) return copyBody(buf, ctx.param_versions_json);
     if (std.mem.eql(u8, path, "/api/v1/params")) return copyBody(buf, ctx.params_json);
     return .{ .status = .not_found, .body = "{\"error\":\"not found\"}" };
@@ -411,6 +418,41 @@ fn handleIntelPost(buf: []u8, req: RequestInfo, ctx: Context) Response {
         .{ item.id(), item.dedupKey() },
     ) catch return .{ .status = .accepted, .body = "{\"ok\":true,\"queued\":true}" };
     return .{ .status = .accepted, .body = body };
+}
+
+fn handleBacktestPost(buf: []u8, req: RequestInfo, ctx: Context) Response {
+    if (!ctx.auth_cfg.required()) {
+        return .{ .status = .unauthorized, .body = "{\"error\":\"auth_required\"}" };
+    }
+    if (ctx.param_db_path.len == 0) {
+        return .{ .status = .service_unavailable, .body = "{\"error\":\"params_unavailable\"}" };
+    }
+    var database = db.Db.open(ctx.param_db_path) catch {
+        return .{ .status = .service_unavailable, .body = "{\"error\":\"params_unavailable\"}" };
+    };
+    defer database.close();
+    const now = if (req.now_ms == 0) clock.SystemClock.clock().wallMs() else req.now_ms;
+    const result = params_backtest.run(&database, ctx.param_min_trade_notional, now, req.body, buf) catch {
+        return .{ .status = .internal_server_error, .body = "{\"error\":\"backtest_failed\"}" };
+    };
+    return .{ .status = result.status.http(), .body = result.body };
+}
+
+fn handleBacktestGet(buf: []u8, req: RequestInfo, ctx: Context) Response {
+    if (ctx.param_db_path.len == 0) {
+        return .{ .status = .service_unavailable, .body = "{\"error\":\"params_unavailable\"}" };
+    }
+    const id = queryParam(req.target, "id") orelse {
+        return .{ .status = .bad_request, .body = "{\"error\":\"bad_id\",\"field\":\"id\"}" };
+    };
+    var database = db.Db.open(ctx.param_db_path) catch {
+        return .{ .status = .service_unavailable, .body = "{\"error\":\"params_unavailable\"}" };
+    };
+    defer database.close();
+    const result = params_backtest.get(&database, id, buf) catch {
+        return .{ .status = .internal_server_error, .body = "{\"error\":\"backtest_failed\"}" };
+    };
+    return .{ .status = result.status.http(), .body = result.body };
 }
 
 fn handleParamPost(buf: []u8, req: RequestInfo, path: []const u8, ctx: Context) Response {
@@ -1385,13 +1427,19 @@ fn handleConnection(io: std.Io, stream: std.Io.net.Stream, ctx_fn: ContextFn, us
     const xff_hdr = copyOptHeader(req.head_buffer, "x-forwarded-for", &xff_buf);
     const peer_ip = formatPeerIp(stream, &peer_ip_buf);
     const content_length = req.head.content_length;
+    const backtest_upload = method == .POST and std.mem.eql(u8, pathOnly(target_buf[0..target_len]), "/api/v1/params/backtest");
 
-    // Review chat + alphabound.intel.v1 envelopes (headline+body+claims near caps).
+    // Review chat + alphabound.intel.v1 envelopes stay small. A backtest
+    // request may carry exported candle and decision CSV.
     var body_storage: [16384]u8 = undefined;
+    var body_heap: []u8 = &.{};
+    defer if (body_heap.len != 0) std.heap.page_allocator.free(body_heap);
     var body_len: usize = 0;
+    var body_ptr: [*]u8 = &body_storage;
     if (method == .POST) {
         if (content_length) |cl| {
-            if (cl > body_storage.len) {
+            const body_cap: usize = if (backtest_upload) 1_048_576 else body_storage.len;
+            if (cl > body_cap) {
                 try req.respond("{\"error\":\"body_too_large\"}", .{
                     .status = .payload_too_large,
                     .extra_headers = &.{
@@ -1402,9 +1450,21 @@ fn handleConnection(io: std.Io, stream: std.Io.net.Stream, ctx_fn: ContextFn, us
             }
             if (cl > 0) {
                 const want: usize = @intCast(cl);
+                if (want > body_storage.len) {
+                    body_heap = std.heap.page_allocator.alloc(u8, want) catch {
+                        try req.respond("{\"error\":\"backtest_failed\"}", .{
+                            .status = .internal_server_error,
+                            .extra_headers = &.{
+                                .{ .name = "content-type", .value = "application/json" },
+                            },
+                        });
+                        return;
+                    };
+                    body_ptr = body_heap.ptr;
+                }
                 var body_reader_buf: [512]u8 = undefined;
                 const br = req.readerExpectNone(&body_reader_buf);
-                br.readSliceAll(body_storage[0..want]) catch {
+                br.readSliceAll(body_ptr[0..want]) catch {
                     try req.respond("{\"error\":\"bad_body\"}", .{
                         .status = .bad_request,
                         .extra_headers = &.{
@@ -1443,7 +1503,7 @@ fn handleConnection(io: std.Io, stream: std.Io.net.Stream, ctx_fn: ContextFn, us
         .host = host_hdr,
         .forwarded_proto = fwd_proto,
         .client_ip = client_ip,
-        .body = body_storage[0..body_len],
+        .body = body_ptr[0..body_len],
         .now_ms = clock.SystemClock.clock().wallMs(),
     };
 
@@ -2214,5 +2274,74 @@ test "param writes require the admin token and never accept max_drawdown" {
     }, ctx);
     try testing.expectEqual(std.http.Status.unprocessable_entity, locked.status);
     try testing.expect(std.mem.indexOf(u8, locked.body, "\"field\":\"max_drawdown\"") != null);
+    try testing.expectEqual(@as(i64, 0), try database.queryInt("SELECT COUNT(*) FROM orders"));
+}
+
+test "backtest gate http returns a stored report and does not place orders" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [512]u8 = undefined;
+    const n = try tmp.dir.realPath(std.testing.io, &dir_buf);
+    var path_buf: [640:0]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "{s}/params.db", .{dir_buf[0..n]});
+    var database = try db.Db.open(path);
+    defer database.close();
+    var cfg = try app_config.parse(std.testing.allocator, "");
+    defer cfg.deinit();
+    _ = try params_store.ensureActive(&database, &cfg, 1_700_000_000_000);
+
+    var ctx = testCtx();
+    ctx.param_db_path = path;
+    ctx.auth_cfg = .{ .api_token = "test-token-not-a-secret-value" };
+    var buf: [65536]u8 = undefined;
+    const denied = handleReq(&buf, .{
+        .method = .POST,
+        .target = "/api/v1/params/backtest",
+        .body = "{}",
+        .now_ms = 1_700_000_000_000,
+    }, ctx);
+    try testing.expectEqual(std.http.Status.unauthorized, denied.status);
+
+    var p = params_dynamic.Params{};
+    var pbuf: [1024]u8 = undefined;
+    var pw: std.Io.Writer = .fixed(&pbuf);
+    try p.writeJson(&pw);
+    var body: [4096]u8 = undefined;
+    const req_body = try std.fmt.bufPrint(&body, "{{\"source\":\"manual\",\"operator\":\"ops\",\"reason\":\"gate\",\"params\":{s},\"candles\":\"ts_ms,close\\n0,100\\n900000,100\\n\",\"decisions\":\"ts_ms,target_weight\\n0,0.4\\n\"}}", .{pw.buffered()});
+    const ran = handleReq(&buf, .{
+        .method = .POST,
+        .target = "/api/v1/params/backtest",
+        .x_api_token = "test-token-not-a-secret-value",
+        .body = req_body,
+        .now_ms = 1_700_000_000_000,
+    }, ctx);
+    try testing.expectEqual(std.http.Status.ok, ran.status);
+    try testing.expect(std.mem.indexOf(u8, ran.body, "\"passed\":false") != null);
+    try testing.expect(std.mem.indexOf(u8, ran.body, "insufficient_bars") != null);
+    try testing.expect(std.mem.indexOf(u8, ran.body, "cannot say what the model would have proposed") != null);
+    const key = "\"id\":\"";
+    const at = std.mem.indexOf(u8, ran.body, key) orelse return error.TestUnexpectedResult;
+    const rest = ran.body[at + key.len ..];
+    const end = std.mem.indexOfScalar(u8, rest, '"') orelse return error.TestUnexpectedResult;
+    var id_buf: [32]u8 = undefined;
+    if (end > id_buf.len) return error.TestUnexpectedResult;
+    @memcpy(id_buf[0..end], rest[0..end]);
+    var target_buf: [96]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buf, "/api/v1/params/backtest?id={s}", .{id_buf[0..end]});
+    const got = handleReq(&buf, .{
+        .method = .GET,
+        .target = target,
+        .x_api_token = "test-token-not-a-secret-value",
+        .now_ms = 1_700_000_000_000,
+    }, ctx);
+    try testing.expectEqual(std.http.Status.ok, got.status);
+    try testing.expect(std.mem.indexOf(u8, got.body, id_buf[0..end]) != null);
+    try testing.expectEqual(std.http.Status.not_found, handleReq(&buf, .{
+        .method = .GET,
+        .target = "/api/v1/params/backtest?id=bt_missing",
+        .x_api_token = "test-token-not-a-secret-value",
+        .now_ms = 1_700_000_000_000,
+    }, ctx).status);
+    try testing.expectEqual(@as(i64, 1), try database.queryInt("SELECT COUNT(*) FROM backtest_reports"));
     try testing.expectEqual(@as(i64, 0), try database.queryInt("SELECT COUNT(*) FROM orders"));
 }

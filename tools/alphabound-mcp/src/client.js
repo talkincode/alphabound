@@ -336,7 +336,7 @@ export const TOOLS = [
   {
     name: "apply_params",
     description:
-      "Activate one pending parameter version. expected_active_version must equal the current active id or the call is rejected and nothing changes. Re-checks the 20% step, the 24h apply limit, and the one-way knobs. backtest_summary must be a passing alphabound.backtest_ref.v1 reference (schema, id, passed=true) unless the daemon's params_allow_unbacked_apply switch is on; that switch defaults off. This phase checks the reference shape only. The new version is read at the start of the next decision and does not interrupt an in-flight decision or order. " +
+      "Activate one pending parameter version. expected_active_version must equal the current active id or the call is rejected and nothing changes. Re-checks the 20% step, the 24h apply limit, and the one-way knobs. backtest_summary must be the backtest_summary string from a run_backtest report: an alphabound.backtest_ref.v1 reference that exists, passed, matches this pending version's parameters and the active baseline version, and is at most 24h old. The daemon switch params_allow_unbacked_apply skips that lookup and defaults off. The new version is read at the start of the next decision and does not interrupt an in-flight decision or order. " +
       PARAMS_DANGER,
     path: "/api/v1/params/apply",
     method: "POST",
@@ -352,9 +352,45 @@ export const TOOLS = [
         backtest_summary: {
           type: "string",
           description:
-            "JSON text of a passing alphabound.backtest_ref.v1 reference: {\"schema\":\"alphabound.backtest_ref.v1\",\"id\":\"bt_...\",\"passed\":true}.",
+            "JSON text of a passing alphabound.backtest_ref.v1 reference from run_backtest (the report's backtest_summary field). It must exist, have passed, match the pending parameters, and be less than 24h old.",
         },
       },
+    },
+  },
+  {
+    name: "run_backtest",
+    description:
+      "Run the filter-layer backtest gate on candidate parameters and return the alphabound.backtest_ref.v1 report id plus pass/fail. Replays recorded decisions only; it does not call the LLM and cannot say what the model would have done. Compares the candidate with the active parameters on a 70/30 out-of-sample split and four rolling windows. Any window at or above 8% max drawdown fails. A short sample fails closed. The work runs off the trading loop and does not place orders. max_drawdown stays 0.10. Omit candles and decisions to read the daemon database; pass both CSV texts to score an export. Copy backtest_summary into apply_params. " +
+      PARAMS_DANGER,
+    path: "/api/v1/params/backtest",
+    method: "POST",
+    forceSource: "mcp",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["operator", "reason", "params"],
+      properties: {
+        ...WRITE_META,
+        params: PARAM_FIELD,
+        candles: {
+          type: "string",
+          description: "Optional CSV (ts_ms,close or OHLCV). Omit, together with decisions, to use the daemon database.",
+        },
+        decisions: {
+          type: "string",
+          description: "Optional CSV ts_ms,target_weight[,agent|operator[,macro 0|1]]. Required if candles is set.",
+        },
+      },
+    },
+  },
+  {
+    name: "get_backtest",
+    description:
+      "Fetch one stored alphabound.backtest_ref.v1 report by id. Read-only. Does not place orders or change parameters.",
+    path: "/api/v1/params/backtest",
+    method: "GET",
+    query: {
+      id: { type: "string", description: "Report id (bt_...)" },
     },
   },
   {

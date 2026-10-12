@@ -262,6 +262,24 @@ describe("CLI HTTP + env token", () => {
     assert.ok("window" in TOOLS.find((x) => x.name === "query_equity").query);
   });
 
+  it("advertises the backtest gate without an order path", () => {
+    const run = TOOLS.find((x) => x.name === "run_backtest");
+    const get = TOOLS.find((x) => x.name === "get_backtest");
+    assert.equal(run.method, "POST");
+    assert.equal(run.path, "/api/v1/params/backtest");
+    assert.equal(run.forceSource, "mcp");
+    assert.match(run.description, /recorded decisions/i);
+    assert.match(run.description, /does not place orders/i);
+    assert.match(run.description, /max_drawdown/);
+    assert.equal(/place_order|flatten|resume/.test(run.path), false);
+    assert.equal(get.method, "GET");
+    assert.equal(get.path, "/api/v1/params/backtest");
+    assert.ok(get.query && "id" in get.query);
+    const apply = TOOLS.find((x) => x.name === "apply_params");
+    assert.match(apply.description, /24h old/);
+    assert.match(apply.inputSchema.properties.backtest_summary.description, /run_backtest/);
+  });
+
   it("advertises parameter writes with the hard bounds and no order path", () => {
     for (const name of ["propose_params", "apply_params", "rollback_params"]) {
       const t = TOOLS.find((x) => x.name === name);
@@ -326,6 +344,29 @@ describe("CLI HTTP + env token", () => {
       file,
       JSON.stringify({ source: "manual", operator: "ops", reason: "undo", version_id: 1, expected_active_version: 2 }),
     );
+    const ran = await captureCli(
+      [
+        "run_backtest",
+        "--json",
+        JSON.stringify({
+          source: "manual",
+          operator: "ops",
+          reason: "gate",
+          params: { daily_trade_cap: 7 },
+        }),
+      ],
+      env,
+    );
+    assert.equal(ran.code, 0, ran.err);
+    const backtest = mock.paramPosts.at(-1);
+    assert.equal(backtest.path, "/api/v1/params/backtest");
+    assert.equal(backtest.payload.source, "mcp");
+    assert.equal(backtest.payload.params.daily_trade_cap, 7);
+
+    const fetched = await captureCli(["get_backtest", "--query", "id=bt_example"], env);
+    assert.equal(fetched.code, 0, fetched.err);
+    assert.equal(JSON.parse(fetched.out).search, "?id=bt_example");
+
     const rolled = await captureCli(["rollback_params", "--file", file], env);
     fs.rmSync(dir, { recursive: true, force: true });
     assert.equal(rolled.code, 0, rolled.err);

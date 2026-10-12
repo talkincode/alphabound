@@ -403,12 +403,12 @@ pub const BacktestRefError = error{
     BadId,
 };
 
-/// Shape check for a passing backtest reference. Phase 3 replaces the body
-/// of this function with a lookup of a real backtest run; callers stay put.
-/// Empty input is `Missing`. A present reference must be
-/// `alphabound.backtest_ref.v1` with a non-empty id and `passed: true`.
-/// Optional `digest` (string) and `as_of_ms` (integer) are accepted and not
-/// verified yet. Any other key is rejected so the interface stays explicit.
+/// Shape check for a passing backtest reference. Existence, the pass bit,
+/// parameter equality and the 24h expiry are checked by `gate.validateStoredRef`
+/// against `backtest_reports`. Empty input is `Missing`. A present reference
+/// must be `alphabound.backtest_ref.v1` with a non-empty id and `passed: true`.
+/// Optional `digest` (string) and `as_of_ms` (integer) are accepted here and
+/// compared to the stored row by the lookup. Any other key is rejected.
 pub fn validateBacktestRef(gpa: std.mem.Allocator, raw: []const u8) BacktestRefError!void {
     if (raw.len == 0) return error.Missing;
     if (raw.len > 1024) return error.Malformed;

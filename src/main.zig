@@ -726,6 +726,7 @@ pub fn main(init: std.process.Init) !u8 {
     // the only writer of trading state; these calls never place an order.
     web_state.param_db_path = db_path;
     web_state.param_allow_unbacked_apply = cfg.params_allow_unbacked_apply;
+    web_state.param_min_trade_notional = cfg.min_trade_notional;
 
     // ---- Web API thread (loopback only, §6.4) -----------------------------
     const web_thread = std.Thread.spawn(.{}, webThreadMain, .{ io, cfg.webHost(), cfg.webPort(), &web_state }) catch |err| {

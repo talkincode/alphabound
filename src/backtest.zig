@@ -27,6 +27,10 @@ pub const SimConfig = struct {
     exit_reserve: Decimal = Decimal.fromRaw(50_000_000), // 0.50 USDT
     price_shock: Decimal = Decimal.fromRaw(5_000_000), // 0.05
     churn_window_ms: i64 = 2 * guard.hour_ms,
+    /// 0 keeps the compiled 50-day trend. The parameter gate sets the
+    /// candidate's `trend_ma_period` so the macro-sell filter can see it.
+    /// `max_drawdown` above stays the kernel constant; callers do not relax it.
+    trend_period: u32 = 0,
 };
 
 pub const Result = struct {
@@ -76,19 +80,24 @@ fn conservative(cash: Decimal, btc: Decimal, bid: Decimal, c: SimConfig) !Decima
     })).equity;
 }
 
+fn trendPeriodOf(c: SimConfig) usize {
+    if (c.trend_period == 0) return guard.TREND_MA_PERIOD;
+    return @min(@as(usize, c.trend_period), 200);
+}
+
 /// Completed daily closes strictly before `ts`, newest first, into `out`.
-fn trendAt(daily: []const DailyBar, ts: i64, out: []Decimal) guard.Trend {
+fn trendAt(daily: []const DailyBar, ts: i64, out: []Decimal, period: usize) guard.Trend {
     var hi: usize = 0;
     while (hi < daily.len and daily[hi].ts + day_ms <= ts) hi += 1;
-    if (hi < guard.TREND_MA_PERIOD) return .{};
+    if (period == 0 or hi < period) return .{};
     var n: usize = 0;
     var i = hi;
-    while (i > 0 and n < out.len) {
+    while (i > 0 and n < out.len and n < period) {
         i -= 1;
         out[n] = daily[i].close;
         n += 1;
     }
-    return guard.trendFromCloses(out[0..n]);
+    return guard.trendFromClosesPeriod(out[0..n], period);
 }
 
 pub fn run(
@@ -119,7 +128,8 @@ pub fn run(
     defer trades.deinit(gpa);
     var agent_ts: std.ArrayList(i64) = .empty;
     defer agent_ts.deinit(gpa);
-    var closes_buf: [guard.TREND_MA_PERIOD]Decimal = undefined;
+    const trend_period = trendPeriodOf(c);
+    var closes_buf: [200]Decimal = undefined;
 
     const stress = admission.StressParams{
         .price_shock = c.price_shock,
@@ -200,7 +210,7 @@ pub fn run(
                     .current_weight = held.weight,
                     .target_weight = admitted,
                     .macro_driven = dc.macro,
-                    .trend = trendAt(daily, bar.ts, &closes_buf),
+                    .trend = trendAt(daily, bar.ts, closes_buf[0..trend_period], trend_period),
                     .recent = recent,
                     .exempt = held.breaches,
                 });
@@ -471,7 +481,7 @@ pub fn ruleDecisions(gpa: std.mem.Allocator, bars: []const Bar, daily: []const D
     for (bars) |b| {
         if (b.ts < next_ts) continue;
         next_ts = b.ts + interval_ms;
-        const t = trendAt(daily, b.ts, &buf);
+        const t = trendAt(daily, b.ts, &buf, guard.TREND_MA_PERIOD);
         if (!t.known) continue;
         const w = if (t.daily_close.gt(t.sma)) Decimal.fromRaw(60_000_000) else Decimal.fromRaw(20_000_000);
         try out.append(gpa, .{ .ts = b.ts, .weight = w });

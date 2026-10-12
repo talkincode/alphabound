@@ -21,6 +21,7 @@ const analytics = @import("../analytics/ab_factor.zig");
 const external = @import("../tools/external.zig");
 const scheduler = @import("../core/scheduler.zig");
 const params_store = @import("../params/store.zig");
+const dec = @import("../core/decimal.zig");
 
 fn nowMs() i64 {
     return clock.SystemClock.clock().wallMs();
@@ -120,6 +121,9 @@ pub const WebState = struct {
     /// Stable for the process. The web thread opens it only for parameter writes.
     param_db_path: [:0]const u8 = "",
     param_allow_unbacked_apply: bool = false,
+    /// Absolute notional floor for the backtest gate. The trading loop keeps
+    /// its own copy from config and does not read this field.
+    param_min_trade_notional: dec.Decimal = dec.Decimal.zero,
     /// Dashboard / MCP auth (optional; empty token = open).
     auth_cfg: web_auth.Config = .{},
     cred_store: ?*web_auth.CredStore = null,
@@ -344,6 +348,7 @@ pub const WebState = struct {
                     .intel_hmac = self.intel_hmac,
                     .param_db_path = self.param_db_path,
                     .param_allow_unbacked_apply = self.param_allow_unbacked_apply,
+                    .param_min_trade_notional = self.param_min_trade_notional,
                     .index_html = self.index_html,
                     .auth_cfg = self.auth_cfg,
                     .cred_store = self.cred_store,
