@@ -133,7 +133,7 @@ open http://127.0.0.1:18180/
 | `POST /api/v1/params/rollback` | 回到指定历史版本。不受幅度和 24h 限制，仍须在绝对边界内。新版本在下一次决策开始时生效，不打断进行中的决策或下单 |
 | `POST /api/v1/intel` | 推送 `alphabound.intel.v1` 信封（需 `ALPHABOUND_INTEL_HMAC`） |
 
-参数写入（propose / apply / rollback）只改过滤层参数，不下单。审计记录来源（`manual` / `mcp` / `review`）、操作者、原因和前后值。`max_drawdown` 仍是编译期 `0.10`。回测门槛只重放已经记下的决策，不调用 LLM，也不能说明模型在新参数下会提出什么；调度类旋钮不改变这次重放。规则与局限见 [BACKTEST.md](https://github.com/talkincode/alphabound/blob/main/docs/BACKTEST.md)。
+参数写入（propose / apply / rollback）只改过滤层参数，不下单。审计记录来源（`manual` / `mcp` / `review`）、操作者、原因和前后值。`max_drawdown` 仍是编译期 `0.10`。配置文件里的 `guard_*` 与 `event_price_move` / `event_drawdown_step` / `event_price_drift` 仅首次初始化使用，之后通过参数库/MCP 调整；和 active 不一致时启动只打 WARN，不覆盖。回测门槛只重放已经记下的决策，不调用 LLM，也不能说明模型在新参数下会提出什么；调度类旋钮不改变这次重放。规则与局限见 [BACKTEST.md](https://github.com/talkincode/alphabound/blob/main/docs/BACKTEST.md)。
 
 协议、TTL、HMAC 与评分见 [投资情报协议](intel.md)。`POST` 在核心环落库前只入 mailbox（202 Accepted）。未配置 HMAC 时 ingest 返回 503，GET 历史仍可用。
 

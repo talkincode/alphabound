@@ -56,6 +56,8 @@ pub const Config = struct {
     /// Voluntary-trade guardrails (tighten-only; see risk/guardrails.zig). The
     /// defaults carry the shipped behaviour, so the production file needs no
     /// new keys. Forced risk exits and operator orders are never gated.
+    /// After the first parameter version exists, the active row wins. These
+    /// keys only bootstrap that row; a mismatch is logged and not applied.
     guard_min_trade_equity_frac: Decimal = guardrails.Params.default_min_trade_equity_frac,
     guard_daily_trade_cap: u32 = guardrails.Params.default_daily_trade_cap,
     guard_reverse_cooldown_ms: i64 = guardrails.Params.default_reverse_cooldown_ms,
@@ -89,6 +91,8 @@ pub const Config = struct {
     /// "22-4"); empty → every hour uses the base cadence.
     active_hours_utc: []const u8 = "",
     /// Early decision when |bid − last_bid| / last_bid ≥ this fraction; 0 off.
+    /// Bootstrap only, same as the `guard_*` keys above: the active parameter
+    /// version is what the scheduler reads after the first start.
     event_price_move: Decimal = Decimal.parse("0.005") catch unreachable,
     /// Early decision when drawdown deepens by ≥ this fraction; 0 off.
     event_drawdown_step: Decimal = Decimal.parse("0.01") catch unreachable,

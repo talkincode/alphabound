@@ -55,6 +55,7 @@ JSON，每个口径一行：`twr_return`、`hold_return`、`alpha`、`max_drawdo
 配置键（`[risk]`，均可缺省；**不要为了“显式”而写进生产配置**——旧二进制拒绝未知键，会破坏回滚）：
 `guard_min_trade_equity_frac`、`guard_daily_trade_cap`（0=关）、`guard_reverse_cooldown_ms`、
 `guard_macro_sell_trend_break`、`guard_sell_exempt_drawdown`。
+这些键，以及 `[agent]` 的 `event_price_move`、`event_drawdown_step`、`event_price_drift`，**仅首次初始化使用，之后通过参数库/MCP 调整**。daemon 读的是 active 版本；启动时若配置和 active 不一致，只打 WARN，不覆盖。
 
 触发时 daemon 记 `EXEC_GUARDRAIL` 事件（含原因与当日统计），决策回到 HOLD 并按退避重新评估。
 

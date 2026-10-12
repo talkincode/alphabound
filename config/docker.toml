@@ -19,6 +19,10 @@ allow_runtime_override = false
 taker_fee_rate = 0.001
 slippage_rate = 0.0005
 initial_capital = 100.0
+# guard_* and event_price_move / event_drawdown_step / event_price_drift
+# bootstrap the first parameter version only. After that, adjust them through
+# the parameter store or MCP (propose/apply or rollback). Editing this file
+# does not override the active version.
 
 [review]
 # 定期复盘（分析用，永不触碰交易路径）：结论只沉淀为低置信度记忆。

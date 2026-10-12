@@ -26,6 +26,10 @@ min_rebalance_weight_delta = 0.01    # skip trades moving weight < 1%; suppresse
 # passed, same parameters, same active baseline, at most 24h old) unless this
 # is true. Leave it false in production. It does not open an order path.
 # params_allow_unbacked_apply = false
+# guard_min_trade_equity_frac, guard_daily_trade_cap, guard_reverse_cooldown_ms,
+# guard_macro_sell_trend_break, guard_sell_exempt_drawdown: bootstrap only.
+# After the first version, the active parameter row wins. Adjust with
+# propose/apply or rollback (HTTP or MCP). Editing this file does not override.
 
 [agent]
 provider = "openai"
@@ -38,6 +42,8 @@ decision_interval_ms = 900000        # 15 min base cadence in active session
 decision_interval_quiet_ms = 3600000 # 60 min outside active session
 decision_min_interval_ms = 180000    # 3 min hard floor between any two calls
 active_hours_utc = "13-21"           # EU/US overlap; empty = always base
+# event_price_move, event_drawdown_step, event_price_drift: bootstrap only.
+# After the first version, change them through the parameter store or MCP.
 event_price_move = 0.005             # fire early on ≥0.5% move since last call
 event_drawdown_step = 0.01           # fire early when drawdown deepens ≥1%
 event_price_drift = 0.02             # fire when price has drifted ≥2% from the last traded price (cumulative across HOLDs, not dampened; 0 = off)

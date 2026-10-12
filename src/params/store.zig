@@ -198,6 +198,35 @@ test "bootstrap writes v1 once and the decision snapshot matches config" {
     try testing.expectEqual(@as(i64, 1), try database.queryInt("SELECT COUNT(*) FROM param_audit"));
 }
 
+test "a later config edit does not replace the active version" {
+    var database = try db.Db.open(":memory:");
+    defer database.close();
+    var cfg = try config.parse(testing.allocator, "");
+    defer cfg.deinit();
+    const now: i64 = 1_700_000_000_000;
+    const first = try ensureActive(&database, &cfg, now);
+    var edited = try config.parse(testing.allocator,
+        \\[risk]
+        \\guard_daily_trade_cap = 4
+        \\guard_sell_exempt_drawdown = 0.02
+        \\[agent]
+        \\event_price_drift = 0.03
+    );
+    defer edited.deinit();
+    const second = try ensureActive(&database, &edited, now + 1_000);
+    try testing.expectEqual(first.version_id, second.version_id);
+    try testing.expect(second.params.eql(first.params));
+    try testing.expectEqual(@as(u32, 6), second.params.daily_trade_cap);
+    try testing.expectEqual(@as(i64, 1), try database.queryInt("SELECT COUNT(*) FROM param_versions"));
+    var buf: [256]u8 = undefined;
+    try testing.expectEqualStrings(
+        "guard_daily_trade_cap,guard_sell_exempt_drawdown,event_price_drift",
+        dynamic.configDrift(second.params, &edited, &buf),
+    );
+    var quiet: [64]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), dynamic.configDrift(second.params, &cfg, &quiet).len);
+}
+
 test "a corrupt active row is not replaced" {
     var database = try db.Db.open(":memory:");
     defer database.close();
