@@ -1185,6 +1185,24 @@ pub fn main(init: std.process.Init) !u8 {
             std.process.exit(0);
         }
     }
+    var strategy_review_lane = ab.strategy_review_lane.Lane{
+        .io = io,
+        .db_path = db_path,
+        .mode = ab.strategy_review.parseSwitch(cfg.strategy_review_mode) orelse .auto,
+        .interval_ms = cfg.strategy_review_interval_ms,
+        .min_notional = cfg.min_trade_notional,
+        .web = &web_state,
+    };
+    strategy_review_lane.start() catch |err| {
+        std.debug.print("[boot] FATAL strategy review lane: {t}\n", .{err});
+        return 1;
+    };
+    defer {
+        if (!strategy_review_lane.shutdown(10_000)) {
+            std.debug.print("[shutdown] strategy review lane still busy — exiting without join\n", .{});
+            std.process.exit(0);
+        }
+    }
 
     while (!shutdown_requested.load(.acquire)) {
         if (cli.max_ticks > 0 and tick_count >= cli.max_ticks) break;

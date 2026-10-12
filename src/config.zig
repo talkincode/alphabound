@@ -133,6 +133,14 @@ pub const Config = struct {
     /// a single decision prompt, so tightening the per-decision budget must
     /// not silently cap — and starve — this call too (see `runPeriodicReview`).
     review_timeout_ms: u32 = 180_000,
+    /// Strategy-review switch. `auto` may apply a passing candidate inside
+    /// the hard bounds, `propose_only` stores a proposal, `off` does not
+    /// search. Default is auto. This does not open an order path and does
+    /// not move `max_drawdown`.
+    strategy_review_mode: []const u8 = "auto",
+    /// Cadence for the automatic round. 0 leaves the schedule idle; a manual
+    /// trigger still runs. Default is one day. Floor is one hour.
+    strategy_review_interval_ms: u32 = 86_400_000,
     /// When true, after a valid proposal run a second LLM reflection call
     /// (structured memory_ops). Fail-closed → deterministic fallback.
     agent_llm_reflection: bool = true,
@@ -441,6 +449,15 @@ fn applyKey(a: std.mem.Allocator, cfg: *Config, section: []const u8, key: []cons
             // starve-the-review bug this field exists to prevent; no 0-off
             // escape hatch (unlike the interval knobs above).
             if (cfg.review_timeout_ms < 30_000) return error.InvalidValue;
+        } else if (std.mem.eql(u8, key, "strategy_mode")) {
+            const mode = try parseString(a, val);
+            if (!std.mem.eql(u8, mode, "auto") and !std.mem.eql(u8, mode, "propose_only") and !std.mem.eql(u8, mode, "off")) {
+                return error.InvalidValue;
+            }
+            cfg.strategy_review_mode = mode;
+        } else if (std.mem.eql(u8, key, "strategy_interval_ms")) {
+            cfg.strategy_review_interval_ms = parseInt(u32, val) catch return error.InvalidValue;
+            if (cfg.strategy_review_interval_ms != 0 and cfg.strategy_review_interval_ms < 3_600_000) return error.InvalidValue;
         } else return error.UnknownKey;
     } else {
         return error.UnknownSection;
@@ -553,6 +570,25 @@ test "[review] section parses, validates floors and stays optional" {
     defer off.deinit();
     try testing.expectEqual(@as(u32, 0), off.review_short_interval_ms);
     try testing.expectEqual(@as(u32, 0), off.review_long_interval_ms);
+    try testing.expectEqualStrings("auto", cfg.strategy_review_mode);
+    try testing.expectEqual(@as(u32, 86_400_000), cfg.strategy_review_interval_ms);
+
+    var strategy = try parse(testing.allocator,
+        \\[review]
+        \\strategy_mode = "propose_only"
+        \\strategy_interval_ms = 0
+    );
+    defer strategy.deinit();
+    try testing.expectEqualStrings("propose_only", strategy.strategy_review_mode);
+    try testing.expectEqual(@as(u32, 0), strategy.strategy_review_interval_ms);
+    try testing.expectError(error.InvalidValue, parse(testing.allocator,
+        \\[review]
+        \\strategy_mode = "live"
+    ));
+    try testing.expectError(error.InvalidValue, parse(testing.allocator,
+        \\[review]
+        \\strategy_interval_ms = 60000
+    ));
 
     try testing.expectError(error.InvalidValue, parse(testing.allocator,
         \\[review]

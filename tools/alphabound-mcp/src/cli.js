@@ -19,7 +19,7 @@ Auth (environment variables; preferred over flags):
 Call options:
   --base <url>    Override ALPHABOUND_API_BASE
   --token <str>   Override token (prefer env; do not commit / log)
-  --json <body>   POST JSON body (submit_intel, propose_params, apply_params, run_backtest, rollback_params)
+  --json <body>   POST JSON body (submit_intel, propose_params, apply_params, run_backtest, rollback_params). run_strategy_review takes no body
   --file <path>   POST JSON body from file
   --query <k=v&k=v>  Query params for GET tools that take them, e.g.
                   list_agent_runs --query "status=error&limit=20"
@@ -182,6 +182,8 @@ function loadPayload(action) {
       throw new Error(`--file ${action.file} is not valid JSON`);
     }
   }
+  const required = tool.inputSchema && tool.inputSchema.required;
+  if (Array.isArray(required) && required.length === 0) return {};
   throw new Error(`${action.name} requires --json <body> or --file <path>`);
 }
 

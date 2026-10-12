@@ -124,6 +124,10 @@ pub const WebState = struct {
     /// Absolute notional floor for the backtest gate. The trading loop keeps
     /// its own copy from config and does not read this field.
     param_min_trade_notional: dec.Decimal = dec.Decimal.zero,
+    /// Manual strategy-review trigger. The review lane consumes it off the
+    /// trading loop; the web thread only sets the flag.
+    strategy_review_kick: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    strategy_review_running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Dashboard / MCP auth (optional; empty token = open).
     auth_cfg: web_auth.Config = .{},
     cred_store: ?*web_auth.CredStore = null,
@@ -349,6 +353,8 @@ pub const WebState = struct {
                     .param_db_path = self.param_db_path,
                     .param_allow_unbacked_apply = self.param_allow_unbacked_apply,
                     .param_min_trade_notional = self.param_min_trade_notional,
+                    .strategy_review_kick = &self.strategy_review_kick,
+                    .strategy_review_running = &self.strategy_review_running,
                     .index_html = self.index_html,
                     .auth_cfg = self.auth_cfg,
                     .cred_store = self.cred_store,
@@ -358,6 +364,20 @@ pub const WebState = struct {
                     .trusted_proxy_hops = self.trusted_proxy_hops,
                 };
             }
+        }
+    }
+
+    /// Seqlock read of the portfolio snapshot. The strategy-review lane uses
+    /// drawdown and risk mode; it does not take the trading-loop lock.
+    pub fn readSnapshot(self: *WebState) state.PortfolioState {
+        while (true) {
+            const s1 = self.seq.load(.acquire);
+            if (s1 % 2 == 1) {
+                std.atomic.spinLoopHint();
+                continue;
+            }
+            const snap = self.snapshot;
+            if (self.seq.load(.acquire) == s1) return snap;
         }
     }
 

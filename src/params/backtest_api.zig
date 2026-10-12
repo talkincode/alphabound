@@ -152,6 +152,12 @@ pub fn run(
     return .{ .status = .ok, .body = slot.report.body };
 }
 
+/// Store one gate report. The strategy review calls this after scoring a
+/// candidate on its own thread. It does not place an order.
+pub fn persist(database: *db.Db, now_ms: i64, report: *const gate.Report) !void {
+    try storeReport(database, now_ms, report);
+}
+
 pub fn get(database: *db.Db, id: []const u8, out: []u8) !ApiResult {
     if (!idOk(id)) return errBody(out, .bad_request, "bad_id", "");
     var stmt = try database.prepare("SELECT report_json FROM backtest_reports WHERE id = ?1");

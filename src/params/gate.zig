@@ -87,6 +87,12 @@ pub const Report = struct {
     baseline_version_id: i64 = 0,
     /// Points at `out` passed to `evaluate`.
     body: []const u8 = "",
+    /// Out-of-sample alpha(candidate) − alpha(baseline). Zero when the sample
+    /// was too short to score. The strategy review uses this to rank passes.
+    oos_alpha_delta: f64 = 0,
+    oos_candidate_drawdown: f64 = 0,
+    summary_buf: [384]u8 = undefined,
+    summary_len: usize = 0,
 
     pub fn idText(self: *const Report) []const u8 {
         return self.id[0..self.id_len];
@@ -102,6 +108,9 @@ pub const Report = struct {
     }
     pub fn digestText(self: *const Report) []const u8 {
         return &self.digest;
+    }
+    pub fn summaryText(self: *const Report) []const u8 {
+        return self.summary_buf[0..self.summary_len];
     }
 };
 
@@ -223,6 +232,7 @@ pub fn evaluate(
 
     if (nreason > 0) {
         report.passed = false;
+        fillSummary(&report);
         report.body = try writeReport(out, &report, meta, reasons[0..nreason], null, null, &.{});
         return report;
     }
@@ -252,6 +262,9 @@ pub fn evaluate(
     if (wins * 2 <= window_count) pushReason(&reasons, &nreason, "windows_majority");
     if (dd_fail) pushReason(&reasons, &nreason, "drawdown_cap");
     report.passed = nreason == 0;
+    report.oos_alpha_delta = oos_score.candidate.alpha - oos_score.baseline.alpha;
+    report.oos_candidate_drawdown = oos_score.candidate.max_drawdown;
+    fillSummary(&report);
     report.body = try writeReport(out, &report, meta, reasons[0..nreason], &is_score, &oos_score, &windows);
     return report;
 }
@@ -552,17 +565,23 @@ fn writeReport(
     return w.buffered();
 }
 
-fn writeSummary(w: *std.Io.Writer, report: *const Report) std.Io.Writer.Error!void {
-    var buf: [256]u8 = undefined;
-    var inner: std.Io.Writer = .fixed(&buf);
+fn fillSummary(report: *Report) void {
+    var inner: std.Io.Writer = .fixed(&report.summary_buf);
     inner.print("{{\"schema\":\"{s}\",\"id\":\"{s}\",\"passed\":{},\"digest\":\"{s}\",\"as_of_ms\":{d}}}", .{
         dynamic.backtest_ref_schema,
         report.idText(),
         report.passed,
         report.digestText(),
         report.as_of_ms,
-    }) catch return error.WriteFailed;
-    try writeEscaped(w, inner.buffered());
+    }) catch {
+        report.summary_len = 0;
+        return;
+    };
+    report.summary_len = inner.buffered().len;
+}
+
+fn writeSummary(w: *std.Io.Writer, report: *const Report) std.Io.Writer.Error!void {
+    try writeEscaped(w, report.summaryText());
 }
 
 fn writeSlice(w: *std.Io.Writer, slice: ?*const SliceScore) std.Io.Writer.Error!void {

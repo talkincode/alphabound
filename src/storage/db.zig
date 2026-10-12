@@ -34,6 +34,7 @@ const migration_0010: [:0]const u8 = @embedFile("migration_0010");
 const migration_0011: [:0]const u8 = @embedFile("migration_0011");
 const migration_0012: [:0]const u8 = @embedFile("migration_0012");
 const migration_0013: [:0]const u8 = @embedFile("migration_0013");
+const migration_0014: [:0]const u8 = @embedFile("migration_0014");
 const intel = @import("../intel/protocol.zig");
 
 /// Ordered list of migrations; user_version tracks the applied count.
@@ -51,6 +52,7 @@ const migrations = [_][:0]const u8{
     migration_0011,
     migration_0012,
     migration_0013,
+    migration_0014,
 };
 
 /// Expected user_version for a fully migrated database (restore drills).

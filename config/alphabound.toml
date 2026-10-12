@@ -54,6 +54,10 @@ prompt_dir = "/etc/alphabound/prompts"
 short_interval_ms = 28800000   # 小周期 8 小时（小时级；常用 4h=14400000）；0 = 关闭
 long_interval_ms = 604800000   # 大周期 7 天；0 = 关闭
 # timeout_ms = 180000           # 复盘 LLM 超时，独立于 decision_timeout_ms（不被其封顶）；最小 30000
+# 策略参数复盘（过滤层，不下单）。默认开启并在硬边界内自动生效。
+# 旧二进制不认识这两个键，回滚前请保持注释。见 docs/STRATEGY_REVIEW.md。
+# strategy_mode = "auto"          # auto | propose_only | off
+# strategy_interval_ms = 86400000 # 默认每日；0 = 不定时，仍可手动触发；最小 3600000
 
 [storage]
 path = "/var/lib/alphabound/trading.db"

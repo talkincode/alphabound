@@ -158,6 +158,10 @@ timeout_ms = 180000            # 复盘 LLM 超时，默认 180000，最小 3000
 | `short_interval_ms` | u32 | `28800000`（8h） | 小周期复盘间隔，按小时级设置（常用 4h = `14400000`）；最小 `600000`；`0` = 关闭 |
 | `long_interval_ms` | u32 | `604800000`（7d） | 大周期复盘间隔；最小 `3600000`；`0` = 关闭 |
 | `timeout_ms` | u32 | `180000` | 该次 LLM 调用的超时预算；最小 `30000`。**独立于** `[agent] decision_timeout_ms`，不会被其封顶——复盘 prompt（窗口事实 + 记忆摘要 + 长周期时的短复盘摘要）通常比单次决策更大，调紧决策超时不应连带拖垮复盘可用性。实际生效值还会按 prompt 体量小幅上调（至多 +50%），见 `periodicReviewTimeoutMs`（`src/main.zig`）。 |
+| `strategy_mode` | string | `auto` | 策略参数复盘：`auto` 在硬边界内自动生效；`propose_only` 只生成提案；`off` 本轮不搜索、不改参数。观察期内的安全回滚不受 `off` 取消 |
+| `strategy_interval_ms` | u32 | `86400000`（1d） | 策略参数复盘间隔；最小 `3600000`；`0` = 不定时，仍可经 HTTP/MCP 手动触发。启动后先等满一个间隔 |
+
+`strategy_mode` / `strategy_interval_ms` 与上面的 LLM 复盘无关。示例配置里保持注释：更旧的二进制把未知键当成错误，带注释才能在回滚二进制后继续启动。规则见 [STRATEGY_REVIEW.md](https://github.com/talkincode/alphabound/blob/main/docs/STRATEGY_REVIEW.md)。
 
 下限用于防止误配把复盘变成第二条决策回路。两个周期同时到期时**大周期优先**，小周期顺延到下一 tick（两次运行之间至少间隔 2 分钟）。进程重启后从库中该周期最新报告的时间戳恢复游标：停机数日只补跑**一次**，不会逐槽回放。
 

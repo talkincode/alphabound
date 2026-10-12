@@ -16,6 +16,7 @@ const params_write = @import("../params/write.zig");
 const params_store = @import("../params/store.zig");
 const params_dynamic = @import("../params/dynamic.zig");
 const params_backtest = @import("../params/backtest_api.zig");
+const strategy_review = @import("../params/strategy_review.zig");
 const app_config = @import("../config.zig");
 
 const favicon_svg: []const u8 = @embedFile("favicon_svg");
@@ -101,6 +102,10 @@ pub const Context = struct {
     /// Absolute notional floor copied from config. The backtest gate uses it
     /// for both sides. The trading loop does not read this field.
     param_min_trade_notional: dec.Decimal = dec.Decimal.zero,
+    /// Set by the web cache from the process-owned atomics. Null in unit
+    /// tests that do not start the review lane.
+    strategy_review_kick: ?*std.atomic.Value(bool) = null,
+    strategy_review_running: ?*std.atomic.Value(bool) = null,
     /// Intel ingest mailbox; null = ingest unavailable.
     intel_inbox: ?*intel_inbox.Inbox = null,
     /// HMAC key for alphabound.intel.v1; empty = ingest disabled.
@@ -279,6 +284,9 @@ pub fn handleReq(buf: []u8, req: RequestInfo, ctx: Context) Response {
         if (checkProtectedAuth(ctx, req)) |denied| return denied;
     }
 
+    if (method == .POST and std.mem.eql(u8, path, "/api/v1/review/strategy")) {
+        return handleStrategyReviewPost(ctx);
+    }
     // --- review (复盘) POST mailbox: analysis-only, never touches trading ---
     if (method == .POST and std.mem.startsWith(u8, path, "/api/v1/review/")) {
         return handleReviewPost(req, path, ctx);
@@ -324,6 +332,7 @@ pub fn handleReq(buf: []u8, req: RequestInfo, ctx: Context) Response {
     if (std.mem.eql(u8, path, "/api/v1/review/context")) return copyBody(buf, ctx.review_ctx_json);
     if (std.mem.eql(u8, path, "/api/v1/review/analytics")) return copyBody(buf, ctx.analytics_json);
     if (std.mem.eql(u8, path, "/api/v1/review/periodic")) return copyBody(buf, ctx.periodic_json);
+    if (std.mem.eql(u8, path, "/api/v1/review/strategy")) return handleStrategyReviewGet(buf, req, ctx);
     if (std.mem.eql(u8, path, "/api/v1/audit")) return copyBody(buf, ctx.audit_json);
     if (std.mem.eql(u8, path, "/api/v1/statistics")) return copyBody(buf, ctx.statistics_json);
     if (std.mem.eql(u8, path, "/api/v1/intel")) return copyBody(buf, ctx.intel_json);
@@ -418,6 +427,47 @@ fn handleIntelPost(buf: []u8, req: RequestInfo, ctx: Context) Response {
         .{ item.id(), item.dedupKey() },
     ) catch return .{ .status = .accepted, .body = "{\"ok\":true,\"queued\":true}" };
     return .{ .status = .accepted, .body = body };
+}
+
+fn handleStrategyReviewPost(ctx: Context) Response {
+    if (!ctx.auth_cfg.required()) {
+        return .{ .status = .unauthorized, .body = "{\"error\":\"auth_required\"}" };
+    }
+    const kick = ctx.strategy_review_kick orelse {
+        return .{ .status = .service_unavailable, .body = "{\"error\":\"review_unavailable\"}" };
+    };
+    if (ctx.strategy_review_running) |running| {
+        if (running.load(.acquire)) {
+            return .{ .status = .conflict, .body = "{\"error\":\"pending\",\"hint\":\"review_already_running\"}" };
+        }
+    }
+    kick.store(true, .release);
+    return .{ .status = .accepted, .body = "{\"ok\":true,\"queued\":true}" };
+}
+
+fn handleStrategyReviewGet(buf: []u8, req: RequestInfo, ctx: Context) Response {
+    if (ctx.param_db_path.len == 0) {
+        return .{ .status = .service_unavailable, .body = "{\"error\":\"review_unavailable\"}" };
+    }
+    var database = db.Db.open(ctx.param_db_path) catch {
+        return .{ .status = .service_unavailable, .body = "{\"error\":\"review_unavailable\"}" };
+    };
+    defer database.close();
+    if (queryParam(req.target, "id")) |id| {
+        const result = strategy_review.getJson(&database, id, buf) catch {
+            return .{ .status = .internal_server_error, .body = "{\"error\":\"review_failed\"}" };
+        };
+        const status: std.http.Status = switch (result.status) {
+            .ok => .ok,
+            .bad_id => .bad_request,
+            .not_found => .not_found,
+        };
+        return .{ .status = status, .body = result.body };
+    }
+    const body = strategy_review.listJson(&database, buf) catch {
+        return .{ .status = .internal_server_error, .body = "{\"error\":\"review_failed\"}" };
+    };
+    return .{ .status = .ok, .body = body };
 }
 
 fn handleBacktestPost(buf: []u8, req: RequestInfo, ctx: Context) Response {
@@ -2343,5 +2393,88 @@ test "backtest gate http returns a stored report and does not place orders" {
         .now_ms = 1_700_000_000_000,
     }, ctx).status);
     try testing.expectEqual(@as(i64, 1), try database.queryInt("SELECT COUNT(*) FROM backtest_reports"));
+    try testing.expectEqual(@as(i64, 0), try database.queryInt("SELECT COUNT(*) FROM orders"));
+}
+
+test "strategy review queues off the request thread and stays readable" {
+    var buf: [8192]u8 = undefined;
+    var ctx = testCtx();
+    const open = handleReq(&buf, .{
+        .method = .POST,
+        .target = "/api/v1/review/strategy",
+        .now_ms = 1_700_000_000_000,
+    }, ctx);
+    try testing.expectEqual(std.http.Status.unauthorized, open.status);
+
+    ctx.auth_cfg = .{ .api_token = "test-token-not-a-secret-value" };
+    const unavailable = handleReq(&buf, .{
+        .method = .POST,
+        .target = "/api/v1/review/strategy",
+        .x_api_token = "test-token-not-a-secret-value",
+        .now_ms = 1_700_000_000_000,
+    }, ctx);
+    try testing.expectEqual(std.http.Status.service_unavailable, unavailable.status);
+
+    var kick = std.atomic.Value(bool).init(false);
+    var running = std.atomic.Value(bool).init(false);
+    ctx.strategy_review_kick = &kick;
+    ctx.strategy_review_running = &running;
+    const queued = handleReq(&buf, .{
+        .method = .POST,
+        .target = "/api/v1/review/strategy",
+        .x_api_token = "test-token-not-a-secret-value",
+        .now_ms = 1_700_000_000_000,
+    }, ctx);
+    try testing.expectEqual(std.http.Status.accepted, queued.status);
+    try testing.expect(std.mem.indexOf(u8, queued.body, "\"queued\":true") != null);
+    try testing.expect(kick.load(.acquire));
+
+    kick.store(false, .release);
+    running.store(true, .release);
+    const busy = handleReq(&buf, .{
+        .method = .POST,
+        .target = "/api/v1/review/strategy",
+        .x_api_token = "test-token-not-a-secret-value",
+        .now_ms = 1_700_000_000_000,
+    }, ctx);
+    try testing.expectEqual(std.http.Status.conflict, busy.status);
+    try testing.expect(!kick.load(.acquire));
+
+    const nodb = handleReq(&buf, .{
+        .method = .GET,
+        .target = "/api/v1/review/strategy",
+        .x_api_token = "test-token-not-a-secret-value",
+        .now_ms = 1_700_000_000_000,
+    }, ctx);
+    try testing.expectEqual(std.http.Status.service_unavailable, nodb.status);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [512]u8 = undefined;
+    const n = try tmp.dir.realPath(std.testing.io, &dir_buf);
+    var path_buf: [640:0]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "{s}/review.db", .{dir_buf[0..n]});
+    var database = try db.Db.open(path);
+    defer database.close();
+    var cfg = try app_config.parse(std.testing.allocator, "");
+    defer cfg.deinit();
+    _ = try params_store.ensureActive(&database, &cfg, 1_700_000_000_000);
+    strategy_review.execute(&database, Decimal.zero, 1_700_003_000_000, .off, "manual", 0.01, true);
+    ctx.param_db_path = path;
+    const listed = handleReq(&buf, .{
+        .method = .GET,
+        .target = "/api/v1/review/strategy",
+        .x_api_token = "test-token-not-a-secret-value",
+        .now_ms = 1_700_003_000_000,
+    }, ctx);
+    try testing.expectEqual(std.http.Status.ok, listed.status);
+    try testing.expect(std.mem.indexOf(u8, listed.body, "skipped") != null);
+    const bad = handleReq(&buf, .{
+        .method = .GET,
+        .target = "/api/v1/review/strategy?id=nope%20id",
+        .x_api_token = "test-token-not-a-secret-value",
+        .now_ms = 1_700_003_000_000,
+    }, ctx);
+    try testing.expectEqual(std.http.Status.bad_request, bad.status);
     try testing.expectEqual(@as(i64, 0), try database.queryInt("SELECT COUNT(*) FROM orders"));
 }
