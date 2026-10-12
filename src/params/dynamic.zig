@@ -62,6 +62,8 @@ pub const Reason = enum {
     step_too_large,
     too_soon,
     not_tighter,
+    /// A proposal named `max_drawdown`. The kernel constant is not a field.
+    locked,
 
     pub fn text(self: Reason) []const u8 {
         return @tagName(self);
@@ -212,8 +214,13 @@ const json_keys = [_][]const u8{
 pub fn parseJson(gpa: std.mem.Allocator, raw: []const u8) ParseError!Params {
     var parsed = std.json.parseFromSlice(std.json.Value, gpa, raw, .{}) catch return error.MalformedJson;
     defer parsed.deinit();
-    if (parsed.value != .object) return error.MalformedJson;
-    const obj = parsed.value.object;
+    return parseValue(parsed.value);
+}
+
+pub fn parseValue(value: std.json.Value) ParseError!Params {
+    if (value != .object) return error.MalformedJson;
+    const obj = value.object;
+    if (obj.get("max_drawdown") != null) return error.UnknownField;
     if (obj.count() != json_keys.len) return error.UnknownField;
     for (json_keys) |k| {
         if (obj.get(k) == null) return error.MissingField;
@@ -234,6 +241,59 @@ pub fn parseJson(gpa: std.mem.Allocator, raw: []const u8) ParseError!Params {
         .volatility_window_ms = try getI64(obj, "volatility_window_ms"),
         .volatility_gap_ms = try getI64(obj, "volatility_gap_ms"),
     };
+}
+
+/// True when a request body names the locked drawdown field. Any such
+/// proposal is rejected before it can become a version.
+pub fn rawLocksDrawdown(raw: []const u8) bool {
+    return std.mem.indexOf(u8, raw, "\"max_drawdown\"") != null;
+}
+
+/// Absolute bounds only. Rollback uses this: step size, the 24h gate, and
+/// the one-way knobs do not apply, but a restored set must still fit.
+pub fn validateAbsolute(proposed: Params) Verdict {
+    if (proposed.daily_trade_cap < daily_cap_min or proposed.daily_trade_cap > daily_cap_max) {
+        return .{ .reason = .out_of_bounds, .field = "daily_trade_cap" };
+    }
+    if (proposed.reverse_cooldown_ms < cooldown_min_ms or proposed.reverse_cooldown_ms > cooldown_max_ms) {
+        return .{ .reason = .out_of_bounds, .field = "reverse_cooldown_ms" };
+    }
+    if (proposed.min_trade_equity_frac.lt(equity_frac_min) or proposed.min_trade_equity_frac.gt(equity_frac_max)) {
+        return .{ .reason = .out_of_bounds, .field = "min_trade_equity_frac" };
+    }
+    if (proposed.sell_exempt_drawdown.lt(sell_exempt_min) or proposed.sell_exempt_drawdown.gt(sell_exempt_max)) {
+        return .{ .reason = .out_of_bounds, .field = "sell_exempt_drawdown" };
+    }
+    if (proposed.trend_ma_period < trend_period_min or proposed.trend_ma_period > trend_period_max) {
+        return .{ .reason = .out_of_bounds, .field = "trend_ma_period" };
+    }
+    if (proposed.position_cap.lt(position_cap_min) or proposed.position_cap.gt(position_cap_max)) {
+        return .{ .reason = .out_of_bounds, .field = "position_cap" };
+    }
+    if (proposed.price_shock.lt(price_shock_min) or proposed.price_shock.gt(price_shock_max)) {
+        return .{ .reason = .out_of_bounds, .field = "price_shock" };
+    }
+    if (proposed.exit_reserve.lt(exit_reserve_min) or proposed.exit_reserve.gt(exit_reserve_max)) {
+        return .{ .reason = .out_of_bounds, .field = "exit_reserve" };
+    }
+    if (proposed.event_price_move.lt(Decimal.zero) or proposed.event_price_move.gt(event_move_max)) {
+        return .{ .reason = .out_of_bounds, .field = "event_price_move" };
+    }
+    if (proposed.event_drawdown_step.lt(Decimal.zero) or proposed.event_drawdown_step.gt(event_dd_max)) {
+        return .{ .reason = .out_of_bounds, .field = "event_drawdown_step" };
+    }
+    if (proposed.event_price_drift.lt(Decimal.zero) or proposed.event_price_drift.gt(event_drift_max)) {
+        return .{ .reason = .out_of_bounds, .field = "event_price_drift" };
+    }
+    if (proposed.volatility_window_ms < window_min_ms or proposed.volatility_window_ms > window_max_ms or
+        @mod(proposed.volatility_window_ms, window_step_ms) != 0)
+    {
+        return .{ .reason = .out_of_bounds, .field = "volatility_window_ms" };
+    }
+    if (proposed.volatility_gap_ms < gap_min_ms or proposed.volatility_gap_ms > gap_max_ms) {
+        return .{ .reason = .out_of_bounds, .field = "volatility_gap_ms" };
+    }
+    return .{ .reason = .ok };
 }
 
 /// `last_change_ms <= 0` means there is no prior change (the gate is open).
@@ -331,6 +391,158 @@ fn getDec(obj: std.json.ObjectMap, key: []const u8) ParseError!Decimal {
     const v = obj.get(key) orelse return error.MissingField;
     if (v != .string) return error.WrongType;
     return Decimal.parse(v.string) catch return error.OutOfRange;
+}
+
+pub const backtest_ref_schema = "alphabound.backtest_ref.v1";
+
+pub const BacktestRefError = error{
+    Missing,
+    Malformed,
+    Schema,
+    NotPassed,
+    BadId,
+};
+
+/// Shape check for a passing backtest reference. Phase 3 replaces the body
+/// of this function with a lookup of a real backtest run; callers stay put.
+/// Empty input is `Missing`. A present reference must be
+/// `alphabound.backtest_ref.v1` with a non-empty id and `passed: true`.
+/// Optional `digest` (string) and `as_of_ms` (integer) are accepted and not
+/// verified yet. Any other key is rejected so the interface stays explicit.
+pub fn validateBacktestRef(gpa: std.mem.Allocator, raw: []const u8) BacktestRefError!void {
+    if (raw.len == 0) return error.Missing;
+    if (raw.len > 1024) return error.Malformed;
+    var parsed = std.json.parseFromSlice(std.json.Value, gpa, raw, .{}) catch return error.Malformed;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.Malformed;
+    const obj = parsed.value.object;
+    var it = obj.iterator();
+    while (it.next()) |entry| {
+        const known = std.mem.eql(u8, entry.key_ptr.*, "schema") or
+            std.mem.eql(u8, entry.key_ptr.*, "id") or
+            std.mem.eql(u8, entry.key_ptr.*, "passed") or
+            std.mem.eql(u8, entry.key_ptr.*, "digest") or
+            std.mem.eql(u8, entry.key_ptr.*, "as_of_ms");
+        if (!known) return error.Malformed;
+    }
+    const schema = obj.get("schema") orelse return error.Schema;
+    if (schema != .string or !std.mem.eql(u8, schema.string, backtest_ref_schema)) return error.Schema;
+    const id = obj.get("id") orelse return error.BadId;
+    if (id != .string or id.string.len < 4 or id.string.len > 80) return error.BadId;
+    for (id.string) |c| {
+        const ok = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+            (c >= '0' and c <= '9') or c == '_' or c == '-' or c == '.';
+        if (!ok) return error.BadId;
+    }
+    const passed = obj.get("passed") orelse return error.NotPassed;
+    if (passed != .bool or !passed.bool) return error.NotPassed;
+    if (obj.get("digest")) |digest| {
+        if (digest != .string or digest.string.len == 0 or digest.string.len > 128) return error.Malformed;
+    }
+    if (obj.get("as_of_ms")) |at| {
+        if (at != .integer or at.integer < 0) return error.Malformed;
+    }
+}
+
+/// Copy scheduler knobs from the active filter set. Cadence floors that are
+/// not part of `Params` are left alone.
+pub fn adoptScheduler(sched: *scheduler.Scheduler, p: Params) void {
+    sched.params.price_move = p.event_price_move;
+    sched.params.drawdown_step = p.event_drawdown_step;
+    sched.params.price_drift = p.event_price_drift;
+    sched.params.volatility_window_ms = p.volatility_window_ms;
+    sched.params.volatility_gap_ms = p.volatility_gap_ms;
+}
+
+/// The system prompt states the position band as `[0, 1]`. That sentence is
+/// the only numeric guardrail in the prompt. When the active cap is still 1
+/// the template is returned unchanged, so a daemon that nobody reconfigures
+/// sends the same bytes as before. A lower cap is rendered in place.
+pub fn renderSystemPrompt(dst: []u8, template: []const u8, params: Params) []const u8 {
+    if (!params.position_cap.lt(Decimal.one)) return template;
+    const needle = "target.btc` in [0, 1]";
+    const at = std.mem.indexOf(u8, template, needle) orelse return template;
+    var cap_buf: [32]u8 = undefined;
+    var cw: std.Io.Writer = .fixed(&cap_buf);
+    cw.print("{f}", .{params.position_cap}) catch return template;
+    const cap = cw.buffered();
+    const prefix = "target.btc` in [0, ";
+    var w: std.Io.Writer = .fixed(dst);
+    w.writeAll(template[0..at]) catch return template;
+    w.writeAll(prefix) catch return template;
+    w.writeAll(cap) catch return template;
+    w.writeByte(']') catch return template;
+    w.writeAll(template[at + needle.len ..]) catch return template;
+    return w.buffered();
+}
+
+/// JSON array of fields whose values differ. Decimal fields are strings,
+/// matching `Params.writeJson`.
+pub fn writeDiff(w: *std.Io.Writer, current: Params, proposed: Params) std.Io.Writer.Error!void {
+    try w.writeByte('[');
+    var n: usize = 0;
+    if (current.daily_trade_cap != proposed.daily_trade_cap) {
+        try comma(w, &n);
+        try w.print("{{\"field\":\"daily_trade_cap\",\"before\":{d},\"after\":{d}}}", .{ current.daily_trade_cap, proposed.daily_trade_cap });
+    }
+    if (current.reverse_cooldown_ms != proposed.reverse_cooldown_ms) {
+        try comma(w, &n);
+        try w.print("{{\"field\":\"reverse_cooldown_ms\",\"before\":{d},\"after\":{d}}}", .{ current.reverse_cooldown_ms, proposed.reverse_cooldown_ms });
+    }
+    if (!current.min_trade_equity_frac.eql(proposed.min_trade_equity_frac)) {
+        try comma(w, &n);
+        try w.print("{{\"field\":\"min_trade_equity_frac\",\"before\":\"{f}\",\"after\":\"{f}\"}}", .{ current.min_trade_equity_frac, proposed.min_trade_equity_frac });
+    }
+    if (current.macro_sell_requires_trend_break != proposed.macro_sell_requires_trend_break) {
+        try comma(w, &n);
+        try w.print("{{\"field\":\"macro_sell_requires_trend_break\",\"before\":{},\"after\":{}}}", .{ current.macro_sell_requires_trend_break, proposed.macro_sell_requires_trend_break });
+    }
+    if (!current.sell_exempt_drawdown.eql(proposed.sell_exempt_drawdown)) {
+        try comma(w, &n);
+        try w.print("{{\"field\":\"sell_exempt_drawdown\",\"before\":\"{f}\",\"after\":\"{f}\"}}", .{ current.sell_exempt_drawdown, proposed.sell_exempt_drawdown });
+    }
+    if (current.trend_ma_period != proposed.trend_ma_period) {
+        try comma(w, &n);
+        try w.print("{{\"field\":\"trend_ma_period\",\"before\":{d},\"after\":{d}}}", .{ current.trend_ma_period, proposed.trend_ma_period });
+    }
+    if (!current.position_cap.eql(proposed.position_cap)) {
+        try comma(w, &n);
+        try w.print("{{\"field\":\"position_cap\",\"before\":\"{f}\",\"after\":\"{f}\"}}", .{ current.position_cap, proposed.position_cap });
+    }
+    if (!current.price_shock.eql(proposed.price_shock)) {
+        try comma(w, &n);
+        try w.print("{{\"field\":\"price_shock\",\"before\":\"{f}\",\"after\":\"{f}\"}}", .{ current.price_shock, proposed.price_shock });
+    }
+    if (!current.exit_reserve.eql(proposed.exit_reserve)) {
+        try comma(w, &n);
+        try w.print("{{\"field\":\"exit_reserve\",\"before\":\"{f}\",\"after\":\"{f}\"}}", .{ current.exit_reserve, proposed.exit_reserve });
+    }
+    if (!current.event_price_move.eql(proposed.event_price_move)) {
+        try comma(w, &n);
+        try w.print("{{\"field\":\"event_price_move\",\"before\":\"{f}\",\"after\":\"{f}\"}}", .{ current.event_price_move, proposed.event_price_move });
+    }
+    if (!current.event_drawdown_step.eql(proposed.event_drawdown_step)) {
+        try comma(w, &n);
+        try w.print("{{\"field\":\"event_drawdown_step\",\"before\":\"{f}\",\"after\":\"{f}\"}}", .{ current.event_drawdown_step, proposed.event_drawdown_step });
+    }
+    if (!current.event_price_drift.eql(proposed.event_price_drift)) {
+        try comma(w, &n);
+        try w.print("{{\"field\":\"event_price_drift\",\"before\":\"{f}\",\"after\":\"{f}\"}}", .{ current.event_price_drift, proposed.event_price_drift });
+    }
+    if (current.volatility_window_ms != proposed.volatility_window_ms) {
+        try comma(w, &n);
+        try w.print("{{\"field\":\"volatility_window_ms\",\"before\":{d},\"after\":{d}}}", .{ current.volatility_window_ms, proposed.volatility_window_ms });
+    }
+    if (current.volatility_gap_ms != proposed.volatility_gap_ms) {
+        try comma(w, &n);
+        try w.print("{{\"field\":\"volatility_gap_ms\",\"before\":{d},\"after\":{d}}}", .{ current.volatility_gap_ms, proposed.volatility_gap_ms });
+    }
+    try w.writeByte(']');
+}
+
+fn comma(w: *std.Io.Writer, n: *usize) std.Io.Writer.Error!void {
+    if (n.* > 0) try w.writeByte(',');
+    n.* += 1;
 }
 
 /// Insert `"param_version":N` before the final `}` of a JSON object.
@@ -480,4 +692,65 @@ test "decision payload records the param version" {
     var again: [160]u8 = undefined;
     try testing.expectEqualStrings(stamped, withParamVersion(&again, stamped, 9));
     try testing.expectEqualStrings("[]", withParamVersion(&buf, "[]", 1));
+}
+
+test "absolute bounds ignore step, direction and the 24h gate" {
+    const base = Params{};
+    try testing.expectEqual(Reason.ok, validateAbsolute(base).reason);
+    var wide = base;
+    wide.daily_trade_cap = 48;
+    wide.position_cap = d("1");
+    wide.price_shock = d("0.05");
+    try testing.expectEqual(Reason.ok, validateAbsolute(wide).reason);
+    var thin = base;
+    thin.exit_reserve = d("0.40");
+    try testing.expectEqual(Reason.out_of_bounds, validateAbsolute(thin).reason);
+    try testing.expectEqualStrings("exit_reserve", validateAbsolute(thin).field);
+    var odd = base;
+    odd.volatility_window_ms = 750_000;
+    try testing.expectEqual(Reason.out_of_bounds, validateAbsolute(odd).reason);
+}
+
+test "backtest reference shape is checked and not executed" {
+    const ok = "{\"schema\":\"alphabound.backtest_ref.v1\",\"id\":\"bt_ok\",\"passed\":true}";
+    try validateBacktestRef(testing.allocator, ok);
+    const with_extra = "{\"schema\":\"alphabound.backtest_ref.v1\",\"id\":\"bt_ok\",\"passed\":true,\"digest\":\"abc\",\"as_of_ms\":10}";
+    try validateBacktestRef(testing.allocator, with_extra);
+    try testing.expectError(error.Missing, validateBacktestRef(testing.allocator, ""));
+    try testing.expectError(error.NotPassed, validateBacktestRef(testing.allocator, "{\"schema\":\"alphabound.backtest_ref.v1\",\"id\":\"bt_ok\",\"passed\":false}"));
+    try testing.expectError(error.Schema, validateBacktestRef(testing.allocator, "{\"schema\":\"other\",\"id\":\"bt_ok\",\"passed\":true}"));
+    try testing.expectError(error.Malformed, validateBacktestRef(testing.allocator, "{\"schema\":\"alphabound.backtest_ref.v1\",\"id\":\"bt_ok\",\"passed\":true,\"run\":1}"));
+}
+
+test "a full position cap leaves the prompt untouched" {
+    const template = "propose target.btc` in [0, 1]. stop";
+    var buf: [128]u8 = undefined;
+    const same = renderSystemPrompt(&buf, template, .{});
+    try testing.expectEqual(template.ptr, same.ptr);
+    var lowered = Params{};
+    lowered.position_cap = d("0.8");
+    const rendered = renderSystemPrompt(&buf, template, lowered);
+    try testing.expectEqualStrings("propose target.btc` in [0, 0.8]. stop", rendered);
+}
+
+test "scheduler adoption touches only filter knobs" {
+    var sched = scheduler.Scheduler.init(.{ .base_interval_ms = 600_000, .price_move = d("0.005") });
+    var p = Params{};
+    p.event_price_move = d("0.006");
+    p.volatility_window_ms = 720_000;
+    adoptScheduler(&sched, p);
+    try testing.expect(sched.params.price_move.eql(d("0.006")));
+    try testing.expectEqual(@as(i64, 720_000), sched.params.volatility_window_ms);
+    try testing.expectEqual(@as(i64, 600_000), sched.params.base_interval_ms);
+}
+
+test "diff lists only changed fields and locks the drawdown name" {
+    var next = Params{};
+    next.daily_trade_cap = 7;
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeDiff(&w, .{}, next);
+    try testing.expectEqualStrings("[{\"field\":\"daily_trade_cap\",\"before\":6,\"after\":7}]", w.buffered());
+    try testing.expect(rawLocksDrawdown("{\"max_drawdown\":\"0.2\"}"));
+    try testing.expect(!rawLocksDrawdown("{\"daily_trade_cap\":6}"));
 }

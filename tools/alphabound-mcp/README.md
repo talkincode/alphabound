@@ -122,7 +122,10 @@ Clients must still present `ALPHABOUND_API_TOKEN` to the **daemon**; the MCP pro
 | `get_auth_status` | `GET /api/v1/auth/status` | |
 | `get_params` | `GET /api/v1/params` | active filter-layer parameter version (read-only) |
 | `list_param_versions` | `GET /api/v1/params/versions` | version history, newest first (read-only) |
+| `propose_params` | `POST /api/v1/params/propose` | pending version + validate. Not an order. 20% / 24h / one-way gates. `max_drawdown` rejected |
+| `apply_params` | `POST /api/v1/params/apply` | activate a pending version. Optimistic concurrency. Backtest ref required unless the daemon switch is on |
+| `rollback_params` | `POST /api/v1/params/rollback` | restore a historical version inside absolute bounds. Not an order |
 | `list_intel` | `GET /api/v1/intel` | history; no signature/nonce |
 | `submit_intel` | `POST /api/v1/intel` | pre-signed envelope only |
 
-No order placement, flatten, resume, or secret readout.
+No order placement, flatten, resume, or secret readout. propose_params / apply_params / rollback_params change filter parameters only, require the same admin token, and record source=mcp.

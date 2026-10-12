@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import { callTool, findTool, listToolsPublic } from "./client.js";
 
-export const HELP = `alphabound-mcp — AlphaBound analytics MCP (read-only + signed intel ingest)
+export const HELP = `alphabound-mcp — AlphaBound analytics MCP (read-only, signed intel, gated parameter writes)
 
 Usage:
   alphabound-mcp                 Start stdio MCP (IDE / Copilot default)
@@ -19,7 +19,7 @@ Auth (environment variables; preferred over flags):
 Call options:
   --base <url>    Override ALPHABOUND_API_BASE
   --token <str>   Override token (prefer env; do not commit / log)
-  --json <body>   POST JSON body (submit_intel)
+  --json <body>   POST JSON body (submit_intel, propose_params, apply_params, rollback_params)
   --file <path>   POST JSON body from file
   --query <k=v&k=v>  Query params for GET tools that take them, e.g.
                   list_agent_runs --query "status=error&limit=20"

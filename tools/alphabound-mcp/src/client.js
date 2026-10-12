@@ -111,9 +111,13 @@ export async function callTool(name, args = {}, overrides = {}) {
     throw err;
   }
   const path = tool.method === "POST" ? tool.path : `${tool.path}${buildQuery(tool, args)}`;
+  let payload = args || {};
+  if (tool.method === "POST" && tool.forceSource) {
+    payload = { ...payload, source: tool.forceSource };
+  }
   const data =
     tool.method === "POST"
-      ? await apiPost(tool.path, args || {}, overrides)
+      ? await apiPost(tool.path, payload, overrides)
       : await apiGet(path, overrides);
   return {
     name: tool.name,
@@ -201,6 +205,53 @@ export const INTEL_ENVELOPE_SCHEMA = {
   },
 };
 
+const PARAM_FIELD = {
+  type: "object",
+  additionalProperties: false,
+  description:
+    "Full filter-layer set. Do not include max_drawdown; that field is locked at 0.10 and any proposal containing it is rejected.",
+  required: [
+    "daily_trade_cap",
+    "reverse_cooldown_ms",
+    "min_trade_equity_frac",
+    "macro_sell_requires_trend_break",
+    "sell_exempt_drawdown",
+    "trend_ma_period",
+    "position_cap",
+    "price_shock",
+    "exit_reserve",
+    "event_price_move",
+    "event_drawdown_step",
+    "event_price_drift",
+    "volatility_window_ms",
+    "volatility_gap_ms",
+  ],
+  properties: {
+    daily_trade_cap: { type: "integer", minimum: 0, maximum: 48 },
+    reverse_cooldown_ms: { type: "integer", minimum: 0 },
+    min_trade_equity_frac: { type: "string" },
+    macro_sell_requires_trend_break: { type: "boolean" },
+    sell_exempt_drawdown: { type: "string" },
+    trend_ma_period: { type: "integer", minimum: 20, maximum: 200 },
+    position_cap: { type: "string", description: "May only decrease. 1 is the current ceiling." },
+    price_shock: { type: "string", description: "May only increase (more conservative)." },
+    exit_reserve: { type: "string", description: "May only increase (more conservative)." },
+    event_price_move: { type: "string" },
+    event_drawdown_step: { type: "string" },
+    event_price_drift: { type: "string" },
+    volatility_window_ms: { type: "integer" },
+    volatility_gap_ms: { type: "integer" },
+  },
+};
+
+const WRITE_META = {
+  operator: { type: "string", description: "Who is requesting the change. Recorded in the audit log." },
+  reason: { type: "string", description: "Why this change is being made. Recorded in the audit log." },
+};
+
+const PARAMS_DANGER =
+  "Does not place orders. Dangerous on a live book: it changes filter-layer risk behavior. Hard bounds: one field at most 20% per apply, at most one apply per 24h, price_shock and exit_reserve may only become more conservative, position_cap may only decrease. max_drawdown stays 0.10 and any payload containing that field is rejected. Requires the dashboard admin token.";
+
 function inputSchemaFor(tool) {
   if (tool.inputSchema) return tool.inputSchema;
   if (tool.query) return { type: "object", properties: tool.query, additionalProperties: false };
@@ -266,6 +317,63 @@ export const TOOLS = [
     description: "Dynamic parameter version history, newest first (read-only). Not a trading or control write.",
     path: "/api/v1/params/versions",
     method: "GET",
+  },
+  {
+    name: "propose_params",
+    description:
+      "Propose a pending filter-layer parameter version. Runs validate and returns the diff plus the verdict. A failed check is stored as rejected and does not become active. " +
+      PARAMS_DANGER,
+    path: "/api/v1/params/propose",
+    method: "POST",
+    forceSource: "mcp",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["operator", "reason", "params"],
+      properties: { ...WRITE_META, params: PARAM_FIELD },
+    },
+  },
+  {
+    name: "apply_params",
+    description:
+      "Activate one pending parameter version. expected_active_version must equal the current active id or the call is rejected and nothing changes. Re-checks the 20% step, the 24h apply limit, and the one-way knobs. backtest_summary must be a passing alphabound.backtest_ref.v1 reference (schema, id, passed=true) unless the daemon's params_allow_unbacked_apply switch is on; that switch defaults off. This phase checks the reference shape only. The new version is read at the start of the next decision and does not interrupt an in-flight decision or order. " +
+      PARAMS_DANGER,
+    path: "/api/v1/params/apply",
+    method: "POST",
+    forceSource: "mcp",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["operator", "reason", "version_id", "expected_active_version", "backtest_summary"],
+      properties: {
+        ...WRITE_META,
+        version_id: { type: "integer", description: "Pending version to activate." },
+        expected_active_version: { type: "integer", description: "Active version the caller believes is current." },
+        backtest_summary: {
+          type: "string",
+          description:
+            "JSON text of a passing alphabound.backtest_ref.v1 reference: {\"schema\":\"alphabound.backtest_ref.v1\",\"id\":\"bt_...\",\"passed\":true}.",
+        },
+      },
+    },
+  },
+  {
+    name: "rollback_params",
+    description:
+      "Copy a historical parameter version forward as the new active version. Not limited by the 20% step or the 24h apply gate, but the restored values must still sit inside the absolute bounds. Cannot target a pending or rejected row. expected_active_version must match. Does not place orders and does not change max_drawdown (locked at 0.10). Use this to undo a bad apply. The restored set takes effect on the next decision, not during one that is already running. Requires the dashboard admin token.",
+    path: "/api/v1/params/rollback",
+    method: "POST",
+    forceSource: "mcp",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["operator", "reason", "version_id", "expected_active_version"],
+      properties: {
+        ...WRITE_META,
+        version_id: { type: "integer", description: "Historical superseded or rolled_back version to restore." },
+        expected_active_version: { type: "integer", description: "Active version the caller believes is current." },
+      },
+    },
   },
   {
     name: "list_intel",
