@@ -62,5 +62,5 @@ npx alphabound-mcp get_system           # CLI 调用同一工具面
 # npx alphabound-mcp --http
 ```
 
-工具列表见 [`tools/alphabound-mcp/README.md`](https://github.com/talkincode/alphabound/blob/main/tools/alphabound-mcp/README.md)。  
+工具列表见 [`tools/alphabound-mcp/README.md`](https://github.com/talkincode/alphabound/blob/main/tools/alphabound-mcp/README.md)。其中 `get_statistics` 读取 24h/7d/30d 权益变化、回撤与买入持有对照；`query_equity` 可用 `since` / `until` / `step` 取有界净值序列。参数写入与回测、策略复盘工具（`get_params`、`list_param_versions`、`propose_params`、`apply_params`、`rollback_params`、`run_backtest`、`get_backtest`、`run_strategy_review`、`list_reviews`、`get_review`）也在同一目录里。  
 规划背景：[AGENT_ANALYTICS_MCP_PLAN.md](https://github.com/talkincode/alphabound/blob/main/docs/AGENT_ANALYTICS_MCP_PLAN.md)。

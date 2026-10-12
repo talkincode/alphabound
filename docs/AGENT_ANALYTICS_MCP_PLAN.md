@@ -55,7 +55,8 @@
 | `list_orders` / `list_fills` | 按 decision_id 关联 |
 | `list_events` | type 前缀过滤 |
 | `list_memories` | 假设/策略记忆 |
-| `query_equity` | 时间窗净值序列 |
+| `query_equity` | 默认最近约 240 个 1 分钟点；`since` / `until` / `step` 查约 48h 有界降采样；`window=long` 约 300 天 |
+| `get_statistics` | `portfolio.last_24h` / `last_7d` / `last_30d`：权益变化、回撤、买入持有。缺标记为 null |
 | `tool_value_summary` | 对齐 `tool-value-report` 指标 |
 | `run_readonly_sql` | **可选、极危险**——默认关闭；若开则白名单视图 |
 

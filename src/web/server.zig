@@ -68,6 +68,8 @@ pub const Context = struct {
     equity_json: []const u8 = "[]",
     /// Bucketed long-horizon equity curve, oldest first (4h ≤14d, daily older).
     equity_long_json: []const u8 = "[]",
+    /// ~48h downsampled span for `since` / `until` / `step`. Core loop publishes it.
+    equity_span_json: []const u8 = "{\"stored_step_minutes\":1,\"window_start\":null,\"cached_from\":null,\"cached_to\":null,\"points\":[]}",
     shadow_json: []const u8 = "{}",
     events_json: []const u8 = "[]",
     candles_json: []const u8 = "[]",
@@ -320,6 +322,10 @@ pub fn handleReq(buf: []u8, req: RequestInfo, ctx: Context) Response {
     if (std.mem.eql(u8, path, "/api/v1/equity")) {
         const q = EquityQuery.fromTarget(req.target);
         if (!q.active()) return copyBody(buf, ctx.equity_json);
+        if (q.ranged() and q.longActive()) {
+            return .{ .status = .bad_request, .body = equity_conflict_body };
+        }
+        if (q.ranged()) return filterEquityRange(buf, ctx.equity_span_json, q);
         return filterEquityLong(buf, ctx.equity_long_json, q);
     }
     if (std.mem.eql(u8, path, "/api/v1/shadow")) return copyBody(buf, ctx.shadow_json);
@@ -1240,25 +1246,59 @@ fn filterAgentRuns(buf: []u8, src: []const u8, source: []const u8, q: RunsQuery)
     return .{ .status = .internal_server_error, .body = "{\"error\":\"render\"}" };
 }
 
+/// Hard cap for `since` / `until` / `step` so one response stays inside the
+/// HTTP body buffer even when decimal text is wide.
+pub const equity_range_max_points: usize = 480;
+
+const equity_conflict_body = "{\"error\":\"conflicting_query\",\"hint\":\"since, until, and step cannot be combined with window, from, to, or limit\"}";
+const equity_range_auto_steps = [_]i64{ 1, 5, 10, 15, 30, 60, 120, 240, 480, 720, 1440 };
+
 /// /api/v1/equity long-horizon view: ?window=long[&from=<RFC3339 prefix>&to=<prefix>&limit=N].
 /// `from`/`to` are inclusive date(-time) prefixes, e.g. `2026-09-09`.
+/// Ranged view: ?since=&until=&step= over the pre-rendered ~48h span.
 const EquityQuery = struct {
     long: bool = false,
     from: ?[]const u8 = null,
     to: ?[]const u8 = null,
     limit: usize = 0,
+    since: ?[]const u8 = null,
+    until: ?[]const u8 = null,
+    step_raw: ?[]const u8 = null,
+
+    fn ranged(self: EquityQuery) bool {
+        return self.since != null or self.until != null or self.step_raw != null;
+    }
+
+    fn longActive(self: EquityQuery) bool {
+        return self.long or self.from != null or self.to != null or self.limit > 0;
+    }
 
     fn active(self: EquityQuery) bool {
-        return self.long or self.from != null or self.to != null or self.limit > 0;
+        return self.ranged() or self.longActive();
     }
 
     fn fromTarget(target: []const u8) EquityQuery {
         var q = EquityQuery{ .from = queryParam(target, "from"), .to = queryParam(target, "to") };
+        q.since = queryParam(target, "since");
+        q.until = queryParam(target, "until");
+        q.step_raw = queryParam(target, "step");
         if (queryParam(target, "window")) |wnd| q.long = std.ascii.eqlIgnoreCase(wnd, "long");
         if (queryParam(target, "limit")) |raw| {
             q.limit = std.fmt.parseInt(usize, raw, 10) catch 0;
         }
         return q;
+    }
+
+    fn inSpan(self: EquityQuery, ts: []const u8) bool {
+        if (self.since) |f| {
+            const n = @min(ts.len, f.len);
+            if (n == 0 or std.mem.order(u8, ts[0..n], f[0..n]) == .lt) return false;
+        }
+        if (self.until) |t| {
+            const n = @min(ts.len, t.len);
+            if (n == 0 or std.mem.order(u8, ts[0..n], t[0..n]) == .gt) return false;
+        }
+        return true;
     }
 
     fn inRange(self: EquityQuery, ts: []const u8) bool {
@@ -1300,6 +1340,229 @@ fn filterEquityLong(buf: []u8, src: []const u8, q: EquityQuery) Response {
         return .{ .status = .ok, .body = w.buffered() };
     }
     return .{ .status = .internal_server_error, .body = "{\"error\":\"render\"}" };
+}
+
+const SpanMeta = struct {
+    step: i64 = 1,
+    window_start: ?[]const u8 = null,
+    cached_from: ?[]const u8 = null,
+    cached_to: ?[]const u8 = null,
+    points: []const u8 = "[]",
+};
+
+fn wrapperAt(src: []const u8, key: []const u8) ?usize {
+    var needle: [64]u8 = undefined;
+    const n = std.fmt.bufPrint(&needle, "\"{s}\":", .{key}) catch return null;
+    return std.mem.indexOf(u8, src, n);
+}
+
+fn wrapperString(src: []const u8, key: []const u8) ?[]const u8 {
+    const at = wrapperAt(src, key) orelse return null;
+    var needle: [64]u8 = undefined;
+    const n = std.fmt.bufPrint(&needle, "\"{s}\":", .{key}) catch return null;
+    var i = at + n.len;
+    while (i < src.len and src[i] == ' ') i += 1;
+    if (i >= src.len or src[i] != '"') return null;
+    const start = i + 1;
+    const end = std.mem.indexOfScalarPos(u8, src, start, '"') orelse return null;
+    return src[start..end];
+}
+
+fn wrapperInt(src: []const u8, key: []const u8) ?i64 {
+    const at = wrapperAt(src, key) orelse return null;
+    var needle: [64]u8 = undefined;
+    const n = std.fmt.bufPrint(&needle, "\"{s}\":", .{key}) catch return null;
+    var i = at + n.len;
+    while (i < src.len and src[i] == ' ') i += 1;
+    const start = i;
+    if (i < src.len and (src[i] == '-' or src[i] == '+')) i += 1;
+    const digits = i;
+    while (i < src.len and src[i] >= '0' and src[i] <= '9') i += 1;
+    if (i == digits) return null;
+    return std.fmt.parseInt(i64, src[start..i], 10) catch null;
+}
+
+fn spanMeta(src: []const u8) SpanMeta {
+    const points = if (std.mem.indexOf(u8, src, "\"points\":")) |at| blk: {
+        const rest = src[at + "\"points\":".len ..];
+        const lb = std.mem.indexOfScalar(u8, rest, '[') orelse break :blk "[]";
+        break :blk rest[lb..];
+    } else if (src.len > 0 and src[0] == '[') src else "[]";
+    const step = wrapperInt(src, "stored_step_minutes") orelse 1;
+    return .{
+        .step = if (step < 1) 1 else step,
+        .window_start = wrapperString(src, "window_start"),
+        .cached_from = wrapperString(src, "cached_from"),
+        .cached_to = wrapperString(src, "cached_to"),
+        .points = points,
+    };
+}
+
+fn parseStepMinutes(raw: []const u8) ?i64 {
+    if (raw.len == 0 or raw.len > 5) return null;
+    for (raw) |ch| if (ch < '0' or ch > '9') return null;
+    const n = std.fmt.parseInt(i64, raw, 10) catch return null;
+    if (n < 1 or n > 10080) return null;
+    return n;
+}
+
+fn prefixBefore(bound: []const u8, ts: []const u8) bool {
+    const n = @min(bound.len, ts.len);
+    if (n == 0) return false;
+    return std.mem.order(u8, bound[0..n], ts[0..n]) == .lt;
+}
+
+fn countSpanStep(points: []const u8, q: EquityQuery, step_min: i64) usize {
+    const step_ms = step_min * std.time.ms_per_min;
+    var count: usize = 0;
+    var open = false;
+    var open_bucket: i64 = 0;
+    var it = ArrayObjIter{ .src = points };
+    while (it.next()) |obj| {
+        const ts = topLevelString(obj, "ts") orelse continue;
+        if (!q.inSpan(ts)) continue;
+        const ts_ms = clock.parseRfc3339Ms(ts) catch continue;
+        const bucket = @divFloor(ts_ms, step_ms);
+        if (!open or bucket != open_bucket) {
+            if (open) count += 1;
+            open = true;
+            open_bucket = bucket;
+        }
+    }
+    if (open) count += 1;
+    return count;
+}
+
+fn nextAutoStep(stored: i64, current: i64) ?i64 {
+    var seen = false;
+    for (equity_range_auto_steps) |step| {
+        if (step < stored or @mod(step, stored) != 0) continue;
+        if (!seen) {
+            if (step == current) seen = true;
+            continue;
+        }
+        return step;
+    }
+    return null;
+}
+
+fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
+    try w.writeByte('"');
+    try w.writeAll(s);
+    try w.writeByte('"');
+}
+
+/// Bounded `since` / `until` / `step` view. Default (no range params) never
+/// reaches here. Points are the bucket's last sample, oldest first. An omitted
+/// step uses the stored step and coarsens only when the selection would exceed
+/// `equity_range_max_points`. An explicit step that is too wide is rejected.
+fn filterEquityRange(buf: []u8, src: []const u8, q: EquityQuery) Response {
+    const meta = spanMeta(src);
+    if (q.since) |since| {
+        if (meta.window_start == null or prefixBefore(since, meta.window_start.?)) {
+            var w: std.Io.Writer = .fixed(buf);
+            w.writeAll("{\"error\":\"range_not_cached\",\"window_start\":") catch {
+                return .{ .status = .internal_server_error, .body = "{\"error\":\"render\"}" };
+            };
+            if (meta.window_start) |ws| {
+                writeJsonString(&w, ws) catch return .{ .status = .internal_server_error, .body = "{\"error\":\"render\"}" };
+            } else {
+                w.writeAll("null") catch return .{ .status = .internal_server_error, .body = "{\"error\":\"render\"}" };
+            }
+            w.print(
+                ",\"stored_step_minutes\":{d},\"hint\":\"series covers about 48h; use window=long for older buckets or get_statistics for 7d and 30d windows\"}}",
+                .{meta.step},
+            ) catch return .{ .status = .internal_server_error, .body = "{\"error\":\"render\"}" };
+            return .{ .status = .bad_request, .body = w.buffered() };
+        }
+    }
+
+    var step: i64 = meta.step;
+    var explicit = false;
+    if (q.step_raw) |raw| {
+        explicit = true;
+        step = parseStepMinutes(raw) orelse {
+            var w: std.Io.Writer = .fixed(buf);
+            w.print(
+                "{{\"error\":\"bad_step\",\"stored_step_minutes\":{d},\"hint\":\"step is whole minutes from 1 to 10080 and a multiple of stored_step_minutes\"}}",
+                .{meta.step},
+            ) catch return .{ .status = .internal_server_error, .body = "{\"error\":\"render\"}" };
+            return .{ .status = .bad_request, .body = w.buffered() };
+        };
+        if (@mod(step, meta.step) != 0) {
+            var w: std.Io.Writer = .fixed(buf);
+            w.print(
+                "{{\"error\":\"step_too_fine\",\"stored_step_minutes\":{d},\"hint\":\"step must be a positive multiple of stored_step_minutes\"}}",
+                .{meta.step},
+            ) catch return .{ .status = .internal_server_error, .body = "{\"error\":\"render\"}" };
+            return .{ .status = .bad_request, .body = w.buffered() };
+        }
+    }
+
+    var count = countSpanStep(meta.points, q, step);
+    if (!explicit) {
+        while (count > equity_range_max_points) {
+            step = nextAutoStep(meta.step, step) orelse break;
+            count = countSpanStep(meta.points, q, step);
+        }
+    }
+    if (count > equity_range_max_points) {
+        var w: std.Io.Writer = .fixed(buf);
+        w.print(
+            "{{\"error\":\"range_too_wide\",\"max_points\":{d},\"stored_step_minutes\":{d},\"hint\":\"narrow since/until or increase step\"}}",
+            .{ equity_range_max_points, meta.step },
+        ) catch return .{ .status = .internal_server_error, .body = "{\"error\":\"render\"}" };
+        return .{ .status = .bad_request, .body = w.buffered() };
+    }
+
+    const step_ms = step * std.time.ms_per_min;
+    var w: std.Io.Writer = .fixed(buf);
+    render: {
+        w.print(
+            "{{\"stored_step_minutes\":{d},\"step_minutes\":{d},\"max_points\":{d},\"window_start\":",
+            .{ meta.step, step, equity_range_max_points },
+        ) catch break :render;
+        if (meta.window_start) |ws| writeJsonString(&w, ws) catch break :render else w.writeAll("null") catch break :render;
+        w.writeAll(",\"cached_from\":") catch break :render;
+        if (meta.cached_from) |cf| writeJsonString(&w, cf) catch break :render else w.writeAll("null") catch break :render;
+        w.writeAll(",\"cached_to\":") catch break :render;
+        if (meta.cached_to) |ct| writeJsonString(&w, ct) catch break :render else w.writeAll("null") catch break :render;
+        w.print(",\"returned\":{d},\"points\":[", .{count}) catch break :render;
+
+        var wrote: usize = 0;
+        var open = false;
+        var open_obj: []const u8 = "";
+        var open_bucket: i64 = 0;
+        var it = ArrayObjIter{ .src = meta.points };
+        while (it.next()) |obj| {
+            const ts = topLevelString(obj, "ts") orelse continue;
+            if (!q.inSpan(ts)) continue;
+            const ts_ms = clock.parseRfc3339Ms(ts) catch continue;
+            const bucket = @divFloor(ts_ms, step_ms);
+            if (!open or bucket != open_bucket) {
+                if (open) {
+                    if (wrote > 0) w.writeByte(',') catch break :render;
+                    w.writeAll(open_obj) catch break :render;
+                    wrote += 1;
+                }
+                open = true;
+                open_bucket = bucket;
+            }
+            open_obj = obj;
+        }
+        if (open) {
+            if (wrote > 0) w.writeByte(',') catch break :render;
+            w.writeAll(open_obj) catch break :render;
+            wrote += 1;
+        }
+        w.writeAll("]}") catch break :render;
+        if (wrote != count) break :render;
+        return .{ .status = .ok, .body = w.buffered() };
+    }
+    return .{
+        .status = .bad_request,
+        .body = "{\"error\":\"range_too_wide\",\"hint\":\"narrow since/until or increase step\"}",
+    };
 }
 
 /// Copy a pre-rendered JSON blob into the per-request body buffer so the
@@ -1845,6 +2108,102 @@ test "equity long window filters by date prefix and limit" {
     try testing.expect(std.mem.indexOf(u8, newest.body, "\"equity\":\"3\"") != null);
     try testing.expect(std.mem.indexOf(u8, newest.body, "\"equity\":\"4\"") != null);
     try testing.expect(std.mem.indexOf(u8, newest.body, "\"equity\":\"2\"") == null);
+}
+
+const equity_span_fixture =
+    "{\"stored_step_minutes\":5,\"window_start\":\"2026-10-12T00:00:00.000Z\",\"cached_from\":\"2026-10-12T00:00:00.000Z\",\"cached_to\":\"2026-10-12T00:30:00.000Z\",\"points\":[" ++
+    "{\"ts\":\"2026-10-12T00:00:00.000Z\",\"equity\":\"0\",\"hwm\":\"0\",\"drawdown\":\"0\",\"bh_equity\":null,\"capital_flow\":null}," ++
+    "{\"ts\":\"2026-10-12T00:05:00.000Z\",\"equity\":\"5\",\"hwm\":\"5\",\"drawdown\":\"0\",\"bh_equity\":\"5\",\"capital_flow\":null}," ++
+    "{\"ts\":\"2026-10-12T00:10:00.000Z\",\"equity\":\"10\",\"hwm\":\"10\",\"drawdown\":\"0\",\"bh_equity\":\"10\",\"capital_flow\":null}," ++
+    "{\"ts\":\"2026-10-12T00:15:00.000Z\",\"equity\":\"15\",\"hwm\":\"15\",\"drawdown\":\"0\",\"bh_equity\":\"15\",\"capital_flow\":null}," ++
+    "{\"ts\":\"2026-10-12T00:20:00.000Z\",\"equity\":\"20\",\"hwm\":\"20\",\"drawdown\":\"0\",\"bh_equity\":\"20\",\"capital_flow\":null}," ++
+    "{\"ts\":\"2026-10-12T00:25:00.000Z\",\"equity\":\"25\",\"hwm\":\"25\",\"drawdown\":\"0\",\"bh_equity\":\"25\",\"capital_flow\":null}," ++
+    "{\"ts\":\"2026-10-12T00:30:00.000Z\",\"equity\":\"30\",\"hwm\":\"30\",\"drawdown\":\"0\",\"bh_equity\":null,\"capital_flow\":\"1\"}]}";
+
+test "equity since/until/step is bounded and the default series stays put" {
+    var buf: [8192]u8 = undefined;
+    var ctx = testCtx();
+    ctx.equity_json = "[{\"equity\":\"100\"}]";
+    ctx.equity_long_json = "[{\"ts\":\"2026-09-08T20:00:00.000Z\",\"equity\":\"1\"}]";
+    ctx.equity_span_json = equity_span_fixture;
+
+    // No query params: the newest ~240 one-minute cache, untouched.
+    try testing.expectEqualStrings("[{\"equity\":\"100\"}]", handle(&buf, .GET, "/api/v1/equity", ctx).body);
+
+    const conflict = handle(&buf, .GET, "/api/v1/equity?window=long&since=2026-10-12T00:00:00.000Z", ctx);
+    try testing.expectEqual(std.http.Status.bad_request, conflict.status);
+    try testing.expect(std.mem.indexOf(u8, conflict.body, "conflicting_query") != null);
+
+    const too_old = handle(&buf, .GET, "/api/v1/equity?since=2026-10-11T00:00:00.000Z", ctx);
+    try testing.expectEqual(std.http.Status.bad_request, too_old.status);
+    try testing.expect(std.mem.indexOf(u8, too_old.body, "range_not_cached") != null);
+
+    const fine = handle(&buf, .GET, "/api/v1/equity?since=2026-10-12T00:00:00.000Z&step=1", ctx);
+    try testing.expectEqual(std.http.Status.bad_request, fine.status);
+    try testing.expect(std.mem.indexOf(u8, fine.body, "step_too_fine") != null);
+
+    const bad = handle(&buf, .GET, "/api/v1/equity?step=abc", ctx);
+    try testing.expectEqual(std.http.Status.bad_request, bad.status);
+    try testing.expect(std.mem.indexOf(u8, bad.body, "bad_step") != null);
+
+    // step=15 keeps the last sample of each 15-minute bucket: 00:10, 00:25, 00:30.
+    const stepped = handle(&buf, .GET, "/api/v1/equity?since=2026-10-12T00:00:00.000Z&until=2026-10-12T00:30:00.000Z&step=15", ctx);
+    try testing.expectEqual(std.http.Status.ok, stepped.status);
+    try testing.expect(std.mem.indexOf(u8, stepped.body, "\"step_minutes\":15") != null);
+    try testing.expect(std.mem.indexOf(u8, stepped.body, "\"returned\":3") != null);
+    try testing.expect(std.mem.indexOf(u8, stepped.body, "\"equity\":\"10\"") != null);
+    try testing.expect(std.mem.indexOf(u8, stepped.body, "\"equity\":\"25\"") != null);
+    try testing.expect(std.mem.indexOf(u8, stepped.body, "\"equity\":\"30\"") != null);
+    try testing.expect(std.mem.indexOf(u8, stepped.body, "\"equity\":\"0\"") == null);
+    try testing.expect(std.mem.indexOf(u8, stepped.body, "\"equity\":\"15\"") == null);
+    // Missing buy-and-hold stays null in the source row that was kept.
+    try testing.expect(std.mem.indexOf(u8, stepped.body, "\"bh_equity\":null") != null);
+
+    const tail = handle(&buf, .GET, "/api/v1/equity?since=2026-10-12T00:15:00.000Z&step=15", ctx);
+    try testing.expectEqual(std.http.Status.ok, tail.status);
+    try testing.expect(std.mem.indexOf(u8, tail.body, "\"equity\":\"25\"") != null);
+    try testing.expect(std.mem.indexOf(u8, tail.body, "\"equity\":\"30\"") != null);
+    try testing.expect(std.mem.indexOf(u8, tail.body, "\"equity\":\"10\"") == null);
+
+    // Inside the cached window but with no samples: an empty list, not a zero return.
+    ctx.equity_span_json = "{\"stored_step_minutes\":5,\"window_start\":\"2026-10-12T00:00:00.000Z\",\"cached_from\":null,\"cached_to\":null,\"points\":[]}";
+    const empty = handle(&buf, .GET, "/api/v1/equity?since=2026-10-12T00:00:00.000Z&step=5", ctx);
+    try testing.expectEqual(std.http.Status.ok, empty.status);
+    try testing.expect(std.mem.indexOf(u8, empty.body, "\"returned\":0") != null);
+    try testing.expect(std.mem.indexOf(u8, empty.body, "\"points\":[]") != null);
+}
+
+test "equity range rejects an explicit step that would exceed the point cap" {
+    var src: [96 * 1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&src);
+    w.writeAll("{\"stored_step_minutes\":1,\"window_start\":\"2026-10-11T00:00:00.000Z\",\"cached_from\":\"2026-10-11T00:00:00.000Z\",\"cached_to\":\"2026-10-11T08:00:00.000Z\",\"points\":[") catch return error.OutOfMemory;
+    const n = equity_range_max_points + 1;
+    const origin = try clock.parseRfc3339Ms("2026-10-11T00:00:00.000Z");
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        if (i > 0) w.writeByte(',') catch return error.OutOfMemory;
+        var ts: [40]u8 = undefined;
+        const stamp = try clock.formatRfc3339Ms(origin + @as(i64, @intCast(i)) * std.time.ms_per_min, &ts);
+        w.print("{{\"ts\":\"{s}\",\"equity\":\"1\",\"hwm\":\"1\",\"drawdown\":\"0\",\"bh_equity\":null,\"capital_flow\":null}}", .{stamp}) catch return error.OutOfMemory;
+    }
+    w.writeAll("]}") catch return error.OutOfMemory;
+
+    var buf: [4096]u8 = undefined;
+    var ctx = testCtx();
+    ctx.equity_json = "[{\"equity\":\"100\"}]";
+    ctx.equity_span_json = w.buffered();
+    const wide = handle(&buf, .GET, "/api/v1/equity?since=2026-10-11T00:00:00.000Z&step=1", ctx);
+    try testing.expectEqual(std.http.Status.bad_request, wide.status);
+    try testing.expect(std.mem.indexOf(u8, wide.body, "range_too_wide") != null);
+
+    // Omitting step coarsens until the selection fits, and says so.
+    var body: [196608]u8 = undefined;
+    const auto = handle(&body, .GET, "/api/v1/equity?since=2026-10-11T00:00:00.000Z", ctx);
+    try testing.expectEqual(std.http.Status.ok, auto.status);
+    try testing.expect(std.mem.indexOf(u8, auto.body, "\"stored_step_minutes\":1") != null);
+    try testing.expect(std.mem.indexOf(u8, auto.body, "\"step_minutes\":5") != null);
+    try testing.expect(std.mem.indexOf(u8, auto.body, "\"returned\":") != null);
+    try testing.expect(std.mem.indexOf(u8, auto.body, "\"equity\":\"100\"") == null);
 }
 
 test "review POST enqueues into inbox; validation and limits enforced" {

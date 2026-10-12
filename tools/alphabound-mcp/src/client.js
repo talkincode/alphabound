@@ -292,7 +292,7 @@ export const TOOLS = [
   {
     name: "query_equity",
     description:
-      "Equity / HWM time series. No params: newest ~240 one-minute samples. window=long: bucketed curve (4h buckets for 14d, daily to ~300d; low/high per bucket), oldest first; from / to take RFC3339 prefixes such as 2026-09-09.",
+      "Equity time series. No params: newest ~240 one-minute samples (unchanged). since/until/step: bounded series over about the last 48h, oldest first, at most 480 points. step is whole minutes and must be a multiple of stored_step_minutes (1 when the cache is still one-minute, otherwise 5, 15, 30, 60, or 240). Omit step to use the stored step, coarsened only if the selection would exceed 480 points. The response reports step_minutes, window_start, and points; empty bh_equity is null, not zero. A since older than window_start is rejected. Do not combine since/until/step with window/from/to/limit. window=long: bucketed curve (4h buckets for 14d, daily to ~300d), oldest first; from/to are RFC3339 prefixes such as 2026-09-09.",
     path: "/api/v1/equity",
     method: "GET",
     query: {
@@ -300,7 +300,23 @@ export const TOOLS = [
       from: { type: "string", description: "Inclusive lower bound, RFC3339 prefix (long window)" },
       to: { type: "string", description: "Inclusive upper bound, RFC3339 prefix (long window)" },
       limit: { type: "integer", description: "Newest N rows of the selection (long window)" },
+      since: {
+        type: "string",
+        description: "Inclusive lower bound, RFC3339 prefix. The series covers about 48h; an older since is rejected.",
+      },
+      until: { type: "string", description: "Inclusive upper bound, RFC3339 prefix." },
+      step: {
+        type: "integer",
+        description: "Downsample width in minutes. Multiple of stored_step_minutes. Omit to use the stored step.",
+      },
     },
+  },
+  {
+    name: "get_statistics",
+    description:
+      "Read-only portfolio and usage windows. portfolio.last_24h, last_7d, and last_30d report equity change (window_return, modified Dietz on the same start_ts and end_ts, external flows removed), max_drawdown, and the buy-and-hold comparison (bh_return, alpha_return). Those fields are null when the start sample, end sample, or buy-and-hold marks are missing; they are not reported as zero. Also includes the existing usage and trading aggregates. No secrets, prompts, or order ids. Does not place orders or change parameters.",
+    path: "/api/v1/statistics",
+    method: "GET",
   },
   { name: "get_candles", description: "Cached multi-timeframe BTC candles", path: "/api/v1/candles", method: "GET" },
   { name: "get_sentiment", description: "Fear & Greed daily curve (now/class/points)", path: "/api/v1/sentiment", method: "GET" },

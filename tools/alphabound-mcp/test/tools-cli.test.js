@@ -6,6 +6,7 @@ import path from "node:path";
 import { after, before, describe, it } from "node:test";
 import { dispatch } from "../src/cli.js";
 import { TOOLS } from "../src/client.js";
+import { readFileSync } from "node:fs";
 
 const TOKEN = "test-env-token-not-for-production";
 const FORBIDDEN = "place_order,flatten,resume,target-weight,secrets";
@@ -44,6 +45,32 @@ function startMockApi() {
       paramPosts.push({ path: url.pathname, payload });
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ ok: true, code: "ok", path: url.pathname }));
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/api/v1/statistics") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          portfolio: {
+            last_24h: {
+              window_return: null,
+              max_drawdown: null,
+              bh_return: null,
+              alpha_return: null,
+              start_ts: null,
+              end_ts: null,
+            },
+            last_7d: {
+              window_return: "0.01",
+              max_drawdown: "0.03",
+              bh_return: "0.02",
+              alpha_return: "-0.01",
+              start_ts: "2026-10-05T00:00:00.000Z",
+              end_ts: "2026-10-12T00:00:00.000Z",
+            },
+          },
+        }),
+      );
       return;
     }
     if (req.method === "GET" && url.pathname === "/api/v1/system") {
@@ -244,6 +271,16 @@ describe("CLI HTTP + env token", () => {
     assert.equal(eq.code, 0, eq.err);
     assert.equal(JSON.parse(eq.out).search, "?window=long&from=2026-09-01");
 
+    const ranged = await captureCli(
+      ["query_equity", "--query", "since=2026-10-11T00:00:00.000Z&until=2026-10-12T00:00:00.000Z&step=15"],
+      env,
+    );
+    assert.equal(ranged.code, 0, ranged.err);
+    assert.equal(
+      JSON.parse(ranged.out).search,
+      "?since=2026-10-11T00:00:00.000Z&until=2026-10-12T00:00:00.000Z&step=15",
+    );
+
     const none = await captureCli(["list_agent_runs"], env);
     assert.equal(JSON.parse(none.out).search, "");
   });
@@ -264,7 +301,67 @@ describe("CLI HTTP + env token", () => {
       assert.ok(t.query && Object.keys(t.query).length > 0, name);
     }
     assert.ok("error_class" in TOOLS.find((x) => x.name === "list_agent_runs").query);
-    assert.ok("window" in TOOLS.find((x) => x.name === "query_equity").query);
+    const equity = TOOLS.find((x) => x.name === "query_equity").query;
+    assert.ok("window" in equity);
+    assert.ok("since" in equity && "until" in equity && "step" in equity);
+  });
+
+  it("keeps the MCP package version and the stdio server version in sync", () => {
+    const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+    const lock = JSON.parse(readFileSync(new URL("../package-lock.json", import.meta.url), "utf8"));
+    const stdio = readFileSync(new URL("../src/stdio.js", import.meta.url), "utf8");
+    assert.equal(pkg.version, "0.2.0");
+    assert.equal(lock.version, pkg.version);
+    assert.equal(lock.packages[""].version, pkg.version);
+    assert.match(stdio, new RegExp(`version: "${pkg.version}"`));
+  });
+
+  it("lists statistics plus the parameter, backtest, and review tools", () => {
+    const required = [
+      "get_params",
+      "list_param_versions",
+      "propose_params",
+      "apply_params",
+      "rollback_params",
+      "run_backtest",
+      "get_backtest",
+      "run_strategy_review",
+      "list_reviews",
+      "get_review",
+      "get_statistics",
+      "query_equity",
+    ];
+    for (const name of required) {
+      assert.ok(TOOLS.some((t) => t.name === name), name);
+    }
+    const stats = TOOLS.find((t) => t.name === "get_statistics");
+    assert.equal(stats.method, "GET");
+    assert.equal(stats.path, "/api/v1/statistics");
+    assert.equal(stats.query, undefined);
+    assert.match(stats.description, /last_24h/);
+    assert.match(stats.description, /max_drawdown/);
+    assert.match(stats.description, /buy-and-hold/i);
+    assert.match(stats.description, /null/);
+    assert.match(stats.description, /does not place orders/i);
+    assert.match(stats.description, /No secrets/);
+    assert.equal(/place_order|flatten|resume/.test(stats.path), false);
+    assert.equal(FORBIDDEN.split(",").some((name) => TOOLS.some((t) => t.name === name)), false);
+  });
+
+  it("passes statistics nulls through and does not invent a zero return", async () => {
+    const env = { ALPHABOUND_API_BASE: mock.base, ALPHABOUND_API_TOKEN: TOKEN };
+    const r = await captureCli(["get_statistics"], env);
+    assert.equal(r.code, 0, r.err);
+    const body = JSON.parse(r.out);
+    assert.equal(body.portfolio.last_24h.window_return, null);
+    assert.equal(body.portfolio.last_24h.max_drawdown, null);
+    assert.equal(body.portfolio.last_24h.bh_return, null);
+    assert.equal(body.portfolio.last_24h.alpha_return, null);
+    assert.equal(body.portfolio.last_7d.window_return, "0.01");
+    assert.equal(body.portfolio.last_7d.bh_return, "0.02");
+    assert.equal(body.portfolio.last_7d.alpha_return, "-0.01");
+    assert.equal(body.portfolio.last_7d.start_ts, "2026-10-05T00:00:00.000Z");
+    assert.equal(body.portfolio.last_7d.end_ts, "2026-10-12T00:00:00.000Z");
   });
 
   it("advertises the backtest gate without an order path", () => {

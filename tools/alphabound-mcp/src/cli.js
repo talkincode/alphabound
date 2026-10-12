@@ -24,6 +24,8 @@ Call options:
   --query <k=v&k=v>  Query params for GET tools that take them, e.g.
                   list_agent_runs --query "status=error&limit=20"
                   query_equity --query "window=long&from=2026-09-01"
+                  query_equity --query "since=2026-10-11T00:00:00.000Z&step=15"
+                  get_statistics
   --meta          Include name/path/method/base envelope
 
 Install options:

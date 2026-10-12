@@ -1105,6 +1105,132 @@ pub const HourlyMark = struct {
     equity: f64,
 };
 
+/// How far `/api/v1/equity?since=` looks back. Older history stays on
+/// `window=long` and on the statistics windows.
+pub const equity_span_hours: i64 = 48;
+/// Newest-first load cap. 48h of 1m samples is 2880 rows; the extra hour of
+/// slack in the query plus a few duplicate minutes still fit.
+pub const equity_span_max_rows: usize = 50 * 60;
+/// Finest step that fits the publish buffer wins. Minutes.
+pub const equity_span_steps_min = [_]i64{ 1, 5, 15, 30, 60, 240 };
+
+const SpanPick = struct {
+    first: usize = 0,
+    last: usize = 0,
+    count: usize = 0,
+};
+
+fn copyExact(dest: []u8, src: []const u8) ?u8 {
+    if (src.len > dest.len or src.len > std.math.maxInt(u8)) return null;
+    @memcpy(dest[0..src.len], src);
+    return @intCast(src.len);
+}
+
+fn selectSpan(rows: []const EquityRepo.SpanSample, step_min: i64) SpanPick {
+    if (rows.len == 0 or step_min < 1) return .{};
+    const step_ms = step_min * std.time.ms_per_min;
+    var pick = SpanPick{};
+    var open: ?usize = null;
+    var open_bucket: i64 = 0;
+    for (rows, 0..) |row, i| {
+        const bucket = @divFloor(row.ts_ms, step_ms);
+        if (open == null or bucket != open_bucket) {
+            if (open) |prev| {
+                if (pick.count == 0) pick.first = prev;
+                pick.last = prev;
+                pick.count += 1;
+            }
+            open = i;
+            open_bucket = bucket;
+        } else {
+            open = i;
+        }
+    }
+    if (open) |prev| {
+        if (pick.count == 0) pick.first = prev;
+        pick.last = prev;
+        pick.count += 1;
+    }
+    return pick;
+}
+
+fn writeQuotedRaw(w: *std.Io.Writer, s: []const u8) !void {
+    try w.writeByte('"');
+    try w.writeAll(s);
+    try w.writeByte('"');
+}
+
+fn writeSpanPoint(w: *std.Io.Writer, row: EquityRepo.SpanSample) !void {
+    try w.writeAll("{\"ts\":");
+    try writeQuotedRaw(w, row.ts[0..row.ts_len]);
+    try w.writeAll(",\"equity\":");
+    try writeQuotedRaw(w, row.equity[0..row.equity_len]);
+    try w.writeAll(",\"hwm\":");
+    try writeQuotedRaw(w, row.hwm[0..row.hwm_len]);
+    try w.writeAll(",\"drawdown\":");
+    try writeQuotedRaw(w, row.drawdown[0..row.drawdown_len]);
+    try w.writeAll(",\"bh_equity\":");
+    if (row.bh_len == 0) try w.writeAll("null") else try writeQuotedRaw(w, row.bh_equity[0..row.bh_len]);
+    try w.writeAll(",\"capital_flow\":");
+    if (row.flow_len == 0) try w.writeAll("null") else try writeQuotedRaw(w, row.capital_flow[0..row.flow_len]);
+    try w.writeByte('}');
+}
+
+/// `count == 0` writes null coverage edges. Returns null when `out` is too small
+/// so the caller can retry at a coarser step.
+fn writeSpanJson(
+    out: []u8,
+    step_min: i64,
+    window_start: []const u8,
+    rows: []const EquityRepo.SpanSample,
+    first: usize,
+    last: usize,
+    count: usize,
+) ?[]const u8 {
+    var w: std.Io.Writer = .fixed(out);
+    w.print("{{\"stored_step_minutes\":{d},\"window_start\":", .{step_min}) catch return null;
+    writeQuotedRaw(&w, window_start) catch return null;
+    w.writeAll(",\"cached_from\":") catch return null;
+    if (count == 0) {
+        w.writeAll("null") catch return null;
+    } else {
+        writeQuotedRaw(&w, rows[first].ts[0..rows[first].ts_len]) catch return null;
+    }
+    w.writeAll(",\"cached_to\":") catch return null;
+    if (count == 0) {
+        w.writeAll("null") catch return null;
+    } else {
+        writeQuotedRaw(&w, rows[last].ts[0..rows[last].ts_len]) catch return null;
+    }
+    w.writeAll(",\"points\":[") catch return null;
+    if (count > 0) {
+        const step_ms = step_min * std.time.ms_per_min;
+        var wrote: usize = 0;
+        var open: ?usize = null;
+        var open_bucket: i64 = 0;
+        for (rows, 0..) |row, i| {
+            const bucket = @divFloor(row.ts_ms, step_ms);
+            if (open == null or bucket != open_bucket) {
+                if (open) |prev| {
+                    if (wrote > 0) w.writeByte(',') catch return null;
+                    writeSpanPoint(&w, rows[prev]) catch return null;
+                    wrote += 1;
+                }
+                open = i;
+                open_bucket = bucket;
+            } else {
+                open = i;
+            }
+        }
+        if (open) |prev| {
+            if (wrote > 0) w.writeByte(',') catch return null;
+            writeSpanPoint(&w, rows[prev]) catch return null;
+        }
+    }
+    w.writeAll("]}") catch return null;
+    return w.buffered();
+}
+
 pub const EquityRepo = struct {
     insert: Stmt,
     pub fn init(db: *Db) DbError!EquityRepo {
@@ -1257,6 +1383,91 @@ pub const EquityRepo = struct {
         }
         w.writeAll("]") catch return DbError.StepFailed;
         return w.buffered();
+    }
+
+    /// One 1m sample copied out of SQLite so a 48h span can be downsampled
+    /// without holding a statement open. Decimal text longer than the field is
+    /// skipped: a truncated number would look like a real equity.
+    pub const SpanSample = struct {
+        ts_ms: i64 = 0,
+        ts: [32]u8 = undefined,
+        ts_len: u8 = 0,
+        equity: [48]u8 = undefined,
+        equity_len: u8 = 0,
+        hwm: [48]u8 = undefined,
+        hwm_len: u8 = 0,
+        drawdown: [48]u8 = undefined,
+        drawdown_len: u8 = 0,
+        bh_equity: [48]u8 = undefined,
+        bh_len: u8 = 0,
+        capital_flow: [48]u8 = undefined,
+        flow_len: u8 = 0,
+    };
+
+    /// Last ~48h of 1m samples, oldest first, downsampled to the finest step in
+    /// `equity_span_steps_min` that fits `out`. The HTTP thread never calls
+    /// this: the core loop publishes the JSON. Empty buy-and-hold or flow
+    /// marks are JSON null, not zero. `rows` is caller-owned scratch.
+    pub fn listSpanJson(
+        self: *EquityRepo,
+        db: *Db,
+        rows: []SpanSample,
+        out: []u8,
+        now_ms: i64,
+    ) DbError![]const u8 {
+        _ = self;
+        if (rows.len == 0 or out.len < 32) return DbError.StepFailed;
+        var lo_buf: [40]u8 = undefined;
+        var hi_buf: [40]u8 = undefined;
+        const lo_ts = clock.formatRfc3339Ms(now_ms - equity_span_hours * std.time.ms_per_hour, &lo_buf) catch return DbError.StepFailed;
+        const hi_ts = clock.formatRfc3339Ms(now_ms + std.time.ms_per_hour, &hi_buf) catch return DbError.StepFailed;
+
+        var stmt = try db.prepare(
+            \\SELECT ts, equity, hwm, drawdown, bh_equity, capital_flow
+            \\FROM equity_samples
+            \\WHERE interval = '1m' AND ts >= ?1 AND ts < ?2
+            \\ORDER BY ts DESC
+            \\LIMIT ?3
+        );
+        defer stmt.finalize();
+        try stmt.bindText(1, lo_ts);
+        try stmt.bindText(2, hi_ts);
+        try stmt.bindInt(3, @intCast(rows.len));
+        var n: usize = 0;
+        while (try stmt.step()) {
+            if (n == rows.len) break;
+            const ts_text = stmt.columnText(0);
+            const ts_len = copyExact(&rows[n].ts, ts_text) orelse continue;
+            const ts_ms = clock.parseRfc3339Ms(ts_text) catch continue;
+            const equity_len = copyExact(&rows[n].equity, stmt.columnText(1)) orelse continue;
+            const hwm_len = copyExact(&rows[n].hwm, stmt.columnText(2)) orelse continue;
+            const dd_len = copyExact(&rows[n].drawdown, stmt.columnText(3)) orelse continue;
+            const bh_len = copyExact(&rows[n].bh_equity, stmt.columnText(4)) orelse continue;
+            const flow_len = copyExact(&rows[n].capital_flow, stmt.columnText(5)) orelse continue;
+            rows[n].ts_ms = ts_ms;
+            rows[n].ts_len = ts_len;
+            rows[n].equity_len = equity_len;
+            rows[n].hwm_len = hwm_len;
+            rows[n].drawdown_len = dd_len;
+            rows[n].bh_len = bh_len;
+            rows[n].flow_len = flow_len;
+            n += 1;
+        }
+        if (n == 0) {
+            return writeSpanJson(out, 1, lo_ts, rows[0..0], 0, 0, 0) orelse return DbError.StepFailed;
+        }
+        var i: usize = 0;
+        while (i < n / 2) : (i += 1) {
+            const tmp = rows[i];
+            rows[i] = rows[n - 1 - i];
+            rows[n - 1 - i] = tmp;
+        }
+        const loaded = rows[0..n];
+        for (equity_span_steps_min) |step| {
+            const sel = selectSpan(loaded, step);
+            if (writeSpanJson(out, step, lo_ts, loaded, sel.first, sel.last, sel.count)) |json| return json;
+        }
+        return DbError.StepFailed;
     }
 
     /// Decode 1m samples at or after `since_ts` into `out`, **oldest first**,
@@ -3573,6 +3784,19 @@ test "LLM usage ledger aggregates priced and unmetered calls explicitly" {
     try testing.expectEqual(@as(i64, 4), all_time.get("calls").?.integer);
     try testing.expectEqual(@as(i64, 3_099), all_time.get("input_cost_nano_usd").?.integer + all_time.get("output_cost_nano_usd").?.integer);
     try testing.expectEqualStrings(ts_old, root.get("ledger_from").?.string);
+    // No equity samples yet: every portfolio window stays null, not zero.
+    for ([_][]const u8{ "last_24h", "last_7d", "last_30d" }) |window| {
+        const empty_pf = root.get("portfolio").?.object.get(window).?.object;
+        try testing.expectEqual(@as(i64, 0), empty_pf.get("sample_count").?.integer);
+        try testing.expect(empty_pf.get("window_return").? == .null);
+        try testing.expect(empty_pf.get("max_drawdown").? == .null);
+        try testing.expect(empty_pf.get("bh_return").? == .null);
+        try testing.expect(empty_pf.get("alpha_return").? == .null);
+        try testing.expect(empty_pf.get("equity_start").? == .null);
+        try testing.expect(empty_pf.get("equity_end").? == .null);
+        try testing.expect(empty_pf.get("start_ts").? == .null);
+        try testing.expect(empty_pf.get("end_ts").? == .null);
+    }
 
     var equity = try EquityRepo.init(&db);
     defer equity.deinit();
@@ -3642,6 +3866,184 @@ test "LLM usage ledger aggregates priced and unmetered calls explicitly" {
     try testing.expectEqualStrings("0.001", trading.get("buy_qty").?.string);
     try testing.expectEqualStrings("0.1", trading.get("buy_notional").?.string);
     try testing.expectEqualStrings("0.01", trading.get("fee_usdt").?.string);
+}
+
+test "equity span covers 24h, drops older samples, and coarsens to fit" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const path = try tmpDbPath(&tmp, &path_buf);
+    var db = try Db.open(path);
+    defer db.close();
+    var equity = try EquityRepo.init(&db);
+    defer equity.deinit();
+
+    const now = try clock.parseRfc3339Ms("2026-10-12T12:00:00.000Z");
+    var ts_buf: [40]u8 = undefined;
+    const old_ts = try clock.formatRfc3339Ms(now - 49 * std.time.ms_per_hour, &ts_buf);
+    try equity.append(.{
+        .ts = old_ts,
+        .interval = "1m",
+        .equity = "999",
+        .hwm = "999",
+        .drawdown = "0",
+        .cash = "1",
+        .btc_value = "0",
+    });
+    var day_buf: [40]u8 = undefined;
+    const day_ts = try clock.formatRfc3339Ms(now - 24 * std.time.ms_per_hour, &day_buf);
+    try equity.append(.{
+        .ts = day_ts,
+        .interval = "1m",
+        .equity = "124",
+        .hwm = "130",
+        .drawdown = "0.04",
+        .cash = "1",
+        .btc_value = "0",
+        .bh_equity = "120",
+        .capital_flow = "0",
+    });
+    var minute: i64 = 0;
+    while (minute <= 180) : (minute += 1) {
+        var one_buf: [40]u8 = undefined;
+        const one_ts = try clock.formatRfc3339Ms(now - (180 - minute) * std.time.ms_per_min, &one_buf);
+        try equity.append(.{
+            .ts = one_ts,
+            .interval = "1m",
+            .equity = "100",
+            .hwm = "130",
+            .drawdown = "0.02",
+            .cash = "1",
+            .btc_value = "0",
+            .bh_equity = "",
+            .capital_flow = "",
+        });
+    }
+
+    const rows = try testing.allocator.alloc(EquityRepo.SpanSample, equity_span_max_rows);
+    defer testing.allocator.free(rows);
+    var out: [64 * 1024]u8 = undefined;
+    const json = try equity.listSpanJson(&db, rows, &out, now);
+    try testing.expect(std.mem.indexOf(u8, json, "999") == null);
+    try testing.expect(std.mem.indexOf(u8, json, day_ts) != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"bh_equity\":\"120\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"bh_equity\":null") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"stored_step_minutes\":1") != null);
+
+    var tiny: [4096]u8 = undefined;
+    const coarse = try equity.listSpanJson(&db, rows, &tiny, now);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, coarse, .{});
+    defer parsed.deinit();
+    const step = parsed.value.object.get("stored_step_minutes").?.integer;
+    try testing.expect(step > 1);
+    try testing.expect(std.mem.indexOf(u8, coarse, "999") == null);
+    try testing.expect(std.mem.indexOf(u8, coarse, "\"equity\":\"124\"") != null);
+}
+
+test "portfolio window matches sample edges and strips external flow" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const path = try tmpDbPath(&tmp, &path_buf);
+    var db = try Db.open(path);
+    defer db.close();
+    var usage = try LlmUsageRepo.init(&db);
+    defer usage.deinit();
+    var equity = try EquityRepo.init(&db);
+    defer equity.deinit();
+    var flows = try CapitalFlowsRepo.init(&db);
+    defer flows.deinit();
+
+    const now = try clock.parseRfc3339Ms("2026-10-12T12:00:00.000Z");
+    var start_buf: [40]u8 = undefined;
+    var end_buf: [40]u8 = undefined;
+    var flow_buf: [40]u8 = undefined;
+    const start_ts = try clock.formatRfc3339Ms(now - 2 * std.time.ms_per_hour, &start_buf);
+    const end_ts = try clock.formatRfc3339Ms(now - std.time.ms_per_min, &end_buf);
+    const flow_ts = try clock.formatRfc3339Ms(now - std.time.ms_per_hour, &flow_buf);
+
+    // Marks missing: equity change is real, benchmark fields stay null.
+    try equity.append(.{
+        .ts = start_ts,
+        .interval = "1m",
+        .equity = "100",
+        .hwm = "100",
+        .drawdown = "0",
+        .cash = "100",
+        .btc_value = "0",
+    });
+    try equity.append(.{
+        .ts = end_ts,
+        .interval = "1m",
+        .equity = "110",
+        .hwm = "110",
+        .drawdown = "0.04",
+        .cash = "110",
+        .btc_value = "0",
+    });
+    var out: [65536]u8 = undefined;
+    const unmarked = try usage.writeStatisticsJson(&db, &out, now);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, unmarked, .{});
+    defer parsed.deinit();
+    const plain = parsed.value.object.get("portfolio").?.object.get("last_24h").?.object;
+    try testing.expectEqualStrings(start_ts, plain.get("start_ts").?.string);
+    try testing.expectEqualStrings(end_ts, plain.get("end_ts").?.string);
+    try testing.expect(plain.get("bh_return").? == .null);
+    try testing.expect(plain.get("alpha_return").? == .null);
+    try testing.expect((try dec.Decimal.parse(plain.get("window_return").?.string)).eql(try dec.Decimal.parse("0.1")));
+    try testing.expectEqualStrings("0.04", plain.get("max_drawdown").?.string);
+    try testing.expectEqual(@as(i64, 0), plain.get("capital_flow_count").?.integer);
+
+    // Same edges, with a deposit. Return uses those timestamps and the flow,
+    // not (end-start)/start.
+    try equity.append(.{
+        .ts = start_ts,
+        .interval = "1m",
+        .equity = "100",
+        .hwm = "100",
+        .drawdown = "0",
+        .cash = "100",
+        .btc_value = "0",
+        .bh_equity = "100",
+        .bid_price = "100",
+        .btc_qty = "1",
+    });
+    try equity.append(.{
+        .ts = end_ts,
+        .interval = "1m",
+        .equity = "160",
+        .hwm = "160",
+        .drawdown = "0",
+        .cash = "160",
+        .btc_value = "0",
+        .bh_equity = "108",
+        .bid_price = "108",
+        .btc_qty = "1",
+    });
+    try flows.append(.{
+        .flow_id = "flow_window",
+        .ts = flow_ts,
+        .direction = "deposit",
+        .cash_delta = "50",
+        .btc_delta = "0",
+        .quote_value = "50",
+        .equity_before = "100",
+        .equity_after = "150",
+    });
+    const marked = try usage.writeStatisticsJson(&db, &out, now);
+    var parsed2 = try std.json.parseFromSlice(std.json.Value, testing.allocator, marked, .{});
+    defer parsed2.deinit();
+    const window = parsed2.value.object.get("portfolio").?.object.get("last_24h").?.object;
+    try testing.expectEqualStrings(start_ts, window.get("start_ts").?.string);
+    try testing.expectEqualStrings(end_ts, window.get("end_ts").?.string);
+    const equity_ret = try flows.summarizeWindow(&db, start_ts, end_ts, try dec.Decimal.parse("100"), try dec.Decimal.parse("160"));
+    const bh_ret = try flows.summarizeWindow(&db, start_ts, end_ts, try dec.Decimal.parse("100"), try dec.Decimal.parse("108"));
+    try testing.expect((try dec.Decimal.parse(window.get("window_return").?.string)).eql(equity_ret.adjusted_return));
+    try testing.expect((try dec.Decimal.parse(window.get("bh_return").?.string)).eql(bh_ret.adjusted_return));
+    const alpha = equity_ret.adjusted_return.sub(bh_ret.adjusted_return) catch return error.Unexpected;
+    try testing.expect((try dec.Decimal.parse(window.get("alpha_return").?.string)).eql(alpha));
+    try testing.expect(!equity_ret.adjusted_return.eql(try dec.Decimal.parse("0.6")));
+    try testing.expectEqual(@as(i64, 1), window.get("capital_flow_count").?.integer);
 }
 
 test "events append and read back" {

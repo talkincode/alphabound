@@ -109,7 +109,7 @@ open http://127.0.0.1:18180/
 | `GET /api/v1/state` | 组合快照：`risk_mode`、现金/BTC、bid、净值/HWM/DD、version、`config_hash`… |
 | `GET /api/v1/events` | 最近事件 JSON 数组 |
 | `GET /api/v1/agent-runs` | 最近 agent_runs（newest first）。带 `status`（`error` 匹配 `error_*` 家族）、`error_class`（`api_error`/`empty_content`/`http_failed`/`timeout`/…）、`before`（游标=上一页 `next_before`）或 `limit`（1–200）时返回 `{source,total_matching,by_status,by_class,items,returned,next_before}`，可翻到最近 300 条非 ok 记录；`status=ok` 只覆盖最近 50 条 |
-| `GET /api/v1/equity` | 最近 equity_samples。`window=long`：1m 样本分桶（近 14 天 4h 桶、更早按日桶，覆盖约 300 天，oldest first），可用 `from` / `to`（RFC3339 前缀，如 `2026-09-09`；`:` 不要百分号编码）与 `limit`（取最新 N 条）过滤 |
+| `GET /api/v1/equity` | 最近 equity_samples（无参数时约 240 个 1 分钟点，newest first）。`since` / `until` / `step`：约最近 48 小时的有界序列（oldest first，最多 480 点）。`step` 为分钟，且必须是缓存步长 `stored_step_minutes` 的整数倍；省略 `step` 时用缓存步长，仅在会超过 480 点时自动加粗。`since` 早于 `window_start` 返回 400。不要和 `window` / `from` / `to` / `limit` 混用。`window=long`：1m 样本分桶（近 14 天 4h 桶、更早按日桶，覆盖约 300 天，oldest first），可用 `from` / `to`（RFC3339 前缀，如 `2026-09-09`；`:` 不要百分号编码）与 `limit`（取最新 N 条）过滤 |
 | `GET /api/v1/shadow` | 实盘净值 vs 同起点 buy-and-hold |
 | `GET /api/v1/candles` | 多周期 K 线缓存 `bars.{1m,5m,15m,1H,4H,1D}` |
 | `GET /api/v1/memories` | 最新版本记忆 |
@@ -220,7 +220,7 @@ Dashboard「统计」页的数据源，含两个子页：**资产与交易**、*
 - **完整性优先**：每次模型调用（成功、业务输出无效、超时/HTTP/解析失败）都写一条账本。`usage_reported=false` 表示 Provider 没有给出 usage；`cost_known=false` 表示模型未识别、usage 缺失或调用失败。二者都不能当作零成本。
 - **价格边界**：目前识别 DeepSeek V4 Flash 的版本化市场价档；按调用开始时的 UTC 峰/非峰段分别计算缓存命中输入、缓存未命中输入和输出成本，使用整数 nano USD 结算。它是**市场价估算，不是供应商、网关或代理商账单**；未知模型保持未定价。
 - **隐私边界**：账本仅保存时间、调用类型、模型、关联 run/decision、延迟、Token、价格档、费用和短错误类别；不保存 Prompt、Completion、Provider URL、密钥或原始错误响应。
-- **资产窗口**：`portfolio.last_24h/7d/30d` 来自 1 分钟 `equity_samples`。缺起点/终点或买入持有标记时对应字段为 `null`，不会把未知收益或超额写成 0。
+- **资产窗口**：`portfolio.last_24h/7d/30d` 来自 1 分钟 `equity_samples`。`window_return` 是同一 `start_ts` / `end_ts` 上的 Modified Dietz 收益（外部资金流已剔除），`max_drawdown` 是窗口内最大回撤，`bh_return` / `alpha_return` 是同一对时间戳上的买入持有对照。缺起点、终点或买入持有标记时对应字段为 `null`，不会把未知收益或超额写成 0。只读客户端用 MCP/CLI `get_statistics` 读取这份快照。
 - **交易窗口**：`trading.*` 按订单创建时间和成交时间计入。名义额与数量用 Decimal 累加；未关联订单的成交计入 `unlinked_fills`，非 USDT 费用计入 `fee_other_fills`，都不并入 USDT 费用合计。
 
 ### `GET /api/v1/candles`
