@@ -34,8 +34,13 @@ pub const AGENT_PROBLEMS_BUFFER_BYTES: usize = 65536;
 pub const AGENT_PROBLEMS_LIMIT: i64 = 300;
 /// Bucketed long-horizon equity (≈340 rows × ≤330 B, see EquityRepo.listLongJson).
 pub const EQUITY_LONG_BUFFER_BYTES: usize = 131072;
+/// Downsampled ~48h equity span for `since` / `until` / `step`. Kept under the
+/// HTTP body buffer so a filtered copy still fits.
+pub const EQUITY_SPAN_BUFFER_BYTES: usize = 160 * 1024;
 const AGENT_PROBLEMS_REFRESH_MS: i64 = 30 * std.time.ms_per_s;
 const EQUITY_LONG_REFRESH_MS: i64 = 15 * std.time.ms_per_min;
+const EQUITY_SPAN_REFRESH_MS: i64 = 60 * std.time.ms_per_s;
+const equity_span_empty: []const u8 = "{\"stored_step_minutes\":1,\"window_start\":null,\"cached_from\":null,\"cached_to\":null,\"points\":[]}";
 
 pub const WebState = struct {
     /// Seqlock: odd = write in progress. Writers (core loop and the slow
@@ -60,9 +65,13 @@ pub const WebState = struct {
     agent_problems_len: usize = 2,
     equity_long_buf: [EQUITY_LONG_BUFFER_BYTES]u8 = undefined,
     equity_long_len: usize = 2,
-    /// Core-loop only; throttle the two slow, history-wide queries.
+    /// ~48h downsampled 1m span (`since` / `until` / `step`).
+    equity_span_buf: [EQUITY_SPAN_BUFFER_BYTES]u8 = undefined,
+    equity_span_len: usize = equity_span_empty.len,
+    /// Core-loop only; throttle the slow history queries.
     agent_problems_refreshed_ms: i64 = 0,
     equity_long_refreshed_ms: i64 = 0,
+    equity_span_refreshed_ms: i64 = 0,
     /// Sized for the 40-row feed under typical event payloads; cache rendering
     /// reports truncation and retries at the largest fitting row count.
     events_buf: [EVENTS_JSON_BUFFER_BYTES]u8 = undefined,
@@ -145,6 +154,8 @@ pub const WebState = struct {
         self.agent_problems_len = 2;
         @memcpy(self.equity_long_buf[0..2], "[]");
         self.equity_long_len = 2;
+        @memcpy(self.equity_span_buf[0..equity_span_empty.len], equity_span_empty);
+        self.equity_span_len = equity_span_empty.len;
         @memcpy(self.events_buf[0..2], "[]");
         self.events_len = 2;
         @memcpy(self.shadow_buf[0..2], "{}");
@@ -202,6 +213,7 @@ pub const WebState = struct {
             var equity: [EQUITY_JSON_BUFFER_BYTES]u8 = undefined;
             var agent_problems: [AGENT_PROBLEMS_BUFFER_BYTES]u8 = undefined;
             var equity_long: [EQUITY_LONG_BUFFER_BYTES]u8 = undefined;
+            var equity_span: [EQUITY_SPAN_BUFFER_BYTES]u8 = undefined;
             var events: [EVENTS_JSON_BUFFER_BYTES]u8 = undefined;
             var shadow: [512]u8 = undefined;
             var candles: [131072]u8 = undefined;
@@ -224,6 +236,7 @@ pub const WebState = struct {
             var equity_len: usize = 2;
             var agent_problems_len: usize = 2;
             var equity_long_len: usize = 2;
+            var equity_span_len: usize = equity_span_empty.len;
             var events_len: usize = 2;
             var shadow_len: usize = 2;
             var candles_len: usize = 2;
@@ -255,6 +268,7 @@ pub const WebState = struct {
             const el = self.equity_len;
             const apl = self.agent_problems_len;
             const ell = self.equity_long_len;
+            const esl = self.equity_span_len;
             const vl = self.events_len;
             const sl = self.shadow_len;
             const cl = self.candles_len;
@@ -272,7 +286,7 @@ pub const WebState = struct {
             const sel = self.sentiment_len;
             const pal = self.params_len;
             const pvl = self.param_versions_len;
-            if (al > Tls.agent.len or el > Tls.equity.len or apl > Tls.agent_problems.len or ell > Tls.equity_long.len or vl > Tls.events.len or sl > Tls.shadow.len or cl > Tls.candles.len or ml > Tls.memories.len or yl > Tls.system.len or dl > Tls.decisions.len or ol > Tls.orders.len or rl > Tls.review_chats.len or rcl > Tls.review_ctx.len or aul > Tls.audit.len or pdl > Tls.periodic.len or anl > Tls.analytics.len or stl > Tls.statistics.len or il > Tls.intel.len or sel > Tls.sentiment.len or pal > Tls.params.len or pvl > Tls.param_versions.len) {
+            if (al > Tls.agent.len or el > Tls.equity.len or apl > Tls.agent_problems.len or ell > Tls.equity_long.len or esl > Tls.equity_span.len or vl > Tls.events.len or sl > Tls.shadow.len or cl > Tls.candles.len or ml > Tls.memories.len or yl > Tls.system.len or dl > Tls.decisions.len or ol > Tls.orders.len or rl > Tls.review_chats.len or rcl > Tls.review_ctx.len or aul > Tls.audit.len or pdl > Tls.periodic.len or anl > Tls.analytics.len or stl > Tls.statistics.len or il > Tls.intel.len or sel > Tls.sentiment.len or pal > Tls.params.len or pvl > Tls.param_versions.len) {
                 std.atomic.spinLoopHint();
                 continue;
             }
@@ -280,6 +294,7 @@ pub const WebState = struct {
             @memcpy(Tls.equity[0..el], self.equity_buf[0..el]);
             @memcpy(Tls.agent_problems[0..apl], self.agent_problems_buf[0..apl]);
             @memcpy(Tls.equity_long[0..ell], self.equity_long_buf[0..ell]);
+            @memcpy(Tls.equity_span[0..esl], self.equity_span_buf[0..esl]);
             @memcpy(Tls.events[0..vl], self.events_buf[0..vl]);
             @memcpy(Tls.shadow[0..sl], self.shadow_buf[0..sl]);
             @memcpy(Tls.candles[0..cl], self.candles_buf[0..cl]);
@@ -302,6 +317,7 @@ pub const WebState = struct {
             Tls.equity_len = el;
             Tls.agent_problems_len = apl;
             Tls.equity_long_len = ell;
+            Tls.equity_span_len = esl;
             Tls.events_len = vl;
             Tls.shadow_len = sl;
             Tls.candles_len = cl;
@@ -330,6 +346,7 @@ pub const WebState = struct {
                     .equity_json = Tls.equity[0..Tls.equity_len],
                     .agent_problems_json = Tls.agent_problems[0..Tls.agent_problems_len],
                     .equity_long_json = Tls.equity_long[0..Tls.equity_long_len],
+                    .equity_span_json = Tls.equity_span[0..Tls.equity_span_len],
                     .events_json = Tls.events[0..Tls.events_len],
                     .shadow_json = Tls.shadow[0..Tls.shadow_len],
                     .candles_json = Tls.candles[0..Tls.candles_len],
@@ -398,7 +415,7 @@ pub const WebState = struct {
         self.endWrite();
     }
 
-    pub fn setJson(self: *WebState, comptime which: enum { agent, agent_problems, equity, equity_long, events, shadow, candles, memories, system, decisions, orders, review, review_ctx, audit, periodic, analytics, statistics, intel, sentiment, params, param_versions }, src: []const u8) void {
+    pub fn setJson(self: *WebState, comptime which: enum { agent, agent_problems, equity, equity_long, equity_span, events, shadow, candles, memories, system, decisions, orders, review, review_ctx, audit, periodic, analytics, statistics, intel, sentiment, params, param_versions }, src: []const u8) void {
         self.beginWrite();
         switch (which) {
             .agent => {
@@ -420,6 +437,11 @@ pub const WebState = struct {
                 const n = @min(src.len, self.equity_long_buf.len);
                 @memcpy(self.equity_long_buf[0..n], src[0..n]);
                 self.equity_long_len = n;
+            },
+            .equity_span => {
+                const n = @min(src.len, self.equity_span_buf.len);
+                @memcpy(self.equity_span_buf[0..n], src[0..n]);
+                self.equity_span_len = n;
             },
             .events => {
                 const n = @min(src.len, self.events_buf.len);
@@ -820,6 +842,19 @@ fn refreshSlowHistoryCaches(
             ws.setJson(.equity_long, j);
         } else |err| {
             std.debug.print("[cache] long equity render failed: {t}\n", .{err});
+        }
+    }
+    if (now - ws.equity_span_refreshed_ms >= EQUITY_SPAN_REFRESH_MS) {
+        ws.equity_span_refreshed_ms = now;
+        // Single-writer core loop. The row scratch is ~0.8MiB; keep it off the stack.
+        const Scratch = struct {
+            var rows: [storage.equity_span_max_rows]storage.EquityRepo.SpanSample = undefined;
+            var json: [EQUITY_SPAN_BUFFER_BYTES]u8 = undefined;
+        };
+        if (equity.listSpanJson(db, &Scratch.rows, &Scratch.json, now)) |j| {
+            ws.setJson(.equity_span, j);
+        } else |err| {
+            std.debug.print("[cache] equity span render failed: {t}\n", .{err});
         }
     }
 }
@@ -1324,8 +1359,10 @@ test "web state seqlock roundtrip preserves json blobs" {
     ws.setJson(.system, "{\"mode\":\"shadow\"}");
     ws.setJson(.orders, "{\"orders\":[1],\"fills\":[]}");
     ws.setJson(.sentiment, "{\"now\":20,\"class\":\"extreme_fear\"}");
+    ws.setJson(.equity_span, equity_span_empty);
     const ctx = WebState.contextFn(&ws);
     try testing.expectEqualStrings("{\"mode\":\"shadow\"}", ctx.system_json);
+    try testing.expectEqualStrings(equity_span_empty, ctx.equity_span_json);
     try testing.expectEqualStrings("{\"orders\":[1],\"fills\":[]}", ctx.orders_json);
     try testing.expectEqualStrings("{\"now\":20,\"class\":\"extreme_fear\"}", ctx.sentiment_json);
     try testing.expectEqualStrings("test", ctx.software_version);

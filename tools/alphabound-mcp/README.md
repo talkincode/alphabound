@@ -116,7 +116,8 @@ Clients must still present `ALPHABOUND_API_TOKEN` to the **daemon**; the MCP pro
 | `list_events` | `GET /api/v1/events` | optional `type`, `exclude_type`, `severity` |
 | `list_memories` | `GET /api/v1/memories` | |
 | `list_agent_runs` | `GET /api/v1/agent-runs` | optional `status`, `error_class`, `before`, `limit`: paged non-ok history with error classes (`--query "status=error&limit=20"`) |
-| `query_equity` | `GET /api/v1/equity` | `window=long` (+ `from`, `to`, `limit`): bucketed curve, 4h for 14d then daily to ~300d |
+| `query_equity` | `GET /api/v1/equity` | No params: newest ~240 one-minute samples. `since` / `until` / `step`: about the last 48h, oldest first, at most 480 points (`step` is minutes). `window=long` (+ `from`, `to`, `limit`): bucketed curve, 4h for 14d then daily to ~300d. Do not mix the two query styles |
+| `get_statistics` | `GET /api/v1/statistics` | `portfolio.last_24h` / `last_7d` / `last_30d`: equity change, max drawdown, buy-and-hold. Missing marks stay null |
 | `get_candles` | `GET /api/v1/candles` | |
 | `get_sentiment` | `GET /api/v1/sentiment` | Fear & Greed daily curve |
 | `get_auth_status` | `GET /api/v1/auth/status` | |

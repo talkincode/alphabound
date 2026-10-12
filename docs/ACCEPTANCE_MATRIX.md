@@ -138,6 +138,7 @@
 | AC-ST4 | HOLD 时按实际持仓压测并告警(`HELD_EXPOSURE_ALERT`),仅告警不改执行 | Unit + Integration | P3 | ☑ `heldAlert` + `logHeldExposure` |
 | AC-ST5 | 重复下单回归:余额推送滞后时已确认成交不得再多开一腿 | Integration | P3 | ☑ `okx_trade.zig` "stale balance feed … triple-submit regression" |
 | AC-ST6 | agent-runs 可按状态/错误类分页,权益可查 300 天 | Unit + Integration | P3 | ☑ `/api/v1/agent-runs`、`/api/v1/equity?window=long`、MCP `--query` |
+| AC-ST8 | 只读客户端可取 24h/7d/30d 权益变化、回撤与买入持有对照;权益序列可按 since/until/step 有界查询,默认仍是约 240 个 1 分钟点 | Unit | P3 | ☑ `/api/v1/statistics` 的 `portfolio` 窗口、`/api/v1/equity?since&until&step`、MCP `get_statistics` |
 | AC-ST7 | 临时记忆(`E_run_*`/`R_run_*`/`PR_short_*`/`PR_long_*`)超 14 天只从索引剔除,不碰策略/受保护/人工反思;启动加载同样跳过 | Unit | P3 | ☑ `Store.pruneExpiredEphemeral`、`MEMORY_PRUNED` 事件 |
 
 ## H. 阶段闸门汇总

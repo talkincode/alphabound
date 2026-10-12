@@ -14,7 +14,7 @@ import { TOOLS, callTool, apiBase, inputSchemaFor } from "./client.js";
 const EMPTY_SCHEMA = { type: "object", properties: {}, additionalProperties: false };
 
 const server = new Server(
-  { name: "alphabound-analytics", version: "0.1.0" },
+  { name: "alphabound-analytics", version: "0.2.0" },
   { capabilities: { tools: {} } },
 );
 
