@@ -161,7 +161,11 @@ pub const Config = struct {
     /// every Nth consecutive no-op and whenever position/cash tension is set,
     /// so a long HOLD streak is examined instead of merely counted. 0 = never.
     agent_llm_reflection_hold_every: u32 = 6,
+    /// Opt-in error ledger and typed failure event fields.
+    llm_error_persist_enabled: bool = false,
     // [storage]
+    /// Zero leaves retention unchanged; positive values age only llm_errors.
+    llm_error_retain_days: u32 = 0,
     db_path: []const u8 = "trading.db",
     wal: bool = true,
     // [web]
@@ -386,7 +390,9 @@ fn applyKey(a: std.mem.Allocator, cfg: *Config, section: []const u8, key: []cons
             cfg.params_allow_unbacked_apply = try parseBool(val);
         } else return error.UnknownKey;
     } else if (std.mem.eql(u8, section, "agent")) {
-        if (std.mem.eql(u8, key, "provider")) {
+        if (std.mem.eql(u8, key, "llm_error_persist_enabled")) {
+            cfg.llm_error_persist_enabled = try parseBool(val);
+        } else if (std.mem.eql(u8, key, "provider")) {
             cfg.agent_provider = try parseString(a, val);
         } else if (std.mem.eql(u8, key, "model")) {
             cfg.agent_model = try parseString(a, val);
@@ -478,6 +484,8 @@ fn applyKey(a: std.mem.Allocator, cfg: *Config, section: []const u8, key: []cons
             cfg.db_path = try parseString(a, val);
         } else if (std.mem.eql(u8, key, "wal")) {
             cfg.wal = try parseBool(val);
+        } else if (std.mem.eql(u8, key, "llm_error_retain_days")) {
+            cfg.llm_error_retain_days = parseInt(u32, val) catch return error.InvalidValue;
         } else return error.UnknownKey;
     } else if (std.mem.eql(u8, section, "web")) {
         if (std.mem.eql(u8, key, "bind")) {
@@ -919,4 +927,19 @@ test "LLM retry keys are whitelisted and preserve defaults" {
     try t.expectError(error.InvalidValue, parse(t.allocator, "[agent]\nllm_retry_backoff_ms=-1"));
     try t.expectError(error.InvalidValue, parse(t.allocator, "[agent]\nllm_retry_jitter_ms=-1"));
     try t.expectError(error.InvalidValue, parse(t.allocator, "[agent]\nllm_retry_5xx_max=-1"));
+}
+
+test "LLM error switches default off and remain whitelisted" {
+    var defaults = try parse(testing.allocator, "");
+    defer defaults.deinit();
+    try testing.expect(!defaults.llm_error_persist_enabled);
+    try testing.expectEqual(@as(u32, 0), defaults.llm_error_retain_days);
+    var enabled = try parse(testing.allocator, "[agent]\nllm_error_persist_enabled = true\n[storage]\nllm_error_retain_days = 180\n");
+    defer enabled.deinit();
+    try testing.expect(enabled.llm_error_persist_enabled);
+    try testing.expectEqual(@as(u32, 180), enabled.llm_error_retain_days);
+    try testing.expectError(error.InvalidValue, parse(testing.allocator, "[storage]\nllm_error_retain_days = -1\n"));
+    try testing.expectError(error.InvalidValue, parse(testing.allocator, "[agent]\nllm_error_persist_enabled = 1\n"));
+    try testing.expectError(error.UnknownKey, parse(testing.allocator, "[agent]\nllm_errors_enabled = true\n"));
+    try testing.expectError(error.UnknownKey, parse(testing.allocator, "[storage]\nllm_errors_retain_days = 180\n"));
 }

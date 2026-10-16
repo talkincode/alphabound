@@ -35,6 +35,7 @@ min_rebalance_weight_delta = 0.01    # skip trades moving weight < 1%; suppresse
 # Optional LLM deadlines; 0 preserves current behavior.
 # connect_timeout_ms = 0
 # request_timeout_ms = 0
+# llm_error_persist_enabled = false # opt-in redacted LLM error history
 provider = "openai"
 model = "gpt-4o-mini"
 base_url = "https://api.openai.com/v1"
@@ -69,6 +70,7 @@ llm_reflection_on_hold = false       # HOLD cycles: deterministic reflection onl
 llm_reflection_hold_every = 6        # ... except every 6th consecutive no-op and whenever position/cash tension is set
 
 [storage]
+# llm_error_retain_days = 0 # 0 leaves existing retention unchanged
 path = "/var/lib/alphabound/trading.db"
 wal = true
 

@@ -114,6 +114,8 @@ pub const Context = struct {
     intel_hmac: []const u8 = "",
     /// AB 因子复盘 analytics blob (experimental, research-only).
     analytics_json: []const u8 = "{}",
+    /// Recent typed LLM failures (llm_errors), pre-rendered by the core loop.
+    llm_errors_json: []const u8 = "[]",
     /// Durable LLM token/cost statistics, pre-rendered by the core loop.
     statistics_json: []const u8 = "{}",
     /// Dashboard HTML served at "/". Embedded at comptime; empty = 404.
@@ -340,6 +342,7 @@ pub fn handleReq(buf: []u8, req: RequestInfo, ctx: Context) Response {
     if (std.mem.eql(u8, path, "/api/v1/review/periodic")) return copyBody(buf, ctx.periodic_json);
     if (std.mem.eql(u8, path, "/api/v1/review/strategy")) return handleStrategyReviewGet(buf, req, ctx);
     if (std.mem.eql(u8, path, "/api/v1/audit")) return copyBody(buf, ctx.audit_json);
+    if (std.mem.eql(u8, path, "/api/v1/llm/errors")) return listLlmErrors(buf, ctx.llm_errors_json, req.target);
     if (std.mem.eql(u8, path, "/api/v1/statistics")) return copyBody(buf, ctx.statistics_json);
     if (std.mem.eql(u8, path, "/api/v1/intel")) return copyBody(buf, ctx.intel_json);
     if (std.mem.eql(u8, path, "/api/v1/sentiment")) return copyBody(buf, ctx.sentiment_json);
@@ -1191,6 +1194,25 @@ const Tally = struct {
         try w.writeAll("}");
     }
 };
+
+/// Bounded slice (default 50, max 200) of the pre-rendered llm_errors list.
+fn listLlmErrors(buf: []u8, src: []const u8, target: []const u8) Response {
+    const limit = if (queryParam(target, "limit")) |raw| @min(@max(std.fmt.parseInt(usize, raw, 10) catch 50, 1), 200) else 50;
+    var w: std.Io.Writer = .fixed(buf);
+    var it = ArrayObjIter{ .src = src };
+    var n: usize = 0;
+    render: {
+        w.writeByte('[') catch break :render;
+        while (n < limit) : (n += 1) {
+            const obj = it.next() orelse break;
+            if (n > 0) w.writeByte(',') catch break :render;
+            w.writeAll(obj) catch break :render;
+        }
+        w.writeByte(']') catch break :render;
+        return .{ .status = .ok, .body = w.buffered() };
+    }
+    return .{ .status = .internal_server_error, .body = "{\"error\":\"render\"}" };
+}
 
 /// Page the pre-rendered agent-run history through the query. Items are newest
 /// first; `next_before` is the cursor for the next page (null when exhausted).
@@ -2836,4 +2858,36 @@ test "strategy review queues off the request thread and stays readable" {
     }, ctx);
     try testing.expectEqual(std.http.Status.bad_request, bad.status);
     try testing.expectEqual(@as(i64, 0), try database.queryInt("SELECT COUNT(*) FROM orders"));
+}
+
+test "LLM errors API array shape and bounded limit" {
+    var buf: [65536]u8 = undefined;
+    var ctx = testCtx();
+    try testing.expectEqualStrings("[]", handle(&buf, .GET, "/api/v1/llm/errors", ctx).body);
+    const row = "{\"id\":1,\"ts_ms\":1800000000000,\"run_id\":\"synthetic\",\"cause\":\"api_status\",\"http_status\":429,\"model\":\"test\",\"attempt\":1,\"detail\":\"api_error\"}";
+    var source: [65536]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&source);
+    try w.writeByte('[');
+    for (0..205) |i| {
+        if (i > 0) try w.writeByte(',');
+        try w.writeAll(row);
+    }
+    try w.writeByte(']');
+    ctx.llm_errors_json = w.buffered();
+    const cases = .{ .{ "", 50 }, .{ "?limit=1", 1 }, .{ "?limit=0", 1 }, .{ "?limit=999", 200 }, .{ "?limit=bad", 50 } };
+    inline for (cases) |case| {
+        const response = handle(&buf, .GET, "/api/v1/llm/errors" ++ case[0], ctx);
+        try testing.expectEqual(std.http.Status.ok, response.status);
+        var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, response.body, .{});
+        defer parsed.deinit();
+        try testing.expectEqual(@as(usize, case[1]), parsed.value.array.items.len);
+        const obj = parsed.value.array.items[0].object;
+        try testing.expectEqual(@as(usize, 8), obj.count());
+        try testing.expectEqualStrings("api_status", obj.get("cause").?.string);
+        try testing.expectEqual(@as(i64, 429), obj.get("http_status").?.integer);
+    }
+    try testing.expectEqual(std.http.Status.method_not_allowed, handle(&buf, .POST, "/api/v1/llm/errors", ctx).status);
+    ctx.auth_cfg = .{ .api_token = "synthetic-test-token" };
+    try testing.expectEqual(std.http.Status.unauthorized, handle(&buf, .GET, "/api/v1/llm/errors", ctx).status);
+    try testing.expectEqual(std.http.Status.ok, handleReq(&buf, .{ .method = .GET, .target = "/api/v1/llm/errors", .authorization = "Bearer synthetic-test-token", .now_ms = 0 }, ctx).status);
 }
