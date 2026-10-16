@@ -50,6 +50,14 @@ pub const Input = struct {
     last_proposal_age_ms: i64 = -1,
     /// Zombie when last_proposal_age exceeds this (see `zombieThresholdMs`).
     zombie_threshold_ms: i64,
+    llm_alert_enabled: bool = false,
+    llm_alert_streak: u32 = 2,
+    llm_alert_window_count: u32 = 3,
+    llm_stale_ms: u32 = 1_800_000,
+    error_llm_streak: i64 = 0,
+    error_llm_window: i64 = 0,
+    llm_status_age_ms: i64 = -1,
+    decision_due: bool = false,
     // --- tools ---
     tool_calls_total: i64 = 0,
     tool_latency_max_ms: i64 = 0,
@@ -101,12 +109,38 @@ fn finding(w: *W, first: *bool, check: []const u8, sev: Severity, comptime fmt: 
     return sev;
 }
 
+fn llmFindings(w: *W, first: *bool, in: Input) W.Error!Severity {
+    var overall: Severity = .ok;
+    if (!in.llm_alert_enabled) return overall;
+    if (in.error_llm_streak >= in.llm_alert_streak) {
+        overall = overall.max(try finding(w, first, "llm.error_llm_streak", .warn, "连续 error_llm 至少 {d} 次", .{in.error_llm_streak}));
+    }
+    if (in.error_llm_window >= in.llm_alert_window_count) {
+        overall = overall.max(try finding(w, first, "llm.error_llm_window", .alert, "告警窗口内 {d} 次 error_llm", .{in.error_llm_window}));
+    }
+    if (in.agent_enabled and in.decision_due and in.llm_status_age_ms > in.llm_stale_ms) {
+        overall = overall.max(try finding(w, first, "llm.status_stale", .alert, "决策已到期，LLM 状态已 {d}ms 未更新", .{in.llm_status_age_ms}));
+    }
+    return overall;
+}
+
+/// Immediate path evaluates only the opt-in LLM rules.
+pub fn writeLlmFindings(w: *W, in: Input) W.Error!Severity {
+    var first = true;
+    try w.writeByte('[');
+    const severity = try llmFindings(w, &first, in);
+    try w.writeByte(']');
+    return severity;
+}
+
 /// Evaluate all checks, writing a findings JSON array (only warn/alert are
 /// listed; an empty array means all green). Returns the overall severity.
 pub fn writeFindings(w: *W, in: Input) W.Error!Severity {
     var overall: Severity = .ok;
     var first = true;
     try w.writeByte('[');
+
+    overall = overall.max(try llmFindings(w, &first, in));
 
     // ---- llm ----
     if (in.runs_total > 0) {
@@ -206,10 +240,10 @@ pub fn writeReport(w: *W, in: Input, audit_id: []const u8, ts: []const u8) W.Err
     try w.print(
         "\"stats\":{{\"runs_total\":{d},\"runs_ok\":{d},\"runs_invalid\":{d},\"runs_error\":{d},\"consecutive_failures\":{d},\"last_proposal_age_ms\":{d},\"tool_calls\":{d},\"tool_latency_max_ms\":{d},\"runs_without_tools\":{d},\"market_stale\":{d},\"triggers\":{d},\"outcomes\":{d},\"proposals\":{d},\"admissions\":{d},\"reflections\":{d},\"backups_ok\":{d},\"critical_faults\":{d},\"equity_sample_age_ms\":{d}}}}}",
         .{
-            in.runs_total,       in.runs_ok,           in.runs_invalid, in.runs_error,
+            in.runs_total,           in.runs_ok,              in.runs_invalid,     in.runs_error,
             in.consecutive_failures, in.last_proposal_age_ms, in.tool_calls_total, in.tool_latency_max_ms,
-            in.runs_without_tools,   in.market_stale_count,   in.triggers,     in.outcomes,
-            in.proposals,            in.admissions,           in.reflections,  in.backup_ok_count,
+            in.runs_without_tools,   in.market_stale_count,   in.triggers,         in.outcomes,
+            in.proposals,            in.admissions,           in.reflections,      in.backup_ok_count,
             in.critical_faults,      in.equity_sample_age_ms,
         },
     );
@@ -319,4 +353,71 @@ test "risk mode and stale samples surface as warns; disabled agent skips zombie"
     try testing.expect(std.mem.indexOf(u8, s, "llm.zombie") == null);
     try testing.expect(std.mem.indexOf(u8, s, "self.risk_mode") != null);
     try testing.expect(std.mem.indexOf(u8, s, "data.equity_samples") != null);
+}
+
+test "LLM alert thresholds, stale due gating, and disabled equivalence" {
+    var in = healthyInput();
+    in.error_llm_streak = 2;
+    in.error_llm_window = 3;
+    in.llm_status_age_ms = 1_800_001;
+    in.decision_due = true;
+    var buf: [8192]u8 = undefined;
+    var w: W = .fixed(&buf);
+    try testing.expectEqual(Severity.ok, try writeFindings(&w, in));
+    try testing.expectEqualStrings("[]", w.buffered());
+    in.llm_alert_enabled = true;
+    w = .fixed(&buf);
+    try testing.expectEqual(Severity.alert, try writeFindings(&w, in));
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "llm.status_stale") != null);
+    in.error_llm_window = 2;
+    in.llm_status_age_ms = 1_800_000;
+    w = .fixed(&buf);
+    try testing.expectEqual(Severity.warn, try writeLlmFindings(&w, in));
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "llm.error_llm_streak") != null);
+    in.error_llm_streak = 1;
+    in.error_llm_window = 3;
+    w = .fixed(&buf);
+    try testing.expectEqual(Severity.alert, try writeLlmFindings(&w, in));
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "llm.error_llm_window") != null);
+    in.error_llm_window = 0;
+    in.llm_status_age_ms += 1;
+    for ([_]bool{ false, true }) |enabled| {
+        for ([_]bool{ false, true }) |due| {
+            in.agent_enabled = enabled;
+            in.decision_due = due;
+            w = .fixed(&buf);
+            try testing.expectEqual(if (enabled and due) Severity.alert else Severity.ok, try writeLlmFindings(&w, in));
+        }
+    }
+    in.agent_enabled = true;
+    in.decision_due = true;
+    in.llm_status_age_ms = -1;
+    w = .fixed(&buf);
+    try testing.expectEqual(Severity.ok, try writeLlmFindings(&w, in));
+}
+
+test "LLM rules honor custom thresholds" {
+    var in = healthyInput();
+    in.llm_alert_enabled = true;
+    in.llm_alert_streak = 4;
+    in.llm_alert_window_count = 5;
+    in.llm_stale_ms = 100;
+    in.error_llm_streak = 3;
+    in.error_llm_window = 4;
+    in.llm_status_age_ms = 100;
+    in.decision_due = true;
+    var buf: [2048]u8 = undefined;
+    var w: W = .fixed(&buf);
+    try testing.expectEqual(Severity.ok, try writeLlmFindings(&w, in));
+    in.error_llm_streak = 4;
+    w = .fixed(&buf);
+    try testing.expectEqual(Severity.warn, try writeLlmFindings(&w, in));
+    in.error_llm_streak = 0;
+    in.error_llm_window = 5;
+    w = .fixed(&buf);
+    try testing.expectEqual(Severity.alert, try writeLlmFindings(&w, in));
+    in.error_llm_window = 0;
+    in.llm_status_age_ms = 101;
+    w = .fixed(&buf);
+    try testing.expectEqual(Severity.alert, try writeLlmFindings(&w, in));
 }

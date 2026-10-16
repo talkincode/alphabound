@@ -89,6 +89,13 @@ pub const Config = struct {
     llm_retry_backoff_ms: u32 = 500,
     llm_retry_jitter_ms: u32 = 250,
     llm_retry_5xx_max: u32 = 2,
+    llm_alert_enabled: bool = false,
+    llm_alert_streak: u32 = 2,
+    llm_alert_window_ms: u32 = 1_800_000,
+    llm_alert_window_count: u32 = 3,
+    llm_stale_ms: u32 = 1_800_000,
+    alert_webhook_enabled: bool = false,
+    alert_webhook_timeout_ms: u32 = 5_000,
     /// A proposal is void when admission/execution happens later than this
     /// after the decision snapshot, or when price/book/risk state moved
     /// materially (see agent/validity.zig); the decision is then redone.
@@ -430,6 +437,25 @@ fn applyKey(a: std.mem.Allocator, cfg: *Config, section: []const u8, key: []cons
             cfg.circuit_breaker_open_ms = try parsePositiveU32(val);
         } else if (std.mem.eql(u8, key, "circuit_breaker_half_open_probes")) {
             cfg.circuit_breaker_half_open_probes = try parsePositiveU32(val);
+        } else if (std.mem.eql(u8, key, "llm_alert_enabled")) {
+            cfg.llm_alert_enabled = try parseBool(val);
+        } else if (std.mem.eql(u8, key, "llm_alert_streak")) {
+            cfg.llm_alert_streak = parseInt(u32, val) catch return error.InvalidValue;
+            if (cfg.llm_alert_streak == 0) return error.InvalidValue;
+        } else if (std.mem.eql(u8, key, "llm_alert_window_ms")) {
+            cfg.llm_alert_window_ms = parseInt(u32, val) catch return error.InvalidValue;
+            if (cfg.llm_alert_window_ms == 0) return error.InvalidValue;
+        } else if (std.mem.eql(u8, key, "llm_alert_window_count")) {
+            cfg.llm_alert_window_count = parseInt(u32, val) catch return error.InvalidValue;
+            if (cfg.llm_alert_window_count == 0) return error.InvalidValue;
+        } else if (std.mem.eql(u8, key, "llm_stale_ms")) {
+            cfg.llm_stale_ms = parseInt(u32, val) catch return error.InvalidValue;
+            if (cfg.llm_stale_ms == 0) return error.InvalidValue;
+        } else if (std.mem.eql(u8, key, "alert_webhook_enabled")) {
+            cfg.alert_webhook_enabled = try parseBool(val);
+        } else if (std.mem.eql(u8, key, "alert_webhook_timeout_ms")) {
+            cfg.alert_webhook_timeout_ms = parseInt(u32, val) catch return error.InvalidValue;
+            if (cfg.alert_webhook_timeout_ms == 0) return error.InvalidValue;
         } else if (std.mem.eql(u8, key, "decision_timeout_ms")) {
             cfg.decision_timeout_ms = parseInt(u32, val) catch return error.InvalidValue;
         } else if (std.mem.eql(u8, key, "connect_timeout_ms")) {
@@ -1025,4 +1051,39 @@ test "circuit breaker defaults, whitelist, validation and env overrides" {
         try bad.put(key, "invalid");
         try testing.expectError(error.InvalidValue, applyCircuitBreakerEnv(&cfg, &bad));
     }
+}
+
+test "LLM alert keys are explicit, opt-in, and positive" {
+    var defaults = try parse(testing.allocator, "");
+    defer defaults.deinit();
+    try testing.expect(!defaults.llm_alert_enabled and !defaults.alert_webhook_enabled);
+    try testing.expectEqual(@as(u32, 2), defaults.llm_alert_streak);
+    try testing.expectEqual(@as(u32, 1_800_000), defaults.llm_alert_window_ms);
+    try testing.expectEqual(@as(u32, 3), defaults.llm_alert_window_count);
+    try testing.expectEqual(@as(u32, 1_800_000), defaults.llm_stale_ms);
+    try testing.expectEqual(@as(u32, 5_000), defaults.alert_webhook_timeout_ms);
+    var cfg = try parse(testing.allocator,
+        \\[agent]
+        \\llm_alert_enabled = true
+        \\llm_alert_streak = 4
+        \\llm_alert_window_ms = 1000
+        \\llm_alert_window_count = 5
+        \\llm_stale_ms = 2000
+        \\alert_webhook_enabled = true
+        \\alert_webhook_timeout_ms = 3000
+    );
+    defer cfg.deinit();
+    try testing.expect(cfg.llm_alert_enabled and cfg.alert_webhook_enabled);
+    try testing.expectEqual(@as(u32, 4), cfg.llm_alert_streak);
+    try testing.expectEqual(@as(u32, 1000), cfg.llm_alert_window_ms);
+    try testing.expectEqual(@as(u32, 5), cfg.llm_alert_window_count);
+    try testing.expectEqual(@as(u32, 2000), cfg.llm_stale_ms);
+    try testing.expectEqual(@as(u32, 3000), cfg.alert_webhook_timeout_ms);
+    inline for (.{ "llm_alert_streak", "llm_alert_window_ms", "llm_alert_window_count", "llm_stale_ms", "alert_webhook_timeout_ms" }) |key| {
+        try testing.expectError(error.InvalidValue, parse(testing.allocator, "[agent]\n" ++ key ++ " = 0"));
+        try testing.expectError(error.InvalidValue, parse(testing.allocator, "[agent]\n" ++ key ++ " = -1"));
+    }
+    try testing.expectError(error.InvalidValue, parse(testing.allocator, "[agent]\nllm_alert_enabled = 1"));
+    try testing.expectError(error.UnknownKey, parse(testing.allocator, "[agent]\nalert_webhook_url = \"https://example.invalid\""));
+    try testing.expectError(error.UnknownKey, parse(testing.allocator, "[agent]\nllm_alert_unknown = true"));
 }

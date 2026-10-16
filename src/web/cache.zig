@@ -712,6 +712,44 @@ pub const RuntimeStatus = struct {
             self.audit_alerts = "[]"; // oversized detail lives in audit_reports
         }
     }
+    /// Immediate LLM alerts replace only their own checks, preserving other
+    /// scheduled findings and their severity until the next full audit.
+    pub fn setLlmAudit(self: *RuntimeStatus, status: []const u8, alerts_json: []const u8) void {
+        self.acquire();
+        defer self.release();
+        var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, self.audit_alerts, .{}) catch return;
+        defer parsed.deinit();
+        var buf: [3072]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        w.writeByte('[') catch return;
+        var count: u32 = 0;
+        var overall = status;
+        for (parsed.value.array.items) |item| {
+            const check = item.object.get("check") orelse continue;
+            if (std.mem.eql(u8, check.string, "llm.error_llm_streak") or
+                std.mem.eql(u8, check.string, "llm.error_llm_window") or
+                std.mem.eql(u8, check.string, "llm.status_stale")) continue;
+            if (count > 0) w.writeByte(',') catch return;
+            std.json.Stringify.value(item, .{}, &w) catch return;
+            count += 1;
+            if (item.object.get("severity")) |sev| {
+                if (std.mem.eql(u8, sev.string, "alert")) overall = "alert";
+            }
+        }
+        if (alerts_json.len > 2) {
+            if (count > 0) w.writeByte(',') catch return;
+            w.writeAll(alerts_json[1 .. alerts_json.len - 1]) catch return;
+            count += @intCast(std.mem.count(u8, alerts_json, "\"check\":"));
+        }
+        w.writeByte(']') catch return;
+        const merged = w.buffered();
+        @memcpy(self.audit_alerts_buf[0..merged.len], merged);
+        self.audit_alerts = self.audit_alerts_buf[0..merged.len];
+        self.audit_status = overall;
+        self.audit_findings = count;
+        self.audit_ms = nowMs();
+    }
+
     /// Publish the latest 定期复盘 outcome. `status` / `cycle` must be static
     /// strings ("ok"/"degraded"/"failed", "short"/"long").
     pub fn setPeriodicReview(self: *RuntimeStatus, status: []const u8, cycle: []const u8) void {
@@ -1448,4 +1486,18 @@ test "runtime status setters clamp and stamp" {
     st.addUsage(.{ .prompt_tokens = 10, .completion_tokens = 5, .total_tokens = 0 });
     try testing.expectEqual(@as(u64, 15), st.total_tokens);
     try testing.expectEqual(@as(u64, 1), st.llm_calls);
+}
+
+test "immediate LLM bell preserves unrelated alerts and replaces old LLM findings" {
+    var st: RuntimeStatus = .{};
+    st.setAudit("alert", "[{\"check\":\"data.db_integrity\",\"severity\":\"alert\",\"detail\":\"synthetic\"}]", 1);
+    const alerts = "[{\"check\":\"llm.error_llm_streak\",\"severity\":\"warn\",\"detail\":\"synthetic\"}]";
+    st.setLlmAudit("warn", alerts);
+    st.setLlmAudit("warn", alerts);
+    try std.testing.expectEqualStrings("alert", st.audit_status);
+    try std.testing.expectEqual(@as(u32, 2), st.audit_findings);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, st.audit_alerts, "llm.error_llm_streak"));
+    try std.testing.expect(std.mem.indexOf(u8, st.audit_alerts, "data.db_integrity") != null);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, st.audit_alerts, .{});
+    defer parsed.deinit();
 }
