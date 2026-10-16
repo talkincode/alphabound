@@ -75,6 +75,7 @@ fn llmErrorClass(err: ab.openai.Error) []const u8 {
     return switch (err) {
         error.HttpFailed => "http_failed",
         error.Timeout => "timeout",
+        error.ConnectTimeout => "connect",
         error.ApiError => "api_error",
         error.MalformedResponse => "malformed_response",
         error.EmptyContent => "empty_content",
@@ -394,6 +395,10 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     };
     defer cfg.deinit();
+    cfg.applyLlmTimeoutOverrides(env.get("LLM_CONNECT_TIMEOUT_MS"), env.get("LLM_REQUEST_TIMEOUT_MS")) catch |err| {
+        std.debug.print("[boot] FATAL LLM timeout config: {t}\n", .{err});
+        return 1;
+    };
 
     // Local admin control is a one-shot CLI that never starts the daemon.
     if (cli.control_cmd) |cmd_name| {
@@ -1796,6 +1801,8 @@ const ThinkLane = struct {
             if (self.llm_env) |l| {
                 llm_client = ab.openai.Client.init(gpa, self.io, l.base_url, l.api_key, l.model);
                 llm_client.?.timeout_ms = cfg.decision_timeout_ms;
+                llm_client.?.connect_timeout_ms = cfg.connect_timeout_ms;
+                llm_client.?.request_timeout_ms = cfg.request_timeout_ms;
             }
         }
 
@@ -3651,6 +3658,7 @@ fn runAgentDecision(
         const tag: []const u8 = switch (err) {
             error.HttpFailed => "http_failed",
             error.Timeout => "timeout",
+            error.ConnectTimeout => "connect",
             error.ApiError => "api_error",
             error.MalformedResponse => "malformed_response",
             error.EmptyContent => "empty_content",
@@ -3761,6 +3769,7 @@ fn runAgentDecision(
             const tag: []const u8 = switch (err) {
                 error.HttpFailed => "http_failed",
                 error.Timeout => "timeout",
+                error.ConnectTimeout => "connect",
                 error.ApiError => "api_error",
                 error.MalformedResponse => "malformed_response",
                 error.EmptyContent => "empty_content",
@@ -6578,4 +6587,9 @@ test "jsonStringArrayLimited escapes and caps" {
     const items = [_][]const u8{ "a\"b", "line\n2", "0123456789abcdef" };
     const out = jsonStringArrayLimited(&buf, items[0..], 2, 8);
     try std.testing.expectEqualStrings("[\"a\\\"b\",\"line\\n2\"]", out);
+}
+
+test "LLM connect deadline has a distinct error class" {
+    try std.testing.expectEqualStrings("connect", llmErrorClass(error.ConnectTimeout));
+    try std.testing.expectEqualStrings("timeout", llmErrorClass(error.Timeout));
 }

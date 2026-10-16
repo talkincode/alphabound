@@ -74,6 +74,10 @@ pub const Config = struct {
     /// Overridable by LLM_API_URL / OPENAI_BASE_URL env.
     agent_base_url: []const u8 = "https://api.openai.com/v1",
     decision_timeout_ms: u32 = 120_000,
+    /// 0 disables the TCP/TLS connect + request-write deadline.
+    connect_timeout_ms: u32 = 0,
+    /// 0 uses the call budget; otherwise caps each LLM attempt.
+    request_timeout_ms: u32 = 0,
     /// A proposal is void when admission/execution happens later than this
     /// after the decision snapshot, or when price/book/risk state moved
     /// materially (see agent/validity.zig); the decision is then redone.
@@ -163,6 +167,21 @@ pub const Config = struct {
 
     arena: std.heap.ArenaAllocator,
 
+    pub fn validateLlmTimeouts(self: *const Config) ConfigError!void {
+        if (self.connect_timeout_ms > 0 and self.connect_timeout_ms >= self.decision_timeout_ms)
+            return error.InvalidValue;
+    }
+
+    /// Apply optional environment overrides atomically, then revalidate.
+    pub fn applyLlmTimeoutOverrides(self: *Config, connect: ?[]const u8, request: ?[]const u8) ConfigError!void {
+        var candidate = self.*;
+        if (connect) |v| candidate.connect_timeout_ms = std.fmt.parseInt(u32, v, 10) catch return error.InvalidValue;
+        if (request) |v| candidate.request_timeout_ms = std.fmt.parseInt(u32, v, 10) catch return error.InvalidValue;
+        try candidate.validateLlmTimeouts();
+        self.connect_timeout_ms = candidate.connect_timeout_ms;
+        self.request_timeout_ms = candidate.request_timeout_ms;
+    }
+
     pub fn deinit(self: *Config) void {
         self.arena.deinit();
     }
@@ -246,6 +265,7 @@ pub fn parse(gpa: std.mem.Allocator, text: []const u8) ConfigError!Config {
     // Cross-field validation belongs after parsing: key order is immaterial.
     if (!cfg.volatility_enter.isZero() and
         !cfg.volatility_exit.lt(cfg.volatility_enter)) return error.InvalidValue;
+    try cfg.validateLlmTimeouts();
     cfg.arena = arena; // final arena state, after all allocations
     return cfg;
 }
@@ -350,6 +370,10 @@ fn applyKey(a: std.mem.Allocator, cfg: *Config, section: []const u8, key: []cons
             cfg.agent_base_url = try parseString(a, val);
         } else if (std.mem.eql(u8, key, "decision_timeout_ms")) {
             cfg.decision_timeout_ms = parseInt(u32, val) catch return error.InvalidValue;
+        } else if (std.mem.eql(u8, key, "connect_timeout_ms")) {
+            cfg.connect_timeout_ms = parseInt(u32, val) catch return error.InvalidValue;
+        } else if (std.mem.eql(u8, key, "request_timeout_ms")) {
+            cfg.request_timeout_ms = parseInt(u32, val) catch return error.InvalidValue;
         } else if (std.mem.eql(u8, key, "proposal_max_age_ms")) {
             cfg.proposal_max_age_ms = parseInt(u32, val) catch return error.InvalidValue;
             if (cfg.proposal_max_age_ms == 0) return error.InvalidValue;
@@ -792,4 +816,34 @@ test "proposal validity keys parse, default conservatively and reject nonsense" 
     try testing.expectError(error.InvalidValue, parse(testing.allocator, "[agent]\nproposal_max_age_ms = 0\n"));
     try testing.expectError(error.InvalidValue, parse(testing.allocator, "[agent]\nproposal_max_price_drift = 1\n"));
     try testing.expectError(error.InvalidValue, parse(testing.allocator, "[agent]\nproposal_max_book_drift = 0\n"));
+}
+
+test "LLM timeout defaults, whitelist, validation and environment overrides" {
+    const t = std.testing;
+    var defaults = try parse(t.allocator, "");
+    defer defaults.deinit();
+    try t.expectEqual(@as(u32, 0), defaults.connect_timeout_ms);
+    try t.expectEqual(@as(u32, 0), defaults.request_timeout_ms);
+    var cfg = try parse(t.allocator, "[agent]\nconnect_timeout_ms=200\nrequest_timeout_ms=500\ndecision_timeout_ms=1000");
+    defer cfg.deinit();
+    try t.expectEqual(@as(u32, 200), cfg.connect_timeout_ms);
+    try t.expectEqual(@as(u32, 500), cfg.request_timeout_ms);
+    try cfg.applyLlmTimeoutOverrides("100", "400");
+    try t.expectEqual(@as(u32, 100), cfg.connect_timeout_ms);
+    try t.expectEqual(@as(u32, 400), cfg.request_timeout_ms);
+    try cfg.applyLlmTimeoutOverrides(null, null);
+    try t.expectError(error.InvalidValue, cfg.applyLlmTimeoutOverrides("1000", "300"));
+    try t.expectEqual(@as(u32, 400), cfg.request_timeout_ms);
+    for ([_][]const u8{ "-1", "4294967296", "bad", "" }) |bad| {
+        try t.expectError(error.InvalidValue, cfg.applyLlmTimeoutOverrides(bad, null));
+        try t.expectError(error.InvalidValue, cfg.applyLlmTimeoutOverrides(null, bad));
+    }
+    try cfg.applyLlmTimeoutOverrides("0", "0");
+    try t.expectEqual(@as(u32, 0), cfg.connect_timeout_ms);
+    try t.expectEqual(@as(u32, 0), cfg.request_timeout_ms);
+    try t.expectError(error.InvalidValue, parse(t.allocator, "[agent]\ndecision_timeout_ms=200\nconnect_timeout_ms=200"));
+    try t.expectError(error.InvalidValue, parse(t.allocator, "[agent]\nconnect_timeout_ms=201\ndecision_timeout_ms=200"));
+    try t.expectError(error.InvalidValue, parse(t.allocator, "[agent]\nconnect_timeout_ms=-1"));
+    try t.expectError(error.InvalidValue, parse(t.allocator, "[agent]\nrequest_timeout_ms=bad"));
+    try t.expectError(error.UnknownKey, parse(t.allocator, "[agent]\nconnect_timout_ms=200"));
 }

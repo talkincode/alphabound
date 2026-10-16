@@ -32,6 +32,9 @@ min_rebalance_weight_delta = 0.01    # skip trades moving weight < 1%; suppresse
 # propose/apply or rollback (HTTP or MCP). Editing this file does not override.
 
 [agent]
+# Optional LLM deadlines; 0 preserves current behavior.
+# connect_timeout_ms = 0
+# request_timeout_ms = 0
 provider = "openai"
 model = "gpt-4o-mini"
 base_url = "https://api.openai.com/v1"
