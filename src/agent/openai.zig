@@ -94,6 +94,8 @@ pub const Client = struct {
     api_key: []const u8,
     model: []const u8,
     auth_style: AuthStyle = .bearer,
+    error_metadata_enabled: bool = false,
+    last_connect_failed: bool = false,
     /// With resilience enabled, the shared chat() budget across attempts and sleeps.
     /// Otherwise preserves the legacy per-attempt budget and transport retry.
     /// Slow Azure/DeepSeek completions often exceed 30s; production should use >=120s.
@@ -142,6 +144,10 @@ pub const Client = struct {
     pub fn chat(self: *Client, system: []const u8, user: []const u8) Error!ChatResult {
         self.last_attempt_count = if (self.llm_resilience_enabled) 0 else null;
         const started_ms = if (self.llm_resilience_enabled) self.retryNow() else 0;
+        if (self.error_metadata_enabled) {
+            self.last_http_status = 0;
+            self.last_connect_failed = false;
+        }
         var body_aw = std.Io.Writer.Allocating.init(self.gpa);
         defer body_aw.deinit();
         try writeChatBody(&body_aw.writer, self.model, system, user);
@@ -162,6 +168,10 @@ pub const Client = struct {
                 std.debug.print("[llm] empty_content; reset_http_retry\n", .{});
             } else {
                 std.debug.print("[llm] transport_failed; reset_http_retry\n", .{});
+            }
+            if (self.error_metadata_enabled) {
+                self.last_http_status = 0;
+                self.last_connect_failed = false;
             }
             self.resetHttp();
             return self.chatBudgeted(url, body, null);
@@ -204,6 +214,7 @@ pub const Client = struct {
             const remaining = self.remainingBudget(started_ms, budget);
             if (remaining == 0) return error.Timeout;
             self.last_http_status = 0;
+            if (self.error_metadata_enabled) self.last_connect_failed = false;
             self.last_api_class = "";
             self.last_attempt_count.? +|= 1;
             var result = self.chatBudgeted(url, body, remaining) catch |err| {
@@ -285,6 +296,7 @@ pub const Client = struct {
             .resilience_enabled = self.llm_resilience_enabled,
             .track_response_start = self.connect_timeout_ms > 0,
             .test_transport = self.test_transport,
+            .error_metadata_enabled = self.error_metadata_enabled,
             .url = self.gpa.dupe(u8, url) catch {
                 self.gpa.destroy(work);
                 return error.OutOfMemory;
@@ -314,6 +326,9 @@ pub const Client = struct {
                 self.last_api_class = work.api_class;
                 const r = work.result;
                 thread.join();
+                if (self.error_metadata_enabled) {
+                    self.last_connect_failed = work.connect_failed;
+                }
                 self.gpa.free(work.url);
                 self.gpa.free(work.body);
                 self.gpa.destroy(work);
@@ -350,6 +365,9 @@ pub const Client = struct {
             self.last_api_class = work.api_class;
             const r = work.result;
             thread.join();
+            if (self.error_metadata_enabled) {
+                self.last_connect_failed = work.connect_failed;
+            }
             self.gpa.free(work.url);
             self.gpa.free(work.body);
             self.gpa.destroy(work);
@@ -397,6 +415,10 @@ pub const Client = struct {
                 std.debug.print("[llm] response_too_large cap={d}\n", .{limits.max_llm_response_bytes});
                 return error.HttpFailed;
             }
+            if (self.error_metadata_enabled) self.last_connect_failed = switch (err) {
+                error.ConnectionRefused, error.Timeout, error.UnknownHostName, error.NetworkUnreachable, error.HostUnreachable => true,
+                else => false,
+            };
             std.debug.print("[llm] transport_failed err={s}\n", .{@errorName(err)});
             return error.HttpFailed;
         };
@@ -404,7 +426,7 @@ pub const Client = struct {
         const owned = fixed_writer.buffered();
 
         const status_code: u16 = @intFromEnum(result.status);
-        if (self.llm_resilience_enabled) {
+        if (self.llm_resilience_enabled or self.error_metadata_enabled) {
             self.last_http_status = status_code;
             self.last_api_class = classifyApiErrorBody(owned);
         }
@@ -497,6 +519,8 @@ const ChatWork = struct {
     auth_style: AuthStyle,
     url: []u8,
     body: []u8,
+    error_metadata_enabled: bool = false,
+    connect_failed: bool = false,
     result: Error!ChatResult = error.HttpFailed,
     resilience_enabled: bool,
     http_status: u16 = 0,
@@ -516,6 +540,7 @@ const ChatWork = struct {
         client.auth_style = self.auth_style;
         client.llm_resilience_enabled = self.resilience_enabled;
         client.test_transport = self.test_transport;
+        client.error_metadata_enabled = self.error_metadata_enabled;
         defer client.deinit();
 
         const r = client.chatOnce(self.url, self.body, if (self.track_response_start) &self.response_started else null);
@@ -523,6 +548,7 @@ const ChatWork = struct {
         self.http_status = client.last_http_status;
         self.api_class = client.last_api_class;
         self.result = r;
+        self.connect_failed = client.last_connect_failed;
         if (self.phase.cmpxchgStrong(phase_running, phase_done, .release, .monotonic)) |_| {
             // Waiter abandoned us — free late success body and self.
             if (r) |ok| self.gpa.free(ok.content) else |_| {}
@@ -1161,4 +1187,28 @@ test "retry delay saturates instead of overflowing for extreme config values" {
     client.llm_retry_backoff_ms = std.math.maxInt(u32);
     client.llm_retry_jitter_ms = std.math.maxInt(u32);
     try testing.expectEqual(std.math.maxInt(u32), client.retryDelay(std.math.maxInt(u32)));
+}
+
+test "error ledger metadata reuses resilience fields without enabling retries" {
+    for ([_]bool{ false, true }) |resilience| {
+        const step: TestTransport.Step = .{ .status = .service_unavailable, .body = "{\"error\":\"overloaded\"}" };
+        var transport: TestTransport = .{ .steps = &.{ step, step } };
+        var runtime: TestRetryRuntime = .{};
+        var client = retryTestClient(&transport, &runtime);
+        defer client.deinit();
+        client.llm_resilience_enabled = resilience;
+        client.llm_retry_5xx_max = 1;
+        client.error_metadata_enabled = true;
+        try testing.expectError(error.ApiError, client.chat("test", "test"));
+        try testing.expectEqual(@as(u16, 503), client.last_http_status);
+        try testing.expectEqual(if (resilience) @as(?u32, 2) else null, client.last_attempt_count);
+        try testing.expectEqual(@as(usize, if (resilience) 2 else 1), transport.index);
+        try testing.expect(!client.last_connect_failed);
+
+        // A later failure before transport must not inherit the prior HTTP code.
+        const long_url = [_]u8{'x'} ** 1100;
+        client.base_url = &long_url;
+        try testing.expectError(error.BufferTooSmall, client.chat("test", "test"));
+        try testing.expectEqual(@as(u16, 0), client.last_http_status);
+    }
 }

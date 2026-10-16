@@ -110,6 +110,9 @@ pub const WebState = struct {
     /// Must match the worst-case test in src/analytics/ab_factor.zig.
     analytics_buf: [131072]u8 = undefined,
     analytics_len: usize = 2,
+    /// Opt-in redacted LLM failure history.
+    llm_errors_buf: [131072]u8 = undefined,
+    llm_errors_len: usize = 2,
     /// Durable LLM / portfolio / trading statistics (UTC windows).
     statistics_buf: [98304]u8 = undefined,
     statistics_len: usize = 2,
@@ -181,6 +184,8 @@ pub const WebState = struct {
         self.periodic_len = 2;
         @memcpy(self.analytics_buf[0..2], "{}");
         self.analytics_len = 2;
+        @memcpy(self.llm_errors_buf[0..2], "[]");
+        self.llm_errors_len = 2;
         @memcpy(self.statistics_buf[0..2], "{}");
         self.statistics_len = 2;
         @memcpy(self.intel_buf[0..2], "[]");
@@ -226,6 +231,7 @@ pub const WebState = struct {
             var audit: [24576]u8 = undefined;
             var periodic: [49152]u8 = undefined;
             var analytics: [131072]u8 = undefined;
+            var llm_errors: [131072]u8 = undefined;
             var statistics: [98304]u8 = undefined;
             var intel: [49152]u8 = undefined;
             var sentiment: [8192]u8 = undefined;
@@ -282,11 +288,12 @@ pub const WebState = struct {
             const pdl = self.periodic_len;
             const anl = self.analytics_len;
             const stl = self.statistics_len;
+            const llm_errors_len = self.llm_errors_len;
             const il = self.intel_len;
             const sel = self.sentiment_len;
             const pal = self.params_len;
             const pvl = self.param_versions_len;
-            if (al > Tls.agent.len or el > Tls.equity.len or apl > Tls.agent_problems.len or ell > Tls.equity_long.len or esl > Tls.equity_span.len or vl > Tls.events.len or sl > Tls.shadow.len or cl > Tls.candles.len or ml > Tls.memories.len or yl > Tls.system.len or dl > Tls.decisions.len or ol > Tls.orders.len or rl > Tls.review_chats.len or rcl > Tls.review_ctx.len or aul > Tls.audit.len or pdl > Tls.periodic.len or anl > Tls.analytics.len or stl > Tls.statistics.len or il > Tls.intel.len or sel > Tls.sentiment.len or pal > Tls.params.len or pvl > Tls.param_versions.len) {
+            if (llm_errors_len > Tls.llm_errors.len or al > Tls.agent.len or el > Tls.equity.len or apl > Tls.agent_problems.len or ell > Tls.equity_long.len or esl > Tls.equity_span.len or vl > Tls.events.len or sl > Tls.shadow.len or cl > Tls.candles.len or ml > Tls.memories.len or yl > Tls.system.len or dl > Tls.decisions.len or ol > Tls.orders.len or rl > Tls.review_chats.len or rcl > Tls.review_ctx.len or aul > Tls.audit.len or pdl > Tls.periodic.len or anl > Tls.analytics.len or stl > Tls.statistics.len or il > Tls.intel.len or sel > Tls.sentiment.len or pal > Tls.params.len or pvl > Tls.param_versions.len) {
                 std.atomic.spinLoopHint();
                 continue;
             }
@@ -307,6 +314,7 @@ pub const WebState = struct {
             @memcpy(Tls.audit[0..aul], self.audit_buf[0..aul]);
             @memcpy(Tls.periodic[0..pdl], self.periodic_buf[0..pdl]);
             @memcpy(Tls.analytics[0..anl], self.analytics_buf[0..anl]);
+            @memcpy(Tls.llm_errors[0..llm_errors_len], self.llm_errors_buf[0..llm_errors_len]);
             @memcpy(Tls.statistics[0..stl], self.statistics_buf[0..stl]);
             @memcpy(Tls.intel[0..il], self.intel_buf[0..il]);
             @memcpy(Tls.sentiment[0..sel], self.sentiment_buf[0..sel]);
@@ -360,6 +368,7 @@ pub const WebState = struct {
                     .audit_json = Tls.audit[0..Tls.audit_len],
                     .periodic_json = Tls.periodic[0..Tls.periodic_len],
                     .analytics_json = Tls.analytics[0..Tls.analytics_len],
+                    .llm_errors_json = Tls.llm_errors[0..llm_errors_len],
                     .statistics_json = Tls.statistics[0..Tls.statistics_len],
                     .intel_json = Tls.intel[0..Tls.intel_len],
                     .sentiment_json = Tls.sentiment[0..Tls.sentiment_len],
@@ -415,7 +424,7 @@ pub const WebState = struct {
         self.endWrite();
     }
 
-    pub fn setJson(self: *WebState, comptime which: enum { agent, agent_problems, equity, equity_long, equity_span, events, shadow, candles, memories, system, decisions, orders, review, review_ctx, audit, periodic, analytics, statistics, intel, sentiment, params, param_versions }, src: []const u8) void {
+    pub fn setJson(self: *WebState, comptime which: enum { agent, agent_problems, equity, equity_long, equity_span, events, shadow, candles, memories, system, decisions, orders, review, review_ctx, audit, periodic, analytics, statistics, llm_errors, intel, sentiment, params, param_versions }, src: []const u8) void {
         self.beginWrite();
         switch (which) {
             .agent => {
@@ -502,6 +511,12 @@ pub const WebState = struct {
                 const n = @min(src.len, self.analytics_buf.len);
                 @memcpy(self.analytics_buf[0..n], src[0..n]);
                 self.analytics_len = n;
+            },
+            .llm_errors => {
+                if (src.len <= self.llm_errors_buf.len) {
+                    @memcpy(self.llm_errors_buf[0..src.len], src);
+                    self.llm_errors_len = src.len;
+                }
             },
             .statistics => {
                 const n = @min(src.len, self.statistics_buf.len);
@@ -1232,6 +1247,11 @@ pub fn refreshSystemCache(
     risk_lat: *const latency.Histogram,
     exec: ExecFlags,
 ) void {
+    if (cfg.llm_error_persist_enabled) {
+        var error_buf: [131072]u8 = undefined;
+        const repo = storage.LlmErrorsRepo{ .db = db };
+        if (repo.listRecentJson(&error_buf, 200)) |json| ws.setJson(.llm_errors, json) else |_| {}
+    }
     st_mut.acquire();
     defer st_mut.release();
     const st: *const RuntimeStatus = st_mut;
@@ -1267,6 +1287,7 @@ pub fn refreshSystemCache(
             memory.MAX_MEMORIES,
         },
     ) catch return;
+    if (cfg.llm_error_persist_enabled) w.writeAll("\"llm_error_persist_enabled\":true,") catch return;
     w.print(
         "\"agent\":{{\"total\":{d},\"ok\":{d},\"invalid\":{d},\"errors\":{d},\"valid_rate\":{d:.1},\"tool_calls\":{d}}},",
         .{ total, ok, invalid, errors, rate, tools_n },
@@ -1359,12 +1380,14 @@ test "web state seqlock roundtrip preserves json blobs" {
     ws.setJson(.system, "{\"mode\":\"shadow\"}");
     ws.setJson(.orders, "{\"orders\":[1],\"fills\":[]}");
     ws.setJson(.sentiment, "{\"now\":20,\"class\":\"extreme_fear\"}");
+    ws.setJson(.llm_errors, "[{\"cause\":\"timeout\"}]");
     ws.setJson(.equity_span, equity_span_empty);
     const ctx = WebState.contextFn(&ws);
     try testing.expectEqualStrings("{\"mode\":\"shadow\"}", ctx.system_json);
     try testing.expectEqualStrings(equity_span_empty, ctx.equity_span_json);
     try testing.expectEqualStrings("{\"orders\":[1],\"fills\":[]}", ctx.orders_json);
     try testing.expectEqualStrings("{\"now\":20,\"class\":\"extreme_fear\"}", ctx.sentiment_json);
+    try testing.expectEqualStrings("[{\"cause\":\"timeout\"}]", ctx.llm_errors_json);
     try testing.expectEqualStrings("test", ctx.software_version);
     try testing.expect(!ctx.ready);
 }

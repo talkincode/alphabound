@@ -17,6 +17,7 @@ pub const exec_lane = @import("execution/exec_lane.zig");
 pub const proposal = @import("agent/proposal.zig");
 pub const validity = @import("agent/validity.zig");
 pub const events = @import("core/events.zig");
+pub const llm_errors = @import("observability/llm_errors.zig");
 pub const redaction = @import("observability/redaction.zig");
 pub const journal = @import("observability/journal.zig");
 pub const maintenance = @import("observability/maintenance.zig");

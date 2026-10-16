@@ -41,7 +41,20 @@ fn meteredChat(
     defer if (client.last_attempt_count) |attempts| {
         std.debug.print("[llm] usage call_kind={s} attempts={d}\n", .{ call_kind, attempts });
     };
+    client.error_metadata_enabled = usage_repo.error_persist_enabled;
     const result = client.chat(system, user) catch |err| {
+        if (usage_repo.error_persist_enabled) {
+            const errors = ab.storage.LlmErrorsRepo{ .db = usage_repo.db };
+            errors.append(.{
+                .ts_ms = started_ms,
+                .run_id = run_id,
+                .cause = ab.llm_errors.classify(err, llmHttpStatus(client), client.last_connect_failed),
+                .http_status = llmHttpStatus(client),
+                .model = client.model,
+                .attempt = client.last_attempt_count orelse 1,
+                .detail = llmErrorClass(err),
+            }) catch |write_err| std.debug.print("[llm] error ledger append failed: {t}\n", .{write_err});
+        }
         persistLlmUsage(usage_repo, .{
             .ts_ms = started_ms,
             .call_kind = call_kind,
@@ -70,6 +83,20 @@ fn meteredChat(
 fn llmAttemptSuffix(client: *const ab.openai.Client, buf: []u8) []const u8 {
     const attempts = client.last_attempt_count orelse return "";
     return std.fmt.bufPrint(buf, ",\"attempts\":{d}", .{attempts}) catch "";
+}
+
+fn llmHttpStatus(client: *const ab.openai.Client) ?u16 {
+    return if (client.last_http_status == 0) null else client.last_http_status;
+}
+
+fn llmFailurePayload(out: []u8, legacy: []const u8, client: *const ab.openai.Client, err: ab.openai.Error) []const u8 {
+    var status_buf: [8]u8 = undefined;
+    const status = if (llmHttpStatus(client)) |code| std.fmt.bufPrint(&status_buf, "{d}", .{code}) catch "null" else "null";
+    return std.fmt.bufPrint(out, "{s},\"cause\":\"{s}\",\"http_status\":{s}}}", .{
+        legacy[0 .. legacy.len - 1],
+        @tagName(ab.llm_errors.classify(err, llmHttpStatus(client), client.last_connect_failed)),
+        status,
+    }) catch legacy;
 }
 
 fn persistLlmUsage(repo: *ab.storage.LlmUsageRepo, call: ab.llm_usage.Call) void {
@@ -618,6 +645,7 @@ pub fn main(init: std.process.Init) !u8 {
     defer tool_calls.deinit();
     var llm_usage_repo = try ab.storage.LlmUsageRepo.init(&db);
     defer llm_usage_repo.deinit();
+    llm_usage_repo.error_persist_enabled = cfg.llm_error_persist_enabled;
     var memories_repo = try ab.storage.MemoriesRepo.init(&db);
     defer memories_repo.deinit();
     var orders_repo = try ab.storage.OrdersRepo.init(&db);
@@ -1795,6 +1823,7 @@ const ThinkLane = struct {
         defer tool_calls.deinit();
         var llm_usage_repo = try ab.storage.LlmUsageRepo.init(&db);
         defer llm_usage_repo.deinit();
+        llm_usage_repo.error_persist_enabled = cfg.llm_error_persist_enabled;
         var memories_repo = try ab.storage.MemoriesRepo.init(&db);
         defer memories_repo.deinit();
         var review_repo = try ab.storage.ReviewChatsRepo.init(&db);
@@ -3694,6 +3723,7 @@ fn runAgentDecision(
         std.debug.print("[agent] LLM failed: {s} → HOLD\n", .{tag});
         st.setLlm("error", tag);
         completeRun(runs, run_id, "error_llm", "", input_digest, nowMs());
+        var typed_fail_buf: [512]u8 = undefined;
         var fail_buf: [256]u8 = undefined;
         var attempt_buf: [40]u8 = undefined;
         const fail_payload = std.fmt.bufPrint(
@@ -3701,7 +3731,7 @@ fn runAgentDecision(
             "{{\"run_id\":\"{s}\",\"model\":\"{s}\",\"error\":\"{s}\",\"degraded\":\"HOLD\"{s}}}",
             .{ run_id, client.model, tag, llmAttemptSuffix(client, &attempt_buf) },
         ) catch "{\"degraded\":\"HOLD\"}";
-        logDecisionPayload(events_repo, engine, "AGENT_LLM_FAILED", "WARN", cfg, fail_payload, dyn.version_id);
+        logDecisionPayload(events_repo, engine, "AGENT_LLM_FAILED", "WARN", cfg, if (cfg.llm_error_persist_enabled) llmFailurePayload(&typed_fail_buf, fail_payload, client, err) else fail_payload, dyn.version_id);
         fb.noteAgentFailure();
         return .done;
     };
@@ -3806,6 +3836,7 @@ fn runAgentDecision(
             std.debug.print("[agent] LLM failed (tool round): {s} → HOLD\n", .{tag});
             st.setLlm("error", tag);
             completeRun(runs, run_id, "error_llm", "", input_digest, nowMs());
+            var typed_fail_buf: [512]u8 = undefined;
             var fail_buf: [256]u8 = undefined;
             var attempt_buf: [40]u8 = undefined;
             const fail_payload = std.fmt.bufPrint(
@@ -3813,7 +3844,7 @@ fn runAgentDecision(
                 "{{\"run_id\":\"{s}\",\"model\":\"{s}\",\"error\":\"{s}\",\"phase\":\"tool_round\",\"degraded\":\"HOLD\"{s}}}",
                 .{ run_id, client.model, tag, llmAttemptSuffix(client, &attempt_buf) },
             ) catch "{\"degraded\":\"HOLD\"}";
-            logDecisionPayload(events_repo, engine, "AGENT_LLM_FAILED", "WARN", cfg, fail_payload, dyn.version_id);
+            logDecisionPayload(events_repo, engine, "AGENT_LLM_FAILED", "WARN", cfg, if (cfg.llm_error_persist_enabled) llmFailurePayload(&typed_fail_buf, fail_payload, client, err) else fail_payload, dyn.version_id);
             fb.noteAgentFailure();
             return .done;
         };
@@ -6620,4 +6651,50 @@ test "jsonStringArrayLimited escapes and caps" {
 test "LLM connect deadline has a distinct error class" {
     try std.testing.expectEqualStrings("connect", llmErrorClass(error.ConnectTimeout));
     try std.testing.expectEqualStrings("timeout", llmErrorClass(error.Timeout));
+}
+
+test "LLM failure persistence defaults off and adds typed metadata only on opt in" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [512]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(t.io, &dir_buf);
+    var path_buf: [640:0]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "{s}/errors.db", .{dir_buf[0..dir_len]});
+    var db = try ab.storage.Db.open(path);
+    defer db.close();
+    var usage = try ab.storage.LlmUsageRepo.init(&db);
+    defer usage.deinit();
+    // Overlong synthetic URL fails before any network operation.
+    const long_url = [_]u8{'x'} ** 1100;
+    var client = ab.openai.Client.init(t.allocator, t.io, &long_url, "", "synthetic");
+    defer client.deinit();
+    try t.expectError(error.BufferTooSmall, meteredChat(&client, &usage, "proposal", "synthetic", "", "", ""));
+    try t.expectEqual(@as(i64, 0), try db.queryInt("SELECT COUNT(*) FROM llm_errors"));
+    usage.error_persist_enabled = true;
+    try t.expectError(error.BufferTooSmall, meteredChat(&client, &usage, "proposal", "synthetic", "", "", ""));
+    try t.expectEqual(@as(i64, 1), try db.queryInt("SELECT COUNT(*) FROM llm_errors WHERE cause='malformed' AND http_status IS NULL AND attempt=1"));
+    try t.expectEqual(@as(i64, 2), try db.queryInt("SELECT COUNT(*) FROM llm_usage WHERE error_class='buffer'"));
+    client.last_http_status = 503;
+    var out: [512]u8 = undefined;
+    const legacy = "{\"run_id\":\"synthetic\",\"degraded\":\"HOLD\"}";
+    const typed = llmFailurePayload(&out, legacy, &client, error.ApiError);
+    var parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, typed, .{});
+    defer parsed.deinit();
+    try t.expectEqualStrings("api_status", parsed.value.object.get("cause").?.string);
+    try t.expectEqual(@as(i64, 503), parsed.value.object.get("http_status").?.integer);
+    try t.expectEqualStrings("HOLD", parsed.value.object.get("degraded").?.string);
+}
+
+test "typed connect timeout payload converts absent shared HTTP status to null" {
+    const t = std.testing;
+    var client = ab.openai.Client.init(t.allocator, t.io, "", "", "synthetic");
+    defer client.deinit();
+    try t.expectEqual(@as(?u16, null), llmHttpStatus(&client));
+    var out: [512]u8 = undefined;
+    const typed = llmFailurePayload(&out, "{\"degraded\":\"HOLD\"}", &client, error.ConnectTimeout);
+    var parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, typed, .{});
+    defer parsed.deinit();
+    try t.expectEqualStrings("connect", parsed.value.object.get("cause").?.string);
+    try t.expect(parsed.value.object.get("http_status").? == .null);
 }
