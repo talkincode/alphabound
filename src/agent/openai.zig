@@ -8,11 +8,13 @@
 //! Credentials stay in this adapter; agent context/proposal layers never see them.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const limits = @import("../security/limits.zig");
 
 pub const Error = error{
     HttpFailed,
     Timeout,
+    ConnectTimeout,
     ApiError,
     MalformedResponse,
     EmptyContent,
@@ -44,6 +46,22 @@ pub const AuthStyle = enum {
     api_key_header,
 };
 
+const TestTransport = struct {
+    response_start: bool,
+    finished: std.atomic.Value(bool) = .init(false),
+
+    fn fetch(self: *TestTransport, io: std.Io, options: std.http.Client.FetchOptions, head: ?*std.atomic.Value(bool)) std.http.Client.FetchError!std.http.Client.FetchResult {
+        defer self.finished.store(true, .release);
+        if (self.response_start) {
+            if (head) |h| h.store(true, .release);
+        }
+        io.sleep(.{ .nanoseconds = 900 * std.time.ns_per_ms }, .awake) catch {};
+        try options.response_writer.?.writeAll("{\"choices\":[{\"message\":{\"content\":\"late\"}}]}");
+        return .{ .status = .ok };
+    }
+};
+const TestTransportHook = if (builtin.is_test) ?*TestTransport else void;
+
 pub const Client = struct {
     http: std.http.Client,
     gpa: std.mem.Allocator,
@@ -55,6 +73,12 @@ pub const Client = struct {
     /// Hard wall-clock budget for one chat() attempt (including one transport retry).
     /// Slow Azure/DeepSeek completions often exceed 30s; production should use >=120s.
     timeout_ms: u32 = 120_000,
+    /// 0 preserves the existing fetch path. >0: deadline for TCP/TLS connect + request write.
+    connect_timeout_ms: u32 = 0,
+    /// Optional per-attempt cap, also bounded by timeout_ms. 0 disables.
+    request_timeout_ms: u32 = 0,
+    // Compiled out of production; tests can model a stalled transport without sockets.
+    test_transport: TestTransportHook = if (builtin.is_test) null else {},
 
     pub fn init(
         gpa: std.mem.Allocator,
@@ -105,11 +129,15 @@ pub const Client = struct {
     }
 
     fn chatBudgeted(self: *Client, url: []const u8, body: []const u8) Error!ChatResult {
-        const budget_ms: u32 = if (self.timeout_ms == 0) 120_000 else self.timeout_ms;
+        const call_budget: u32 = if (self.timeout_ms == 0) 120_000 else self.timeout_ms;
+        const budget_ms = if (self.request_timeout_ms == 0) call_budget else @min(call_budget, self.request_timeout_ms);
 
         // Prefer a worker thread so a wedged socket cannot block the daemon forever.
-        // Fallback to sync if threads are unavailable.
-        const work = self.gpa.create(ChatWork) catch return self.chatOnce(url, body);
+        // Preserve the legacy sync fallback only when deadlines are disabled.
+        const work = self.gpa.create(ChatWork) catch {
+            if (self.connect_timeout_ms > 0 or self.request_timeout_ms > 0) return error.OutOfMemory;
+            return self.chatOnce(url, body, null);
+        };
         work.* = .{
             .gpa = self.gpa,
             .io = self.http.io,
@@ -117,6 +145,8 @@ pub const Client = struct {
             .api_key = self.api_key,
             .model = self.model,
             .auth_style = self.auth_style,
+            .track_response_start = self.connect_timeout_ms > 0,
+            .test_transport = self.test_transport,
             .url = self.gpa.dupe(u8, url) catch {
                 self.gpa.destroy(work);
                 return error.OutOfMemory;
@@ -129,14 +159,17 @@ pub const Client = struct {
         };
 
         const thread = std.Thread.spawn(.{}, ChatWork.run, .{work}) catch {
-            const r = self.chatOnce(url, body);
+            const r: Error!ChatResult = if (self.connect_timeout_ms > 0 or self.request_timeout_ms > 0) error.HttpFailed else self.chatOnce(url, body, null);
             self.gpa.free(work.url);
             self.gpa.free(work.body);
             self.gpa.destroy(work);
             return r;
         };
 
+        const deadlines_enabled = self.connect_timeout_ms > 0 or self.request_timeout_ms > 0;
+        const started = if (deadlines_enabled) std.Io.Timestamp.now(self.http.io, .awake) else null;
         var waited_ms: u32 = 0;
+        var timeout_error: Error = error.Timeout;
         while (waited_ms < budget_ms) {
             if (work.phase.load(.acquire) == ChatWork.phase_done) {
                 const r = work.result;
@@ -146,9 +179,29 @@ pub const Client = struct {
                 self.gpa.destroy(work);
                 return r;
             }
-            self.http.io.sleep(.{ .nanoseconds = 100_000_000 }, .awake) catch {};
-            waited_ms +|= 100;
+            if (self.connect_timeout_ms > 0 and waited_ms >= self.connect_timeout_ms and
+                !work.response_started.load(.acquire))
+            {
+                timeout_error = error.ConnectTimeout;
+                break;
+            }
+            // Preserve the existing polling cadence when the switch is off.
+            const sleep_ms: u32 = if (!deadlines_enabled) 100 else @min(100, @min(budget_ms - waited_ms, if (!work.response_started.load(.acquire) and waited_ms < self.connect_timeout_ms)
+                self.connect_timeout_ms - waited_ms
+            else
+                budget_ms - waited_ms));
+            self.http.io.sleep(.{ .nanoseconds = @as(i96, sleep_ms) * std.time.ns_per_ms }, .awake) catch {};
+            waited_ms +|= sleep_ms;
+            if (started) |start| {
+                const elapsed = start.durationTo(std.Io.Timestamp.now(self.http.io, .awake)).toMilliseconds();
+                waited_ms = @intCast(@min(std.math.maxInt(u32), @max(0, elapsed)));
+            }
         }
+
+        // If scheduling skipped past both deadlines, the earlier one wins.
+        if (self.connect_timeout_ms > 0 and self.connect_timeout_ms < budget_ms and
+            waited_ms >= self.connect_timeout_ms and !work.response_started.load(.acquire))
+            timeout_error = error.ConnectTimeout;
 
         // Timed out: try to abandon. If worker finished in the race window, take the result.
         if (work.phase.cmpxchgStrong(ChatWork.phase_running, ChatWork.phase_abandoned, .acq_rel, .acquire)) |_| {
@@ -161,11 +214,15 @@ pub const Client = struct {
             return r;
         }
         thread.detach();
-        std.debug.print("[llm] timeout budget_ms={d}\n", .{budget_ms});
-        return error.Timeout;
+        if (timeout_error == error.ConnectTimeout) {
+            std.debug.print("[llm] connect_timeout budget_ms={d}\n", .{self.connect_timeout_ms});
+        } else {
+            std.debug.print("[llm] timeout budget_ms={d}\n", .{budget_ms});
+        }
+        return timeout_error;
     }
 
-    fn chatOnce(self: *Client, url: []const u8, body: []const u8) Error!ChatResult {
+    fn chatOnce(self: *Client, url: []const u8, body: []const u8, response_start: ?*std.atomic.Value(bool)) Error!ChatResult {
         var auth_buf: [600]u8 = undefined;
         const auth_headers: []const std.http.Header = switch (self.auth_style) {
             .bearer => blk: {
@@ -184,7 +241,7 @@ pub const Client = struct {
         defer self.gpa.free(sink);
         var fixed_writer: std.Io.Writer = .fixed(sink);
 
-        const result = self.http.fetch(.{
+        const options: std.http.Client.FetchOptions = .{
             .location = .{ .url = url },
             .method = .POST,
             .payload = body,
@@ -192,7 +249,8 @@ pub const Client = struct {
             .extra_headers = auth_headers,
             .headers = .{ .content_type = .{ .override = "application/json" } },
             .keep_alive = false,
-        }) catch |err| {
+        };
+        const result = self.fetch(options, response_start) catch |err| {
             if (err == error.WriteFailed) {
                 std.debug.print("[llm] response_too_large cap={d}\n", .{limits.max_llm_response_bytes});
                 return error.HttpFailed;
@@ -227,6 +285,52 @@ pub const Client = struct {
         return parsed;
     }
 
+    fn fetch(self: *Client, options: std.http.Client.FetchOptions, head: ?*std.atomic.Value(bool)) std.http.Client.FetchError!std.http.Client.FetchResult {
+        if (builtin.is_test) {
+            if (self.test_transport) |transport| return transport.fetch(self.http.io, options, head);
+        }
+        return if (head) |h| self.fetchWithFirstByte(options, h) else self.http.fetch(options);
+    }
+
+    /// Equivalent to std.http.fetch for our POST, publishing when the connection is
+    /// established and the request is sent. Slow responses remain total-budget timeouts.
+    fn fetchWithFirstByte(self: *Client, options: std.http.Client.FetchOptions, head: *std.atomic.Value(bool)) std.http.Client.FetchError!std.http.Client.FetchResult {
+        const uri = try std.Uri.parse(options.location.url);
+        var req = try self.http.request(.POST, uri, .{
+            .redirect_behavior = .unhandled,
+            .headers = options.headers,
+            .extra_headers = options.extra_headers,
+            .keep_alive = false,
+        });
+        defer req.deinit();
+        const payload = options.payload.?;
+        req.transfer_encoding = .{ .content_length = payload.len };
+        var body = try req.sendBodyUnflushed(&.{});
+        try body.writer.writeAll(payload);
+        try body.end();
+        try req.connection.?.flush();
+        // TCP+TLS established and request fully written: the "connect" phase is over.
+        // Non-streaming completions send no bytes until generation finishes, so waiting
+        // for the first response byte here would misclassify slow models as connect failures.
+        head.store(true, .release);
+        var response = try req.receiveHead(&.{});
+        const decompress_buffer: []u8 = switch (response.head.content_encoding) {
+            .identity => &.{},
+            .zstd => try self.gpa.alloc(u8, std.compress.zstd.default_window_len),
+            .deflate, .gzip => try self.gpa.alloc(u8, std.compress.flate.max_window_len),
+            .compress => return error.UnsupportedCompressionMethod,
+        };
+        defer self.gpa.free(decompress_buffer);
+        var transfer_buffer: [64]u8 = undefined;
+        var decompress: std.http.Decompress = undefined;
+        const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
+        _ = reader.streamRemaining(options.response_writer.?) catch |err| switch (err) {
+            error.ReadFailed => return response.bodyErr().?,
+            else => |e| return e,
+        };
+        return .{ .status = response.head.status };
+    }
+
     /// Drop any pooled sockets (including half-closed ones Zig may have re-offered).
     fn resetHttp(self: *Client) void {
         const io = self.http.io;
@@ -247,6 +351,9 @@ const ChatWork = struct {
     url: []u8,
     body: []u8,
     result: Error!ChatResult = error.HttpFailed,
+    track_response_start: bool,
+    test_transport: TestTransportHook,
+    response_started: std.atomic.Value(bool) = .init(false),
     /// 0 running, 1 done (result published), 2 abandoned by waiter.
     phase: std.atomic.Value(u8) = .init(phase_running),
 
@@ -257,9 +364,10 @@ const ChatWork = struct {
     fn run(self: *ChatWork) void {
         var client = Client.init(self.gpa, self.io, self.base_url, self.api_key, self.model);
         client.auth_style = self.auth_style;
+        client.test_transport = self.test_transport;
         defer client.deinit();
 
-        const r = client.chatOnce(self.url, self.body);
+        const r = client.chatOnce(self.url, self.body, if (self.track_response_start) &self.response_started else null);
         // Publish result before flipping phase to done (release).
         self.result = r;
         if (self.phase.cmpxchgStrong(phase_running, phase_done, .release, .monotonic)) |_| {
@@ -631,4 +739,45 @@ test "parses usage tokens" {
     try std.testing.expectEqual(@as(u64, 4), r.usage.cached_prompt_tokens);
     try std.testing.expectEqual(@as(u64, 7), r.usage.completion_tokens);
     try std.testing.expectEqual(@as(u64, 18), r.usage.total_tokens);
+}
+
+// A transport hook is used because sandboxed runners can forbid loopback binds.
+// It exercises the real worker, polling, abandonment, and late-result cleanup.
+fn expectTransportTimeout(connect_ms: u32, request_ms: u32, send_byte: bool, expected: Error, min_ms: i64, max_ms: i64) !void {
+    const io = std.testing.io;
+    var transport = TestTransport{ .response_start = send_byte };
+    // The hook must outlive the abandoned worker's transport call.
+    defer while (!transport.finished.load(.acquire)) {
+        io.sleep(.{ .nanoseconds = 10 * std.time.ns_per_ms }, .awake) catch {};
+    };
+    // Workers intentionally outlive timed-out callers; use a process-lifetime
+    // allocator, rather than a test allocator that could be torn down first.
+    var client = Client.init(std.heap.page_allocator, io, "http://test.invalid", "synthetic", "test-model");
+    defer client.deinit();
+    client.test_transport = &transport;
+    client.timeout_ms = 600;
+    client.connect_timeout_ms = connect_ms;
+    client.request_timeout_ms = request_ms;
+    const start = std.Io.Timestamp.now(io, .awake);
+    try std.testing.expectError(expected, client.chat("test", "test"));
+    const elapsed = start.durationTo(std.Io.Timestamp.now(io, .awake)).toMilliseconds();
+    try std.testing.expect(elapsed >= min_ms);
+    try std.testing.expect(elapsed < max_ms);
+}
+
+test "silent transport hits connect deadline before total budget" {
+    try expectTransportTimeout(200, 0, false, error.ConnectTimeout, 150, 550);
+}
+
+test "disabled connect deadline preserves total budget timeout" {
+    try expectTransportTimeout(0, 0, false, error.Timeout, 550, 850);
+}
+
+test "connected then slow response is total timeout, not connect" {
+    try expectTransportTimeout(200, 0, true, error.Timeout, 550, 850);
+}
+
+test "request timeout caps attempt and never extends call budget" {
+    try expectTransportTimeout(0, 200, false, error.Timeout, 150, 550);
+    try expectTransportTimeout(0, 2000, false, error.Timeout, 550, 850);
 }
