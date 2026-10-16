@@ -344,6 +344,14 @@ fn firstEnv(map: *const std.process.Environ.Map, names: []const []const u8) ?[]c
     return null;
 }
 
+// Environment switches override TOML in either direction; URL is env-only.
+fn applyLlmAlertEnv(cfg: *ab.config.Config, env: *const std.process.Environ.Map) void {
+    if (env.get("LLM_ALERT_ENABLED") != null)
+        cfg.llm_alert_enabled = envGetTruthy(env, "LLM_ALERT_ENABLED");
+    if (env.get("ALPHABOUND_ALERT_WEBHOOK_ENABLED") != null)
+        cfg.alert_webhook_enabled = envGetTruthy(env, "ALPHABOUND_ALERT_WEBHOOK_ENABLED");
+}
+
 fn envGetTruthy(map: *const std.process.Environ.Map, name: []const u8) bool {
     const v = map.get(name) orelse return false;
     return std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "yes");
@@ -451,6 +459,8 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("[boot] FATAL circuit breaker config: {t}\n", .{err});
         return 1;
     };
+
+    applyLlmAlertEnv(&cfg, env);
 
     // Local admin control is a one-shot CLI that never starts the daemon.
     if (cli.control_cmd) |cmd_name| {
@@ -1567,6 +1577,10 @@ pub fn main(init: std.process.Init) !u8 {
             }
         }
 
+        const llm_alert_due = cfg.llm_alert_enabled and agent_on and !admin_paused and
+            (think.isBusy() or think.jobs.depth() > 0 or
+                evaluateAgentSchedule(&agent_sched, engine.snapshot(), nowMs()).fire);
+
         if (advisoryDecisionAllowed(admin_paused, engine.snapshot().risk_mode)) {
             // One decision in flight at a time; the model runs on the thinking
             // lane, so this loop never waits for it. Not firing while the lane
@@ -1644,7 +1658,7 @@ pub fn main(init: std.process.Init) !u8 {
                     last_audit_ms = tnow;
                     const agent_live = agent_on and
                         cfg.decision_interval_ms > 0 and !admin_paused;
-                    runScheduledAudit(&db, &audit_repo, &events_repo, &engine, &cfg, &web_state, &runtime_status, agent_live);
+                    runScheduledAudit(&db, &audit_repo, &events_repo, &engine, &cfg, &web_state, &runtime_status, agent_live, llm_alert_due, boot_ms, env);
                     refreshSystemCache(&web_state, &db, &cfg, think.mem_count.load(.acquire), boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), agent_on, admin_paused, &runtime_status, &risk_latency);
                 }
             }
@@ -3783,6 +3797,7 @@ fn runAgentDecision(
             .{ run_id, client.model, tag, llmAttemptSuffix(client, &attempt_buf) },
         ) catch "{\"degraded\":\"HOLD\"}";
         logDecisionPayload(events_repo, engine, "AGENT_LLM_FAILED", "WARN", cfg, if (cfg.llm_error_persist_enabled) llmFailurePayload(&typed_fail_buf, fail_payload, client, err) else fail_payload, dyn.version_id);
+        maybeFireLlmAlert(db, events_repo, engine, cfg, env, st);
         fb.noteAgentFailure();
         return .done;
     };
@@ -3898,6 +3913,7 @@ fn runAgentDecision(
                 .{ run_id, client.model, tag, llmAttemptSuffix(client, &attempt_buf) },
             ) catch "{\"degraded\":\"HOLD\"}";
             logDecisionPayload(events_repo, engine, "AGENT_LLM_FAILED", "WARN", cfg, if (cfg.llm_error_persist_enabled) llmFailurePayload(&typed_fail_buf, fail_payload, client, err) else fail_payload, dyn.version_id);
+            maybeFireLlmAlert(db, events_repo, engine, cfg, env, st);
             fb.noteAgentFailure();
             return .done;
         };
@@ -5922,6 +5938,104 @@ fn auditLatestAge(db: *ab.storage.Db, comptime sql: [:0]const u8, now_ms: i64) i
     return @max(@as(i64, 0), now_ms - ms);
 }
 
+/// Count completed error_llm runs exactly once (not also their failure events).
+/// Consecutiveness is over all runs; any other status breaks the streak.
+fn collectLlmAlerts(db: *ab.storage.Db, cfg: *const ab.config.Config, in: *ab.auditor.Input) void {
+    in.llm_alert_enabled = cfg.llm_alert_enabled;
+    in.llm_alert_streak = cfg.llm_alert_streak;
+    in.llm_alert_window_count = cfg.llm_alert_window_count;
+    in.llm_stale_ms = cfg.llm_stale_ms;
+    var from_buf: [32]u8 = undefined;
+    const from = ab.clock.formatRfc3339Ms(in.now_ms - cfg.llm_alert_window_ms, &from_buf) catch return;
+    // finished_ts makes a slow failed request count when it actually failed.
+    in.error_llm_window = auditCountBound(
+        db,
+        "SELECT COUNT(*) FROM agent_runs WHERE status = 'error_llm' AND finished_ts >= ?1",
+        from,
+    );
+    var stmt = db.prepare("SELECT status FROM agent_runs ORDER BY started_ts DESC, rowid DESC") catch return;
+    defer stmt.finalize();
+    while (stmt.step() catch false) {
+        if (!std.mem.eql(u8, stmt.columnText(0), "error_llm")) break;
+        in.error_llm_streak += 1;
+        // Only the threshold is needed; keep immediate work bounded.
+        if (in.error_llm_streak >= cfg.llm_alert_streak) break;
+    }
+}
+
+fn maybeFireLlmAlert(
+    db: *ab.storage.Db,
+    events_repo: *ab.storage.EventsRepo,
+    engine: *ab.state.Engine,
+    cfg: *const ab.config.Config,
+    env: *const std.process.Environ.Map,
+    st: *RuntimeStatus,
+) void {
+    if (!cfg.llm_alert_enabled) return;
+    var in: ab.auditor.Input = .{
+        .now_ms = nowMs(),
+        .window_ms = cfg.llm_alert_window_ms,
+        .agent_enabled = true,
+        .zombie_threshold_ms = 0,
+    };
+    collectLlmAlerts(db, cfg, &in);
+    publishLlmAlerts(in, events_repo, engine, cfg, env, st);
+}
+
+var llm_alert_sequence = std.atomic.Value(u64).init(0);
+
+fn publishLlmAlerts(
+    in: ab.auditor.Input,
+    events_repo: *ab.storage.EventsRepo,
+    engine: *ab.state.Engine,
+    cfg: *const ab.config.Config,
+    env: *const std.process.Environ.Map,
+    st: ?*RuntimeStatus,
+) void {
+    var buf: [2048]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    const severity = ab.auditor.writeLlmFindings(&w, in) catch return;
+    if (severity == .ok) return;
+    const findings = w.buffered();
+    if (st) |status| status.setLlmAudit(severity.text(), findings);
+    // Notification persistence is best-effort: unlike the trading journal,
+    // an alert write failure must not submit a trading-state message.
+    var id_buf: [64]u8 = undefined;
+    const seq = llm_alert_sequence.fetchAdd(1, .monotonic);
+    const id = std.fmt.bufPrint(&id_buf, "llm_alert_{d}_{d}", .{ in.now_ms, seq }) catch return;
+    var ts_buf: [32]u8 = undefined;
+    const ts = ab.clock.formatRfc3339Ms(in.now_ms, &ts_buf) catch return;
+    var clean: [4096]u8 = undefined;
+    events_repo.append(.{
+        .event_id = id,
+        .ts = ts,
+        .type = "AGENT_LLM_ALERT",
+        .source = "audit",
+        .severity = if (severity == .alert) "CRITICAL" else "WARN",
+        .state_version = @intCast(engine.snapshot().version),
+        .software_version = ab.journal.software_version,
+        .config_hash = cfg.hash(),
+        .payload_json = ab.redaction.redact(findings, &clean),
+    }) catch std.debug.print("[alert] event persistence failed\n", .{});
+    if (!cfg.alert_webhook_enabled) return;
+    // Only locally generated rule details are sent; no model/error text or URL.
+    var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, findings, .{}) catch return;
+    defer parsed.deinit();
+    // One notification per evaluation, choosing the most severe finding.
+    for (parsed.value.array.items) |item| {
+        const obj = item.object;
+        if (!std.mem.eql(u8, obj.get("severity").?.string, severity.text())) continue;
+        ab.alerter.send(true, env.get("ALPHABOUND_ALERT_WEBHOOK_URL"), cfg.alert_webhook_timeout_ms, .{
+            .severity = severity.text(),
+            .check = obj.get("check").?.string,
+            .detail = obj.get("detail").?.string,
+            .instance_id = cfg.instance_id,
+            .ts = ts,
+        });
+        break;
+    }
+}
+
 fn runScheduledAudit(
     db: *ab.storage.Db,
     audit_repo: *ab.storage.AuditReportsRepo,
@@ -5931,6 +6045,9 @@ fn runScheduledAudit(
     web_state: *WebState,
     st: *RuntimeStatus,
     agent_live: bool,
+    decision_due: bool,
+    boot_ms: i64,
+    env: *const std.process.Environ.Map,
 ) void {
     const now = nowMs();
     const window_ms: i64 = @intCast(cfg.audit_interval_ms);
@@ -5946,6 +6063,16 @@ fn runScheduledAudit(
             @intCast(cfg.review_backoff_max_ms),
         ),
     };
+
+    if (cfg.llm_alert_enabled) {
+        collectLlmAlerts(db, cfg, &in);
+        st.acquire();
+        const llm_ms = st.llm_ms;
+        st.release();
+        in.llm_status_age_ms = @max(0, now - (if (llm_ms > 0) llm_ms else boot_ms));
+        in.decision_due = decision_due;
+        publishLlmAlerts(in, events_repo, engine, cfg, env, null);
+    }
 
     // --- llm ---
     in.runs_total = auditCountBound(db, "SELECT COUNT(*) FROM agent_runs WHERE started_ts >= ?1", ts_from);
@@ -6751,4 +6878,71 @@ test "typed connect timeout payload converts absent shared HTTP status to null" 
     defer parsed.deinit();
     try t.expectEqualStrings("connect", parsed.value.object.get("cause").?.string);
     try t.expect(parsed.value.object.get("http_status").? == .null);
+}
+
+test "LLM alert collection counts completed runs with inclusive window and resets streak" {
+    var db = try ab.storage.Db.open(":memory:");
+    defer db.close();
+    var cfg = try ab.config.parse(std.testing.allocator, "[agent]\nllm_alert_enabled = true\nllm_alert_window_ms = 1000\nllm_alert_streak = 8");
+    defer cfg.deinit();
+    try db.execAll(
+        \\INSERT INTO agent_runs(run_id,snapshot_version,model,prompt_hash,status,started_ts,finished_ts) VALUES
+        \\('old',0,'test','test','error_llm','2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z'),
+        \\('ok',0,'test','test','ok','2026-01-01T00:00:01.000Z','2026-01-01T00:00:01.000Z'),
+        \\('edge',0,'test','test','error_llm','2026-01-01T00:00:01.100Z','2026-01-01T00:00:02.000Z'),
+        \\('new',0,'test','test','error_llm','2026-01-01T00:00:02.000Z','2026-01-01T00:00:02.500Z');
+    );
+    var in: ab.auditor.Input = .{ .now_ms = try ab.clock.parseRfc3339Ms("2026-01-01T00:00:03.000Z"), .window_ms = 1000, .agent_enabled = true, .zombie_threshold_ms = 0 };
+    collectLlmAlerts(&db, &cfg, &in);
+    try std.testing.expectEqual(@as(i64, 2), in.error_llm_window);
+    try std.testing.expectEqual(@as(i64, 2), in.error_llm_streak);
+    try db.execAll("UPDATE agent_runs SET status = 'invalid_output' WHERE run_id = 'new'");
+    in.error_llm_streak = 0;
+    collectLlmAlerts(&db, &cfg, &in);
+    try std.testing.expectEqual(@as(i64, 1), in.error_llm_window);
+    try std.testing.expectEqual(@as(i64, 0), in.error_llm_streak);
+}
+
+test "immediate LLM alerts are opt-in, persist an event, and light the bell without trading messages" {
+    var db = try ab.storage.Db.open(":memory:");
+    defer db.close();
+    var events = try ab.storage.EventsRepo.init(&db);
+    defer events.deinit();
+    var cfg = try ab.config.parse(std.testing.allocator, "[agent]\nllm_alert_streak = 1");
+    defer cfg.deinit();
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    var st: RuntimeStatus = .{};
+    var engine = ab.state.Engine.init(.{ .fee_rate = cfg.taker_fee_rate, .slippage_rate = cfg.slippage_rate }, cfg.max_drawdown);
+    try db.execAll("INSERT INTO agent_runs(run_id,snapshot_version,model,prompt_hash,status,started_ts,finished_ts) VALUES ('test',0,'test','test','error_llm','2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z')");
+    maybeFireLlmAlert(&db, &events, &engine, &cfg, &env, &st);
+    try std.testing.expectEqualStrings("unknown", st.audit_status);
+    try std.testing.expectEqual(@as(i64, 0), auditCountBound(&db, "SELECT COUNT(*) FROM events WHERE type = 'AGENT_LLM_ALERT' AND ts >= ?1", ""));
+    cfg.llm_alert_enabled = true;
+    maybeFireLlmAlert(&db, &events, &engine, &cfg, &env, &st);
+    try std.testing.expectEqualStrings("warn", st.audit_status);
+    try std.testing.expectEqual(@as(u32, 1), st.audit_findings);
+    try std.testing.expect(std.mem.indexOf(u8, st.audit_alerts, "llm.error_llm_streak") != null);
+    try std.testing.expectEqual(@as(i64, 1), auditCountBound(&db, "SELECT COUNT(*) FROM events WHERE type = 'AGENT_LLM_ALERT' AND ts >= ?1", ""));
+    const before = engine.snapshot();
+    try db.execAll("CREATE TRIGGER reject_alert BEFORE INSERT ON events BEGIN SELECT RAISE(FAIL, 'synthetic'); END");
+    maybeFireLlmAlert(&db, &events, &engine, &cfg, &env, &st);
+    try std.testing.expectEqualDeep(before, engine.snapshot());
+}
+
+test "LLM alert env overrides can enable and disable without a TOML URL" {
+    var cfg = try ab.config.parse(std.testing.allocator, "");
+    defer cfg.deinit();
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    applyLlmAlertEnv(&cfg, &env);
+    try std.testing.expect(!cfg.llm_alert_enabled and !cfg.alert_webhook_enabled);
+    try env.put("LLM_ALERT_ENABLED", "true");
+    try env.put("ALPHABOUND_ALERT_WEBHOOK_ENABLED", "1");
+    applyLlmAlertEnv(&cfg, &env);
+    try std.testing.expect(cfg.llm_alert_enabled and cfg.alert_webhook_enabled);
+    try env.put("LLM_ALERT_ENABLED", "false");
+    try env.put("ALPHABOUND_ALERT_WEBHOOK_ENABLED", "0");
+    applyLlmAlertEnv(&cfg, &env);
+    try std.testing.expect(!cfg.llm_alert_enabled and !cfg.alert_webhook_enabled);
 }

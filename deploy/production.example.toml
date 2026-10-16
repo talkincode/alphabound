@@ -36,6 +36,15 @@ min_rebalance_weight_delta = 0.01    # skip trades moving weight < 1%; suppresse
 # connect_timeout_ms = 0
 # request_timeout_ms = 0
 # llm_error_persist_enabled = false # opt-in redacted LLM error history
+# Optional LLM alerts (all behavior disabled by default).
+# llm_alert_enabled = false
+# llm_alert_streak = 2
+# llm_alert_window_ms = 1800000
+# llm_alert_window_count = 3
+# llm_stale_ms = 1800000
+# alert_webhook_enabled = false
+# alert_webhook_timeout_ms = 5000
+# Webhook URL is environment-only; see secrets.env.example.
 provider = "openai"
 model = "gpt-4o-mini"
 base_url = "https://api.openai.com/v1"
