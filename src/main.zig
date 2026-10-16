@@ -447,6 +447,11 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     };
 
+    ab.config.applyCircuitBreakerEnv(&cfg, env) catch |err| {
+        std.debug.print("[boot] FATAL circuit breaker config: {t}\n", .{err});
+        return 1;
+    };
+
     // Local admin control is a one-shot CLI that never starts the daemon.
     if (cli.control_cmd) |cmd_name| {
         return runControlCli(io, cmd_name, cfg.db_path);
@@ -1871,6 +1876,12 @@ const ThinkLane = struct {
         restorePeriodicSchedule(&periodic_repo, &db, &review_sched);
         self.status.setReviewDueAt(review_sched.nextAt(.short), review_sched.nextAt(.long));
 
+        var llm_breaker = ab.circuit_breaker.Breaker{ .params = .{
+            .failure_threshold = cfg.circuit_breaker_failures,
+            .open_ms = cfg.circuit_breaker_open_ms,
+            .half_open_probes = cfg.circuit_breaker_half_open_probes,
+        } };
+        if (cfg.circuit_breaker_enabled) self.status.setLlmBreaker(.closed);
         var last_memory_prune_ms: i64 = 0;
         while (!self.stop.load(.acquire)) {
             // Index-only retention for per-run memory copies (durable rows stay).
@@ -1928,6 +1939,7 @@ const ThinkLane = struct {
                             job.bh_cmp,
                             reason,
                             decision_params,
+                            &llm_breaker,
                         );
                         const mode = self.engine.snapshot().risk_mode;
                         if (out == .stale_proposal and attempt < max_stale_redos and
@@ -3470,6 +3482,31 @@ const AgentOutcome = enum {
     stale_proposal,
 };
 
+/// Called only for proposal chat completions, before proposal validation.
+fn noteLlmBreaker(
+    breaker: *ab.circuit_breaker.Breaker,
+    cfg: *const ab.config.Config,
+    st: *RuntimeStatus,
+    events_repo: *ab.storage.EventsRepo,
+    engine: *ab.state.Engine,
+    version_id: i64,
+    failure: ?[]const u8,
+) void {
+    if (!cfg.circuit_breaker_enabled) return;
+    if (failure) |tag| {
+        if (breaker.recordFailure(tag, nowMs())) {
+            const kind: []const u8 = if (cfg.circuit_breaker_mode == .observe)
+                "AGENT_LLM_BREAKER_WOULD_OPEN"
+            else
+                "AGENT_LLM_BREAKER_OPEN";
+            logDecisionPayload(events_repo, engine, kind, "WARN", cfg, "{\"state\":\"open\"}", version_id);
+        }
+    } else {
+        breaker.recordSuccess();
+    }
+    st.setLlmBreaker(breaker.state);
+}
+
 fn runAgentDecision(
     gpa: std.mem.Allocator,
     client: *ab.openai.Client,
@@ -3497,6 +3534,7 @@ fn runAgentDecision(
     bh_cmp: ab.shadow_bench.Comparison,
     trigger_reason: []const u8,
     dyn: ab.params_store.Snapshot,
+    breaker: *ab.circuit_breaker.Breaker,
 ) AgentOutcome {
     const snap = engine.snapshot();
     // What the model sees; proposals are only executable while this still
@@ -3527,6 +3565,18 @@ fn runAgentDecision(
         std.debug.print("[agent] agent_runs start failed: {t}\n", .{err});
         return .done;
     };
+
+    if (cfg.circuit_breaker_enabled) {
+        const allowed = breaker.allow(nowMs(), cfg.circuit_breaker_mode);
+        st.setLlmBreaker(breaker.state);
+        if (!allowed) {
+            st.setLlm("breaker_hold", "open");
+            completeRun(runs, run_id, "breaker_hold", "", "", nowMs());
+            logDecisionPayload(events_repo, engine, "AGENT_LLM_BREAKER_OPEN", "WARN", cfg, "{\"degraded\":\"HOLD\"}", dyn.version_id);
+            fb.noteAgentFailure();
+            return .done;
+        }
+    }
 
     var obs_bufs: [5][32768]u8 = undefined;
     var obs_ptrs: [5][]const u8 = .{ "", "", "", "", "" };
@@ -3721,6 +3771,7 @@ fn runAgentDecision(
             error.BufferTooSmall => "buffer",
         };
         std.debug.print("[agent] LLM failed: {s} → HOLD\n", .{tag});
+        noteLlmBreaker(breaker, cfg, st, events_repo, engine, dyn.version_id, tag);
         st.setLlm("error", tag);
         completeRun(runs, run_id, "error_llm", "", input_digest, nowMs());
         var typed_fail_buf: [512]u8 = undefined;
@@ -3735,6 +3786,7 @@ fn runAgentDecision(
         fb.noteAgentFailure();
         return .done;
     };
+    noteLlmBreaker(breaker, cfg, st, events_repo, engine, dyn.version_id, null);
     defer gpa.free(chat_res.content);
     st.addUsage(chat_res.usage);
     st.setLlm("ok", "proposal");
@@ -3834,6 +3886,7 @@ fn runAgentDecision(
                 error.BufferTooSmall => "buffer",
             };
             std.debug.print("[agent] LLM failed (tool round): {s} → HOLD\n", .{tag});
+            noteLlmBreaker(breaker, cfg, st, events_repo, engine, dyn.version_id, tag);
             st.setLlm("error", tag);
             completeRun(runs, run_id, "error_llm", "", input_digest, nowMs());
             var typed_fail_buf: [512]u8 = undefined;
@@ -3848,6 +3901,7 @@ fn runAgentDecision(
             fb.noteAgentFailure();
             return .done;
         };
+        noteLlmBreaker(breaker, cfg, st, events_repo, engine, dyn.version_id, null);
         raw2 = chat2.content;
         st.addUsage(chat2.usage);
         usage.prompt_tokens += chat2.usage.prompt_tokens;
