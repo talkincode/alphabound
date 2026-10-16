@@ -562,6 +562,7 @@ pub const RuntimeStatus = struct {
     okx_private: []const u8 = "unknown",
     okx_private_ms: i64 = 0,
     okx_private_detail: []const u8 = "",
+    llm_breaker: []const u8 = "disabled",
     llm: []const u8 = "unknown",
     llm_ms: i64 = 0,
     llm_detail: []const u8 = "",
@@ -661,6 +662,12 @@ pub const RuntimeStatus = struct {
         self.priv_detail_len = n;
         self.okx_private_detail = self.priv_detail_buf[0..self.priv_detail_len];
     }
+    pub fn setLlmBreaker(self: *RuntimeStatus, breaker_state: @import("../agent/circuit_breaker.zig").State) void {
+        self.acquire();
+        defer self.release();
+        self.llm_breaker = @tagName(breaker_state);
+    }
+
     pub fn setLlm(self: *RuntimeStatus, status: []const u8, detail: []const u8) void {
         self.acquire();
         defer self.release();
@@ -1159,6 +1166,31 @@ fn countdownUntil(due_ms: i64, now_ms: i64) i64 {
     return @max(@as(i64, 0), due_ms - now_ms);
 }
 
+fn writeLlmBreaker(w: *std.Io.Writer, cfg: *const config.Config, st: *const RuntimeStatus) !void {
+    if (cfg.circuit_breaker_enabled) try w.print("\"llm_breaker\":\"{s}\",", .{st.llm_breaker});
+}
+
+test "breaker system field is absent by default and exposes enabled state" {
+    var cfg = try config.parse(std.testing.allocator, "");
+    defer cfg.deinit();
+    var st = RuntimeStatus{};
+    var buf: [128]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeLlmBreaker(&w, &cfg, &st);
+    try std.testing.expectEqualStrings("", w.buffered());
+    cfg.circuit_breaker_enabled = true;
+    inline for (.{ .closed, .open, .half_open }) |breaker_state| {
+        st.setLlmBreaker(breaker_state);
+        w = .fixed(&buf);
+        try w.writeByte('{');
+        try writeLlmBreaker(&w, &cfg, &st);
+        try w.writeAll("\"extra\":0}");
+        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, w.buffered(), .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(@tagName(breaker_state), parsed.value.object.get("llm_breaker").?.string);
+    }
+}
+
 fn writeReview(w: *std.Io.Writer, cfg: *const config.Config, st: *const RuntimeStatus, now_ms: i64) !void {
     try w.print(
         "\"review\":{{\"status\":\"{s}\",\"cycle\":\"{s}\",\"ts_ms\":{d},\"short_interval_ms\":{d},\"long_interval_ms\":{d},\"next_short_ms\":{d},\"next_long_ms\":{d}}},",
@@ -1300,6 +1332,7 @@ pub fn refreshSystemCache(
         "\"audit\":{{\"status\":\"{s}\",\"ts_ms\":{d},\"findings\":{d},\"interval_ms\":{d},\"alerts\":{s}}},",
         .{ st.audit_status, st.audit_ms, st.audit_findings, cfg.audit_interval_ms, st.audit_alerts },
     ) catch return;
+    writeLlmBreaker(&w, cfg, st) catch return;
     writeReview(&w, cfg, st, nowMs()) catch return;
 
     w.print(
