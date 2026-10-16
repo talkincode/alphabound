@@ -38,6 +38,9 @@ fn meteredChat(
     user: []const u8,
 ) ab.openai.Error!ab.openai.ChatResult {
     const started_ms = nowMs();
+    defer if (client.last_attempt_count) |attempts| {
+        std.debug.print("[llm] usage call_kind={s} attempts={d}\n", .{ call_kind, attempts });
+    };
     const result = client.chat(system, user) catch |err| {
         persistLlmUsage(usage_repo, .{
             .ts_ms = started_ms,
@@ -62,6 +65,11 @@ fn meteredChat(
         .usage = result.usage,
     });
     return result;
+}
+
+fn llmAttemptSuffix(client: *const ab.openai.Client, buf: []u8) []const u8 {
+    const attempts = client.last_attempt_count orelse return "";
+    return std.fmt.bufPrint(buf, ",\"attempts\":{d}", .{attempts}) catch "";
 }
 
 fn persistLlmUsage(repo: *ab.storage.LlmUsageRepo, call: ab.llm_usage.Call) void {
@@ -397,6 +405,18 @@ pub fn main(init: std.process.Init) !u8 {
     defer cfg.deinit();
     cfg.applyLlmTimeoutOverrides(env.get("LLM_CONNECT_TIMEOUT_MS"), env.get("LLM_REQUEST_TIMEOUT_MS")) catch |err| {
         std.debug.print("[boot] FATAL LLM timeout config: {t}\n", .{err});
+        return 1;
+    };
+
+    cfg.applyLlmRetryOverrides(.{
+        env.get("LLM_RESILIENCE_ENABLED"),
+        env.get("LLM_RETRY_ON_TIMEOUT"),
+        env.get("LLM_RETRY_MAX"),
+        env.get("LLM_RETRY_BACKOFF_MS"),
+        env.get("LLM_RETRY_JITTER_MS"),
+        env.get("LLM_RETRY_5XX_MAX"),
+    }) catch |err| {
+        std.debug.print("[boot] FATAL LLM retry config: {t}\n", .{err});
         return 1;
     };
 
@@ -1803,6 +1823,12 @@ const ThinkLane = struct {
                 llm_client.?.timeout_ms = cfg.decision_timeout_ms;
                 llm_client.?.connect_timeout_ms = cfg.connect_timeout_ms;
                 llm_client.?.request_timeout_ms = cfg.request_timeout_ms;
+                llm_client.?.llm_resilience_enabled = cfg.llm_resilience_enabled;
+                llm_client.?.llm_retry_on_timeout = cfg.llm_retry_on_timeout;
+                llm_client.?.llm_retry_max = cfg.llm_retry_max;
+                llm_client.?.llm_retry_backoff_ms = cfg.llm_retry_backoff_ms;
+                llm_client.?.llm_retry_jitter_ms = cfg.llm_retry_jitter_ms;
+                llm_client.?.llm_retry_5xx_max = cfg.llm_retry_5xx_max;
             }
         }
 
@@ -3669,10 +3695,11 @@ fn runAgentDecision(
         st.setLlm("error", tag);
         completeRun(runs, run_id, "error_llm", "", input_digest, nowMs());
         var fail_buf: [256]u8 = undefined;
+        var attempt_buf: [40]u8 = undefined;
         const fail_payload = std.fmt.bufPrint(
             &fail_buf,
-            "{{\"run_id\":\"{s}\",\"model\":\"{s}\",\"error\":\"{s}\",\"degraded\":\"HOLD\"}}",
-            .{ run_id, client.model, tag },
+            "{{\"run_id\":\"{s}\",\"model\":\"{s}\",\"error\":\"{s}\",\"degraded\":\"HOLD\"{s}}}",
+            .{ run_id, client.model, tag, llmAttemptSuffix(client, &attempt_buf) },
         ) catch "{\"degraded\":\"HOLD\"}";
         logDecisionPayload(events_repo, engine, "AGENT_LLM_FAILED", "WARN", cfg, fail_payload, dyn.version_id);
         fb.noteAgentFailure();
@@ -3780,10 +3807,11 @@ fn runAgentDecision(
             st.setLlm("error", tag);
             completeRun(runs, run_id, "error_llm", "", input_digest, nowMs());
             var fail_buf: [256]u8 = undefined;
+            var attempt_buf: [40]u8 = undefined;
             const fail_payload = std.fmt.bufPrint(
                 &fail_buf,
-                "{{\"run_id\":\"{s}\",\"model\":\"{s}\",\"error\":\"{s}\",\"phase\":\"tool_round\",\"degraded\":\"HOLD\"}}",
-                .{ run_id, client.model, tag },
+                "{{\"run_id\":\"{s}\",\"model\":\"{s}\",\"error\":\"{s}\",\"phase\":\"tool_round\",\"degraded\":\"HOLD\"{s}}}",
+                .{ run_id, client.model, tag, llmAttemptSuffix(client, &attempt_buf) },
             ) catch "{\"degraded\":\"HOLD\"}";
             logDecisionPayload(events_repo, engine, "AGENT_LLM_FAILED", "WARN", cfg, fail_payload, dyn.version_id);
             fb.noteAgentFailure();

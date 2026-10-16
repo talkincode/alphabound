@@ -78,6 +78,12 @@ pub const Config = struct {
     connect_timeout_ms: u32 = 0,
     /// 0 uses the call budget; otherwise caps each LLM attempt.
     request_timeout_ms: u32 = 0,
+    llm_resilience_enabled: bool = false,
+    llm_retry_on_timeout: bool = true,
+    llm_retry_max: u32 = 1,
+    llm_retry_backoff_ms: u32 = 500,
+    llm_retry_jitter_ms: u32 = 250,
+    llm_retry_5xx_max: u32 = 2,
     /// A proposal is void when admission/execution happens later than this
     /// after the decision snapshot, or when price/book/risk state moved
     /// materially (see agent/validity.zig); the decision is then redone.
@@ -180,6 +186,24 @@ pub const Config = struct {
         try candidate.validateLlmTimeouts();
         self.connect_timeout_ms = candidate.connect_timeout_ms;
         self.request_timeout_ms = candidate.request_timeout_ms;
+    }
+
+    /// Optional environment values in the same order as the documented retry keys.
+    /// Parse all values before applying any of them.
+    pub fn applyLlmRetryOverrides(self: *Config, values: [6]?[]const u8) ConfigError!void {
+        var candidate = self.*;
+        if (values[0]) |v| candidate.llm_resilience_enabled = try parseBool(v);
+        if (values[1]) |v| candidate.llm_retry_on_timeout = try parseBool(v);
+        if (values[2]) |v| candidate.llm_retry_max = std.fmt.parseInt(u32, v, 10) catch return error.InvalidValue;
+        if (values[3]) |v| candidate.llm_retry_backoff_ms = std.fmt.parseInt(u32, v, 10) catch return error.InvalidValue;
+        if (values[4]) |v| candidate.llm_retry_jitter_ms = std.fmt.parseInt(u32, v, 10) catch return error.InvalidValue;
+        if (values[5]) |v| candidate.llm_retry_5xx_max = std.fmt.parseInt(u32, v, 10) catch return error.InvalidValue;
+        self.llm_resilience_enabled = candidate.llm_resilience_enabled;
+        self.llm_retry_on_timeout = candidate.llm_retry_on_timeout;
+        self.llm_retry_max = candidate.llm_retry_max;
+        self.llm_retry_backoff_ms = candidate.llm_retry_backoff_ms;
+        self.llm_retry_jitter_ms = candidate.llm_retry_jitter_ms;
+        self.llm_retry_5xx_max = candidate.llm_retry_5xx_max;
     }
 
     pub fn deinit(self: *Config) void {
@@ -374,6 +398,18 @@ fn applyKey(a: std.mem.Allocator, cfg: *Config, section: []const u8, key: []cons
             cfg.connect_timeout_ms = parseInt(u32, val) catch return error.InvalidValue;
         } else if (std.mem.eql(u8, key, "request_timeout_ms")) {
             cfg.request_timeout_ms = parseInt(u32, val) catch return error.InvalidValue;
+        } else if (std.mem.eql(u8, key, "llm_resilience_enabled")) {
+            cfg.llm_resilience_enabled = try parseBool(val);
+        } else if (std.mem.eql(u8, key, "llm_retry_on_timeout")) {
+            cfg.llm_retry_on_timeout = try parseBool(val);
+        } else if (std.mem.eql(u8, key, "llm_retry_max")) {
+            cfg.llm_retry_max = parseInt(u32, val) catch return error.InvalidValue;
+        } else if (std.mem.eql(u8, key, "llm_retry_backoff_ms")) {
+            cfg.llm_retry_backoff_ms = parseInt(u32, val) catch return error.InvalidValue;
+        } else if (std.mem.eql(u8, key, "llm_retry_jitter_ms")) {
+            cfg.llm_retry_jitter_ms = parseInt(u32, val) catch return error.InvalidValue;
+        } else if (std.mem.eql(u8, key, "llm_retry_5xx_max")) {
+            cfg.llm_retry_5xx_max = parseInt(u32, val) catch return error.InvalidValue;
         } else if (std.mem.eql(u8, key, "proposal_max_age_ms")) {
             cfg.proposal_max_age_ms = parseInt(u32, val) catch return error.InvalidValue;
             if (cfg.proposal_max_age_ms == 0) return error.InvalidValue;
@@ -846,4 +882,41 @@ test "LLM timeout defaults, whitelist, validation and environment overrides" {
     try t.expectError(error.InvalidValue, parse(t.allocator, "[agent]\nconnect_timeout_ms=-1"));
     try t.expectError(error.InvalidValue, parse(t.allocator, "[agent]\nrequest_timeout_ms=bad"));
     try t.expectError(error.UnknownKey, parse(t.allocator, "[agent]\nconnect_timout_ms=200"));
+}
+
+test "LLM retry keys are whitelisted and preserve defaults" {
+    const t = std.testing;
+    var defaults = try parse(t.allocator, "");
+    defer defaults.deinit();
+    try t.expectEqual(@as(bool, false), defaults.llm_resilience_enabled);
+    try t.expectEqual(@as(bool, true), defaults.llm_retry_on_timeout);
+    try t.expectEqual(@as(u32, 1), defaults.llm_retry_max);
+    try t.expectEqual(@as(u32, 500), defaults.llm_retry_backoff_ms);
+    try t.expectEqual(@as(u32, 250), defaults.llm_retry_jitter_ms);
+    try t.expectEqual(@as(u32, 2), defaults.llm_retry_5xx_max);
+    var cfg = try parse(t.allocator, "[agent]\nllm_resilience_enabled=true\nllm_retry_on_timeout=false\nllm_retry_max=3\nllm_retry_backoff_ms=10\nllm_retry_jitter_ms=20\nllm_retry_5xx_max=4");
+    defer cfg.deinit();
+    try t.expect(cfg.llm_resilience_enabled);
+    try t.expect(!cfg.llm_retry_on_timeout);
+    try t.expectEqual(@as(u32, 3), cfg.llm_retry_max);
+    try t.expectEqual(@as(u32, 10), cfg.llm_retry_backoff_ms);
+    try t.expectEqual(@as(u32, 20), cfg.llm_retry_jitter_ms);
+    try t.expectEqual(@as(u32, 4), cfg.llm_retry_5xx_max);
+    try cfg.applyLlmRetryOverrides(.{ "false", "true", "1", "500", "250", "2" });
+    try t.expectEqual(@as(bool, false), cfg.llm_resilience_enabled);
+    try t.expectEqual(@as(bool, true), cfg.llm_retry_on_timeout);
+    try t.expectEqual(@as(u32, 1), cfg.llm_retry_max);
+    try t.expectEqual(@as(u32, 500), cfg.llm_retry_backoff_ms);
+    try t.expectEqual(@as(u32, 250), cfg.llm_retry_jitter_ms);
+    try t.expectEqual(@as(u32, 2), cfg.llm_retry_5xx_max);
+    try t.expectError(error.InvalidValue, cfg.applyLlmRetryOverrides(.{ "true", null, "-1", null, null, null }));
+    try t.expect(!cfg.llm_resilience_enabled);
+    try t.expectError(error.InvalidValue, cfg.applyLlmRetryOverrides(.{ "invalid", null, null, null, null, null }));
+    try t.expectError(error.UnknownKey, parse(t.allocator, "[agent]\nllm_retry_unknown=1"));
+    try t.expectError(error.InvalidValue, parse(t.allocator, "[agent]\nllm_resilience_enabled=invalid"));
+    try t.expectError(error.InvalidValue, parse(t.allocator, "[agent]\nllm_retry_on_timeout=invalid"));
+    try t.expectError(error.InvalidValue, parse(t.allocator, "[agent]\nllm_retry_max=-1"));
+    try t.expectError(error.InvalidValue, parse(t.allocator, "[agent]\nllm_retry_backoff_ms=-1"));
+    try t.expectError(error.InvalidValue, parse(t.allocator, "[agent]\nllm_retry_jitter_ms=-1"));
+    try t.expectError(error.InvalidValue, parse(t.allocator, "[agent]\nllm_retry_5xx_max=-1"));
 }
