@@ -3329,6 +3329,21 @@ fn executionNoteMeansFill(note: []const u8) bool {
     return std.mem.startsWith(u8, note, "filled") or std.mem.startsWith(u8, note, "partial");
 }
 
+test "newestFillAgeMs uses the newest fill, not the first (oldest-first window)" {
+    const oldest = ab.clock.parseRfc3339Ms("2026-09-22T00:00:00.000Z") catch unreachable;
+    const newest = ab.clock.parseRfc3339Ms("2026-10-07T12:00:00.000Z") catch unreachable;
+    const now = newest + 3_600_000;
+    const lines = [_][]const u8{
+        "{\"ts\":\"2026-09-22T00:00:00.000Z\",\"side\":\"buy\"}",
+        "{\"ts\":\"2026-10-01T00:00:00.000Z\",\"side\":\"sell\"}",
+        "{\"ts\":\"2026-10-07T12:00:00.000Z\",\"side\":\"buy\"}",
+    };
+    try std.testing.expectEqual(@as(?i64, now - newest), newestFillAgeMs(&lines, now));
+    try std.testing.expect(newestFillAgeMs(&lines, now).? < now - oldest);
+    try std.testing.expectEqual(@as(?i64, null), newestFillAgeMs(&[_][]const u8{}, now));
+    try std.testing.expectEqual(@as(?i64, null), newestFillAgeMs(&lines, newest - 1));
+}
+
 test "executionNoteMeansFill is a positive list" {
     try std.testing.expect(executionNoteMeansFill("filled"));
     try std.testing.expect(executionNoteMeansFill("partial_then_hold"));
@@ -3467,6 +3482,20 @@ fn compactJsonTsMs(line: []const u8) ?i64 {
     const from = start + key.len;
     const end = std.mem.indexOfScalarPos(u8, line, from, '"') orelse return null;
     return ab.clock.parseRfc3339Ms(line[from..end]) catch null;
+}
+
+/// Age of the most recent fill in a compact evidence window.
+/// `FillsRepo.listCompactForContext` returns fills oldest-first, so index 0
+/// is NOT the newest; scan for the max timestamp instead of trusting order.
+fn newestFillAgeMs(lines: []const []const u8, now_ms: i64) ?i64 {
+    var newest: ?i64 = null;
+    for (lines) |line| {
+        const at = compactJsonTsMs(line) orelse continue;
+        if (newest == null or at > newest.?) newest = at;
+    }
+    const ts = newest orelse return null;
+    const age = now_ms - ts;
+    return if (age >= 0) age else null;
 }
 
 /// Field accessor: string value from a parsed JSON object, else null.
@@ -3702,12 +3731,7 @@ fn runAgentDecision(
     var cohort_ts_buf: [32]u8 = undefined;
     const cohort_ts = ab.clock.formatRfc3339Ms(decision_evidence_start_ms, &cohort_ts_buf) catch return .done;
     review_facts.hold_streak = events_repo.noopStreakSince(db, cohort_ts) catch 0;
-    if (fill_n > 0) {
-        if (compactJsonTsMs(recent_fills[0])) |fts| {
-            const age = nowMs() - fts;
-            if (age >= 0) review_facts.ms_since_last_fill = age;
-        }
-    }
+    if (newestFillAgeMs(recent_fills, nowMs())) |age| review_facts.ms_since_last_fill = age;
     // The cumulative benchmark may predate this evidence cohort. Keep it in
     // the audit/dashboard, not as a current-policy result. Periodic reviews
     // compute flow-adjusted comparisons from cohort-local window edges.
