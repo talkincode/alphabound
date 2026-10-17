@@ -4,7 +4,10 @@
 //! attribution, lessons, and *structured* memory operations. No hidden
 //! chain-of-thought — everything here is auditable. Like proposals,
 //! anything malformed voids the whole reflection (fail-closed: no memory
-//! mutation from a bad document).
+//! mutation from a bad document). Over-long *narrative* fields
+//! (expected_outcome, error_type, lessons) are clipped on a UTF-8 boundary
+//! and over-long narrative lists are capped, mirroring periodic review, so a
+//! verbose model does not throw away an otherwise valid reflection.
 
 const std = @import("std");
 const dec = @import("../core/decimal.zig");
@@ -64,7 +67,7 @@ pub fn parse(gpa: std.mem.Allocator, raw: []const u8) ValidationError!Reflection
     if (episode_id.len < 4 or episode_id.len > 64 or !std.mem.startsWith(u8, episode_id, "ep_"))
         return error.EpisodeIdInvalid;
 
-    const expected = try dupString(a, try getString(obj, "expected_outcome"));
+    const expected = try dupString(a, try getNarrative(obj, "expected_outcome"));
 
     const actual_v = obj.get("actual_outcome") orelse return error.MissingField;
     if (actual_v != .object) return error.WrongType;
@@ -192,17 +195,34 @@ fn getString(obj: std.json.ObjectMap, key: []const u8) ValidationError![]const u
     return v.string;
 }
 
+/// Narrative string: type-checked like getString, but clipped to
+/// MAX_STRING_LEN bytes on a UTF-8 boundary instead of rejected.
+fn getNarrative(obj: std.json.ObjectMap, key: []const u8) ValidationError![]const u8 {
+    const v = obj.get(key) orelse return error.MissingField;
+    if (v != .string) return error.WrongType;
+    return utf8Prefix(v.string, MAX_STRING_LEN);
+}
+
+/// Narrative list: extra items beyond MAX_LIST_ITEMS are dropped and each
+/// kept item is clipped (still type-checked), so one verbose field does not
+/// void the whole reflection.
 fn getStringList(a: std.mem.Allocator, obj: std.json.ObjectMap, key: []const u8) ValidationError![][]const u8 {
     const v = obj.get(key) orelse return error.MissingField;
     if (v != .array) return error.WrongType;
-    if (v.array.items.len > MAX_LIST_ITEMS) return error.ListTooLong;
-    var out = a.alloc([]const u8, v.array.items.len) catch return error.OutOfMemory;
-    for (v.array.items, 0..) |item, i| {
+    const n = @min(v.array.items.len, MAX_LIST_ITEMS);
+    var out = a.alloc([]const u8, n) catch return error.OutOfMemory;
+    for (v.array.items[0..n], 0..) |item, i| {
         if (item != .string) return error.WrongType;
-        if (item.string.len > MAX_STRING_LEN) return error.StringTooLong;
-        out[i] = try dupString(a, item.string);
+        out[i] = try dupString(a, utf8Prefix(item.string, MAX_STRING_LEN));
     }
     return out;
+}
+
+fn utf8Prefix(s: []const u8, max_len: usize) []const u8 {
+    if (s.len <= max_len) return s;
+    var end = max_len;
+    while (end > 0 and (s[end] & 0xc0) == 0x80) end -= 1;
+    return s[0..end];
 }
 
 /// Read a JSON number in [0,1] as Decimal.
@@ -313,6 +333,47 @@ test "reflection ops drive the memory store end to end" {
     try testing.expectEqual(mem_store.Status.invalidated, store.find("H03").?.status);
     try testing.expectEqual(mem_store.Status.merged, store.find("H05").?.status);
     try testing.expectEqual(@as(u32, 0), store.find("H22").?.evidence_count); // created fresh
+}
+
+test "oversized narrative strings and lists are clipped, not rejected" {
+    const a = testing.allocator;
+    // 300 CJK characters = 900 bytes, well over MAX_STRING_LEN.
+    var long_cjk: std.ArrayList(u8) = .empty;
+    defer long_cjk.deinit(a);
+    for (0..300) |_| try long_cjk.appendSlice(a, "\u{590d}");
+    var raw: std.ArrayList(u8) = .empty;
+    defer raw.deinit(a);
+    try raw.appendSlice(a, "{\"episode_id\":\"ep_1x\",\"expected_outcome\":\"");
+    try raw.appendSlice(a, long_cjk.items);
+    try raw.appendSlice(a, "\",\"actual_outcome\":{},\"error_type\":[");
+    for (0..MAX_LIST_ITEMS + 4) |i| {
+        if (i > 0) try raw.append(a, ',');
+        try raw.appendSlice(a, "\"e\"");
+    }
+    try raw.appendSlice(a, "],\"lessons\":[\"");
+    try raw.appendSlice(a, long_cjk.items);
+    try raw.appendSlice(a, "\"],\"memory_ops\":[]}");
+
+    var r = try parse(a, raw.items);
+    defer r.deinit();
+    try testing.expect(r.expected_outcome.len <= MAX_STRING_LEN);
+    try testing.expect(r.expected_outcome.len > 0);
+    try testing.expect(std.unicode.utf8ValidateSlice(r.expected_outcome));
+    try testing.expectEqual(@as(usize, MAX_LIST_ITEMS), r.error_types.len);
+    try testing.expectEqual(@as(usize, 1), r.lessons.len);
+    try testing.expect(r.lessons[0].len <= MAX_STRING_LEN);
+    try testing.expect(std.unicode.utf8ValidateSlice(r.lessons[0]));
+}
+
+test "narrative clipping keeps type and identifier checks fatal" {
+    try testing.expectError(error.WrongType, parse(testing.allocator,
+        \\{"episode_id":"ep_1x","expected_outcome":"e","actual_outcome":{},
+        \\ "error_type":[1],"lessons":[],"memory_ops":[]}
+    ));
+    try testing.expectError(error.WrongType, parse(testing.allocator,
+        \\{"episode_id":"ep_1x","expected_outcome":7,"actual_outcome":{},
+        \\ "error_type":[],"lessons":[],"memory_ops":[]}
+    ));
 }
 
 test "malformed reflections are rejected fail-closed" {
