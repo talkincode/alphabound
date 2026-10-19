@@ -48,6 +48,7 @@ cd alphabound
 zig version                    # 应为 0.16.0
 zig build
 zig build test --summary all
+node scripts/test-dashboard-review.js   # 复盘图纯逻辑测试（CI dashboard job）
 
 # 配置自检（TOML / DB 路径 / Web 绑定）
 ./zig-out/bin/alphabound --config config/alphabound.toml --self-check

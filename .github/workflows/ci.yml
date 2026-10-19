@@ -81,3 +81,13 @@ jobs:
           npm test
           node src/index.js --help
           node src/index.js install --print --source npm --client copilot
+
+  dashboard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Review chart logic tests
+        run: node scripts/test-dashboard-review.js

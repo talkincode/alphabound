@@ -2949,6 +2949,67 @@ let rvMa5 = null, rvMa20 = null, rvEma20 = null, rvBollUp = null, rvBollMid = nu
 let rvRsi = null, rvMacdHist = null, rvMacdLine = null, rvMacdSignal = null;
 let rvLastSig = "";
 const RV_BAR_SEC = { "1m": 60, "5m": 300, "15m": 900, "1H": 3600, "4H": 14400, "1D": 86400 };
+let rvNeedFit = true;   // 首帧 / 切周期 / 该周期数据首次到达时重置默认窗口
+let rvCenterKey = "";   // 选中决策后把可视范围居中到该 K 线
+let rvPrevBars = 0;     // 上次写入的根数，用于贴右边缘时随新增 K 线跟随
+
+/* REVIEW-CHART-LOGIC-BEGIN */
+// Pure viewport/snapping logic; scripts/test-dashboard-review.js extracts this block.
+const RV_DEFAULT_VISIBLE_BARS = 100; // 各周期统一默认窗口；数据不足时显示全部
+const RV_RIGHT_OFFSET = 2;
+
+/** 最后一根 time <= t 的下标（二分），无则 -1。 */
+function lastBarIndex(times, t) {
+  if (!times.length || t == null || !isFinite(t)) return -1;
+  let lo = 0, hi = times.length - 1, best = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (times[mid] <= t) { best = mid; lo = mid + 1; } else { hi = mid - 1; }
+  }
+  return best;
+}
+
+/**
+ * 决策时间对应的 K 线：返回满足 times[i] <= tsSec < times[i] + barSec 的最后一根时间。
+ * 早于首根或落在缺口（无该分钟 K 线）返回 null；不假设周期起点对齐（1D 为 UTC+8 开盘）。
+ */
+function snapBar(times, tsSec, barSec) {
+  const i = lastBarIndex(times, tsSec);
+  if (i < 0 || !(barSec > 0)) return null;
+  return tsSec < times[i] + barSec ? times[i] : null;
+}
+
+/**
+ * 计算下一次可视范围（纯函数，不触碰图表对象）。
+ * - needFit / 无上次范围：默认窗口约 100 根（数据不足显示全部），右侧留 RV_RIGHT_OFFSET。
+ * - 否则保留上次范围；用户原本贴右边缘时，随新增 K 线整体右移。
+ * - centerTime 存在且不在范围内时，把该 K 线居中。
+ */
+function computeReviewViewport(n, times, prevRange, prevBars, needFit, centerTime) {
+  let defaulted = false;
+  let range;
+  if (needFit || !prevRange) {
+    defaulted = true;
+    const from = Math.max(0, n - RV_DEFAULT_VISIBLE_BARS);
+    range = { from: from, to: n + RV_RIGHT_OFFSET };
+  } else {
+    range = { from: prevRange.from, to: prevRange.to };
+    const appended = n - prevBars;
+    if (appended > 0 && prevBars > 0 && prevRange.to >= prevBars - 1) {
+      range = { from: range.from + appended, to: range.to + appended };
+    }
+  }
+  if (centerTime != null) {
+    const idx = lastBarIndex(times || [], centerTime);
+    if (idx >= 0 && !(idx >= range.from && idx <= range.to)) {
+      const span = Math.max(10, range.to - range.from);
+      const from = idx - span / 2;
+      range = { from: from, to: from + span };
+    }
+  }
+  return { range: range, needFit: defaulted ? false : needFit, defaulted: defaulted };
+}
+/* REVIEW-CHART-LOGIC-END */
 
 // --- indicator math (close-based) ---
 function indSma(vals, n) {
@@ -3054,7 +3115,7 @@ function ensureReviewChart() {
   reviewChart.priceScale("rvsub").applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
   reviewChart.priceScale("right").applyOptions({ scaleMargins: { top: 0.06, bottom: 0.24 } });
   reviewChart.applyOptions({ width: el.clientWidth || el.offsetWidth || 800 });
-  reviewChart.timeScale().applyOptions({ rightOffset: 2, lockVisibleTimeRangeOnResize: true });
+  reviewChart.timeScale().applyOptions({ rightOffset: RV_RIGHT_OFFSET, lockVisibleTimeRangeOnResize: true });
   bindChartResize(reviewChart, el);
   reviewChart.subscribeClick(onReviewChartClick);
   linkAbReviewTimeScale();
@@ -3095,6 +3156,7 @@ function updateReviewChart() {
   const list = bundle.candles || [];
   const barLabel = BAR_LABEL[rvBar] || rvBar;
   if (!list.length) {
+    rvNeedFit = true; // 数据到达后按默认窗口定位
     if (meta) meta.innerHTML = "<span>" + inst + " · " + barLabel + "</span><span class=\"muted\">暂无行情数据</span>";
     return;
   }
@@ -3117,12 +3179,11 @@ function updateReviewChart() {
       dedupV[dedupV.length - 1] = vols[i];
     } else { dedup.push(rows[i]); dedupV.push(vols[i]); }
   }
-  if (!dedup.length) return;
+  if (!dedup.length) { rvNeedFit = true; return; }
 
   const times = dedup.map(r => r.time);
   const closes = dedup.map(r => r.close);
   const barSec = RV_BAR_SEC[rvBar] || 900;
-  const timeSet = new Set(times);
 
   // markers from decisions (snap to bar bucket; keep only on-chart ones)
   const decs = reviewDecisionList();
@@ -3134,11 +3195,7 @@ function updateReviewChart() {
     const key = reviewKeyOf(e);
     const tsSec = toUnixSec(e.ts);
     const target = p.target_btc_weight != null ? parseFloat(p.target_btc_weight) : null;
-    let snap = null;
-    if (tsSec != null) {
-      const bucket = Math.floor(tsSec / barSec) * barSec;
-      if (timeSet.has(bucket)) snap = bucket;
-    }
+    const snap = tsSec != null ? snapBar(times, tsSec, barSec) : null;
     const isSel = key === rvSelectedKey;
     if (snap != null) {
       onChart++;
@@ -3168,11 +3225,28 @@ function updateReviewChart() {
   }
   markers.sort((a, b) => a.time - b.time);
 
-  const sig = rvBar + "|" + rvSub + "|" + JSON.stringify(Object.entries(rvInd)) + "|" +
-    (dedup.length ? dedup[dedup.length - 1].time + ":" + dedup[dedup.length - 1].close : "") + "|" +
-    dedup.length + "|" + markers.map(m => m.id + m.size).join(",");
+  // 选中决策的落点：数据写入后若不在可视范围内则居中到该 K 线。
+  const centerKey = rvCenterKey;
+  rvCenterKey = "";
+  let centerTime = null;
+  if (centerKey) {
+    const sel = reviewFindByKey(centerKey);
+    const selTs = sel ? toUnixSec(sel.ts) : null;
+    if (selTs != null) centerTime = snapBar(times, selTs, barSec);
+  }
+
+  // 结构签名（周期/子图/指标/根数与首根时间/markers）与最新 K 线分开：只有最新 K 线变化时也走原有重绘，
+  // 但可视范围由 rvNeedFit 与上一次范围决定，轮询不再重置。
+  const structSig = rvBar + "|" + rvSub + "|" + JSON.stringify(Object.entries(rvInd)) + "|" +
+    (dedup.length ? dedup[0].time : "") + "|" + dedup.length + "|" +
+    markers.map(m => m.id + m.size).join(",");
+  const lastCandleSig = dedup[dedup.length - 1].time + ":" + dedup[dedup.length - 1].close;
+  const sig = structSig + "|" + lastCandleSig;
   if (sig !== rvLastSig) {
     rvLastSig = sig;
+    const scale = reviewChart.timeScale();
+    const prevRange = scale.getVisibleLogicalRange();
+    const prevBars = rvPrevBars;
     rvCandleSeries.setData(dedup);
     rvMa5.setData(rvInd.ma5 ? toLineData(times, indSma(closes, 5)) : []);
     rvMa20.setData(rvInd.ma20 ? toLineData(times, indSma(closes, 20)) : []);
@@ -3199,7 +3273,8 @@ function updateReviewChart() {
       rvMacdHist.setData([]); rvMacdLine.setData([]); rvMacdSignal.setData([]);
     }
     rvCandleSeries.setMarkers(markers);
-    reviewChart.timeScale().fitContent();
+    rvPrevBars = dedup.length;
+    applyReviewViewport(scale, dedup.length, times, prevRange, prevBars, centerTime);
   }
   rvTimes = times;
   if (abChart && abTimes.length) requestAnimationFrame(syncAbFromReview);
@@ -3208,9 +3283,27 @@ function updateReviewChart() {
     const last = dedup[dedup.length - 1].close;
     let note = "提案标记 " + onChart + "/" + decs.length;
     if (rvSelectedKey && !markers.some(m => m.id === rvSelectedKey)) {
-      note += " · <span class=\"warn\">所选决策超出当前周期范围，试试更大周期</span>";
+      const sel = reviewFindByKey(rvSelectedKey);
+      const selTs = sel ? toUnixSec(sel.ts) : null;
+      note += (selTs != null && times.length && selTs < times[0])
+        ? " · <span class=\"warn\">所选决策早于首根 K 线（数据窗口不足）</span>"
+        : " · <span class=\"warn\">当前周期无对应 K 线</span>";
     }
     meta.innerHTML = "<span><b>" + inst + "</b> · " + barLabel + " · 最新 <b>" + last + "</b></span><span>" + note + "</span>";
+  }
+}
+
+/**
+ * 应用可视范围：只有 rvNeedFit（首帧/切周期/该周期数据首次到达）才设默认窗口（约 100 根，数据不足则全部）；
+ * 其余情况保留用户当前的缩放与拖动，贴右边缘时随新增 K 线整体右移。
+ */
+function applyReviewViewport(ts, n, times, prevRange, prevBars, centerTime) {
+  const plan = computeReviewViewport(n, times, prevRange, prevBars, rvNeedFit, centerTime);
+  rvNeedFit = plan.needFit;
+  try {
+    ts.setVisibleLogicalRange(plan.range);
+  } catch (_) {
+    if (plan.defaulted) ts.fitContent();
   }
 }
 
@@ -3234,6 +3327,7 @@ function onReviewChartClick(param) {
 function selectReviewDecision(key) {
   if (!key || key === rvSelectedKey) return;
   rvSelectedKey = key;
+  rvCenterKey = key; // 该 K 线不在可视范围内时居中
   rvChatPendingSince = 0;
   rvLastSig = ""; // marker highlight redraw
   renderReviewSelection();
@@ -3615,16 +3709,11 @@ function applySnappedRange(chart, times, range) {
 function linkAbReviewTimeScale() {
   if (abRangeLinked || !reviewChart || !abChart) return;
   abRangeLinked = true;
+  // 单向：K 线 → AB 因子图。AB 图自身拖动不回写 K 线（否则会把 K 线钳到 AB 的 48h 覆盖范围）。
   reviewChart.timeScale().subscribeVisibleTimeRangeChange(r => {
     if (abSyncing || !r) return;
     abSyncing = true;
     applySnappedRange(abChart, abTimes, r);
-    abSyncing = false;
-  });
-  abChart.timeScale().subscribeVisibleTimeRangeChange(r => {
-    if (abSyncing || !r) return;
-    abSyncing = true;
-    applySnappedRange(reviewChart, rvTimes, r);
     abSyncing = false;
   });
 }
@@ -3749,6 +3838,7 @@ document.querySelectorAll("#rv_bar_filters button[data-bar]").forEach(btn => {
     rvBar = btn.getAttribute("data-bar") || "15m";
     try { localStorage.setItem("ab_rv_bar", rvBar); } catch (_) {}
     document.querySelectorAll("#rv_bar_filters button").forEach(b => b.classList.toggle("active", b === btn));
+    rvNeedFit = true; // 只有切换周期才重新定位
     rvLastSig = "";
     updateReviewChart();
   });
