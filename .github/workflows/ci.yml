@@ -2,22 +2,85 @@ name: CI
 
 on:
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
-      - name: Preserve PR status (tests run locally)
-        run: echo "Run zig build and zig build test locally; this check is status-only."
+      - uses: actions/checkout@v4
+
+      # Pinned to build.zig.zon minimum_zig_version. setup-zig caches the
+      # toolchain and the Zig global cache (keyed per job) automatically.
+      - name: Install Zig (pinned)
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Version check
+        run: zig version
+
+      - name: Build
+        run: zig build --summary all
+
+      - name: Unit tests
+        run: zig build test --summary all
+
+      - name: Self-check smoke test (shadow, no network, no orders)
+        run: |
+          cat > /tmp/ci.toml <<'TOML'
+          [app]
+          environment = "development"
+          instance_id = "ci"
+
+          [exchange]
+          provider = "okx"
+          instrument = "BTC-USDT"
+          mode = "shadow"
+
+          [risk]
+          max_drawdown = 0.10
+          valuation = "conservative_liquidation"
+          allow_runtime_override = false
+
+          [storage]
+          path = "/tmp/ci-trading.db"
+          wal = true
+
+          [web]
+          bind = "127.0.0.1:8080"
+          TOML
+          ./zig-out/bin/alphabound --config /tmp/ci.toml --self-check
 
   mcp:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: tools/alphabound-mcp
     steps:
-      - name: Preserve PR status (tests run locally)
-        run: echo "Run npm test in tools/alphabound-mcp locally; this check is status-only."
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: tools/alphabound-mcp/package-lock.json
+
+      - name: Install and test MCP CLI
+        run: |
+          npm ci
+          npm test
+          node src/index.js --help
+          node src/index.js install --print --source npm --client copilot
 
   dashboard:
     runs-on: ubuntu-latest
