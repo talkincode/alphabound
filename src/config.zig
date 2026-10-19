@@ -73,7 +73,29 @@ pub const Config = struct {
     /// OpenAI-compatible API root (no trailing slash), e.g. https://api.openai.com/v1
     /// Overridable by LLM_API_URL / OPENAI_BASE_URL env.
     agent_base_url: []const u8 = "https://api.openai.com/v1",
+    circuit_breaker_enabled: bool = false,
+    circuit_breaker_mode: @import("agent/circuit_breaker.zig").Mode = .observe,
+    circuit_breaker_failures: u32 = 3,
+    circuit_breaker_open_ms: u32 = 720_000,
+    circuit_breaker_half_open_probes: u32 = 1,
     decision_timeout_ms: u32 = 120_000,
+    /// 0 disables the TCP/TLS connect + request-write deadline.
+    connect_timeout_ms: u32 = 0,
+    /// 0 uses the call budget; otherwise caps each LLM attempt.
+    request_timeout_ms: u32 = 0,
+    llm_resilience_enabled: bool = false,
+    llm_retry_on_timeout: bool = true,
+    llm_retry_max: u32 = 1,
+    llm_retry_backoff_ms: u32 = 500,
+    llm_retry_jitter_ms: u32 = 250,
+    llm_retry_5xx_max: u32 = 2,
+    llm_alert_enabled: bool = false,
+    llm_alert_streak: u32 = 2,
+    llm_alert_window_ms: u32 = 1_800_000,
+    llm_alert_window_count: u32 = 3,
+    llm_stale_ms: u32 = 1_800_000,
+    alert_webhook_enabled: bool = false,
+    alert_webhook_timeout_ms: u32 = 5_000,
     /// A proposal is void when admission/execution happens later than this
     /// after the decision snapshot, or when price/book/risk state moved
     /// materially (see agent/validity.zig); the decision is then redone.
@@ -151,7 +173,11 @@ pub const Config = struct {
     /// every Nth consecutive no-op and whenever position/cash tension is set,
     /// so a long HOLD streak is examined instead of merely counted. 0 = never.
     agent_llm_reflection_hold_every: u32 = 6,
+    /// Opt-in error ledger and typed failure event fields.
+    llm_error_persist_enabled: bool = false,
     // [storage]
+    /// Zero leaves retention unchanged; positive values age only llm_errors.
+    llm_error_retain_days: u32 = 0,
     db_path: []const u8 = "trading.db",
     wal: bool = true,
     // [web]
@@ -162,6 +188,39 @@ pub const Config = struct {
     config_hash: [71]u8 = undefined,
 
     arena: std.heap.ArenaAllocator,
+
+    pub fn validateLlmTimeouts(self: *const Config) ConfigError!void {
+        if (self.connect_timeout_ms > 0 and self.connect_timeout_ms >= self.decision_timeout_ms)
+            return error.InvalidValue;
+    }
+
+    /// Apply optional environment overrides atomically, then revalidate.
+    pub fn applyLlmTimeoutOverrides(self: *Config, connect: ?[]const u8, request: ?[]const u8) ConfigError!void {
+        var candidate = self.*;
+        if (connect) |v| candidate.connect_timeout_ms = std.fmt.parseInt(u32, v, 10) catch return error.InvalidValue;
+        if (request) |v| candidate.request_timeout_ms = std.fmt.parseInt(u32, v, 10) catch return error.InvalidValue;
+        try candidate.validateLlmTimeouts();
+        self.connect_timeout_ms = candidate.connect_timeout_ms;
+        self.request_timeout_ms = candidate.request_timeout_ms;
+    }
+
+    /// Optional environment values in the same order as the documented retry keys.
+    /// Parse all values before applying any of them.
+    pub fn applyLlmRetryOverrides(self: *Config, values: [6]?[]const u8) ConfigError!void {
+        var candidate = self.*;
+        if (values[0]) |v| candidate.llm_resilience_enabled = try parseBool(v);
+        if (values[1]) |v| candidate.llm_retry_on_timeout = try parseBool(v);
+        if (values[2]) |v| candidate.llm_retry_max = std.fmt.parseInt(u32, v, 10) catch return error.InvalidValue;
+        if (values[3]) |v| candidate.llm_retry_backoff_ms = std.fmt.parseInt(u32, v, 10) catch return error.InvalidValue;
+        if (values[4]) |v| candidate.llm_retry_jitter_ms = std.fmt.parseInt(u32, v, 10) catch return error.InvalidValue;
+        if (values[5]) |v| candidate.llm_retry_5xx_max = std.fmt.parseInt(u32, v, 10) catch return error.InvalidValue;
+        self.llm_resilience_enabled = candidate.llm_resilience_enabled;
+        self.llm_retry_on_timeout = candidate.llm_retry_on_timeout;
+        self.llm_retry_max = candidate.llm_retry_max;
+        self.llm_retry_backoff_ms = candidate.llm_retry_backoff_ms;
+        self.llm_retry_jitter_ms = candidate.llm_retry_jitter_ms;
+        self.llm_retry_5xx_max = candidate.llm_retry_5xx_max;
+    }
 
     pub fn deinit(self: *Config) void {
         self.arena.deinit();
@@ -246,6 +305,7 @@ pub fn parse(gpa: std.mem.Allocator, text: []const u8) ConfigError!Config {
     // Cross-field validation belongs after parsing: key order is immaterial.
     if (!cfg.volatility_enter.isZero() and
         !cfg.volatility_exit.lt(cfg.volatility_enter)) return error.InvalidValue;
+    try cfg.validateLlmTimeouts();
     cfg.arena = arena; // final arena state, after all allocations
     return cfg;
 }
@@ -254,6 +314,23 @@ pub fn loadFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !Config {
     const text = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(256 * 1024));
     defer gpa.free(text);
     return try parse(gpa, text);
+}
+
+fn parseBreakerMode(val: []const u8) ConfigError!@import("agent/circuit_breaker.zig").Mode {
+    return std.meta.stringToEnum(@import("agent/circuit_breaker.zig").Mode, val) orelse error.InvalidValue;
+}
+
+fn parsePositiveU32(val: []const u8) ConfigError!u32 {
+    const n = parseInt(u32, val) catch return error.InvalidValue;
+    return if (n > 0) n else error.InvalidValue;
+}
+
+/// Only proposal availability settings; invalid overrides fail boot closed.
+pub fn applyCircuitBreakerEnv(cfg: *Config, env: *const std.process.Environ.Map) ConfigError!void {
+    if (env.get("LLM_CIRCUIT_BREAKER_ENABLED")) |v| cfg.circuit_breaker_enabled = try parseBool(v);
+    if (env.get("LLM_CB_MODE")) |v| cfg.circuit_breaker_mode = try parseBreakerMode(v);
+    if (env.get("LLM_CB_FAILURES")) |v| cfg.circuit_breaker_failures = try parsePositiveU32(v);
+    if (env.get("LLM_CB_OPEN_MS")) |v| cfg.circuit_breaker_open_ms = try parsePositiveU32(v);
 }
 
 fn computeHash(text: []const u8, out: *[71]u8) void {
@@ -342,14 +419,61 @@ fn applyKey(a: std.mem.Allocator, cfg: *Config, section: []const u8, key: []cons
             cfg.params_allow_unbacked_apply = try parseBool(val);
         } else return error.UnknownKey;
     } else if (std.mem.eql(u8, section, "agent")) {
-        if (std.mem.eql(u8, key, "provider")) {
+        if (std.mem.eql(u8, key, "llm_error_persist_enabled")) {
+            cfg.llm_error_persist_enabled = try parseBool(val);
+        } else if (std.mem.eql(u8, key, "provider")) {
             cfg.agent_provider = try parseString(a, val);
         } else if (std.mem.eql(u8, key, "model")) {
             cfg.agent_model = try parseString(a, val);
         } else if (std.mem.eql(u8, key, "base_url")) {
             cfg.agent_base_url = try parseString(a, val);
+        } else if (std.mem.eql(u8, key, "circuit_breaker_enabled")) {
+            cfg.circuit_breaker_enabled = try parseBool(val);
+        } else if (std.mem.eql(u8, key, "circuit_breaker_mode")) {
+            cfg.circuit_breaker_mode = try parseBreakerMode(try parseString(a, val));
+        } else if (std.mem.eql(u8, key, "circuit_breaker_failures")) {
+            cfg.circuit_breaker_failures = try parsePositiveU32(val);
+        } else if (std.mem.eql(u8, key, "circuit_breaker_open_ms")) {
+            cfg.circuit_breaker_open_ms = try parsePositiveU32(val);
+        } else if (std.mem.eql(u8, key, "circuit_breaker_half_open_probes")) {
+            cfg.circuit_breaker_half_open_probes = try parsePositiveU32(val);
+        } else if (std.mem.eql(u8, key, "llm_alert_enabled")) {
+            cfg.llm_alert_enabled = try parseBool(val);
+        } else if (std.mem.eql(u8, key, "llm_alert_streak")) {
+            cfg.llm_alert_streak = parseInt(u32, val) catch return error.InvalidValue;
+            if (cfg.llm_alert_streak == 0) return error.InvalidValue;
+        } else if (std.mem.eql(u8, key, "llm_alert_window_ms")) {
+            cfg.llm_alert_window_ms = parseInt(u32, val) catch return error.InvalidValue;
+            if (cfg.llm_alert_window_ms == 0) return error.InvalidValue;
+        } else if (std.mem.eql(u8, key, "llm_alert_window_count")) {
+            cfg.llm_alert_window_count = parseInt(u32, val) catch return error.InvalidValue;
+            if (cfg.llm_alert_window_count == 0) return error.InvalidValue;
+        } else if (std.mem.eql(u8, key, "llm_stale_ms")) {
+            cfg.llm_stale_ms = parseInt(u32, val) catch return error.InvalidValue;
+            if (cfg.llm_stale_ms == 0) return error.InvalidValue;
+        } else if (std.mem.eql(u8, key, "alert_webhook_enabled")) {
+            cfg.alert_webhook_enabled = try parseBool(val);
+        } else if (std.mem.eql(u8, key, "alert_webhook_timeout_ms")) {
+            cfg.alert_webhook_timeout_ms = parseInt(u32, val) catch return error.InvalidValue;
+            if (cfg.alert_webhook_timeout_ms == 0) return error.InvalidValue;
         } else if (std.mem.eql(u8, key, "decision_timeout_ms")) {
             cfg.decision_timeout_ms = parseInt(u32, val) catch return error.InvalidValue;
+        } else if (std.mem.eql(u8, key, "connect_timeout_ms")) {
+            cfg.connect_timeout_ms = parseInt(u32, val) catch return error.InvalidValue;
+        } else if (std.mem.eql(u8, key, "request_timeout_ms")) {
+            cfg.request_timeout_ms = parseInt(u32, val) catch return error.InvalidValue;
+        } else if (std.mem.eql(u8, key, "llm_resilience_enabled")) {
+            cfg.llm_resilience_enabled = try parseBool(val);
+        } else if (std.mem.eql(u8, key, "llm_retry_on_timeout")) {
+            cfg.llm_retry_on_timeout = try parseBool(val);
+        } else if (std.mem.eql(u8, key, "llm_retry_max")) {
+            cfg.llm_retry_max = parseInt(u32, val) catch return error.InvalidValue;
+        } else if (std.mem.eql(u8, key, "llm_retry_backoff_ms")) {
+            cfg.llm_retry_backoff_ms = parseInt(u32, val) catch return error.InvalidValue;
+        } else if (std.mem.eql(u8, key, "llm_retry_jitter_ms")) {
+            cfg.llm_retry_jitter_ms = parseInt(u32, val) catch return error.InvalidValue;
+        } else if (std.mem.eql(u8, key, "llm_retry_5xx_max")) {
+            cfg.llm_retry_5xx_max = parseInt(u32, val) catch return error.InvalidValue;
         } else if (std.mem.eql(u8, key, "proposal_max_age_ms")) {
             cfg.proposal_max_age_ms = parseInt(u32, val) catch return error.InvalidValue;
             if (cfg.proposal_max_age_ms == 0) return error.InvalidValue;
@@ -418,6 +542,8 @@ fn applyKey(a: std.mem.Allocator, cfg: *Config, section: []const u8, key: []cons
             cfg.db_path = try parseString(a, val);
         } else if (std.mem.eql(u8, key, "wal")) {
             cfg.wal = try parseBool(val);
+        } else if (std.mem.eql(u8, key, "llm_error_retain_days")) {
+            cfg.llm_error_retain_days = parseInt(u32, val) catch return error.InvalidValue;
         } else return error.UnknownKey;
     } else if (std.mem.eql(u8, section, "web")) {
         if (std.mem.eql(u8, key, "bind")) {
@@ -792,4 +918,172 @@ test "proposal validity keys parse, default conservatively and reject nonsense" 
     try testing.expectError(error.InvalidValue, parse(testing.allocator, "[agent]\nproposal_max_age_ms = 0\n"));
     try testing.expectError(error.InvalidValue, parse(testing.allocator, "[agent]\nproposal_max_price_drift = 1\n"));
     try testing.expectError(error.InvalidValue, parse(testing.allocator, "[agent]\nproposal_max_book_drift = 0\n"));
+}
+
+test "LLM timeout defaults, whitelist, validation and environment overrides" {
+    const t = std.testing;
+    var defaults = try parse(t.allocator, "");
+    defer defaults.deinit();
+    try t.expectEqual(@as(u32, 0), defaults.connect_timeout_ms);
+    try t.expectEqual(@as(u32, 0), defaults.request_timeout_ms);
+    var cfg = try parse(t.allocator, "[agent]\nconnect_timeout_ms=200\nrequest_timeout_ms=500\ndecision_timeout_ms=1000");
+    defer cfg.deinit();
+    try t.expectEqual(@as(u32, 200), cfg.connect_timeout_ms);
+    try t.expectEqual(@as(u32, 500), cfg.request_timeout_ms);
+    try cfg.applyLlmTimeoutOverrides("100", "400");
+    try t.expectEqual(@as(u32, 100), cfg.connect_timeout_ms);
+    try t.expectEqual(@as(u32, 400), cfg.request_timeout_ms);
+    try cfg.applyLlmTimeoutOverrides(null, null);
+    try t.expectError(error.InvalidValue, cfg.applyLlmTimeoutOverrides("1000", "300"));
+    try t.expectEqual(@as(u32, 400), cfg.request_timeout_ms);
+    for ([_][]const u8{ "-1", "4294967296", "bad", "" }) |bad| {
+        try t.expectError(error.InvalidValue, cfg.applyLlmTimeoutOverrides(bad, null));
+        try t.expectError(error.InvalidValue, cfg.applyLlmTimeoutOverrides(null, bad));
+    }
+    try cfg.applyLlmTimeoutOverrides("0", "0");
+    try t.expectEqual(@as(u32, 0), cfg.connect_timeout_ms);
+    try t.expectEqual(@as(u32, 0), cfg.request_timeout_ms);
+    try t.expectError(error.InvalidValue, parse(t.allocator, "[agent]\ndecision_timeout_ms=200\nconnect_timeout_ms=200"));
+    try t.expectError(error.InvalidValue, parse(t.allocator, "[agent]\nconnect_timeout_ms=201\ndecision_timeout_ms=200"));
+    try t.expectError(error.InvalidValue, parse(t.allocator, "[agent]\nconnect_timeout_ms=-1"));
+    try t.expectError(error.InvalidValue, parse(t.allocator, "[agent]\nrequest_timeout_ms=bad"));
+    try t.expectError(error.UnknownKey, parse(t.allocator, "[agent]\nconnect_timout_ms=200"));
+}
+
+test "LLM retry keys are whitelisted and preserve defaults" {
+    const t = std.testing;
+    var defaults = try parse(t.allocator, "");
+    defer defaults.deinit();
+    try t.expectEqual(@as(bool, false), defaults.llm_resilience_enabled);
+    try t.expectEqual(@as(bool, true), defaults.llm_retry_on_timeout);
+    try t.expectEqual(@as(u32, 1), defaults.llm_retry_max);
+    try t.expectEqual(@as(u32, 500), defaults.llm_retry_backoff_ms);
+    try t.expectEqual(@as(u32, 250), defaults.llm_retry_jitter_ms);
+    try t.expectEqual(@as(u32, 2), defaults.llm_retry_5xx_max);
+    var cfg = try parse(t.allocator, "[agent]\nllm_resilience_enabled=true\nllm_retry_on_timeout=false\nllm_retry_max=3\nllm_retry_backoff_ms=10\nllm_retry_jitter_ms=20\nllm_retry_5xx_max=4");
+    defer cfg.deinit();
+    try t.expect(cfg.llm_resilience_enabled);
+    try t.expect(!cfg.llm_retry_on_timeout);
+    try t.expectEqual(@as(u32, 3), cfg.llm_retry_max);
+    try t.expectEqual(@as(u32, 10), cfg.llm_retry_backoff_ms);
+    try t.expectEqual(@as(u32, 20), cfg.llm_retry_jitter_ms);
+    try t.expectEqual(@as(u32, 4), cfg.llm_retry_5xx_max);
+    try cfg.applyLlmRetryOverrides(.{ "false", "true", "1", "500", "250", "2" });
+    try t.expectEqual(@as(bool, false), cfg.llm_resilience_enabled);
+    try t.expectEqual(@as(bool, true), cfg.llm_retry_on_timeout);
+    try t.expectEqual(@as(u32, 1), cfg.llm_retry_max);
+    try t.expectEqual(@as(u32, 500), cfg.llm_retry_backoff_ms);
+    try t.expectEqual(@as(u32, 250), cfg.llm_retry_jitter_ms);
+    try t.expectEqual(@as(u32, 2), cfg.llm_retry_5xx_max);
+    try t.expectError(error.InvalidValue, cfg.applyLlmRetryOverrides(.{ "true", null, "-1", null, null, null }));
+    try t.expect(!cfg.llm_resilience_enabled);
+    try t.expectError(error.InvalidValue, cfg.applyLlmRetryOverrides(.{ "invalid", null, null, null, null, null }));
+    try t.expectError(error.UnknownKey, parse(t.allocator, "[agent]\nllm_retry_unknown=1"));
+    try t.expectError(error.InvalidValue, parse(t.allocator, "[agent]\nllm_resilience_enabled=invalid"));
+    try t.expectError(error.InvalidValue, parse(t.allocator, "[agent]\nllm_retry_on_timeout=invalid"));
+    try t.expectError(error.InvalidValue, parse(t.allocator, "[agent]\nllm_retry_max=-1"));
+    try t.expectError(error.InvalidValue, parse(t.allocator, "[agent]\nllm_retry_backoff_ms=-1"));
+    try t.expectError(error.InvalidValue, parse(t.allocator, "[agent]\nllm_retry_jitter_ms=-1"));
+    try t.expectError(error.InvalidValue, parse(t.allocator, "[agent]\nllm_retry_5xx_max=-1"));
+}
+
+test "LLM error switches default off and remain whitelisted" {
+    var defaults = try parse(testing.allocator, "");
+    defer defaults.deinit();
+    try testing.expect(!defaults.llm_error_persist_enabled);
+    try testing.expectEqual(@as(u32, 0), defaults.llm_error_retain_days);
+    var enabled = try parse(testing.allocator, "[agent]\nllm_error_persist_enabled = true\n[storage]\nllm_error_retain_days = 180\n");
+    defer enabled.deinit();
+    try testing.expect(enabled.llm_error_persist_enabled);
+    try testing.expectEqual(@as(u32, 180), enabled.llm_error_retain_days);
+    try testing.expectError(error.InvalidValue, parse(testing.allocator, "[storage]\nllm_error_retain_days = -1\n"));
+    try testing.expectError(error.InvalidValue, parse(testing.allocator, "[agent]\nllm_error_persist_enabled = 1\n"));
+    try testing.expectError(error.UnknownKey, parse(testing.allocator, "[agent]\nllm_errors_enabled = true\n"));
+    try testing.expectError(error.UnknownKey, parse(testing.allocator, "[storage]\nllm_errors_retain_days = 180\n"));
+}
+
+test "circuit breaker defaults, whitelist, validation and env overrides" {
+    var defaults = try parse(testing.allocator, "");
+    defer defaults.deinit();
+    try testing.expect(!defaults.circuit_breaker_enabled);
+    try testing.expectEqual(.observe, defaults.circuit_breaker_mode);
+    try testing.expectEqual(@as(u32, 3), defaults.circuit_breaker_failures);
+    try testing.expectEqual(@as(u32, 720_000), defaults.circuit_breaker_open_ms);
+    try testing.expectEqual(@as(u32, 1), defaults.circuit_breaker_half_open_probes);
+    var cfg = try parse(testing.allocator,
+        \\[agent]
+        \\circuit_breaker_enabled = true
+        \\circuit_breaker_mode = "enforce"
+        \\circuit_breaker_failures = 4
+        \\circuit_breaker_open_ms = 1000
+        \\circuit_breaker_half_open_probes = 2
+    );
+    defer cfg.deinit();
+    try testing.expect(cfg.circuit_breaker_enabled);
+    try testing.expectEqual(.enforce, cfg.circuit_breaker_mode);
+    try testing.expectEqual(@as(u32, 4), cfg.circuit_breaker_failures);
+    try testing.expectEqual(@as(u32, 1000), cfg.circuit_breaker_open_ms);
+    try testing.expectEqual(@as(u32, 2), cfg.circuit_breaker_half_open_probes);
+    inline for (.{ "circuit_breaker_failures", "circuit_breaker_open_ms", "circuit_breaker_half_open_probes" }) |key| {
+        inline for (.{ "0", "-1", "4294967296", "no" }) |v| {
+            try testing.expectError(error.InvalidValue, parse(testing.allocator, "[agent]\n" ++ key ++ " = " ++ v));
+        }
+    }
+    try testing.expectError(error.InvalidValue, parse(testing.allocator, "[agent]\ncircuit_breaker_mode = \"other\""));
+    try testing.expectError(error.InvalidValue, parse(testing.allocator, "[agent]\ncircuit_breaker_enabled = 1"));
+    try testing.expectError(error.UnknownKey, parse(testing.allocator, "[agent]\ncircuit_breaker_typo = true"));
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try applyCircuitBreakerEnv(&cfg, &env);
+    try testing.expect(cfg.circuit_breaker_enabled);
+    try env.put("LLM_CIRCUIT_BREAKER_ENABLED", "false");
+    try env.put("LLM_CB_MODE", "observe");
+    try env.put("LLM_CB_FAILURES", "5");
+    try env.put("LLM_CB_OPEN_MS", "2000");
+    try applyCircuitBreakerEnv(&cfg, &env);
+    try testing.expect(!cfg.circuit_breaker_enabled);
+    try testing.expectEqual(.observe, cfg.circuit_breaker_mode);
+    try testing.expectEqual(@as(u32, 5), cfg.circuit_breaker_failures);
+    try testing.expectEqual(@as(u32, 2000), cfg.circuit_breaker_open_ms);
+    inline for (.{ "LLM_CIRCUIT_BREAKER_ENABLED", "LLM_CB_MODE", "LLM_CB_FAILURES", "LLM_CB_OPEN_MS" }) |key| {
+        var bad = std.process.Environ.Map.init(testing.allocator);
+        defer bad.deinit();
+        try bad.put(key, "invalid");
+        try testing.expectError(error.InvalidValue, applyCircuitBreakerEnv(&cfg, &bad));
+    }
+}
+
+test "LLM alert keys are explicit, opt-in, and positive" {
+    var defaults = try parse(testing.allocator, "");
+    defer defaults.deinit();
+    try testing.expect(!defaults.llm_alert_enabled and !defaults.alert_webhook_enabled);
+    try testing.expectEqual(@as(u32, 2), defaults.llm_alert_streak);
+    try testing.expectEqual(@as(u32, 1_800_000), defaults.llm_alert_window_ms);
+    try testing.expectEqual(@as(u32, 3), defaults.llm_alert_window_count);
+    try testing.expectEqual(@as(u32, 1_800_000), defaults.llm_stale_ms);
+    try testing.expectEqual(@as(u32, 5_000), defaults.alert_webhook_timeout_ms);
+    var cfg = try parse(testing.allocator,
+        \\[agent]
+        \\llm_alert_enabled = true
+        \\llm_alert_streak = 4
+        \\llm_alert_window_ms = 1000
+        \\llm_alert_window_count = 5
+        \\llm_stale_ms = 2000
+        \\alert_webhook_enabled = true
+        \\alert_webhook_timeout_ms = 3000
+    );
+    defer cfg.deinit();
+    try testing.expect(cfg.llm_alert_enabled and cfg.alert_webhook_enabled);
+    try testing.expectEqual(@as(u32, 4), cfg.llm_alert_streak);
+    try testing.expectEqual(@as(u32, 1000), cfg.llm_alert_window_ms);
+    try testing.expectEqual(@as(u32, 5), cfg.llm_alert_window_count);
+    try testing.expectEqual(@as(u32, 2000), cfg.llm_stale_ms);
+    try testing.expectEqual(@as(u32, 3000), cfg.alert_webhook_timeout_ms);
+    inline for (.{ "llm_alert_streak", "llm_alert_window_ms", "llm_alert_window_count", "llm_stale_ms", "alert_webhook_timeout_ms" }) |key| {
+        try testing.expectError(error.InvalidValue, parse(testing.allocator, "[agent]\n" ++ key ++ " = 0"));
+        try testing.expectError(error.InvalidValue, parse(testing.allocator, "[agent]\n" ++ key ++ " = -1"));
+    }
+    try testing.expectError(error.InvalidValue, parse(testing.allocator, "[agent]\nllm_alert_enabled = 1"));
+    try testing.expectError(error.UnknownKey, parse(testing.allocator, "[agent]\nalert_webhook_url = \"https://example.invalid\""));
+    try testing.expectError(error.UnknownKey, parse(testing.allocator, "[agent]\nllm_alert_unknown = true"));
 }

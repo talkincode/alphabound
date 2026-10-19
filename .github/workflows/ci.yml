@@ -18,3 +18,13 @@ jobs:
     steps:
       - name: Preserve PR status (tests run locally)
         run: echo "Run npm test in tools/alphabound-mcp locally; this check is status-only."
+
+  dashboard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Review chart logic tests
+        run: node scripts/test-dashboard-review.js

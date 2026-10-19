@@ -38,7 +38,23 @@ fn meteredChat(
     user: []const u8,
 ) ab.openai.Error!ab.openai.ChatResult {
     const started_ms = nowMs();
+    defer if (client.last_attempt_count) |attempts| {
+        std.debug.print("[llm] usage call_kind={s} attempts={d}\n", .{ call_kind, attempts });
+    };
+    client.error_metadata_enabled = usage_repo.error_persist_enabled;
     const result = client.chat(system, user) catch |err| {
+        if (usage_repo.error_persist_enabled) {
+            const errors = ab.storage.LlmErrorsRepo{ .db = usage_repo.db };
+            errors.append(.{
+                .ts_ms = started_ms,
+                .run_id = run_id,
+                .cause = ab.llm_errors.classify(err, llmHttpStatus(client), client.last_connect_failed),
+                .http_status = llmHttpStatus(client),
+                .model = client.model,
+                .attempt = client.last_attempt_count orelse 1,
+                .detail = llmErrorClass(err),
+            }) catch |write_err| std.debug.print("[llm] error ledger append failed: {t}\n", .{write_err});
+        }
         persistLlmUsage(usage_repo, .{
             .ts_ms = started_ms,
             .call_kind = call_kind,
@@ -64,6 +80,25 @@ fn meteredChat(
     return result;
 }
 
+fn llmAttemptSuffix(client: *const ab.openai.Client, buf: []u8) []const u8 {
+    const attempts = client.last_attempt_count orelse return "";
+    return std.fmt.bufPrint(buf, ",\"attempts\":{d}", .{attempts}) catch "";
+}
+
+fn llmHttpStatus(client: *const ab.openai.Client) ?u16 {
+    return if (client.last_http_status == 0) null else client.last_http_status;
+}
+
+fn llmFailurePayload(out: []u8, legacy: []const u8, client: *const ab.openai.Client, err: ab.openai.Error) []const u8 {
+    var status_buf: [8]u8 = undefined;
+    const status = if (llmHttpStatus(client)) |code| std.fmt.bufPrint(&status_buf, "{d}", .{code}) catch "null" else "null";
+    return std.fmt.bufPrint(out, "{s},\"cause\":\"{s}\",\"http_status\":{s}}}", .{
+        legacy[0 .. legacy.len - 1],
+        @tagName(ab.llm_errors.classify(err, llmHttpStatus(client), client.last_connect_failed)),
+        status,
+    }) catch legacy;
+}
+
 fn persistLlmUsage(repo: *ab.storage.LlmUsageRepo, call: ab.llm_usage.Call) void {
     var ts_buf: [40]u8 = undefined;
     repo.append(ab.llm_usage.row(call, &ts_buf)) catch |err| {
@@ -75,6 +110,7 @@ fn llmErrorClass(err: ab.openai.Error) []const u8 {
     return switch (err) {
         error.HttpFailed => "http_failed",
         error.Timeout => "timeout",
+        error.ConnectTimeout => "connect",
         error.ApiError => "api_error",
         error.MalformedResponse => "malformed_response",
         error.EmptyContent => "empty_content",
@@ -308,6 +344,14 @@ fn firstEnv(map: *const std.process.Environ.Map, names: []const []const u8) ?[]c
     return null;
 }
 
+// Environment switches override TOML in either direction; URL is env-only.
+fn applyLlmAlertEnv(cfg: *ab.config.Config, env: *const std.process.Environ.Map) void {
+    if (env.get("LLM_ALERT_ENABLED") != null)
+        cfg.llm_alert_enabled = envGetTruthy(env, "LLM_ALERT_ENABLED");
+    if (env.get("ALPHABOUND_ALERT_WEBHOOK_ENABLED") != null)
+        cfg.alert_webhook_enabled = envGetTruthy(env, "ALPHABOUND_ALERT_WEBHOOK_ENABLED");
+}
+
 fn envGetTruthy(map: *const std.process.Environ.Map, name: []const u8) bool {
     const v = map.get(name) orelse return false;
     return std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "yes");
@@ -394,6 +438,29 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     };
     defer cfg.deinit();
+    cfg.applyLlmTimeoutOverrides(env.get("LLM_CONNECT_TIMEOUT_MS"), env.get("LLM_REQUEST_TIMEOUT_MS")) catch |err| {
+        std.debug.print("[boot] FATAL LLM timeout config: {t}\n", .{err});
+        return 1;
+    };
+
+    cfg.applyLlmRetryOverrides(.{
+        env.get("LLM_RESILIENCE_ENABLED"),
+        env.get("LLM_RETRY_ON_TIMEOUT"),
+        env.get("LLM_RETRY_MAX"),
+        env.get("LLM_RETRY_BACKOFF_MS"),
+        env.get("LLM_RETRY_JITTER_MS"),
+        env.get("LLM_RETRY_5XX_MAX"),
+    }) catch |err| {
+        std.debug.print("[boot] FATAL LLM retry config: {t}\n", .{err});
+        return 1;
+    };
+
+    ab.config.applyCircuitBreakerEnv(&cfg, env) catch |err| {
+        std.debug.print("[boot] FATAL circuit breaker config: {t}\n", .{err});
+        return 1;
+    };
+
+    applyLlmAlertEnv(&cfg, env);
 
     // Local admin control is a one-shot CLI that never starts the daemon.
     if (cli.control_cmd) |cmd_name| {
@@ -593,6 +660,7 @@ pub fn main(init: std.process.Init) !u8 {
     defer tool_calls.deinit();
     var llm_usage_repo = try ab.storage.LlmUsageRepo.init(&db);
     defer llm_usage_repo.deinit();
+    llm_usage_repo.error_persist_enabled = cfg.llm_error_persist_enabled;
     var memories_repo = try ab.storage.MemoriesRepo.init(&db);
     defer memories_repo.deinit();
     var orders_repo = try ab.storage.OrdersRepo.init(&db);
@@ -1509,6 +1577,10 @@ pub fn main(init: std.process.Init) !u8 {
             }
         }
 
+        const llm_alert_due = cfg.llm_alert_enabled and agent_on and !admin_paused and
+            (think.isBusy() or think.jobs.depth() > 0 or
+                evaluateAgentSchedule(&agent_sched, engine.snapshot(), nowMs()).fire);
+
         if (advisoryDecisionAllowed(admin_paused, engine.snapshot().risk_mode)) {
             // One decision in flight at a time; the model runs on the thinking
             // lane, so this loop never waits for it. Not firing while the lane
@@ -1586,7 +1658,7 @@ pub fn main(init: std.process.Init) !u8 {
                     last_audit_ms = tnow;
                     const agent_live = agent_on and
                         cfg.decision_interval_ms > 0 and !admin_paused;
-                    runScheduledAudit(&db, &audit_repo, &events_repo, &engine, &cfg, &web_state, &runtime_status, agent_live);
+                    runScheduledAudit(&db, &audit_repo, &events_repo, &engine, &cfg, &web_state, &runtime_status, agent_live, llm_alert_due, boot_ms, env);
                     refreshSystemCache(&web_state, &db, &cfg, think.mem_count.load(.acquire), boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), agent_on, admin_paused, &runtime_status, &risk_latency);
                 }
             }
@@ -1770,6 +1842,7 @@ const ThinkLane = struct {
         defer tool_calls.deinit();
         var llm_usage_repo = try ab.storage.LlmUsageRepo.init(&db);
         defer llm_usage_repo.deinit();
+        llm_usage_repo.error_persist_enabled = cfg.llm_error_persist_enabled;
         var memories_repo = try ab.storage.MemoriesRepo.init(&db);
         defer memories_repo.deinit();
         var review_repo = try ab.storage.ReviewChatsRepo.init(&db);
@@ -1796,6 +1869,14 @@ const ThinkLane = struct {
             if (self.llm_env) |l| {
                 llm_client = ab.openai.Client.init(gpa, self.io, l.base_url, l.api_key, l.model);
                 llm_client.?.timeout_ms = cfg.decision_timeout_ms;
+                llm_client.?.connect_timeout_ms = cfg.connect_timeout_ms;
+                llm_client.?.request_timeout_ms = cfg.request_timeout_ms;
+                llm_client.?.llm_resilience_enabled = cfg.llm_resilience_enabled;
+                llm_client.?.llm_retry_on_timeout = cfg.llm_retry_on_timeout;
+                llm_client.?.llm_retry_max = cfg.llm_retry_max;
+                llm_client.?.llm_retry_backoff_ms = cfg.llm_retry_backoff_ms;
+                llm_client.?.llm_retry_jitter_ms = cfg.llm_retry_jitter_ms;
+                llm_client.?.llm_retry_5xx_max = cfg.llm_retry_5xx_max;
             }
         }
 
@@ -1809,6 +1890,12 @@ const ThinkLane = struct {
         restorePeriodicSchedule(&periodic_repo, &db, &review_sched);
         self.status.setReviewDueAt(review_sched.nextAt(.short), review_sched.nextAt(.long));
 
+        var llm_breaker = ab.circuit_breaker.Breaker{ .params = .{
+            .failure_threshold = cfg.circuit_breaker_failures,
+            .open_ms = cfg.circuit_breaker_open_ms,
+            .half_open_probes = cfg.circuit_breaker_half_open_probes,
+        } };
+        if (cfg.circuit_breaker_enabled) self.status.setLlmBreaker(.closed);
         var last_memory_prune_ms: i64 = 0;
         while (!self.stop.load(.acquire)) {
             // Index-only retention for per-run memory copies (durable rows stay).
@@ -1866,6 +1953,7 @@ const ThinkLane = struct {
                             job.bh_cmp,
                             reason,
                             decision_params,
+                            &llm_breaker,
                         );
                         const mode = self.engine.snapshot().risk_mode;
                         if (out == .stale_proposal and attempt < max_stale_redos and
@@ -3241,6 +3329,21 @@ fn executionNoteMeansFill(note: []const u8) bool {
     return std.mem.startsWith(u8, note, "filled") or std.mem.startsWith(u8, note, "partial");
 }
 
+test "newestFillAgeMs uses the newest fill, not the first (oldest-first window)" {
+    const oldest = ab.clock.parseRfc3339Ms("2026-09-22T00:00:00.000Z") catch unreachable;
+    const newest = ab.clock.parseRfc3339Ms("2026-10-07T12:00:00.000Z") catch unreachable;
+    const now = newest + 3_600_000;
+    const lines = [_][]const u8{
+        "{\"ts\":\"2026-09-22T00:00:00.000Z\",\"side\":\"buy\"}",
+        "{\"ts\":\"2026-10-01T00:00:00.000Z\",\"side\":\"sell\"}",
+        "{\"ts\":\"2026-10-07T12:00:00.000Z\",\"side\":\"buy\"}",
+    };
+    try std.testing.expectEqual(@as(?i64, now - newest), newestFillAgeMs(&lines, now));
+    try std.testing.expect(newestFillAgeMs(&lines, now).? < now - oldest);
+    try std.testing.expectEqual(@as(?i64, null), newestFillAgeMs(&[_][]const u8{}, now));
+    try std.testing.expectEqual(@as(?i64, null), newestFillAgeMs(&lines, newest - 1));
+}
+
 test "executionNoteMeansFill is a positive list" {
     try std.testing.expect(executionNoteMeansFill("filled"));
     try std.testing.expect(executionNoteMeansFill("partial_then_hold"));
@@ -3381,6 +3484,20 @@ fn compactJsonTsMs(line: []const u8) ?i64 {
     return ab.clock.parseRfc3339Ms(line[from..end]) catch null;
 }
 
+/// Age of the most recent fill in a compact evidence window.
+/// `FillsRepo.listCompactForContext` returns fills oldest-first, so index 0
+/// is NOT the newest; scan for the max timestamp instead of trusting order.
+fn newestFillAgeMs(lines: []const []const u8, now_ms: i64) ?i64 {
+    var newest: ?i64 = null;
+    for (lines) |line| {
+        const at = compactJsonTsMs(line) orelse continue;
+        if (newest == null or at > newest.?) newest = at;
+    }
+    const ts = newest orelse return null;
+    const age = now_ms - ts;
+    return if (age >= 0) age else null;
+}
+
 /// Field accessor: string value from a parsed JSON object, else null.
 fn jsonStr(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     const v = obj.get(key) orelse return null;
@@ -3407,6 +3524,31 @@ const AgentOutcome = enum {
     /// The proposal went stale before execution; nothing was admitted or sent.
     stale_proposal,
 };
+
+/// Called only for proposal chat completions, before proposal validation.
+fn noteLlmBreaker(
+    breaker: *ab.circuit_breaker.Breaker,
+    cfg: *const ab.config.Config,
+    st: *RuntimeStatus,
+    events_repo: *ab.storage.EventsRepo,
+    engine: *ab.state.Engine,
+    version_id: i64,
+    failure: ?[]const u8,
+) void {
+    if (!cfg.circuit_breaker_enabled) return;
+    if (failure) |tag| {
+        if (breaker.recordFailure(tag, nowMs())) {
+            const kind: []const u8 = if (cfg.circuit_breaker_mode == .observe)
+                "AGENT_LLM_BREAKER_WOULD_OPEN"
+            else
+                "AGENT_LLM_BREAKER_OPEN";
+            logDecisionPayload(events_repo, engine, kind, "WARN", cfg, "{\"state\":\"open\"}", version_id);
+        }
+    } else {
+        breaker.recordSuccess();
+    }
+    st.setLlmBreaker(breaker.state);
+}
 
 fn runAgentDecision(
     gpa: std.mem.Allocator,
@@ -3435,6 +3577,7 @@ fn runAgentDecision(
     bh_cmp: ab.shadow_bench.Comparison,
     trigger_reason: []const u8,
     dyn: ab.params_store.Snapshot,
+    breaker: *ab.circuit_breaker.Breaker,
 ) AgentOutcome {
     const snap = engine.snapshot();
     // What the model sees; proposals are only executable while this still
@@ -3465,6 +3608,18 @@ fn runAgentDecision(
         std.debug.print("[agent] agent_runs start failed: {t}\n", .{err});
         return .done;
     };
+
+    if (cfg.circuit_breaker_enabled) {
+        const allowed = breaker.allow(nowMs(), cfg.circuit_breaker_mode);
+        st.setLlmBreaker(breaker.state);
+        if (!allowed) {
+            st.setLlm("breaker_hold", "open");
+            completeRun(runs, run_id, "breaker_hold", "", "", nowMs());
+            logDecisionPayload(events_repo, engine, "AGENT_LLM_BREAKER_OPEN", "WARN", cfg, "{\"degraded\":\"HOLD\"}", dyn.version_id);
+            fb.noteAgentFailure();
+            return .done;
+        }
+    }
 
     var obs_bufs: [5][32768]u8 = undefined;
     var obs_ptrs: [5][]const u8 = .{ "", "", "", "", "" };
@@ -3576,12 +3731,7 @@ fn runAgentDecision(
     var cohort_ts_buf: [32]u8 = undefined;
     const cohort_ts = ab.clock.formatRfc3339Ms(decision_evidence_start_ms, &cohort_ts_buf) catch return .done;
     review_facts.hold_streak = events_repo.noopStreakSince(db, cohort_ts) catch 0;
-    if (fill_n > 0) {
-        if (compactJsonTsMs(recent_fills[0])) |fts| {
-            const age = nowMs() - fts;
-            if (age >= 0) review_facts.ms_since_last_fill = age;
-        }
-    }
+    if (newestFillAgeMs(recent_fills, nowMs())) |age| review_facts.ms_since_last_fill = age;
     // The cumulative benchmark may predate this evidence cohort. Keep it in
     // the audit/dashboard, not as a current-policy result. Periodic reviews
     // compute flow-adjusted comparisons from cohort-local window edges.
@@ -3651,6 +3801,7 @@ fn runAgentDecision(
         const tag: []const u8 = switch (err) {
             error.HttpFailed => "http_failed",
             error.Timeout => "timeout",
+            error.ConnectTimeout => "connect",
             error.ApiError => "api_error",
             error.MalformedResponse => "malformed_response",
             error.EmptyContent => "empty_content",
@@ -3658,18 +3809,23 @@ fn runAgentDecision(
             error.BufferTooSmall => "buffer",
         };
         std.debug.print("[agent] LLM failed: {s} → HOLD\n", .{tag});
+        noteLlmBreaker(breaker, cfg, st, events_repo, engine, dyn.version_id, tag);
         st.setLlm("error", tag);
         completeRun(runs, run_id, "error_llm", "", input_digest, nowMs());
+        var typed_fail_buf: [512]u8 = undefined;
         var fail_buf: [256]u8 = undefined;
+        var attempt_buf: [40]u8 = undefined;
         const fail_payload = std.fmt.bufPrint(
             &fail_buf,
-            "{{\"run_id\":\"{s}\",\"model\":\"{s}\",\"error\":\"{s}\",\"degraded\":\"HOLD\"}}",
-            .{ run_id, client.model, tag },
+            "{{\"run_id\":\"{s}\",\"model\":\"{s}\",\"error\":\"{s}\",\"degraded\":\"HOLD\"{s}}}",
+            .{ run_id, client.model, tag, llmAttemptSuffix(client, &attempt_buf) },
         ) catch "{\"degraded\":\"HOLD\"}";
-        logDecisionPayload(events_repo, engine, "AGENT_LLM_FAILED", "WARN", cfg, fail_payload, dyn.version_id);
+        logDecisionPayload(events_repo, engine, "AGENT_LLM_FAILED", "WARN", cfg, if (cfg.llm_error_persist_enabled) llmFailurePayload(&typed_fail_buf, fail_payload, client, err) else fail_payload, dyn.version_id);
+        maybeFireLlmAlert(db, events_repo, engine, cfg, env, st);
         fb.noteAgentFailure();
         return .done;
     };
+    noteLlmBreaker(breaker, cfg, st, events_repo, engine, dyn.version_id, null);
     defer gpa.free(chat_res.content);
     st.addUsage(chat_res.usage);
     st.setLlm("ok", "proposal");
@@ -3761,6 +3917,7 @@ fn runAgentDecision(
             const tag: []const u8 = switch (err) {
                 error.HttpFailed => "http_failed",
                 error.Timeout => "timeout",
+                error.ConnectTimeout => "connect",
                 error.ApiError => "api_error",
                 error.MalformedResponse => "malformed_response",
                 error.EmptyContent => "empty_content",
@@ -3768,18 +3925,23 @@ fn runAgentDecision(
                 error.BufferTooSmall => "buffer",
             };
             std.debug.print("[agent] LLM failed (tool round): {s} → HOLD\n", .{tag});
+            noteLlmBreaker(breaker, cfg, st, events_repo, engine, dyn.version_id, tag);
             st.setLlm("error", tag);
             completeRun(runs, run_id, "error_llm", "", input_digest, nowMs());
+            var typed_fail_buf: [512]u8 = undefined;
             var fail_buf: [256]u8 = undefined;
+            var attempt_buf: [40]u8 = undefined;
             const fail_payload = std.fmt.bufPrint(
                 &fail_buf,
-                "{{\"run_id\":\"{s}\",\"model\":\"{s}\",\"error\":\"{s}\",\"phase\":\"tool_round\",\"degraded\":\"HOLD\"}}",
-                .{ run_id, client.model, tag },
+                "{{\"run_id\":\"{s}\",\"model\":\"{s}\",\"error\":\"{s}\",\"phase\":\"tool_round\",\"degraded\":\"HOLD\"{s}}}",
+                .{ run_id, client.model, tag, llmAttemptSuffix(client, &attempt_buf) },
             ) catch "{\"degraded\":\"HOLD\"}";
-            logDecisionPayload(events_repo, engine, "AGENT_LLM_FAILED", "WARN", cfg, fail_payload, dyn.version_id);
+            logDecisionPayload(events_repo, engine, "AGENT_LLM_FAILED", "WARN", cfg, if (cfg.llm_error_persist_enabled) llmFailurePayload(&typed_fail_buf, fail_payload, client, err) else fail_payload, dyn.version_id);
+            maybeFireLlmAlert(db, events_repo, engine, cfg, env, st);
             fb.noteAgentFailure();
             return .done;
         };
+        noteLlmBreaker(breaker, cfg, st, events_repo, engine, dyn.version_id, null);
         raw2 = chat2.content;
         st.addUsage(chat2.usage);
         usage.prompt_tokens += chat2.usage.prompt_tokens;
@@ -5800,6 +5962,104 @@ fn auditLatestAge(db: *ab.storage.Db, comptime sql: [:0]const u8, now_ms: i64) i
     return @max(@as(i64, 0), now_ms - ms);
 }
 
+/// Count completed error_llm runs exactly once (not also their failure events).
+/// Consecutiveness is over all runs; any other status breaks the streak.
+fn collectLlmAlerts(db: *ab.storage.Db, cfg: *const ab.config.Config, in: *ab.auditor.Input) void {
+    in.llm_alert_enabled = cfg.llm_alert_enabled;
+    in.llm_alert_streak = cfg.llm_alert_streak;
+    in.llm_alert_window_count = cfg.llm_alert_window_count;
+    in.llm_stale_ms = cfg.llm_stale_ms;
+    var from_buf: [32]u8 = undefined;
+    const from = ab.clock.formatRfc3339Ms(in.now_ms - cfg.llm_alert_window_ms, &from_buf) catch return;
+    // finished_ts makes a slow failed request count when it actually failed.
+    in.error_llm_window = auditCountBound(
+        db,
+        "SELECT COUNT(*) FROM agent_runs WHERE status = 'error_llm' AND finished_ts >= ?1",
+        from,
+    );
+    var stmt = db.prepare("SELECT status FROM agent_runs ORDER BY started_ts DESC, rowid DESC") catch return;
+    defer stmt.finalize();
+    while (stmt.step() catch false) {
+        if (!std.mem.eql(u8, stmt.columnText(0), "error_llm")) break;
+        in.error_llm_streak += 1;
+        // Only the threshold is needed; keep immediate work bounded.
+        if (in.error_llm_streak >= cfg.llm_alert_streak) break;
+    }
+}
+
+fn maybeFireLlmAlert(
+    db: *ab.storage.Db,
+    events_repo: *ab.storage.EventsRepo,
+    engine: *ab.state.Engine,
+    cfg: *const ab.config.Config,
+    env: *const std.process.Environ.Map,
+    st: *RuntimeStatus,
+) void {
+    if (!cfg.llm_alert_enabled) return;
+    var in: ab.auditor.Input = .{
+        .now_ms = nowMs(),
+        .window_ms = cfg.llm_alert_window_ms,
+        .agent_enabled = true,
+        .zombie_threshold_ms = 0,
+    };
+    collectLlmAlerts(db, cfg, &in);
+    publishLlmAlerts(in, events_repo, engine, cfg, env, st);
+}
+
+var llm_alert_sequence = std.atomic.Value(u64).init(0);
+
+fn publishLlmAlerts(
+    in: ab.auditor.Input,
+    events_repo: *ab.storage.EventsRepo,
+    engine: *ab.state.Engine,
+    cfg: *const ab.config.Config,
+    env: *const std.process.Environ.Map,
+    st: ?*RuntimeStatus,
+) void {
+    var buf: [2048]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    const severity = ab.auditor.writeLlmFindings(&w, in) catch return;
+    if (severity == .ok) return;
+    const findings = w.buffered();
+    if (st) |status| status.setLlmAudit(severity.text(), findings);
+    // Notification persistence is best-effort: unlike the trading journal,
+    // an alert write failure must not submit a trading-state message.
+    var id_buf: [64]u8 = undefined;
+    const seq = llm_alert_sequence.fetchAdd(1, .monotonic);
+    const id = std.fmt.bufPrint(&id_buf, "llm_alert_{d}_{d}", .{ in.now_ms, seq }) catch return;
+    var ts_buf: [32]u8 = undefined;
+    const ts = ab.clock.formatRfc3339Ms(in.now_ms, &ts_buf) catch return;
+    var clean: [4096]u8 = undefined;
+    events_repo.append(.{
+        .event_id = id,
+        .ts = ts,
+        .type = "AGENT_LLM_ALERT",
+        .source = "audit",
+        .severity = if (severity == .alert) "CRITICAL" else "WARN",
+        .state_version = @intCast(engine.snapshot().version),
+        .software_version = ab.journal.software_version,
+        .config_hash = cfg.hash(),
+        .payload_json = ab.redaction.redact(findings, &clean),
+    }) catch std.debug.print("[alert] event persistence failed\n", .{});
+    if (!cfg.alert_webhook_enabled) return;
+    // Only locally generated rule details are sent; no model/error text or URL.
+    var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, findings, .{}) catch return;
+    defer parsed.deinit();
+    // One notification per evaluation, choosing the most severe finding.
+    for (parsed.value.array.items) |item| {
+        const obj = item.object;
+        if (!std.mem.eql(u8, obj.get("severity").?.string, severity.text())) continue;
+        ab.alerter.send(true, env.get("ALPHABOUND_ALERT_WEBHOOK_URL"), cfg.alert_webhook_timeout_ms, .{
+            .severity = severity.text(),
+            .check = obj.get("check").?.string,
+            .detail = obj.get("detail").?.string,
+            .instance_id = cfg.instance_id,
+            .ts = ts,
+        });
+        break;
+    }
+}
+
 fn runScheduledAudit(
     db: *ab.storage.Db,
     audit_repo: *ab.storage.AuditReportsRepo,
@@ -5809,6 +6069,9 @@ fn runScheduledAudit(
     web_state: *WebState,
     st: *RuntimeStatus,
     agent_live: bool,
+    decision_due: bool,
+    boot_ms: i64,
+    env: *const std.process.Environ.Map,
 ) void {
     const now = nowMs();
     const window_ms: i64 = @intCast(cfg.audit_interval_ms);
@@ -5824,6 +6087,16 @@ fn runScheduledAudit(
             @intCast(cfg.review_backoff_max_ms),
         ),
     };
+
+    if (cfg.llm_alert_enabled) {
+        collectLlmAlerts(db, cfg, &in);
+        st.acquire();
+        const llm_ms = st.llm_ms;
+        st.release();
+        in.llm_status_age_ms = @max(0, now - (if (llm_ms > 0) llm_ms else boot_ms));
+        in.decision_due = decision_due;
+        publishLlmAlerts(in, events_repo, engine, cfg, env, null);
+    }
 
     // --- llm ---
     in.runs_total = auditCountBound(db, "SELECT COUNT(*) FROM agent_runs WHERE started_ts >= ?1", ts_from);
@@ -6578,4 +6851,122 @@ test "jsonStringArrayLimited escapes and caps" {
     const items = [_][]const u8{ "a\"b", "line\n2", "0123456789abcdef" };
     const out = jsonStringArrayLimited(&buf, items[0..], 2, 8);
     try std.testing.expectEqualStrings("[\"a\\\"b\",\"line\\n2\"]", out);
+}
+
+test "LLM connect deadline has a distinct error class" {
+    try std.testing.expectEqualStrings("connect", llmErrorClass(error.ConnectTimeout));
+    try std.testing.expectEqualStrings("timeout", llmErrorClass(error.Timeout));
+}
+
+test "LLM failure persistence defaults off and adds typed metadata only on opt in" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [512]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(t.io, &dir_buf);
+    var path_buf: [640:0]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "{s}/errors.db", .{dir_buf[0..dir_len]});
+    var db = try ab.storage.Db.open(path);
+    defer db.close();
+    var usage = try ab.storage.LlmUsageRepo.init(&db);
+    defer usage.deinit();
+    // Overlong synthetic URL fails before any network operation.
+    const long_url = [_]u8{'x'} ** 1100;
+    var client = ab.openai.Client.init(t.allocator, t.io, &long_url, "", "synthetic");
+    defer client.deinit();
+    try t.expectError(error.BufferTooSmall, meteredChat(&client, &usage, "proposal", "synthetic", "", "", ""));
+    try t.expectEqual(@as(i64, 0), try db.queryInt("SELECT COUNT(*) FROM llm_errors"));
+    usage.error_persist_enabled = true;
+    try t.expectError(error.BufferTooSmall, meteredChat(&client, &usage, "proposal", "synthetic", "", "", ""));
+    try t.expectEqual(@as(i64, 1), try db.queryInt("SELECT COUNT(*) FROM llm_errors WHERE cause='malformed' AND http_status IS NULL AND attempt=1"));
+    try t.expectEqual(@as(i64, 2), try db.queryInt("SELECT COUNT(*) FROM llm_usage WHERE error_class='buffer'"));
+    client.last_http_status = 503;
+    var out: [512]u8 = undefined;
+    const legacy = "{\"run_id\":\"synthetic\",\"degraded\":\"HOLD\"}";
+    const typed = llmFailurePayload(&out, legacy, &client, error.ApiError);
+    var parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, typed, .{});
+    defer parsed.deinit();
+    try t.expectEqualStrings("api_status", parsed.value.object.get("cause").?.string);
+    try t.expectEqual(@as(i64, 503), parsed.value.object.get("http_status").?.integer);
+    try t.expectEqualStrings("HOLD", parsed.value.object.get("degraded").?.string);
+}
+
+test "typed connect timeout payload converts absent shared HTTP status to null" {
+    const t = std.testing;
+    var client = ab.openai.Client.init(t.allocator, t.io, "", "", "synthetic");
+    defer client.deinit();
+    try t.expectEqual(@as(?u16, null), llmHttpStatus(&client));
+    var out: [512]u8 = undefined;
+    const typed = llmFailurePayload(&out, "{\"degraded\":\"HOLD\"}", &client, error.ConnectTimeout);
+    var parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, typed, .{});
+    defer parsed.deinit();
+    try t.expectEqualStrings("connect", parsed.value.object.get("cause").?.string);
+    try t.expect(parsed.value.object.get("http_status").? == .null);
+}
+
+test "LLM alert collection counts completed runs with inclusive window and resets streak" {
+    var db = try ab.storage.Db.open(":memory:");
+    defer db.close();
+    var cfg = try ab.config.parse(std.testing.allocator, "[agent]\nllm_alert_enabled = true\nllm_alert_window_ms = 1000\nllm_alert_streak = 8");
+    defer cfg.deinit();
+    try db.execAll(
+        \\INSERT INTO agent_runs(run_id,snapshot_version,model,prompt_hash,status,started_ts,finished_ts) VALUES
+        \\('old',0,'test','test','error_llm','2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z'),
+        \\('ok',0,'test','test','ok','2026-01-01T00:00:01.000Z','2026-01-01T00:00:01.000Z'),
+        \\('edge',0,'test','test','error_llm','2026-01-01T00:00:01.100Z','2026-01-01T00:00:02.000Z'),
+        \\('new',0,'test','test','error_llm','2026-01-01T00:00:02.000Z','2026-01-01T00:00:02.500Z');
+    );
+    var in: ab.auditor.Input = .{ .now_ms = try ab.clock.parseRfc3339Ms("2026-01-01T00:00:03.000Z"), .window_ms = 1000, .agent_enabled = true, .zombie_threshold_ms = 0 };
+    collectLlmAlerts(&db, &cfg, &in);
+    try std.testing.expectEqual(@as(i64, 2), in.error_llm_window);
+    try std.testing.expectEqual(@as(i64, 2), in.error_llm_streak);
+    try db.execAll("UPDATE agent_runs SET status = 'invalid_output' WHERE run_id = 'new'");
+    in.error_llm_streak = 0;
+    collectLlmAlerts(&db, &cfg, &in);
+    try std.testing.expectEqual(@as(i64, 1), in.error_llm_window);
+    try std.testing.expectEqual(@as(i64, 0), in.error_llm_streak);
+}
+
+test "immediate LLM alerts are opt-in, persist an event, and light the bell without trading messages" {
+    var db = try ab.storage.Db.open(":memory:");
+    defer db.close();
+    var events = try ab.storage.EventsRepo.init(&db);
+    defer events.deinit();
+    var cfg = try ab.config.parse(std.testing.allocator, "[agent]\nllm_alert_streak = 1");
+    defer cfg.deinit();
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    var st: RuntimeStatus = .{};
+    var engine = ab.state.Engine.init(.{ .fee_rate = cfg.taker_fee_rate, .slippage_rate = cfg.slippage_rate }, cfg.max_drawdown);
+    try db.execAll("INSERT INTO agent_runs(run_id,snapshot_version,model,prompt_hash,status,started_ts,finished_ts) VALUES ('test',0,'test','test','error_llm','2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z')");
+    maybeFireLlmAlert(&db, &events, &engine, &cfg, &env, &st);
+    try std.testing.expectEqualStrings("unknown", st.audit_status);
+    try std.testing.expectEqual(@as(i64, 0), auditCountBound(&db, "SELECT COUNT(*) FROM events WHERE type = 'AGENT_LLM_ALERT' AND ts >= ?1", ""));
+    cfg.llm_alert_enabled = true;
+    maybeFireLlmAlert(&db, &events, &engine, &cfg, &env, &st);
+    try std.testing.expectEqualStrings("warn", st.audit_status);
+    try std.testing.expectEqual(@as(u32, 1), st.audit_findings);
+    try std.testing.expect(std.mem.indexOf(u8, st.audit_alerts, "llm.error_llm_streak") != null);
+    try std.testing.expectEqual(@as(i64, 1), auditCountBound(&db, "SELECT COUNT(*) FROM events WHERE type = 'AGENT_LLM_ALERT' AND ts >= ?1", ""));
+    const before = engine.snapshot();
+    try db.execAll("CREATE TRIGGER reject_alert BEFORE INSERT ON events BEGIN SELECT RAISE(FAIL, 'synthetic'); END");
+    maybeFireLlmAlert(&db, &events, &engine, &cfg, &env, &st);
+    try std.testing.expectEqualDeep(before, engine.snapshot());
+}
+
+test "LLM alert env overrides can enable and disable without a TOML URL" {
+    var cfg = try ab.config.parse(std.testing.allocator, "");
+    defer cfg.deinit();
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    applyLlmAlertEnv(&cfg, &env);
+    try std.testing.expect(!cfg.llm_alert_enabled and !cfg.alert_webhook_enabled);
+    try env.put("LLM_ALERT_ENABLED", "true");
+    try env.put("ALPHABOUND_ALERT_WEBHOOK_ENABLED", "1");
+    applyLlmAlertEnv(&cfg, &env);
+    try std.testing.expect(cfg.llm_alert_enabled and cfg.alert_webhook_enabled);
+    try env.put("LLM_ALERT_ENABLED", "false");
+    try env.put("ALPHABOUND_ALERT_WEBHOOK_ENABLED", "0");
+    applyLlmAlertEnv(&cfg, &env);
+    try std.testing.expect(!cfg.llm_alert_enabled and !cfg.alert_webhook_enabled);
 }

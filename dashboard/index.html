@@ -1584,6 +1584,11 @@
 
   <!-- ========== 统计 ========== -->
   <div class="panel" id="panel-statistics">
+    <section id="llm_errors_panel" hidden>
+      <h2>LLM errors</h2>
+      <p class="ap-note">最近的模型调用错误（只读）</p>
+      <pre id="llm_errors_list"></pre>
+    </section>
     <div class="stats-subtabs" id="stats_subtabs" role="tablist" aria-label="统计分类">
       <button type="button" class="active" data-stats-pane="book">资产与交易</button>
       <button type="button" data-stats-pane="llm">模型用量</button>
@@ -2945,11 +2950,67 @@ let rvMa5 = null, rvMa20 = null, rvEma20 = null, rvBollUp = null, rvBollMid = nu
 let rvRsi = null, rvMacdHist = null, rvMacdLine = null, rvMacdSignal = null;
 let rvLastSig = "";
 const RV_BAR_SEC = { "1m": 60, "5m": 300, "15m": 900, "1H": 3600, "4H": 14400, "1D": 86400 };
-const RV_DEFAULT_VISIBLE_BARS = 100; // 各周期统一默认窗口；数据不足时显示全部
-const RV_RIGHT_OFFSET = 2;
 let rvNeedFit = true;   // 首帧 / 切周期 / 该周期数据首次到达时重置默认窗口
 let rvCenterKey = "";   // 选中决策后把可视范围居中到该 K 线
 let rvPrevBars = 0;     // 上次写入的根数，用于贴右边缘时随新增 K 线跟随
+
+/* REVIEW-CHART-LOGIC-BEGIN */
+// Pure viewport/snapping logic; scripts/test-dashboard-review.js extracts this block.
+const RV_DEFAULT_VISIBLE_BARS = 100; // 各周期统一默认窗口；数据不足时显示全部
+const RV_RIGHT_OFFSET = 2;
+
+/** 最后一根 time <= t 的下标（二分），无则 -1。 */
+function lastBarIndex(times, t) {
+  if (!times.length || t == null || !isFinite(t)) return -1;
+  let lo = 0, hi = times.length - 1, best = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (times[mid] <= t) { best = mid; lo = mid + 1; } else { hi = mid - 1; }
+  }
+  return best;
+}
+
+/**
+ * 决策时间对应的 K 线：返回满足 times[i] <= tsSec < times[i] + barSec 的最后一根时间。
+ * 早于首根或落在缺口（无该分钟 K 线）返回 null；不假设周期起点对齐（1D 为 UTC+8 开盘）。
+ */
+function snapBar(times, tsSec, barSec) {
+  const i = lastBarIndex(times, tsSec);
+  if (i < 0 || !(barSec > 0)) return null;
+  return tsSec < times[i] + barSec ? times[i] : null;
+}
+
+/**
+ * 计算下一次可视范围（纯函数，不触碰图表对象）。
+ * - needFit / 无上次范围：默认窗口约 100 根（数据不足显示全部），右侧留 RV_RIGHT_OFFSET。
+ * - 否则保留上次范围；用户原本贴右边缘时，随新增 K 线整体右移。
+ * - centerTime 存在且不在范围内时，把该 K 线居中。
+ */
+function computeReviewViewport(n, times, prevRange, prevBars, needFit, centerTime) {
+  let defaulted = false;
+  let range;
+  if (needFit || !prevRange) {
+    defaulted = true;
+    const from = Math.max(0, n - RV_DEFAULT_VISIBLE_BARS);
+    range = { from: from, to: n + RV_RIGHT_OFFSET };
+  } else {
+    range = { from: prevRange.from, to: prevRange.to };
+    const appended = n - prevBars;
+    if (appended > 0 && prevBars > 0 && prevRange.to >= prevBars - 1) {
+      range = { from: range.from + appended, to: range.to + appended };
+    }
+  }
+  if (centerTime != null) {
+    const idx = lastBarIndex(times || [], centerTime);
+    if (idx >= 0 && !(idx >= range.from && idx <= range.to)) {
+      const span = Math.max(10, range.to - range.from);
+      const from = idx - span / 2;
+      range = { from: from, to: from + span };
+    }
+  }
+  return { range: range, needFit: defaulted ? false : needFit, defaulted: defaulted };
+}
+/* REVIEW-CHART-LOGIC-END */
 
 // --- indicator math (close-based) ---
 function indSma(vals, n) {
@@ -3024,27 +3085,6 @@ function toLineData(times, vals) {
     if (vals[i] != null && isFinite(vals[i])) out.push({ time: times[i], value: vals[i] });
   }
   return out;
-}
-
-/** 最后一根 time <= t 的下标（二分），无则 -1。 */
-function lastBarIndex(times, t) {
-  if (!times.length || t == null || !isFinite(t)) return -1;
-  let lo = 0, hi = times.length - 1, best = -1;
-  while (lo <= hi) {
-    const mid = (lo + hi) >> 1;
-    if (times[mid] <= t) { best = mid; lo = mid + 1; } else { hi = mid - 1; }
-  }
-  return best;
-}
-
-/**
- * 决策时间对应的 K 线：返回满足 times[i] <= tsSec < times[i] + barSec 的最后一根时间。
- * 早于首根或落在缺口（无该分钟 K 线）返回 null；不假设周期起点对齐（1D 为 UTC+8 开盘）。
- */
-function snapBar(times, tsSec, barSec) {
-  const i = lastBarIndex(times, tsSec);
-  if (i < 0 || !(barSec > 0)) return null;
-  return tsSec < times[i] + barSec ? times[i] : null;
 }
 
 function ensureReviewChart() {
@@ -3282,33 +3322,17 @@ function updateReviewChart() {
 }
 
 /**
- * 可视范围：只有 rvNeedFit（首帧/切周期/该周期数据首次到达）才设默认窗口（约 100 根，数据不足则全部）；
+ * 应用可视范围：只有 rvNeedFit（首帧/切周期/该周期数据首次到达）才设默认窗口（约 100 根，数据不足则全部）；
  * 其余情况保留用户当前的缩放与拖动，贴右边缘时随新增 K 线整体右移。
  */
 function applyReviewViewport(ts, n, times, prevRange, prevBars, centerTime) {
-  if (rvNeedFit || !prevRange) {
-    rvNeedFit = false;
-    const from = Math.max(0, n - RV_DEFAULT_VISIBLE_BARS);
-    try {
-      ts.setVisibleLogicalRange({ from: from, to: n + RV_RIGHT_OFFSET });
-    } catch (_) { ts.fitContent(); }
-  } else {
-    let from = prevRange.from, to = prevRange.to;
-    const appended = n - prevBars;
-    if (appended > 0 && prevBars > 0 && prevRange.to >= prevBars - 1) {
-      from += appended;
-      to += appended;
-    }
-    try { ts.setVisibleLogicalRange({ from: from, to: to }); } catch (_) {}
+  const plan = computeReviewViewport(n, times, prevRange, prevBars, rvNeedFit, centerTime);
+  rvNeedFit = plan.needFit;
+  try {
+    ts.setVisibleLogicalRange(plan.range);
+  } catch (_) {
+    if (plan.defaulted) ts.fitContent();
   }
-  if (centerTime == null) return;
-  const idx = lastBarIndex(times, centerTime);
-  if (idx < 0) return;
-  const cur = ts.getVisibleLogicalRange();
-  if (cur && idx >= cur.from && idx <= cur.to) return;
-  const span = cur ? Math.max(10, cur.to - cur.from) : RV_DEFAULT_VISIBLE_BARS;
-  const from = idx - span / 2;
-  try { ts.setVisibleLogicalRange({ from: from, to: from + span }); } catch (_) {}
 }
 
 function onReviewChartClick(param) {
@@ -5215,6 +5239,15 @@ async function poll() {
     cachedPeriodic = Array.isArray(periodicReviews) ? periodicReviews : [];
     cachedStatistics = statistics && typeof statistics === "object" ? statistics : {};
     cachedSystem = system;
+    if (system && system.llm_error_persist_enabled) {
+      try {
+        const errors = await jget("/api/v1/llm/errors?limit=50");
+        $("llm_errors_panel").hidden = false;
+        $("llm_errors_list").textContent = Array.isArray(errors) && errors.length
+          ? errors.map(e => `${new Date(e.ts_ms).toISOString()} · ${e.cause}${e.http_status ? " (" + e.http_status + ")" : ""} · ${e.model} · attempt ${e.attempt} · ${e.run_id}`).join("\n")
+          : "暂无错误记录";
+      } catch (err) { console.error("llm errors", err); }
+    }
     try { renderAuditBell(system); } catch (err) { console.error("audit bell", err); }
     try { renderPeriodicReviews(system); } catch (err) { console.error("periodic review", err); }
     cachedOrdersBundle = ordersBundle && typeof ordersBundle === "object"

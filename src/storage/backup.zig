@@ -189,6 +189,11 @@ pub fn runSqliteBackup(
     const now_ms = nowMs();
     rotateBackups(io, db, cfg, now_ms);
     runRetentionSweep(db, now_ms);
+    if (cfg.llm_error_retain_days > 0) {
+        const errors = storage.LlmErrorsRepo{ .db = db };
+        errors.prune(now_ms, cfg.llm_error_retain_days) catch |err|
+            std.debug.print("[retention] llm errors prune failed: {t}\n", .{err});
+    }
 }
 
 /// Hourly/daily rotated snapshots next to the DB, pruned to the newest
@@ -292,4 +297,3 @@ fn runRetentionSweep(db: *storage.Db, now_ms: i64) void {
             std.debug.print("[retention] events long prune failed: {t}\n", .{err});
     } else |_| {}
 }
-

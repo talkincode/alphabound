@@ -34,6 +34,7 @@ const migration_0010: [:0]const u8 = @embedFile("migration_0010");
 const migration_0011: [:0]const u8 = @embedFile("migration_0011");
 const migration_0012: [:0]const u8 = @embedFile("migration_0012");
 const migration_0013: [:0]const u8 = @embedFile("migration_0013");
+const migration_0015: [:0]const u8 = @embedFile("migration_0015");
 const migration_0014: [:0]const u8 = @embedFile("migration_0014");
 const intel = @import("../intel/protocol.zig");
 
@@ -53,6 +54,7 @@ const migrations = [_][:0]const u8{
     migration_0012,
     migration_0013,
     migration_0014,
+    migration_0015,
 };
 
 /// Expected user_version for a fully migrated database (restore drills).
@@ -1835,6 +1837,75 @@ pub const ToolCallsRepo = struct {
     }
 };
 
+/// Independent redacted failure history, without prompt/completion content.
+pub const LlmErrorRow = struct {
+    ts_ms: i64,
+    run_id: []const u8,
+    cause: @import("../observability/llm_errors.zig").Cause,
+    http_status: ?u16 = null,
+    model: []const u8,
+    attempt: u32 = 1,
+    // Only local error tags, never provider bodies or credentials.
+    detail: []const u8,
+};
+
+pub const LlmErrorsRepo = struct {
+    db: *Db,
+    pub fn append(self: LlmErrorsRepo, row: LlmErrorRow) DbError!void {
+        var stmt = try self.db.prepare("INSERT INTO llm_errors(ts_ms,run_id,cause,http_status,model,attempt,detail) VALUES(?1,?2,?3,?4,?5,?6,?7)");
+        defer stmt.finalize();
+        var run_buf: [320]u8 = undefined;
+        var model_buf: [320]u8 = undefined;
+        var detail_buf: [320]u8 = undefined;
+        const redact = @import("../observability/redaction.zig").redact;
+        try stmt.bindInt(1, row.ts_ms);
+        try stmt.bindText(2, redact(row.run_id[0..@min(row.run_id.len, 256)], &run_buf));
+        try stmt.bindText(3, @tagName(row.cause));
+        // Unbound parameter is SQL NULL; absence must not look like HTTP 0.
+        if (row.http_status) |code| try stmt.bindInt(4, code);
+        try stmt.bindText(5, redact(row.model[0..@min(row.model.len, 256)], &model_buf));
+        try stmt.bindInt(6, row.attempt);
+        try stmt.bindText(7, redact(row.detail[0..@min(row.detail.len, 256)], &detail_buf));
+        _ = try stmt.step();
+    }
+
+    pub fn listRecentJson(self: LlmErrorsRepo, out: []u8, limit: i64) DbError![]const u8 {
+        var stmt = try self.db.prepare("SELECT id,ts_ms,run_id,cause,http_status,model,attempt,detail FROM llm_errors ORDER BY ts_ms DESC,id DESC LIMIT ?1");
+        defer stmt.finalize();
+        try stmt.bindInt(1, @min(@max(limit, 1), 200));
+        var w: std.Io.Writer = .fixed(out);
+        w.writeByte('[') catch return error.StepFailed;
+        var first = true;
+        while (try stmt.step()) {
+            if (!first) w.writeByte(',') catch return error.StepFailed;
+            first = false;
+            w.print("{{\"id\":{d},\"ts_ms\":{d},\"run_id\":\"", .{ stmt.columnInt(0), stmt.columnInt(1) }) catch return error.StepFailed;
+            writeJsonEscaped(&w, stmt.columnText(2)) catch return error.StepFailed;
+            w.writeAll("\",\"cause\":\"") catch return error.StepFailed;
+            writeJsonEscaped(&w, stmt.columnText(3)) catch return error.StepFailed;
+            w.writeAll("\",\"http_status\":") catch return error.StepFailed;
+            if (c.sqlite3_column_type(stmt.handle, 4) == c.SQLITE_NULL) {
+                w.writeAll("null") catch return error.StepFailed;
+            } else w.print("{d}", .{stmt.columnInt(4)}) catch return error.StepFailed;
+            w.writeAll(",\"model\":\"") catch return error.StepFailed;
+            writeJsonEscaped(&w, stmt.columnText(5)) catch return error.StepFailed;
+            w.print("\",\"attempt\":{d},\"detail\":\"", .{stmt.columnInt(6)}) catch return error.StepFailed;
+            writeJsonEscaped(&w, stmt.columnText(7)) catch return error.StepFailed;
+            w.writeAll("\"}") catch return error.StepFailed;
+        }
+        w.writeByte(']') catch return error.StepFailed;
+        return w.buffered();
+    }
+
+    pub fn prune(self: LlmErrorsRepo, now_ms: i64, retain_days: u32) DbError!void {
+        if (retain_days == 0) return;
+        var stmt = try self.db.prepare("DELETE FROM llm_errors WHERE ts_ms < ?1");
+        defer stmt.finalize();
+        try stmt.bindInt(1, now_ms - @as(i64, retain_days) * std.time.ms_per_day);
+        _ = try stmt.step();
+    }
+};
+
 /// One provider invocation, persisted without prompt/completion content so
 /// statistics can remain useful and safe to expose through the Dashboard.
 pub const LlmUsageRow = struct {
@@ -1859,9 +1930,11 @@ pub const LlmUsageRow = struct {
 
 pub const LlmUsageRepo = struct {
     insert: Stmt,
+    db: *Db,
+    error_persist_enabled: bool = false,
 
     pub fn init(db: *Db) DbError!LlmUsageRepo {
-        return .{ .insert = try db.prepare(
+        return .{ .db = db, .insert = try db.prepare(
             \\INSERT INTO llm_usage (
             \\  ts, call_kind, run_id, decision_id, model, outcome, error_class,
             \\  latency_ms, usage_reported, prompt_tokens, cached_prompt_tokens,
@@ -5273,4 +5346,46 @@ test "cumulative fill reads do not pin a read snapshot" {
     try events_b.append(.{ .event_id = "e2", .ts = "t", .type = "T", .source = "s", .severity = "INFO", .state_version = 1, .payload_json = "{}" });
     _ = try fills_a.applyCumulative(&a, .{ .order_id = "abpin", .cum_qty = try D.parse("0.0003"), .avg_price = try D.parse("100"), .cum_fee = D.zero, .fee_ccy = "USDT", .ts = "t" });
     try testing.expectEqual(@as(i64, 2), try a.queryInt("SELECT COUNT(*) FROM fills"));
+}
+
+test "LLM errors insert list redaction and independent retention" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [512]u8 = undefined;
+    var db = try Db.open(try tmpDbPath(&tmp, &path_buf));
+    defer db.close();
+    const repo = LlmErrorsRepo{ .db = &db };
+    var out: [8192]u8 = undefined;
+    try testing.expectEqualStrings("[]", try repo.listRecentJson(&out, 50));
+    const now: i64 = 1_800_000_000_000;
+    const cutoff = now - 180 * std.time.ms_per_day;
+    try repo.append(.{ .ts_ms = cutoff - 1, .run_id = "old", .cause = .timeout, .model = "synthetic", .detail = "timeout" });
+    try repo.append(.{ .ts_ms = cutoff, .run_id = "boundary", .cause = .empty, .model = "synthetic", .detail = "empty_content" });
+    try repo.append(.{ .ts_ms = now, .run_id = "recent\"\\", .cause = .api_status, .http_status = 429, .model = "synthetic", .attempt = 2, .detail = "token=synthetic-value" });
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, try repo.listRecentJson(&out, 50), .{});
+    defer parsed.deinit();
+    const items = parsed.value.array.items;
+    try testing.expectEqual(@as(usize, 3), items.len);
+    const row = items[0].object;
+    try testing.expectEqual(@as(i64, 429), row.get("http_status").?.integer);
+    try testing.expectEqualStrings("api_status", row.get("cause").?.string);
+    try testing.expectEqualStrings("recent\"\\", row.get("run_id").?.string);
+    try testing.expectEqualStrings("token=[REDACTED]", row.get("detail").?.string);
+    try testing.expectEqual(@as(i64, 2), row.get("attempt").?.integer);
+    try testing.expect(items[1].object.get("http_status").? == .null);
+    try repo.prune(now, 0);
+    try testing.expectEqual(@as(i64, 3), try db.queryInt("SELECT COUNT(*) FROM llm_errors"));
+    // Legacy retention has no agent_runs/llm_usage deletion; even explicit
+    // parent cleanup must never cascade into this independent error history.
+    try db.execAll("INSERT INTO agent_runs(run_id,snapshot_version,model,prompt_hash,status,started_ts) VALUES('boundary',1,'synthetic','','error_llm','synthetic');");
+    var usage = try LlmUsageRepo.init(&db);
+    defer usage.deinit();
+    try usage.append(.{ .ts = "synthetic", .run_id = "boundary", .call_kind = "proposal", .model = "synthetic", .outcome = "error" });
+    try db.execAll("DELETE FROM llm_usage; DELETE FROM agent_runs;");
+    try repo.prune(now, 180);
+    try testing.expectEqual(@as(i64, 2), try db.queryInt("SELECT COUNT(*) FROM llm_errors"));
+    try testing.expectEqual(@as(i64, 1), try db.queryInt("SELECT COUNT(*) FROM llm_errors WHERE run_id='boundary'"));
+    var limited = try std.json.parseFromSlice(std.json.Value, testing.allocator, try repo.listRecentJson(&out, 1), .{});
+    defer limited.deinit();
+    try testing.expectEqual(@as(usize, 1), limited.value.array.items.len);
 }

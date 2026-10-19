@@ -110,6 +110,9 @@ pub const WebState = struct {
     /// Must match the worst-case test in src/analytics/ab_factor.zig.
     analytics_buf: [131072]u8 = undefined,
     analytics_len: usize = 2,
+    /// Opt-in redacted LLM failure history.
+    llm_errors_buf: [131072]u8 = undefined,
+    llm_errors_len: usize = 2,
     /// Durable LLM / portfolio / trading statistics (UTC windows).
     statistics_buf: [98304]u8 = undefined,
     statistics_len: usize = 2,
@@ -181,6 +184,8 @@ pub const WebState = struct {
         self.periodic_len = 2;
         @memcpy(self.analytics_buf[0..2], "{}");
         self.analytics_len = 2;
+        @memcpy(self.llm_errors_buf[0..2], "[]");
+        self.llm_errors_len = 2;
         @memcpy(self.statistics_buf[0..2], "{}");
         self.statistics_len = 2;
         @memcpy(self.intel_buf[0..2], "[]");
@@ -226,6 +231,7 @@ pub const WebState = struct {
             var audit: [24576]u8 = undefined;
             var periodic: [49152]u8 = undefined;
             var analytics: [131072]u8 = undefined;
+            var llm_errors: [131072]u8 = undefined;
             var statistics: [98304]u8 = undefined;
             var intel: [49152]u8 = undefined;
             var sentiment: [8192]u8 = undefined;
@@ -282,11 +288,12 @@ pub const WebState = struct {
             const pdl = self.periodic_len;
             const anl = self.analytics_len;
             const stl = self.statistics_len;
+            const llm_errors_len = self.llm_errors_len;
             const il = self.intel_len;
             const sel = self.sentiment_len;
             const pal = self.params_len;
             const pvl = self.param_versions_len;
-            if (al > Tls.agent.len or el > Tls.equity.len or apl > Tls.agent_problems.len or ell > Tls.equity_long.len or esl > Tls.equity_span.len or vl > Tls.events.len or sl > Tls.shadow.len or cl > Tls.candles.len or ml > Tls.memories.len or yl > Tls.system.len or dl > Tls.decisions.len or ol > Tls.orders.len or rl > Tls.review_chats.len or rcl > Tls.review_ctx.len or aul > Tls.audit.len or pdl > Tls.periodic.len or anl > Tls.analytics.len or stl > Tls.statistics.len or il > Tls.intel.len or sel > Tls.sentiment.len or pal > Tls.params.len or pvl > Tls.param_versions.len) {
+            if (llm_errors_len > Tls.llm_errors.len or al > Tls.agent.len or el > Tls.equity.len or apl > Tls.agent_problems.len or ell > Tls.equity_long.len or esl > Tls.equity_span.len or vl > Tls.events.len or sl > Tls.shadow.len or cl > Tls.candles.len or ml > Tls.memories.len or yl > Tls.system.len or dl > Tls.decisions.len or ol > Tls.orders.len or rl > Tls.review_chats.len or rcl > Tls.review_ctx.len or aul > Tls.audit.len or pdl > Tls.periodic.len or anl > Tls.analytics.len or stl > Tls.statistics.len or il > Tls.intel.len or sel > Tls.sentiment.len or pal > Tls.params.len or pvl > Tls.param_versions.len) {
                 std.atomic.spinLoopHint();
                 continue;
             }
@@ -307,6 +314,7 @@ pub const WebState = struct {
             @memcpy(Tls.audit[0..aul], self.audit_buf[0..aul]);
             @memcpy(Tls.periodic[0..pdl], self.periodic_buf[0..pdl]);
             @memcpy(Tls.analytics[0..anl], self.analytics_buf[0..anl]);
+            @memcpy(Tls.llm_errors[0..llm_errors_len], self.llm_errors_buf[0..llm_errors_len]);
             @memcpy(Tls.statistics[0..stl], self.statistics_buf[0..stl]);
             @memcpy(Tls.intel[0..il], self.intel_buf[0..il]);
             @memcpy(Tls.sentiment[0..sel], self.sentiment_buf[0..sel]);
@@ -360,6 +368,7 @@ pub const WebState = struct {
                     .audit_json = Tls.audit[0..Tls.audit_len],
                     .periodic_json = Tls.periodic[0..Tls.periodic_len],
                     .analytics_json = Tls.analytics[0..Tls.analytics_len],
+                    .llm_errors_json = Tls.llm_errors[0..llm_errors_len],
                     .statistics_json = Tls.statistics[0..Tls.statistics_len],
                     .intel_json = Tls.intel[0..Tls.intel_len],
                     .sentiment_json = Tls.sentiment[0..Tls.sentiment_len],
@@ -415,7 +424,7 @@ pub const WebState = struct {
         self.endWrite();
     }
 
-    pub fn setJson(self: *WebState, comptime which: enum { agent, agent_problems, equity, equity_long, equity_span, events, shadow, candles, memories, system, decisions, orders, review, review_ctx, audit, periodic, analytics, statistics, intel, sentiment, params, param_versions }, src: []const u8) void {
+    pub fn setJson(self: *WebState, comptime which: enum { agent, agent_problems, equity, equity_long, equity_span, events, shadow, candles, memories, system, decisions, orders, review, review_ctx, audit, periodic, analytics, statistics, llm_errors, intel, sentiment, params, param_versions }, src: []const u8) void {
         self.beginWrite();
         switch (which) {
             .agent => {
@@ -503,6 +512,12 @@ pub const WebState = struct {
                 @memcpy(self.analytics_buf[0..n], src[0..n]);
                 self.analytics_len = n;
             },
+            .llm_errors => {
+                if (src.len <= self.llm_errors_buf.len) {
+                    @memcpy(self.llm_errors_buf[0..src.len], src);
+                    self.llm_errors_len = src.len;
+                }
+            },
             .statistics => {
                 const n = @min(src.len, self.statistics_buf.len);
                 @memcpy(self.statistics_buf[0..n], src[0..n]);
@@ -547,6 +562,7 @@ pub const RuntimeStatus = struct {
     okx_private: []const u8 = "unknown",
     okx_private_ms: i64 = 0,
     okx_private_detail: []const u8 = "",
+    llm_breaker: []const u8 = "disabled",
     llm: []const u8 = "unknown",
     llm_ms: i64 = 0,
     llm_detail: []const u8 = "",
@@ -646,6 +662,12 @@ pub const RuntimeStatus = struct {
         self.priv_detail_len = n;
         self.okx_private_detail = self.priv_detail_buf[0..self.priv_detail_len];
     }
+    pub fn setLlmBreaker(self: *RuntimeStatus, breaker_state: @import("../agent/circuit_breaker.zig").State) void {
+        self.acquire();
+        defer self.release();
+        self.llm_breaker = @tagName(breaker_state);
+    }
+
     pub fn setLlm(self: *RuntimeStatus, status: []const u8, detail: []const u8) void {
         self.acquire();
         defer self.release();
@@ -690,6 +712,44 @@ pub const RuntimeStatus = struct {
             self.audit_alerts = "[]"; // oversized detail lives in audit_reports
         }
     }
+    /// Immediate LLM alerts replace only their own checks, preserving other
+    /// scheduled findings and their severity until the next full audit.
+    pub fn setLlmAudit(self: *RuntimeStatus, status: []const u8, alerts_json: []const u8) void {
+        self.acquire();
+        defer self.release();
+        var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, self.audit_alerts, .{}) catch return;
+        defer parsed.deinit();
+        var buf: [3072]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        w.writeByte('[') catch return;
+        var count: u32 = 0;
+        var overall = status;
+        for (parsed.value.array.items) |item| {
+            const check = item.object.get("check") orelse continue;
+            if (std.mem.eql(u8, check.string, "llm.error_llm_streak") or
+                std.mem.eql(u8, check.string, "llm.error_llm_window") or
+                std.mem.eql(u8, check.string, "llm.status_stale")) continue;
+            if (count > 0) w.writeByte(',') catch return;
+            std.json.Stringify.value(item, .{}, &w) catch return;
+            count += 1;
+            if (item.object.get("severity")) |sev| {
+                if (std.mem.eql(u8, sev.string, "alert")) overall = "alert";
+            }
+        }
+        if (alerts_json.len > 2) {
+            if (count > 0) w.writeByte(',') catch return;
+            w.writeAll(alerts_json[1 .. alerts_json.len - 1]) catch return;
+            count += @intCast(std.mem.count(u8, alerts_json, "\"check\":"));
+        }
+        w.writeByte(']') catch return;
+        const merged = w.buffered();
+        @memcpy(self.audit_alerts_buf[0..merged.len], merged);
+        self.audit_alerts = self.audit_alerts_buf[0..merged.len];
+        self.audit_status = overall;
+        self.audit_findings = count;
+        self.audit_ms = nowMs();
+    }
+
     /// Publish the latest 定期复盘 outcome. `status` / `cycle` must be static
     /// strings ("ok"/"degraded"/"failed", "short"/"long").
     pub fn setPeriodicReview(self: *RuntimeStatus, status: []const u8, cycle: []const u8) void {
@@ -1144,6 +1204,31 @@ fn countdownUntil(due_ms: i64, now_ms: i64) i64 {
     return @max(@as(i64, 0), due_ms - now_ms);
 }
 
+fn writeLlmBreaker(w: *std.Io.Writer, cfg: *const config.Config, st: *const RuntimeStatus) !void {
+    if (cfg.circuit_breaker_enabled) try w.print("\"llm_breaker\":\"{s}\",", .{st.llm_breaker});
+}
+
+test "breaker system field is absent by default and exposes enabled state" {
+    var cfg = try config.parse(std.testing.allocator, "");
+    defer cfg.deinit();
+    var st = RuntimeStatus{};
+    var buf: [128]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeLlmBreaker(&w, &cfg, &st);
+    try std.testing.expectEqualStrings("", w.buffered());
+    cfg.circuit_breaker_enabled = true;
+    inline for (.{ .closed, .open, .half_open }) |breaker_state| {
+        st.setLlmBreaker(breaker_state);
+        w = .fixed(&buf);
+        try w.writeByte('{');
+        try writeLlmBreaker(&w, &cfg, &st);
+        try w.writeAll("\"extra\":0}");
+        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, w.buffered(), .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(@tagName(breaker_state), parsed.value.object.get("llm_breaker").?.string);
+    }
+}
+
 fn writeReview(w: *std.Io.Writer, cfg: *const config.Config, st: *const RuntimeStatus, now_ms: i64) !void {
     try w.print(
         "\"review\":{{\"status\":\"{s}\",\"cycle\":\"{s}\",\"ts_ms\":{d},\"short_interval_ms\":{d},\"long_interval_ms\":{d},\"next_short_ms\":{d},\"next_long_ms\":{d}}},",
@@ -1232,6 +1317,11 @@ pub fn refreshSystemCache(
     risk_lat: *const latency.Histogram,
     exec: ExecFlags,
 ) void {
+    if (cfg.llm_error_persist_enabled) {
+        var error_buf: [131072]u8 = undefined;
+        const repo = storage.LlmErrorsRepo{ .db = db };
+        if (repo.listRecentJson(&error_buf, 200)) |json| ws.setJson(.llm_errors, json) else |_| {}
+    }
     st_mut.acquire();
     defer st_mut.release();
     const st: *const RuntimeStatus = st_mut;
@@ -1267,6 +1357,7 @@ pub fn refreshSystemCache(
             memory.MAX_MEMORIES,
         },
     ) catch return;
+    if (cfg.llm_error_persist_enabled) w.writeAll("\"llm_error_persist_enabled\":true,") catch return;
     w.print(
         "\"agent\":{{\"total\":{d},\"ok\":{d},\"invalid\":{d},\"errors\":{d},\"valid_rate\":{d:.1},\"tool_calls\":{d}}},",
         .{ total, ok, invalid, errors, rate, tools_n },
@@ -1279,6 +1370,7 @@ pub fn refreshSystemCache(
         "\"audit\":{{\"status\":\"{s}\",\"ts_ms\":{d},\"findings\":{d},\"interval_ms\":{d},\"alerts\":{s}}},",
         .{ st.audit_status, st.audit_ms, st.audit_findings, cfg.audit_interval_ms, st.audit_alerts },
     ) catch return;
+    writeLlmBreaker(&w, cfg, st) catch return;
     writeReview(&w, cfg, st, nowMs()) catch return;
 
     w.print(
@@ -1359,12 +1451,14 @@ test "web state seqlock roundtrip preserves json blobs" {
     ws.setJson(.system, "{\"mode\":\"shadow\"}");
     ws.setJson(.orders, "{\"orders\":[1],\"fills\":[]}");
     ws.setJson(.sentiment, "{\"now\":20,\"class\":\"extreme_fear\"}");
+    ws.setJson(.llm_errors, "[{\"cause\":\"timeout\"}]");
     ws.setJson(.equity_span, equity_span_empty);
     const ctx = WebState.contextFn(&ws);
     try testing.expectEqualStrings("{\"mode\":\"shadow\"}", ctx.system_json);
     try testing.expectEqualStrings(equity_span_empty, ctx.equity_span_json);
     try testing.expectEqualStrings("{\"orders\":[1],\"fills\":[]}", ctx.orders_json);
     try testing.expectEqualStrings("{\"now\":20,\"class\":\"extreme_fear\"}", ctx.sentiment_json);
+    try testing.expectEqualStrings("[{\"cause\":\"timeout\"}]", ctx.llm_errors_json);
     try testing.expectEqualStrings("test", ctx.software_version);
     try testing.expect(!ctx.ready);
 }
@@ -1392,4 +1486,18 @@ test "runtime status setters clamp and stamp" {
     st.addUsage(.{ .prompt_tokens = 10, .completion_tokens = 5, .total_tokens = 0 });
     try testing.expectEqual(@as(u64, 15), st.total_tokens);
     try testing.expectEqual(@as(u64, 1), st.llm_calls);
+}
+
+test "immediate LLM bell preserves unrelated alerts and replaces old LLM findings" {
+    var st: RuntimeStatus = .{};
+    st.setAudit("alert", "[{\"check\":\"data.db_integrity\",\"severity\":\"alert\",\"detail\":\"synthetic\"}]", 1);
+    const alerts = "[{\"check\":\"llm.error_llm_streak\",\"severity\":\"warn\",\"detail\":\"synthetic\"}]";
+    st.setLlmAudit("warn", alerts);
+    st.setLlmAudit("warn", alerts);
+    try std.testing.expectEqualStrings("alert", st.audit_status);
+    try std.testing.expectEqual(@as(u32, 2), st.audit_findings);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, st.audit_alerts, "llm.error_llm_streak"));
+    try std.testing.expect(std.mem.indexOf(u8, st.audit_alerts, "data.db_integrity") != null);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, st.audit_alerts, .{});
+    defer parsed.deinit();
 }
