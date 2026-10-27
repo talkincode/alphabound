@@ -164,6 +164,15 @@ class Handler(BaseHTTPRequestHandler):
                         break
             if fault:
                 a = fault["action"]
+                if a == "stall":
+                    # Do not stall the control plane or unrelated requests.
+                    seconds = fault.get("seconds", 10)
+                    V.lock.release()
+                    try:
+                        time.sleep(seconds)
+                        return self._drop()
+                    finally:
+                        V.lock.acquire()
                 if a == "http_error":
                     return self._drop()
                 if a == "api_error":

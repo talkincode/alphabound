@@ -9,6 +9,7 @@ import argparse
 import json
 import os
 import signal
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -331,7 +332,123 @@ def scenario_foreign_order_exit(binpath, workdir):
         dm.stop()
 
 
+def scenario_network_stalls(binpath, workdir):
+    ctl("reset")
+    ctl("set", usdt="1000", btc="0", llm_action="HOLD", llm_delay_s=0)
+    dm = Daemon(binpath, workdir, "network-stall").start()
+    try:
+        web_ready(dm)
+        wait_for(lambda: dm.api("/api/v1/state").get("risk_mode") == "NORMAL", 15, "normal before fault")
+        ctl("fault", method="GET", path="/market/ticker", nth=0, action="stall", seconds=10)
+        ctl("fault", method="GET", path="/account/balance", nth=0, action="stall", seconds=10)
+        time.sleep(1)
+        before = dm.api("/api/v1/state")["version"]
+        dm.control("pause")
+        wait_for(lambda: dm.api("/api/v1/system").get("paused") is True, 2, "pause while both feeds hang")
+        time.sleep(1)
+        assert dm.api("/api/v1/state")["version"] > before
+        wait_for(lambda: dm.api("/api/v1/state").get("risk_mode") == "EXIT_ONLY", 15, "clock-driven stale-data gate")
+        assert vstate()["post_order_calls"] == 0
+        ctl("clear_faults")
+        wait_for(lambda: dm.api("/api/v1/state").get("risk_mode") == "NORMAL", 35, "feeds recover after bounded timeouts")
+        evidence("network-stall", "clock and pause remained responsive while ticker/account sockets hung")
+    finally:
+        dm.stop()
+
+
+def scenario_accounting_quarantine(binpath, workdir):
+    ctl("reset")
+    ctl("set", usdt="1000", btc="0", llm_action="HOLD", llm_delay_s=0)
+    dm = Daemon(binpath, workdir, "accounting").start()
+    try:
+        web_ready(dm)
+        wait_for(lambda: dm.api("/api/v1/state").get("accounting_ok") is True and dm.api("/api/v1/state").get("risk_mode") == "NORMAL", 15, "accounting baseline")
+        before = dm.api("/api/v1/state")
+        ctl("set", usdt="850")  # no fill or independently verified transfer
+        dm.control("reconcile")
+        wait_for(lambda: dm.api("/api/v1/state").get("accounting_ok") is False, 15, "unexplained delta quarantined")
+        dm.control("reconcile")
+        time.sleep(1)
+        after = dm.api("/api/v1/state")
+        assert after["accounting_ok"] is False
+        assert after["high_watermark"] == before["high_watermark"], "loss was rebased away"
+        assert not dm.events("CAPITAL_FLOW_DETECTED"), "unproven transfer invented"
+        assert vstate()["post_order_calls"] == 0
+        evidence("accounting", "unexplained loss did not alter HWM; polling did not clear quarantine")
+    finally:
+        dm.stop()
+
+
+def scenario_safety_latches_survive_restart(binpath, workdir):
+    """Clean restart preserves pause; kill -9 cannot clear HALTED or implicitly
+    resume autonomous work. Only an explicit operator resume unlocks it."""
+    ctl("reset")
+    ctl("set", usdt="1000", btc="0", llm_action="HOLD", llm_delay_s=0)
+    processes = []
+    try:
+        first = Daemon(binpath, workdir, "safety").start("a")
+        processes.append(first)
+        web_ready(first)
+        first.control("pause")
+        wait_for(lambda: first.api("/api/v1/system").get("paused") is True, 10, "pause before restart")
+        first.stop()
+        second = Daemon(binpath, workdir, "safety").start("b")
+        processes.append(second)
+        web_ready(second)
+        wait_for(lambda: second.api("/api/v1/system").get("paused") is True, 10, "durable pause")
+        second.control("resume")
+        wait_for(lambda: second.api("/api/v1/system").get("paused") is False, 10, "explicit resume")
+        second.control("flatten")
+        wait_for(lambda: second.api("/api/v1/state").get("risk_mode") == "HALTED", 15, "halt latch")
+        second.kill9()
+        third = Daemon(binpath, workdir, "safety").start("c")
+        processes.append(third)
+        web_ready(third)
+        wait_for(lambda: third.api("/api/v1/state").get("risk_mode") == "HALTED", 10, "durable halt")
+        wait_for(lambda: third.api("/api/v1/system").get("paused") is True, 10, "unclean exit requires resume")
+        assert vstate()["post_order_calls"] == 0
+        third.control("resume")
+        wait_for(lambda: third.api("/api/v1/state").get("risk_mode") == "NORMAL", 15, "operator reset after reconcile")
+        evidence("safety", "pause and HALTED survived restarts; explicit resume restored normal operation")
+    finally:
+        for process in reversed(processes):
+            process.stop()
+
+
+def scenario_slow_http_client(binpath, workdir):
+    """An idle header or incomplete POST must not monopolize HTTP or survive
+    the request deadline. Auth and cache rendering remain serialized safely."""
+    ctl("reset")
+    ctl("set", usdt="1000", btc="0", llm_action="HOLD", llm_delay_s=0)
+    dm = Daemon(binpath, workdir, "slow-http").start()
+    try:
+        web_ready(dm)
+        for partial_body in (False, True):
+            with socket.create_connection(("127.0.0.1", WEB_PORT), timeout=3) as slow:
+                if partial_body:
+                    slow.sendall(b"POST /api/v1/review/chat HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1024\r\n\r\n{")
+                time.sleep(0.1)
+                started = time.monotonic()
+                assert dm.api("/health/live")["status"] == "ok"
+                assert time.monotonic() - started < 2, "health queued behind slow peer"
+                slow.settimeout(7)
+                try:
+                    while slow.recv(1024):
+                        pass
+                except ConnectionResetError:
+                    pass
+                assert time.monotonic() - started < 7, "slow peer escaped deadline"
+        assert dm.api("/health/live")["status"] == "ok"
+        evidence("slow-http", "idle header and incomplete POST expired; concurrent health remained responsive")
+    finally:
+        dm.stop()
+
+
 SCENARIOS = {
+    "network_stall": scenario_network_stalls,
+    "accounting_quarantine": scenario_accounting_quarantine,
+    "safety_restart": scenario_safety_latches_survive_restart,
+    "slow_http": scenario_slow_http_client,
     "foreign_order_exit": scenario_foreign_order_exit,
     "slow_model": scenario_slow_model_risk_and_flatten,
     "lost_response": scenario_lost_order_response,

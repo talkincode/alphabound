@@ -129,6 +129,15 @@ health_ready() {
   return 1
 }
 
+# Parse preserved site configuration before interrupting the old process.
+if ! "$RELEASE_DIR/alphabound" --config /etc/alphabound/alphabound.toml --control status >/dev/null 2>&1; then
+  echo "[install] config preflight failed; previous release left running"
+  exit 1
+fi
+# Quiesce before queuing the pause so the old process cannot consume it.
+# Deployment/rollback never implicitly re-enables autonomous buying.
+systemctl stop alphabound
+"$RELEASE_DIR/alphabound" --config /etc/alphabound/alphabound.toml --control pause
 switch_release "$RELEASE_DIR"
 # Rolling-soak accounting: every deploy restart is recorded so the soak
 # report can separate intentional restarts from crashes.
@@ -142,6 +151,8 @@ else
   echo "[install] HEALTH FAILED on new release"
   if [[ -n "$PREV_TARGET" && -x "$PREV_TARGET/alphabound" ]]; then
     echo "[install] rolling back to $(basename "$PREV_TARGET")"
+    systemctl stop alphabound
+    "$PREV_TARGET/alphabound" --config /etc/alphabound/alphabound.toml --control pause
     switch_release "$PREV_TARGET"
     log_deploy "rollback-auto from=$(basename "$RELEASE_DIR") to=$(basename "$PREV_TARGET")"
     systemctl restart alphabound

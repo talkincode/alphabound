@@ -864,6 +864,8 @@ fn renderState(buf: []u8, ctx: Context) Response {
         s.write(snap.unresolved_orders) catch break :render;
         s.objectField("foreign_pending") catch break :render;
         s.write(snap.foreign_pending) catch break :render;
+        s.objectField("accounting_ok") catch break :render;
+        s.write(snap.accounting_ok) catch break :render;
         s.objectField("account_projected") catch break :render;
         s.write(snap.account_projected) catch break :render;
         s.objectField("ledger_ok") catch break :render;
@@ -1617,8 +1619,38 @@ pub const ServerOptions = struct {
 /// Provider callback: fills a Context for each request.
 pub const ContextFn = *const fn (userdata: ?*anyopaque) Context;
 
-/// Blocking accept loop. Each connection handles one request batch.
-/// Runs until the stream listener fails; caller owns thread/lifecycle.
+const ConnectionPool = struct {
+    io: std.Io,
+    ctx_fn: ContextFn,
+    userdata: ?*anyopaque,
+    active: std.atomic.Value(u32) = .init(0),
+    // Cache callback scratch and auth stores remain single-router-owned.
+    // Socket reads/writes happen outside this lock.
+    route_mutex: std.Io.Mutex = .init,
+    deadline_ms: u32 = 5_000,
+    const max_connections = 8;
+
+    fn deadline(io: std.Io, ms: u32) std.Io.Cancelable!void {
+        try io.sleep(.{ .nanoseconds = @as(i96, ms) * 1_000_000 }, .awake);
+    }
+
+    fn run(self: *ConnectionPool, stream: std.Io.net.Stream) void {
+        defer _ = self.active.fetchSub(1, .release);
+        const Done = union(enum) { request: anyerror!void, deadline: std.Io.Cancelable!void };
+        var results: [2]Done = undefined;
+        var race = std.Io.Select(Done).init(self.io, &results);
+        defer race.cancelDiscard(); // joins the canceled request before releasing its storage
+        race.concurrent(.request, handleConnection, .{ self.io, stream, self.ctx_fn, self.userdata, &self.route_mutex }) catch {
+            stream.close(self.io);
+            return;
+        };
+        race.concurrent(.deadline, deadline, .{ self.io, self.deadline_ms }) catch return;
+        _ = race.await() catch return;
+    }
+};
+
+/// Bounded concurrent connections with an end-to-end read/write deadline.
+/// Saturation closes excess connections; it never creates unbounded workers.
 pub fn serve(
     io: std.Io,
     opts: ServerOptions,
@@ -1628,13 +1660,24 @@ pub fn serve(
     const addr = try std.Io.net.IpAddress.parse(opts.host, opts.port);
     var listener = try addr.listen(io, .{ .reuse_address = true });
     defer listener.deinit(io);
+    var pool = ConnectionPool{ .io = io, .ctx_fn = ctx_fn, .userdata = userdata };
+    var workers: std.Io.Group = .init;
+    defer workers.cancel(io);
 
     while (true) {
         const stream = listener.accept(io) catch |err| switch (err) {
             error.ConnectionAborted => continue,
             else => return err,
         };
-        handleConnection(io, stream, ctx_fn, userdata) catch {};
+        if (pool.active.load(.acquire) >= ConnectionPool.max_connections) {
+            stream.close(io);
+            continue;
+        }
+        _ = pool.active.fetchAdd(1, .acq_rel);
+        workers.concurrent(io, ConnectionPool.run, .{ &pool, stream }) catch {
+            _ = pool.active.fetchSub(1, .release);
+            stream.close(io);
+        };
     }
 }
 
@@ -1729,7 +1772,7 @@ fn clientIpOk(ip: []const u8) bool {
     return true;
 }
 
-fn handleConnection(io: std.Io, stream: std.Io.net.Stream, ctx_fn: ContextFn, userdata: ?*anyopaque) !void {
+fn handleConnection(io: std.Io, stream: std.Io.net.Stream, ctx_fn: ContextFn, userdata: ?*anyopaque, route_mutex: *std.Io.Mutex) !void {
     defer stream.close(io);
     var in_buf: [8192]u8 = undefined;
     // Large enough for multi-timeframe candles JSON + headers (and dashboard HTML path).
@@ -1815,35 +1858,39 @@ fn handleConnection(io: std.Io, stream: std.Io.net.Stream, ctx_fn: ContextFn, us
 
     var cookie_buf: [256]u8 = undefined;
     var auth_buf: [4096]u8 = undefined;
-    var ctx = ctx_fn(userdata);
-    ctx.cookie_buf = &cookie_buf;
-    ctx.auth_buf = &auth_buf;
-
-    var client_ip: []const u8 = peer_ip;
-    if (ctx.trust_proxy) {
-        if (xff_hdr) |xff| {
-            const hops = if (ctx.trusted_proxy_hops == 0) 1 else ctx.trusted_proxy_hops;
-            const picked = forwardedClientIp(xff, hops);
-            if (clientIpOk(picked)) client_ip = picked;
-        }
-        // No XFF → keep TCP peer (usually the proxy). Do not honor client-spoofable headers alone.
-    }
-
-    const info = RequestInfo{
-        .method = method,
-        .target = target_buf[0..target_len],
-        .authorization = authorization,
-        .x_api_token = x_api_token,
-        .cookie = cookie_hdr,
-        .host = host_hdr,
-        .forwarded_proto = fwd_proto,
-        .client_ip = client_ip,
-        .body = body_ptr[0..body_len],
-        .now_ms = clock.SystemClock.clock().wallMs(),
-    };
-
     var body_buf: [196608]u8 = undefined;
-    const resp = handleReq(&body_buf, info, ctx);
+    const resp = route: {
+        try route_mutex.lock(io);
+        defer route_mutex.unlock(io);
+        var ctx = ctx_fn(userdata);
+        ctx.cookie_buf = &cookie_buf;
+        ctx.auth_buf = &auth_buf;
+
+        var client_ip: []const u8 = peer_ip;
+        if (ctx.trust_proxy) {
+            if (xff_hdr) |xff| {
+                const hops = if (ctx.trusted_proxy_hops == 0) 1 else ctx.trusted_proxy_hops;
+                const picked = forwardedClientIp(xff, hops);
+                if (clientIpOk(picked)) client_ip = picked;
+            }
+            // No XFF → keep TCP peer (usually the proxy). Do not honor client-spoofable headers alone.
+        }
+
+        const info = RequestInfo{
+            .method = method,
+            .target = target_buf[0..target_len],
+            .authorization = authorization,
+            .x_api_token = x_api_token,
+            .cookie = cookie_hdr,
+            .host = host_hdr,
+            .forwarded_proto = fwd_proto,
+            .client_ip = client_ip,
+            .body = body_ptr[0..body_len],
+            .now_ms = clock.SystemClock.clock().wallMs(),
+        };
+
+        break :route handleReq(&body_buf, info, ctx);
+    };
 
     var retry_buf: [16]u8 = undefined;
     const retry_hdr: ?[]const u8 = if (resp.retry_after_sec) |sec|

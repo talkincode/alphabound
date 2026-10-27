@@ -450,6 +450,8 @@ pub fn tryDemoExecute(
     opts: Options,
 ) []const u8 {
     const exit_mode = opts.intent == .emergency_exit;
+    var sizing_instrument = instrument;
+    if (exit_mode) sizing_instrument.min_notional = instrument.venue_min_notional orelse instrument.min_notional;
     if (!exit_mode and !std.mem.eql(u8, verdict_txt, "APPROVE") and !std.mem.eql(u8, verdict_txt, "REDUCE")) {
         return "skipped_reject";
     }
@@ -495,6 +497,7 @@ pub fn tryDemoExecute(
         }
 
         var sell_cap: ?Decimal = null;
+        var leg_admission: ?gate.ShadowAdmission = null;
         if (exit_mode) {
             switch (gate.exitAdmit(snap, nowMs())) {
                 .approve => |a| sell_cap = a.max_sell_qty,
@@ -506,14 +509,16 @@ pub fn tryDemoExecute(
                 },
             }
             weight = Decimal.zero;
-        } else if (seq > 0) {
-            // Every later leg is a new risk decision on a fresh snapshot.
-            const adm = gate.shadowAdmit(snap, snap.version, requested, cfg, nowMs());
+        } else {
+            // Even the first leg needs a locally derived proof, not a trusted
+            // APPROVE string. Never exceed the caller's already-clamped ceiling.
+            const adm = gate.shadowAdmit(snap, snap.version, Decimal.min(requested, admitted_weight), cfg, nowMs());
+            leg_admission = adm;
             if (!std.mem.eql(u8, adm.verdict_txt, "APPROVE") and !std.mem.eql(u8, adm.verdict_txt, "REDUCE")) {
                 var pbuf: [200]u8 = undefined;
                 const p = std.fmt.bufPrint(&pbuf, "{{\"seq\":{d},\"verdict\":\"{s}\",\"reason\":\"{s}\"}}", .{ seq, adm.verdict_txt, adm.reason_txt }) catch "{}";
                 ctx.event("EXEC_REPLAN_REJECTED", "WARN", p);
-                return if (last_filled) "filled_readmit_rejected" else "partial_readmit_rejected";
+                return if (any_fill) (if (last_filled) "filled_readmit_rejected" else "partial_readmit_rejected") else "skipped_reject";
             }
             weight = adm.admitted_weight;
         }
@@ -530,7 +535,7 @@ pub fn tryDemoExecute(
             .equity = equity,
             .mark_price = mark,
             .admitted_btc_weight = weight,
-            .instrument = instrument,
+            .instrument = sizing_instrument,
             // Band only gates the opening leg; seq>0 legs finish an already
             // admitted delta after partial fills.
             .min_weight_delta = if (seq == 0 and !exit_mode) cfg.min_rebalance_weight_delta else Decimal.zero,
@@ -583,6 +588,7 @@ pub fn tryDemoExecute(
             prefer_limit,
             order_policy.urgency,
             order_policy.max_wait_ms,
+            .{ .snapshot = snap, .intent = opts.intent, .admission = leg_admission, .weight = weight, .sell_cap = sell_cap },
         );
         last_note = leg.note;
 
@@ -618,7 +624,7 @@ pub fn tryDemoExecute(
                     .equity = eq2,
                     .mark_price = mark2,
                     .admitted_btc_weight = weight,
-                    .instrument = instrument,
+                    .instrument = sizing_instrument,
                     .max_sell_qty = if (exit_mode) snap.btc_available else null,
                 }) catch break;
                 if (more == .hold) return "filled";
@@ -634,6 +640,68 @@ pub fn tryDemoExecute(
     return last_note;
 }
 
+const LegProof = struct {
+    snapshot: state.PortfolioState,
+    intent: Intent,
+    admission: ?gate.ShadowAdmission,
+    weight: Decimal,
+    sell_cap: ?Decimal,
+};
+
+fn persistIntent(ctx: *const Ctx, ref: OrderRef, proof: LegProof) storage.DbError!void {
+    var payload_buf: [2048]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&payload_buf);
+    std.json.Stringify.value(.{
+        .decision_id = ref.decision_id,
+        .clOrdId = ref.cl_id,
+        .snapshot_version = proof.snapshot.version,
+        .intent = @tagName(proof.intent),
+        .decimal_scale = 8,
+        .admitted_weight_raw = proof.weight.raw,
+        .stress_equity_raw = if (proof.admission) |a| @as(?i128, a.stress_equity.raw) else null,
+        .floor_raw = if (proof.admission) |a| @as(?i128, a.floor.raw) else null,
+        .cash_raw = proof.snapshot.cash_usdt.raw,
+        .btc_raw = proof.snapshot.btc_total.raw,
+        .bid_raw = proof.snapshot.bid_price.raw,
+        .mark_raw = proof.snapshot.mark_price.raw,
+        .hwm_raw = proof.snapshot.high_watermark.raw,
+        .risk_mode = proof.snapshot.risk_mode.jsonName(),
+        .fee_rate_raw = ctx.cfg.taker_fee_rate.raw,
+        .slippage_raw = ctx.cfg.slippage_rate.raw,
+        .max_sell_qty_raw = if (proof.sell_cap) |q| @as(?i128, q.raw) else null,
+        .side = ref.side,
+        .qty = ref.qty_s,
+        .price = ref.price_s,
+    }, .{ .emit_nonportable_numbers_as_strings = true }, &writer) catch return error.StepFailed;
+    var id_buf: [64]u8 = undefined;
+    const id = std.fmt.bufPrint(&id_buf, "intent_{s}", .{ref.cl_id}) catch return error.StepFailed;
+    try ctx.db.execAll("BEGIN IMMEDIATE");
+    errdefer ctx.db.execAll("ROLLBACK") catch {};
+    try ctx.orders_repo.upsert(.{
+        .client_order_id = ref.cl_id,
+        .decision_id = ref.decision_id,
+        .side = ref.side,
+        .qty = ref.qty_s,
+        .price = ref.price_s,
+        .status = "PLANNED",
+        .created_ts = ref.created_ts,
+        .updated_ts = ref.created_ts,
+    });
+    try ctx.events_repo.append(.{
+        .event_id = id,
+        .ts = ref.created_ts,
+        .type = "ORDER_INTENT",
+        .source = "execution",
+        .severity = "INFO",
+        .correlation_id = ref.decision_id,
+        .state_version = @intCast(proof.snapshot.version),
+        .software_version = journal.software_version,
+        .config_hash = ctx.cfg.hash(),
+        .payload_json = writer.buffered(),
+    });
+    try ctx.db.execAll("COMMIT");
+}
+
 /// Single place + settle leg. `seq` differentiates client_order_id on replans.
 /// When `prefer_limit`, posts a limit at urgency-adjusted mark (tick-snapped).
 fn placeLeg(
@@ -647,6 +715,7 @@ fn placeLeg(
     prefer_limit: bool,
     urgency: Decimal,
     max_wait_ms: u32,
+    proof: LegProof,
 ) Leg {
     var cl_buf: [32]u8 = undefined;
     const cl_id = orders.clientOrderId(&cl_buf, decision_id, snap_version, seq);
@@ -696,14 +765,25 @@ fn placeLeg(
         .created_ms = ts_now,
     };
 
-    // The intent must be recoverable before the venue can possibly see it.
-    if (!persistOrder(ctx, ref, .planned, "", price_s)) {
+    // Commit the admission facts and intent together before the first byte of
+    // an order can reach the venue. No engine/owner waits while holding the DB
+    // transaction: publish health only after commit/rollback has completed.
+    persistIntent(ctx, ref, proof) catch {
+        ctx.setLedger(false);
         var pbuf: [160]u8 = undefined;
         const p = std.fmt.bufPrint(&pbuf, "{{\"clOrdId\":\"{s}\",\"reason\":\"intent_not_durable\"}}", .{cl_id}) catch "{}";
         ctx.event("ORDER_INTENT_PERSIST_FAILED", "CRITICAL", p);
         return .{ .note = "intent_persist_failed" };
-    }
+    };
     ctx.setLedger(true);
+    const latest = ctx.engine.snapshot();
+    if (ctx.aborted() or latest.risk_mode == .halted or
+        (proof.intent != .emergency_exit and latest.risk_mode == .flattening) or
+        (po.side == .buy and (!latest.accounting_ok or latest.risk_mode != .normal)))
+    {
+        _ = persistOrder(ctx, ref, .canceled, "", price_s); // provably never sent
+        return .{ .note = "aborted_before_send" };
+    }
 
     const resp = ctx.okx.postPrivate("/api/v5/trade/order", body, ts_now) catch {
         // Unknown outcome: the order may be on the book. Record, then query.

@@ -1,8 +1,8 @@
-//! External capital-flow inference from consecutive reconciled account books.
+//! Legacy capital-flow hypothesis and serialization helpers.
 //!
-//! Both books are valued at the same bid, so market movement cannot create a
-//! flow. Value-balanced opposing cash/BTC legs remain below materiality as spot
-//! execution, while any material residual is classified as external capital.
+//! `detect` is diagnostic only, NOT proof of a transfer: trade timing/slippage
+//! can create a residual even when two books use the same current bid. The
+//! daemon uses accounting.zig and never feeds this hypothesis into HWM/BH.
 
 const std = @import("std");
 const dec = @import("decimal.zig");

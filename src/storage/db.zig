@@ -76,7 +76,7 @@ pub const Db = struct {
 
         try db.execAll(
             \\PRAGMA journal_mode = WAL;
-            \\PRAGMA synchronous = NORMAL;
+            \\PRAGMA synchronous = FULL;
             \\PRAGMA busy_timeout = 5000;
             \\PRAGMA foreign_keys = ON;
         );
@@ -4262,13 +4262,13 @@ test "audit chain queries trace orders to stamped decision events (AC-GO5)" {
     const q_no_proposal =
         \\SELECT COUNT(*) FROM orders o WHERE NOT EXISTS (
         \\  SELECT 1 FROM events e
-        \\  WHERE e.type IN ('AGENT_PROPOSAL_OK','ADMIN_TARGET_WEIGHT')
+        \\  WHERE e.type IN ('ORDER_INTENT','AGENT_PROPOSAL_OK','ADMIN_TARGET_WEIGHT')
         \\  AND instr(e.payload_json, '"decision_id":"' || o.decision_id || '"') > 0)
     ;
     const q_unstamped =
         \\SELECT COUNT(*) FROM orders o WHERE EXISTS (
         \\  SELECT 1 FROM events e
-        \\  WHERE e.type IN ('AGENT_PROPOSAL_OK','ADMIN_TARGET_WEIGHT')
+        \\  WHERE e.type IN ('ORDER_INTENT','AGENT_PROPOSAL_OK','ADMIN_TARGET_WEIGHT')
         \\  AND instr(e.payload_json, '"decision_id":"' || o.decision_id || '"') > 0
         \\  AND (e.config_hash = '' OR e.software_version = ''))
     ;

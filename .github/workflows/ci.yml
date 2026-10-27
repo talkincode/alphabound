@@ -1,6 +1,8 @@
 name: CI
 
 on:
+  push:
+    branches: [main]
   pull_request:
 
 permissions:
@@ -9,18 +11,39 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - name: Preserve PR status (tests run locally)
-        run: echo "Run zig build and zig build test locally; this check is status-only."
+      - uses: actions/checkout@v4
+      - name: Install pinned Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Build
+        run: zig build --summary all
+      - name: Unit, execution-chain and concurrency tests
+        run: zig build test --summary all
+      - name: Daemon fault drills (synthetic services only)
+        run: python3 tools/e2e/run_e2e.py
 
   mcp:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: tools/alphabound-mcp
     steps:
-      - name: Preserve PR status (tests run locally)
-        run: echo "Run npm test in tools/alphabound-mcp locally; this check is status-only."
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: tools/alphabound-mcp/package-lock.json
+      - run: npm ci
+      - run: npm test
 
   dashboard:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

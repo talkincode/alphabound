@@ -18,6 +18,27 @@ const d = harness.d;
 
 const place_path = "/api/v5/trade/order";
 
+test "intent and admission proof roll back together when event persistence fails" {
+    var h = try Harness.create(testing.allocator, "demo");
+    defer h.destroy();
+    h.seed("1000", "0", "100000", "1000");
+    try h.db.execAll("CREATE TRIGGER reject_intent BEFORE INSERT ON events WHEN NEW.type='ORDER_INTENT' BEGIN SELECT RAISE(ABORT,'synthetic failure'); END");
+    try testing.expectEqualStrings("intent_persist_failed", h.execute("dec_audit_fail", "0.5", false));
+    try testing.expectEqual(@as(usize, 0), h.fake.countCalls(.POST, place_path));
+    try testing.expectEqual(@as(i64, 0), h.countOrders());
+    try testing.expect(!h.engine.snapshot().ledger_ok);
+}
+
+test "every order carries a stamped pre-send admission proof" {
+    var h = try Harness.create(testing.allocator, "demo");
+    defer h.destroy();
+    h.seed("1000", "0", "100000", "1000");
+    _ = h.execute("dec_audit_ok", "0.5", false);
+    const n = try h.db.queryInt("SELECT count(*) FROM events WHERE type='ORDER_INTENT' AND config_hash<>'' AND software_version<>'' AND correlation_id='dec_audit_ok' AND json_extract(payload_json,'$.floor_raw')>0 AND seq < (SELECT min(seq) FROM events WHERE type='ORDER_ACK')");
+    try testing.expectEqual(@as(i64, 1), n);
+    try testing.expectEqual(@as(i64, 2), try h.db.queryInt("PRAGMA synchronous"));
+}
+
 test "P1-1: a lost placement response is queried, never re-sent" {
     var h = try Harness.create(testing.allocator, "demo");
     defer h.destroy();
@@ -222,6 +243,19 @@ test "P1-8: cumulative fills accumulate across partial -> larger partial -> fill
     _ = demo_runner.observeOnce(&ctx, ref);
 
     try testing.expect(h.filledQty(cl).eql(d("0.001")));
+}
+
+test "emergency exit uses venue minimum rather than strategy trade floor" {
+    var h = try Harness.create(testing.allocator, "demo");
+    defer h.destroy();
+    h.seed("95", "0.00005", "100000", "100");
+    h.instrument.venue_min_notional = d("1");
+    h.instrument.min_notional = d("10");
+    _ = try h.engine.apply(.{ .risk_trigger = .exit_trigger });
+    var last: i64 = 0;
+    operator.driveFlatten(h.operatorEnv(), &last, true);
+    try testing.expectEqual(@as(usize, 1), h.fake.countCalls(.POST, place_path));
+    try testing.expectEqual(risk_sm.RiskMode.halted, h.engine.snapshot().risk_mode);
 }
 
 test "P0-1: a flatten drive past the drawdown boundary can still reduce the position" {
