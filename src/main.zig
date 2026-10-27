@@ -675,6 +675,16 @@ pub fn main(init: std.process.Init) !u8 {
     defer periodic_repo.deinit();
     var kv_repo = try ab.storage.KvRepo.init(&db);
     defer kv_repo.deinit();
+    var saved_safety = try ab.safety.load(&db, &kv_repo);
+    const startup_paused = saved_safety.paused or !saved_safety.clean;
+    // Arm the crash latch before any worker can start. A crash between a
+    // mode change and its checkpoint still cannot silently resume buys.
+    try ab.safety.checkpoint(&kv_repo, &saved_safety, startup_paused, saved_safety.mode);
+    switch (saved_safety.mode) {
+        .halted => _ = try engine.apply(.{ .risk_trigger = .fatal }),
+        .flattening => _ = try engine.apply(.{ .risk_trigger = .exit_trigger }),
+        else => {},
+    }
     decision_evidence_start_ms = try ensureDecisionCohort(gpa, &kv_repo, decisionMode(cfg.mode, exec_real_money), cfg.instrument, nowMs());
     var intel_repo = try ab.storage.IntelRepo.init(&db);
     defer intel_repo.deinit();
@@ -854,6 +864,7 @@ pub fn main(init: std.process.Init) !u8 {
     // Config floor on per-trade notional: dust rebalances whose fee round-trip
     // exceeds any plausible edge should plan to HOLD (§4.1 keeps venue limits
     // authoritative; this only ever raises the bar, never lowers it).
+    trade_instrument.venue_min_notional = trade_instrument.min_notional;
     if (cfg.min_trade_notional.gt(trade_instrument.min_notional)) {
         trade_instrument.min_notional = cfg.min_trade_notional;
         std.debug.print("[boot] min trade notional raised to {f} USDT (config)\n", .{cfg.min_trade_notional});
@@ -872,7 +883,6 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     }
     var startup_bid = ab.decimal.Decimal.zero;
-    var startup_bid_ts_ms: i64 = 0;
     {
         var startup_ticker_path_buf: [128]u8 = undefined;
         const startup_ticker_path = std.fmt.bufPrint(
@@ -884,7 +894,6 @@ pub fn main(init: std.process.Init) !u8 {
             defer gpa.free(body);
             if (ab.okx_rest.parseTicker(gpa, body)) |ticker| {
                 startup_bid = ticker.bid;
-                startup_bid_ts_ms = ticker.ts_ms;
             } else |err| {
                 std.debug.print("[connect] startup ticker parse failed: {t}\n", .{err});
             }
@@ -965,8 +974,8 @@ pub fn main(init: std.process.Init) !u8 {
             if (okx.getPrivate("/api/v5/account/config", nowMs())) |cbody| {
                 defer gpa.free(cbody);
                 if (ab.okx_rest.parseKeyPerms(gpa, cbody)) |perms| {
-                    if (perms.can_withdraw) {
-                        std.debug.print("[boot] FATAL real-money key has WITHDRAW permission — use a read+trade-only key\n", .{});
+                    if (!perms.permitsTrading()) {
+                        std.debug.print("[boot] FATAL real-money key requires verified read+trade permissions without withdraw\n", .{});
                         logEvent(&events_repo, &engine, "KEY_PERMS_REJECTED", "exchange", "CRITICAL", &cfg);
                         return 1;
                     }
@@ -975,10 +984,12 @@ pub fn main(init: std.process.Init) !u8 {
                         .{ perms.can_read, perms.can_trade, perms.can_withdraw },
                     );
                 } else |_| {
-                    std.debug.print("[boot] WARN key perms unparseable — proceeding (verify manually)\n", .{});
+                    std.debug.print("[boot] FATAL key permission proof unparseable — refusing real-money startup\n", .{});
+                    return 1;
                 }
             } else |_| {
-                std.debug.print("[boot] WARN key perms probe failed — proceeding (verify manually)\n", .{});
+                std.debug.print("[boot] FATAL key permission probe failed — refusing real-money startup\n", .{});
+                return 1;
             }
         }
         // Private WS probe is opt-in: TLS+WS over std.http.Client currently gets
@@ -993,37 +1004,8 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("[reconcile] no keys — skip private balance\n", .{});
     }
 
-    if (cfg.mode.isTrading() and boot_balance_loaded) {
-        const previous_balances = loadReconciledBalances(&kv_repo) catch |err| {
-            std.debug.print("[reconcile] stored balance checkpoint unreadable: {t}\n", .{err});
-            return 1;
-        };
-        if (previous_balances) |previous| {
-            if (startup_bid.gt(ab.decimal.Decimal.zero) and
-                startup_bid_ts_ms > 0 and
-                boot_balance_ts_ms - startup_bid_ts_ms <= engine.snapshot().freshness.market_ttl_ms)
-            {
-                startup_flow = ab.capital_flow.detect(.{
-                    .before = previous,
-                    .after = .{
-                        .cash_usdt = boot_cash,
-                        .btc_total = boot_btc,
-                    },
-                    .bid_price = startup_bid,
-                    .exit_costs = .{
-                        .fee_rate = cfg.taker_fee_rate,
-                        .slippage_rate = cfg.slippage_rate,
-                    },
-                }) catch |err| {
-                    std.debug.print("[reconcile] startup capital-flow detection failed: {t}\n", .{err});
-                    return 1;
-                };
-            } else {
-                std.debug.print("[reconcile] startup bid unavailable — refusing to advance balance checkpoint\n", .{});
-                return 1;
-            }
-        }
-    }
+    // No inference-based capital rebasing. persistAccountReconcile verifies
+    // asset deltas against fills and quarantines unexplained differences.
     if (cfg.mode.isTrading() and boot_balance_loaded) {
         if (!persistAccountReconcile(
             &db,
@@ -1067,7 +1049,7 @@ pub fn main(init: std.process.Init) !u8 {
     }
 
     // Local admin pause flag (control file). Risk/market loop keeps running.
-    var admin_paused: bool = false;
+    var admin_paused: bool = startup_paused;
     var runtime_status = RuntimeStatus{};
     var res_sampler = ab.resources.Sampler.init();
 
@@ -1111,9 +1093,7 @@ pub fn main(init: std.process.Init) !u8 {
     ab.web_cache.refreshIntelCache(&web_state, &db, &intel_repo, nowMs());
     ab.web_cache.refreshAuditCache(&web_state, &db, &audit_repo);
     ab.web_cache.refreshAnalyticsCache(&web_state, &db, &equity_repo);
-    refreshCandlesCache(gpa, &web_state, &okx, &cfg);
-    refreshSentimentCache(gpa, &web_state, &okx);
-    refreshEgressIp(&okx, &runtime_status);
+    // Network-only presentation caches are published by Poller after startup.
     refreshDiskStatus(&cfg, &engine, &events_repo, &runtime_status);
     runtime_status.setResources(res_sampler.sample(nowMs()));
     refreshSystemCache(&web_state, &db, &cfg, mem_store.count(), boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), agent_on, admin_paused, &runtime_status, &risk_latency);
@@ -1123,7 +1103,6 @@ pub fn main(init: std.process.Init) !u8 {
     var last_sample_min: i64 = 0;
     var last_private_ms: i64 = 0;
     var last_dashboard_ms: i64 = 0;
-    var last_sentiment_ms: i64 = nowMs();
     var agent_done_once = false;
     // Multi-factor decision scheduler: session-aware base cadence + event
     // triggers (price move / drawdown step / risk-mode change) + cooldown floor.
@@ -1145,34 +1124,37 @@ pub fn main(init: std.process.Init) !u8 {
         .volatility_gap_ms = param_snap.params.volatility_gap_ms,
     });
     var live_param_version: i64 = param_snap.version_id;
-    var ticker_path_buf: [128]u8 = undefined;
-    const ticker_path = std.fmt.bufPrint(&ticker_path_buf, "/api/v5/market/ticker?instId={s}", .{cfg.instrument}) catch return 1;
     // Gate 1: periodic private REST reconcile; private WS is boot probe + optional re-probe.
     // Trading executes against the exchange book: reconcile must beat account_ttl_ms
     // (30s) or the risk kernel flaps NORMAL→EXIT_ONLY between reconciles.
     const private_reconcile_ms: i64 = if (cfg.mode.isTrading()) 20_000 else 60_000;
     const dashboard_refresh_ms: i64 = 5_000;
-    const sentiment_refresh_ms: i64 = 1_800_000;
-    const private_ws_reprobe_ms: i64 = 300_000;
     const backup_interval_ms: i64 = 3_600_000;
-    const egress_refresh_ms: i64 = 3_600_000;
     // FD7: probe DB volume free space often enough to catch fill-ups.
     const disk_refresh_ms: i64 = 60_000;
     // AB 因子复盘 analytics: recompute over the 48h 1m trail once a minute.
     const analytics_refresh_ms: i64 = 60_000;
-    var last_egress_ms: i64 = 0;
     var last_disk_ms: i64 = 0;
     var last_analytics_ms: i64 = 0;
-    var last_private_ws_ms: i64 = now_boot;
     var last_backup_ms: i64 = 0;
     var last_audit_ms: i64 = 0;
     ab.web_cache.refreshPeriodicReviewCache(&web_state, &db, &periodic_repo);
     var last_flatten_submit_ms: i64 = 0;
     var last_recovery_submit_ms: i64 = 0;
     var next_poll_ms: i64 = 0;
-    var account_reconcile_ctx = AccountReconcileContext{
+    var poller = ab.poller.Poller{
         .gpa = gpa,
-        .okx = &okx,
+        .io = io,
+        .cfg = &cfg,
+        .creds = auth_creds,
+        .simulated = if (okx_env) |c| c.simulated else false,
+        .ws = &web_state,
+        .status = &runtime_status,
+    };
+    try poller.start();
+    defer poller.stop();
+    var account_reconcile_ctx = AccountReconcileContext{
+        .poller = &poller,
         .db = &db,
         .engine = &engine,
         .events_repo = &events_repo,
@@ -1278,11 +1260,19 @@ pub fn main(init: std.process.Init) !u8 {
         // order, by the single writer; owner-only work (account reconcile)
         // is run on request; scheduler feedback from finished decisions.
         _ = engine.drainInbox();
-        _ = reconcile_service.pump(&account_reconcile_ctx, refreshAccountForExecution);
+        pumpAccountReconcile(&account_reconcile_ctx, &reconcile_service);
+        _ = engine.apply(.{ .clock_tick = .{ .ts_ms = nowMs() } }) catch {};
+        web_state.update(engine.snapshot(), true);
         drainThinkFeedback(&think, &agent_sched);
         // Journal any risk-mode transition from the previous iteration, whatever
         // engine message caused it (single emission point).
         drainModeTransitions(&events_repo, &engine, &cfg);
+        ab.safety.checkpoint(&kv_repo, &saved_safety, admin_paused, engine.snapshot().risk_mode) catch {
+            if (exec_started) exec.setAgentBlocked(true);
+            _ = engine.apply(.{ .risk_trigger = .fatal }) catch {};
+            std.debug.print("[safety] checkpoint failed; refusing autonomous continuation\n", .{});
+            return 1;
+        };
         {
             const lane_snap = engine.snapshot();
             const blocked = admin_paused or lane_snap.risk_mode == .flattening or lane_snap.risk_mode == .halted;
@@ -1347,18 +1337,7 @@ pub fn main(init: std.process.Init) !u8 {
                     .reconcile => {
                         std.debug.print("[admin] reconcile requested\n", .{});
                         if (okx_env != null) {
-                            const outcome = runPrivateReconcile(gpa, &okx, &db, &engine, &events_repo, &capital_flows_repo, &kv_repo, &bh, &cfg, &runtime_status);
-                            if (outcome.flow) |flow| {
-                                applyCapitalFlowEffects(
-                                    flow,
-                                    &engine,
-                                    &bh,
-                                    &last_bh_cmp,
-                                    &events_repo,
-                                    &cfg,
-                                    &agent_sched,
-                                );
-                            }
+                            account_reconcile_ctx.request(&reconcile_service);
                         }
                         logEvent(&events_repo, &engine, "ADMIN_RECONCILE", "admin", "INFO", &cfg);
                     },
@@ -1412,6 +1391,12 @@ pub fn main(init: std.process.Init) !u8 {
                     },
                     .none => {},
                 }
+                // A command is acknowledged only after its latch is durable.
+                ab.safety.checkpoint(&kv_repo, &saved_safety, admin_paused, engine.snapshot().risk_mode) catch {
+                    if (exec_started) exec.setAgentBlocked(true);
+                    _ = engine.apply(.{ .risk_trigger = .fatal }) catch {};
+                    return 1;
+                };
                 writeControlState(io, control_state_path, admin_paused, req.cmd, true);
             }
         }
@@ -1425,9 +1410,9 @@ pub fn main(init: std.process.Init) !u8 {
         }
         next_poll_ms = spin_now + @as(i64, cfg.poll_interval_ms);
 
-        if (okx.getPublic(ticker_path)) |body| {
-            defer gpa.free(body);
-            if (ab.okx_rest.parseTicker(gpa, body)) |ticker| {
+        if (poller.takeTick()) |received| {
+            if (received == .ok) {
+                const ticker = received.ok;
                 // Shadow uses a simulated book: keep account freshness aligned with
                 // market ticks so the risk mode does not spuriously enter EXIT_ONLY
                 // after account_ttl without private WS updates. Applied *before*
@@ -1518,15 +1503,10 @@ pub fn main(init: std.process.Init) !u8 {
                         last_sample_min = minute;
                     }
                 }
-            } else |_| {
-                _ = engine.apply(.{ .clock_tick = .{ .ts_ms = nowMs() } }) catch {};
+            } else {
+                runtime_status.setPub("error", "ticker_http");
                 web_state.update(engine.snapshot(), true);
             }
-        } else |err| {
-            std.debug.print("[loop] ticker fetch failed: {t}\n", .{err});
-            runtime_status.setPub("error", "ticker_http");
-            _ = engine.apply(.{ .clock_tick = .{ .ts_ms = nowMs() } }) catch {};
-            web_state.update(engine.snapshot(), true);
         }
 
         // Periodic read-only private balance probe (shadow keeps simulated engine cash).
@@ -1534,24 +1514,7 @@ pub fn main(init: std.process.Init) !u8 {
             const tnow = nowMs();
             if (last_private_ms == 0 or tnow - last_private_ms >= private_reconcile_ms) {
                 last_private_ms = tnow;
-                const outcome = runPrivateReconcile(gpa, &okx, &db, &engine, &events_repo, &capital_flows_repo, &kv_repo, &bh, &cfg, &runtime_status);
-                if (outcome.flow) |flow| {
-                    applyCapitalFlowEffects(
-                        flow,
-                        &engine,
-                        &bh,
-                        &last_bh_cmp,
-                        &events_repo,
-                        &cfg,
-                        &agent_sched,
-                    );
-                }
-            }
-            if (envGetTruthy(env, "ALPHABOUND_PRIVATE_WS") and
-                tnow - last_private_ws_ms >= private_ws_reprobe_ms)
-            {
-                last_private_ws_ms = tnow;
-                runPrivateWsProbe(gpa, &okx, okx_env.?.asAuth(), &engine, &events_repo, &cfg);
+                account_reconcile_ctx.request(&reconcile_service);
             }
         }
 
@@ -1628,16 +1591,7 @@ pub fn main(init: std.process.Init) !u8 {
                 web_state.refreshParamsCache(&db);
                 ab.web_cache.refreshIntelCache(&web_state, &db, &intel_repo, tnow);
                 ab.web_cache.refreshStatisticsCache(&web_state, &db, &llm_usage_repo);
-                refreshCandlesCache(gpa, &web_state, &okx, &cfg);
-                if (last_sentiment_ms == 0 or tnow - last_sentiment_ms >= sentiment_refresh_ms) {
-                    last_sentiment_ms = tnow;
-                    refreshSentimentCache(gpa, &web_state, &okx);
-                }
                 refreshSystemCache(&web_state, &db, &cfg, think.mem_count.load(.acquire), boot_ms, okx_env != null, envGetTruthy(env, "ALPHABOUND_PRIVATE_WS"), agent_on, admin_paused, &runtime_status, &risk_latency);
-            }
-            if (last_egress_ms == 0 or tnow - last_egress_ms >= egress_refresh_ms) {
-                last_egress_ms = tnow;
-                refreshEgressIp(&okx, &runtime_status);
             }
             if (last_disk_ms == 0 or tnow - last_disk_ms >= disk_refresh_ms) {
                 last_disk_ms = tnow;
@@ -1678,7 +1632,7 @@ pub fn main(init: std.process.Init) !u8 {
         const stop_deadline = nowMs() + @as(i64, if (cli.max_ticks > 0) 120_000 else 10_000);
         while (nowMs() < stop_deadline and !((!exec_started or exec.isStopped()) and think.isStopped())) {
             _ = engine.drainInbox();
-            _ = reconcile_service.pump(&account_reconcile_ctx, refreshAccountForExecution);
+            pumpAccountReconcile(&account_reconcile_ctx, &reconcile_service);
             io.sleep(.{ .nanoseconds = 20_000_000 }, .awake) catch break;
         }
         _ = engine.drainInbox();
@@ -1689,6 +1643,11 @@ pub fn main(init: std.process.Init) !u8 {
     refreshWebCaches(&web_state, &db, &agent_runs, &equity_repo, &events_repo, &memories_repo, &orders_repo, &fills_repo, last_bh_cmp);
     ab.web_cache.refreshStatisticsCache(&web_state, &db, &llm_usage_repo);
     logEvent(&events_repo, &engine, "SHUTDOWN_CLEAN", "core", "CRITICAL", &cfg);
+    try ab.safety.save(&kv_repo, .{
+        .paused = admin_paused,
+        .mode = engine.snapshot().risk_mode,
+        .clean = (!exec_started or exec.isStopped()) and think.isStopped(),
+    });
     return 0;
 }
 
@@ -2039,10 +1998,7 @@ const ThinkLane = struct {
     }
 };
 
-const PrivateProbe = union(enum) {
-    ok: ab.okx_rest.Balance,
-    err: []const u8,
-};
+const PrivateProbe = ab.okx_rest.BalanceProbe;
 
 const PrivateReconcileOutcome = struct {
     ok: bool = false,
@@ -2050,8 +2006,8 @@ const PrivateReconcileOutcome = struct {
 };
 
 const AccountReconcileContext = struct {
-    gpa: std.mem.Allocator,
-    okx: *ab.okx_rest.Client,
+    poller: *ab.poller.Poller,
+    in_flight: bool = false,
     db: *ab.storage.Db,
     engine: *ab.state.Engine,
     events_repo: *ab.storage.EventsRepo,
@@ -2062,34 +2018,42 @@ const AccountReconcileContext = struct {
     cfg: *const ab.config.Config,
     status: *RuntimeStatus,
     sched: *ab.scheduler.Scheduler,
+
+    fn request(self: *AccountReconcileContext, service: *ab.lanes.Service) void {
+        if (self.in_flight) return;
+        self.in_flight = self.poller.requests.push(service.requested.load(.acquire));
+    }
 };
 
-fn refreshAccountForExecution(raw: *anyopaque) bool {
-    const ctx: *AccountReconcileContext = @ptrCast(@alignCast(raw));
-    const outcome = runPrivateReconcile(
-        ctx.gpa,
-        ctx.okx,
-        ctx.db,
-        ctx.engine,
-        ctx.events_repo,
-        ctx.capital_flows_repo,
-        ctx.kv_repo,
-        ctx.bh,
-        ctx.cfg,
-        ctx.status,
-    );
-    if (outcome.flow) |flow| {
-        applyCapitalFlowEffects(
-            flow,
+fn pumpAccountReconcile(ctx: *AccountReconcileContext, service: *ab.lanes.Service) void {
+    if (ctx.poller.accounts.pop()) |account| {
+        ctx.in_flight = false;
+        const outcome = applyPrivateReconcile(
+            account.probe,
+            ctx.db,
             ctx.engine,
-            ctx.bh,
-            ctx.comparison,
             ctx.events_repo,
+            ctx.capital_flows_repo,
+            ctx.kv_repo,
+            ctx.bh,
             ctx.cfg,
-            ctx.sched,
+            ctx.status,
         );
+        if (outcome.flow) |flow| {
+            applyCapitalFlowEffects(
+                flow,
+                ctx.engine,
+                ctx.bh,
+                ctx.comparison,
+                ctx.events_repo,
+                ctx.cfg,
+                ctx.sched,
+            );
+        }
+        service.ok.store(outcome.ok, .release);
+        service.completed.store(account.ticket, .release);
     }
-    return outcome.ok;
+    if (service.requested.load(.acquire) > service.completed.load(.acquire)) ctx.request(service);
 }
 
 /// Read-only signed GET /api/v5/account/balance. Never places orders.
@@ -2256,8 +2220,6 @@ fn printAgentStats(db: *ab.storage.Db) void {
 }
 
 const refreshWebCaches = ab.web_cache.refreshWebCaches;
-const refreshCandlesCache = ab.web_cache.refreshCandlesCache;
-const refreshSentimentCache = ab.web_cache.refreshSentimentCache;
 
 /// One-shot private WS TLS login/subscribe probe. Never places orders.
 fn runPrivateWsProbe(
@@ -2337,9 +2299,8 @@ var last_balance_event: struct {
     }
 } = .{};
 
-fn runPrivateReconcile(
-    gpa: std.mem.Allocator,
-    okx: *ab.okx_rest.Client,
+fn applyPrivateReconcile(
+    probe: PrivateProbe,
     db: *ab.storage.Db,
     engine: *ab.state.Engine,
     events_repo: *ab.storage.EventsRepo,
@@ -2349,11 +2310,10 @@ fn runPrivateReconcile(
     cfg: *const ab.config.Config,
     st: *RuntimeStatus,
 ) PrivateReconcileOutcome {
-    const probe = probePrivateBalance(gpa, okx);
     switch (probe) {
         .ok => |b| {
             const ts_ms = nowMs();
-            var detected: ?ab.capital_flow.Flow = null;
+            const detected: ?ab.capital_flow.Flow = null;
             if (cfg.mode.isTrading()) {
                 const before = engine.snapshot();
                 const prior_balances = loadReconciledBalances(kv_repo) catch |err| {
@@ -2369,32 +2329,6 @@ fn runPrivateReconcile(
                         std.debug.print("[reconcile] journal fail-close state update failed: {t}\n", .{err});
                     };
                     return .{};
-                }
-                if (prior_balances != null and
-                    (!before.bid_price.gt(ab.decimal.Decimal.zero) or !before.freshness.marketFresh(ts_ms)))
-                {
-                    std.debug.print("[reconcile] fresh bid unavailable — refusing to advance balance checkpoint\n", .{});
-                    _ = engine.apply(.{ .journal_status = .{ .ok = false } }) catch |err| {
-                        std.debug.print("[reconcile] journal fail-close state update failed: {t}\n", .{err});
-                    };
-                    return .{};
-                }
-                if (prior_balances != null) {
-                    detected = ab.capital_flow.detect(.{
-                        .before = prior_balances.?,
-                        .after = .{ .cash_usdt = b.usdt_cash, .btc_total = b.btc_cash },
-                        .bid_price = before.bid_price,
-                        .exit_costs = .{
-                            .fee_rate = cfg.taker_fee_rate,
-                            .slippage_rate = cfg.slippage_rate,
-                        },
-                    }) catch |err| {
-                        std.debug.print("[reconcile] capital-flow detection failed: {t}\n", .{err});
-                        _ = engine.apply(.{ .journal_status = .{ .ok = false } }) catch |state_err| {
-                            std.debug.print("[reconcile] journal fail-close state update failed: {t}\n", .{state_err});
-                        };
-                        return .{};
-                    };
                 }
                 if (!persistAccountReconcile(
                     db,
@@ -2531,8 +2465,15 @@ fn persistAccountReconcile(
         };
     };
 
-    if (flow) |capital_flow| {
-        if (!recordCapitalFlow(repo, events_repo, engine, cfg, ts_ms, capital_flow)) return false;
+    // Only an explicit, independently verified transfer workflow may rebase
+    // capital. This automatic path has no such proof and must never guess.
+    if (flow != null) return false;
+    _ = repo;
+    const accounting_ok = ab.accounting.check(db, kv_repo, balances, ts) catch return false;
+    const was_accounting_ok = engine.snapshot().accounting_ok;
+    _ = engine.apply(.{ .accounting_status = .{ .ok = accounting_ok } }) catch return false;
+    if (!accounting_ok and was_accounting_ok) {
+        if (!logEventPayloadChecked(events_repo, engine, "ACCOUNTING_UNEXPLAINED", "reconcile", "CRITICAL", cfg, "{\"action\":\"block_increases_preserve_hwm\",\"reason\":\"balance_not_explained_by_confirmed_fills\"}")) return false;
     }
     if (!persistReconciledBalances(kv_repo, balances)) {
         std.debug.print("[reconcile] balance checkpoint persistence failed\n", .{});
@@ -4543,35 +4484,6 @@ fn refreshDiskStatus(
         ) catch "{\"band\":\"?\"}";
         const sev: []const u8 = if (band == .critical) "CRITICAL" else if (band == .low) "WARN" else "INFO";
         logEventPayload(events_repo, engine, "DISK_STATUS", "storage", sev, cfg, payload);
-    }
-}
-
-fn refreshEgressIp(okx: *ab.okx_rest.Client, st: *RuntimeStatus) void {
-    // Best-effort; never let a half-closed pooled socket permanently block egress probe.
-    var attempt: u8 = 0;
-    while (attempt < 2) : (attempt += 1) {
-        var sink: [ab.security_limits.max_probe_response_bytes]u8 = undefined;
-        var fixed_writer: std.Io.Writer = .fixed(&sink);
-        const result = okx.http.fetch(.{
-            .location = .{ .url = "https://api.ipify.org" },
-            .method = .GET,
-            .response_writer = &fixed_writer,
-            .keep_alive = false,
-        }) catch {
-            if (attempt == 0) {
-                const io = okx.http.io;
-                const allocator = okx.http.allocator;
-                okx.http.deinit();
-                okx.http = .{ .allocator = allocator, .io = io };
-                continue;
-            }
-            return;
-        };
-        _ = result;
-        const body = fixed_writer.buffered();
-        const ip = std.mem.trim(u8, body, " \t\r\n");
-        if (ip.len > 0 and ip.len < 64) st.setEgress(ip);
-        return;
     }
 }
 

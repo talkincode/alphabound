@@ -452,6 +452,10 @@ pub const KeyPerms = struct {
     can_read: bool,
     can_trade: bool,
     can_withdraw: bool,
+
+    pub fn permitsTrading(self: KeyPerms) bool {
+        return self.can_read and self.can_trade and !self.can_withdraw;
+    }
 };
 
 pub fn parseKeyPerms(gpa: std.mem.Allocator, body: []const u8) Error!KeyPerms {
@@ -469,6 +473,24 @@ pub fn parseKeyPerms(gpa: std.mem.Allocator, body: []const u8) Error!KeyPerms {
         if (std.mem.eql(u8, p, "withdraw")) out.can_withdraw = true;
     }
     return out;
+}
+
+test "live permission proof requires read and trade without withdrawal" {
+    const cases = [_]struct { perm: []const u8, expected: bool }{
+        .{ .perm = "read_only,trade", .expected = true },
+        .{ .perm = "read_only", .expected = false },
+        .{ .perm = "trade", .expected = false },
+        .{ .perm = "read_only,trade,withdraw", .expected = false },
+        .{ .perm = "", .expected = false },
+    };
+    for (cases) |case| {
+        var buf: [192]u8 = undefined;
+        const body = try std.fmt.bufPrint(&buf, "{{\"code\":\"0\",\"data\":[{{\"perm\":\"{s}\"}}]}}", .{case.perm});
+        const perms = try parseKeyPerms(std.testing.allocator, body);
+        try std.testing.expectEqual(case.expected, perms.permitsTrading());
+    }
+    try std.testing.expectError(Error.MalformedResponse, parseKeyPerms(std.testing.allocator, "{\"code\":\"0\",\"data\":[{}]}"));
+    try std.testing.expectError(Error.ApiError, parseKeyPerms(std.testing.allocator, "{\"code\":\"50011\",\"data\":[]}"));
 }
 
 pub const OrderAck = struct {
@@ -751,6 +773,8 @@ pub const Client = struct {
     /// Set true when using OKX demo trading (adds x-simulated-trading: 1).
     simulated: bool = false,
     transport: ?Transport = null,
+    /// Per-attempt wall-clock bound; reads may retry once, writes never do.
+    timeout_ms: u32 = 5_000,
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, base_url: []const u8, creds: ?auth.Credentials) Client {
         return .{
@@ -832,7 +856,30 @@ pub const Client = struct {
 
     fn fetchRawOnce(self: *Client, method: auth.Method, url: []const u8, body: []const u8, extra_headers: []const std.http.Header) ![]u8 {
         if (self.transport) |t| return t.fetch_fn(t.context, self.gpa, method, url, body);
+        const Done = union(enum) { response: anyerror![]u8, timeout: std.Io.Cancelable!void };
+        var results: [2]Done = undefined;
+        var race = std.Io.Select(Done).init(self.http.io, &results);
+        // Cancel and JOIN the outstanding I/O; never leak an abandoned worker
+        // or a response that finished concurrently with the timer.
+        defer while (race.cancel()) |done| {
+            if (done == .response) {
+                if (done.response) |bytes| self.gpa.free(bytes) else |_| {}
+            }
+        };
+        try race.concurrent(.response, fetchNetwork, .{ self, method, url, body, extra_headers });
+        try race.concurrent(.timeout, requestDeadline, .{ self.http.io, self.timeout_ms });
+        const done = try race.await();
+        return switch (done) {
+            .response => |response| response,
+            .timeout => Error.HttpFailed,
+        };
+    }
 
+    fn requestDeadline(io: std.Io, ms: u32) std.Io.Cancelable!void {
+        try io.sleep(.{ .nanoseconds = @as(i96, @max(ms, 1)) * 1_000_000 }, .awake);
+    }
+
+    fn fetchNetwork(self: *Client, method: auth.Method, url: []const u8, body: []const u8, extra_headers: []const std.http.Header) ![]u8 {
         // AC-SEC5: fixed-capacity sink — a hostile/broken gateway cannot balloon memory.
         const sink = self.gpa.alloc(u8, limits.max_okx_response_bytes) catch return Error.OutOfMemory;
         defer self.gpa.free(sink);

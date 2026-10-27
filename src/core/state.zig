@@ -42,6 +42,9 @@ pub const PortfolioState = struct {
     /// Cash/BTC hold a local projection of fills the venue has not yet
     /// confirmed through an authoritative balance. Never counts as fresh.
     account_projected: bool = false,
+    /// Balance changes must be explained by confirmed fills or external proof.
+    /// Unknown differences block increases/HWM advancement, not safe exits.
+    accounting_ok: bool = true,
     unresolved_orders: bool = false,
     /// Orders the local ledger does not own are resting on the venue. Blocks
     /// new risk (like `unresolved_orders`) but never blocks a risk-reducing exit.
@@ -104,6 +107,7 @@ pub const Message = union(enum) {
     journal_status: struct { ok: bool },
     /// Order ledger (intent/progress rows) write health. `ok=false` → degraded.
     ledger_status: struct { ok: bool },
+    accounting_status: struct { ok: bool },
     clock_tick: struct { ts_ms: i64 }, // periodic freshness re-evaluation
 };
 
@@ -345,6 +349,10 @@ pub const Engine = struct {
                 self.state.ledger_ok = l.ok;
                 self.evaluateHealth(self.state.as_of_ms);
             },
+            .accounting_status => |a| {
+                self.state.accounting_ok = a.ok;
+                self.evaluateHealth(self.state.as_of_ms);
+            },
             .clock_tick => |c| {
                 self.state.as_of_ms = c.ts_ms;
                 self.evaluateHealth(c.ts_ms);
@@ -394,7 +402,7 @@ pub const Engine = struct {
                 .exit_costs = self.exit_costs,
             });
             self.state.conservative_equity = r.equity;
-            if (self.state.reconciled and advance_hwm and !self.state.account_projected) {
+            if (self.state.reconciled and advance_hwm and !self.state.account_projected and self.state.accounting_ok and self.state.freshness.marketFresh(now_ms)) {
                 // HWM only advances on reconciled data — unconfirmed balances
                 // must not raise the boundary reference (§5.1 conservatism).
                 self.state.high_watermark = equity_mod.updateHighWatermark(self.state.high_watermark, r.equity);
@@ -420,6 +428,7 @@ pub const Engine = struct {
             self.state.journal_ok and
             self.state.ledger_ok and
             !self.state.account_projected and
+            self.state.accounting_ok and
             self.state.freshness.marketFresh(now_ms) and
             self.state.freshness.accountFresh(now_ms);
         const trigger: sm.Trigger = if (healthy) .conditions_ok else .degraded;

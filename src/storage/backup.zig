@@ -120,13 +120,13 @@ pub fn verifyDbSnapshot(path: []const u8) u8 {
         const o_no_proposal = db.queryInt(
             \\SELECT COUNT(*) FROM orders o WHERE NOT EXISTS (
             \\  SELECT 1 FROM events e
-            \\  WHERE e.type IN ('AGENT_PROPOSAL_OK','ADMIN_TARGET_WEIGHT')
+            \\  WHERE e.type IN ('ORDER_INTENT','AGENT_PROPOSAL_OK','ADMIN_TARGET_WEIGHT')
             \\  AND instr(e.payload_json, '"decision_id":"' || o.decision_id || '"') > 0)
         ) catch -1;
         const o_unstamped_dec = db.queryInt(
             \\SELECT COUNT(*) FROM orders o WHERE EXISTS (
             \\  SELECT 1 FROM events e
-            \\  WHERE e.type IN ('AGENT_PROPOSAL_OK','ADMIN_TARGET_WEIGHT')
+            \\  WHERE e.type IN ('ORDER_INTENT','AGENT_PROPOSAL_OK','ADMIN_TARGET_WEIGHT')
             \\  AND instr(e.payload_json, '"decision_id":"' || o.decision_id || '"') > 0
             \\  AND (e.config_hash = '' OR e.software_version = ''))
         ) catch -1;

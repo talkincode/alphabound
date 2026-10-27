@@ -17,6 +17,9 @@ pub const Instrument = struct {
     min_size: Decimal,
     /// Some venues also enforce a min notional; 0 disables.
     min_notional: Decimal = Decimal.zero,
+    /// Original venue floor, before any strategy minimum is applied.
+    /// Emergency exits use this instead of the policy-raised minimum.
+    venue_min_notional: ?Decimal = null,
 };
 
 pub const PlanInputs = struct {
