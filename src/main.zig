@@ -646,6 +646,9 @@ pub fn main(init: std.process.Init) !u8 {
         .fee_rate = cfg.taker_fee_rate,
         .slippage_rate = cfg.slippage_rate,
     }, cfg.max_drawdown);
+    // Freshness runs on the local receive clock; keep enough headroom that one
+    // slow poll cannot degrade the book (three polls, floor at the default).
+    engine.state.freshness.market_ttl_ms = ab.state.FreshnessState.marketTtlFor(cfg.poll_interval_ms);
     // This thread is the single writer of trading state; the slow lanes only
     // submit messages and read snapshots.
     engine.claimOwner();
@@ -1413,6 +1416,9 @@ pub fn main(init: std.process.Init) !u8 {
         if (poller.takeTick()) |received| {
             if (received == .ok) {
                 const ticker = received.ok;
+                // Same wall clock for the shadow account refresh and the tick's
+                // freshness stamp; the venue ts only orders price samples.
+                const seen_ms = if (ticker.seen_ms > 0) ticker.seen_ms else nowMs();
                 // Shadow uses a simulated book: keep account freshness aligned with
                 // market ticks so the risk mode does not spuriously enter EXIT_ONLY
                 // after account_ttl without private WS updates. Applied *before*
@@ -1421,7 +1427,7 @@ pub fn main(init: std.process.Init) !u8 {
                 if (cfg.mode == .shadow) {
                     const s0 = engine.snapshot();
                     _ = engine.apply(.{ .account_update = .{
-                        .ts_ms = ticker.ts_ms,
+                        .ts_ms = seen_ms,
                         .cash_usdt = s0.cash_usdt,
                         .btc_total = s0.btc_total,
                         .btc_available = s0.btc_available,
@@ -1430,6 +1436,7 @@ pub fn main(init: std.process.Init) !u8 {
                 const lat_t0 = ab.clock.SystemClock.clock().monotonicNs();
                 _ = engine.apply(.{ .market_tick = .{
                     .ts_ms = ticker.ts_ms,
+                    .seen_ms = seen_ms,
                     .bid = ticker.bid,
                     .mark = ticker.last,
                 } }) catch continue;

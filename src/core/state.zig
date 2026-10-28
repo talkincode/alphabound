@@ -11,11 +11,23 @@ const equity_mod = @import("../risk/equity.zig");
 const orders_mod = @import("../execution/orders.zig");
 
 pub const FreshnessState = struct {
+    pub const default_market_ttl_ms: i64 = 10_000;
+
+    /// Local wall-clock time when the last market input was *received*.
+    /// Never the venue timestamp: an exchange `ts` can already be one poll
+    /// interval old at ingestion, so judging freshness by it expired the TTL
+    /// just before the next poll and flapped NORMAL↔EXIT_ONLY.
     market_last_ms: i64 = 0,
     account_last_ms: i64 = 0,
     /// Data older than this is stale (drives EXIT_ONLY, §7.2).
-    market_ttl_ms: i64 = 10_000,
+    market_ttl_ms: i64 = default_market_ttl_ms,
     account_ttl_ms: i64 = 30_000,
+
+    /// Three polls of tolerance: one slow request must not degrade the book,
+    /// two consecutive misses should.
+    pub fn marketTtlFor(poll_interval_ms: u32) i64 {
+        return @max(default_market_ttl_ms, @as(i64, poll_interval_ms) * 3);
+    }
 
     pub fn marketFresh(self: FreshnessState, now_ms: i64) bool {
         return self.market_last_ms > 0 and now_ms - self.market_last_ms <= self.market_ttl_ms;
@@ -65,9 +77,13 @@ pub const PortfolioState = struct {
 
 pub const Message = union(enum) {
     market_tick: struct {
+        /// Venue timestamp: display/ordering only, never freshness.
         ts_ms: i64,
         bid: Decimal,
         mark: Decimal,
+        /// Local wall time when the poller received the tick. 0 keeps callers
+        /// that already work in local time (tests) on the `ts_ms` fallback.
+        seen_ms: i64 = 0,
     },
     account_update: struct {
         ts_ms: i64,
@@ -285,11 +301,12 @@ pub const Engine = struct {
 
         switch (msg) {
             .market_tick => |t| {
+                const seen_ms = if (t.seen_ms > 0) t.seen_ms else t.ts_ms;
                 self.state.bid_price = t.bid;
                 self.state.mark_price = t.mark;
-                self.state.freshness.market_last_ms = t.ts_ms;
-                self.state.as_of_ms = t.ts_ms;
-                try self.revalue(t.ts_ms);
+                self.state.freshness.market_last_ms = seen_ms;
+                self.state.as_of_ms = seen_ms;
+                try self.revalue(seen_ms);
             },
             .account_update => |u| {
                 self.state.cash_usdt = u.cash_usdt;
@@ -551,6 +568,38 @@ test "stale market data degrades to exit_only" {
     _ = try e.apply(.{ .account_update = .{ .ts_ms = 61_500, .cash_usdt = d("100"), .btc_total = d("0"), .btc_available = d("0") } });
     _ = try e.apply(.{ .market_tick = .{ .ts_ms = 62_000, .bid = d("100000"), .mark = d("100000") } });
     try testing.expectEqual(sm.RiskMode.normal, e.snapshot().risk_mode);
+}
+
+test "market freshness uses local receipt time, not the venue timestamp" {
+    var e = testEngine();
+    // Book and balance arrive together at local time 9000, but the venue
+    // stamped the tick 8s earlier. Judging freshness by the venue ts expired
+    // the TTL just before the next poll and flapped NORMAL↔EXIT_ONLY (issue #65).
+    _ = try e.apply(.{ .market_tick = .{ .ts_ms = 1000, .seen_ms = 9000, .bid = d("100000"), .mark = d("100000") } });
+    _ = try e.apply(.{ .reconcile_result = .{
+        .ts_ms = 9000,
+        .cash_usdt = d("100"),
+        .btc_total = d("0"),
+        .btc_available = d("0"),
+        .hwm_from_db = d("100"),
+        .clean = true,
+    } });
+    try testing.expectEqual(sm.RiskMode.normal, e.snapshot().risk_mode);
+    try testing.expectEqual(@as(i64, 9000), e.snapshot().freshness.market_last_ms);
+
+    // Still well inside the TTL of the *receipt* stamp: no degradation.
+    _ = try e.apply(.{ .clock_tick = .{ .ts_ms = 12_000 } });
+    try testing.expectEqual(sm.RiskMode.normal, e.snapshot().risk_mode);
+
+    // The TTL still bites once the local stamp is genuinely old.
+    _ = try e.apply(.{ .clock_tick = .{ .ts_ms = 19_500 } });
+    try testing.expectEqual(sm.RiskMode.exit_only, e.snapshot().risk_mode);
+}
+
+test "market ttl derives from the poll interval with a floor" {
+    try testing.expectEqual(@as(i64, 10_000), FreshnessState.marketTtlFor(2000));
+    try testing.expectEqual(@as(i64, 10_000), FreshnessState.marketTtlFor(3000));
+    try testing.expectEqual(@as(i64, 15_000), FreshnessState.marketTtlFor(5000));
 }
 
 test "operator exit_trigger moves normal to flattening" {

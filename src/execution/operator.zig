@@ -66,6 +66,7 @@ pub fn refreshBeforeAdmission(
             if (okx_rest.parseTicker(gpa, body)) |ticker| {
                 _ = engine.apply(.{ .market_tick = .{
                     .ts_ms = ticker.ts_ms,
+                    .seen_ms = clock.SystemClock.clock().wallMs(),
                     .bid = ticker.bid,
                     .mark = ticker.last,
                 } }) catch {};

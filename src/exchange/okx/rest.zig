@@ -92,10 +92,13 @@ pub fn parseInstrument(gpa: std.mem.Allocator, body: []const u8) Error!Instrumen
 }
 
 pub const Ticker = struct {
+    /// Venue timestamp. Exchange clocks and network lag make this unsafe for
+    /// freshness decisions; the poller stamps `seen_ms` on receipt instead.
     ts_ms: i64,
     bid: Decimal,
     ask: Decimal,
     last: Decimal,
+    seen_ms: i64 = 0,
 };
 
 pub fn parseTicker(gpa: std.mem.Allocator, body: []const u8) Error!Ticker {

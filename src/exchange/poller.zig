@@ -56,7 +56,9 @@ pub const Poller = struct {
             const result: Tick = blk: {
                 const body = c.getPublic(path) catch break :blk .failed;
                 defer self.gpa.free(body);
-                const ticker = rest.parseTicker(self.gpa, body) catch break :blk .failed;
+                var ticker = rest.parseTicker(self.gpa, body) catch break :blk .failed;
+                // Freshness is judged on the local receive clock, not venue ts.
+                ticker.seen_ms = clock.SystemClock.clock().wallMs();
                 break :blk .{ .ok = ticker };
             };
             // Never wait for a reader; stale inputs are rejected by freshness.
