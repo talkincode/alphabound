@@ -321,6 +321,12 @@ def scenario_foreign_order_exit(binpath, workdir):
         st = dm.api("/api/v1/state")
         evidence("foreign", "state after recovery: unresolved_orders=%s mode=%s" % (st.get("unresolved_orders"), st.get("risk_mode")))
         assert st.get("unresolved_orders") is False
+        # The exit trigger is the drawdown breach measured against the HWM set
+        # at the pre-drop price. If the bid drops before the bot has priced the
+        # initial book, the HWM is first set at the lower price and there is no
+        # breach to trigger, so wait for that reference instead of racing it.
+        wait_for(lambda: float(dm.api("/api/v1/state").get("high_watermark") or 0) > 1900, 25,
+                 "initial HWM priced at the pre-drop bid")
         ctl("set", bid="70000")
         wait_for(lambda: float(vstate()["btc"]) < 0.00001, 20, "position sold despite foreign orders")
         wait_for(lambda: dm.api("/api/v1/state").get("risk_mode") == "HALTED", 15, "HALTED")
