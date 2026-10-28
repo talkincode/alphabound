@@ -9,7 +9,7 @@ const lanes = @import("../core/lanes.zig");
 const web = @import("../web/cache.zig");
 const clock = @import("../core/clock.zig");
 
-pub const Tick = union(enum) { ok: rest.Ticker, failed };
+pub const Tick = union(enum) { ok: struct { ticker: rest.Ticker, recv_ms: i64 }, failed };
 pub const Account = struct { ticket: u64, probe: rest.BalanceProbe };
 pub const Poller = struct {
     gpa: std.mem.Allocator,
@@ -56,8 +56,9 @@ pub const Poller = struct {
             const result: Tick = blk: {
                 const body = c.getPublic(path) catch break :blk .failed;
                 defer self.gpa.free(body);
+                const recv_ms = clock.SystemClock.clock().wallMs();
                 const ticker = rest.parseTicker(self.gpa, body) catch break :blk .failed;
-                break :blk .{ .ok = ticker };
+                break :blk .{ .ok = .{ .ticker = ticker, .recv_ms = recv_ms } };
             };
             // Never wait for a reader; stale inputs are rejected by freshness.
             _ = self.ticks.push(result);

@@ -11,6 +11,7 @@ const equity_mod = @import("../risk/equity.zig");
 const orders_mod = @import("../execution/orders.zig");
 
 pub const FreshnessState = struct {
+    /// Local receipt time of the latest market tick.
     market_last_ms: i64 = 0,
     account_last_ms: i64 = 0,
     /// Data older than this is stale (drives EXIT_ONLY, §7.2).
@@ -66,6 +67,7 @@ pub const PortfolioState = struct {
 pub const Message = union(enum) {
     market_tick: struct {
         ts_ms: i64,
+        recv_ms: i64,
         bid: Decimal,
         mark: Decimal,
     },
@@ -287,9 +289,9 @@ pub const Engine = struct {
             .market_tick => |t| {
                 self.state.bid_price = t.bid;
                 self.state.mark_price = t.mark;
-                self.state.freshness.market_last_ms = t.ts_ms;
-                self.state.as_of_ms = t.ts_ms;
-                try self.revalue(t.ts_ms);
+                self.state.freshness.market_last_ms = t.recv_ms;
+                self.state.as_of_ms = t.recv_ms;
+                try self.revalue(t.recv_ms);
             },
             .account_update => |u| {
                 self.state.cash_usdt = u.cash_usdt;
@@ -455,7 +457,7 @@ test "starts exit_only until reconciled and fresh" {
     var e = testEngine();
     try testing.expectEqual(sm.RiskMode.exit_only, e.snapshot().risk_mode);
 
-    _ = try e.apply(.{ .market_tick = .{ .ts_ms = 1000, .bid = d("100000"), .mark = d("100050") } });
+    _ = try e.apply(.{ .market_tick = .{ .ts_ms = 1000, .recv_ms = 1000, .bid = d("100000"), .mark = d("100050") } });
     try testing.expectEqual(sm.RiskMode.exit_only, e.snapshot().risk_mode); // account still unknown
 
     _ = try e.apply(.{ .reconcile_result = .{
@@ -480,7 +482,7 @@ test "versions increase monotonically per message" {
 
 test "disk not ok degrades to exit_only until cleared" {
     var e = testEngine();
-    _ = try e.apply(.{ .market_tick = .{ .ts_ms = 1000, .bid = d("100000"), .mark = d("100000") } });
+    _ = try e.apply(.{ .market_tick = .{ .ts_ms = 1000, .recv_ms = 1000, .bid = d("100000"), .mark = d("100000") } });
     _ = try e.apply(.{ .reconcile_result = .{
         .ts_ms = 1000,
         .cash_usdt = d("100"),
@@ -496,17 +498,17 @@ test "disk not ok degrades to exit_only until cleared" {
     try testing.expect(!e.snapshot().disk_ok);
 
     // Fresh market tick must not clear disk pressure by itself.
-    _ = try e.apply(.{ .market_tick = .{ .ts_ms = 2000, .bid = d("100000"), .mark = d("100000") } });
+    _ = try e.apply(.{ .market_tick = .{ .ts_ms = 2000, .recv_ms = 2000, .bid = d("100000"), .mark = d("100000") } });
     try testing.expectEqual(sm.RiskMode.exit_only, e.snapshot().risk_mode);
 
     _ = try e.apply(.{ .disk_status = .{ .ok = true } });
-    _ = try e.apply(.{ .market_tick = .{ .ts_ms = 3000, .bid = d("100000"), .mark = d("100000") } });
+    _ = try e.apply(.{ .market_tick = .{ .ts_ms = 3000, .recv_ms = 3000, .bid = d("100000"), .mark = d("100000") } });
     try testing.expectEqual(sm.RiskMode.normal, e.snapshot().risk_mode);
 }
 
 test "journal failure degrades to exit_only until writes recover (AC-GO6)" {
     var e = testEngine();
-    _ = try e.apply(.{ .market_tick = .{ .ts_ms = 1000, .bid = d("100000"), .mark = d("100000") } });
+    _ = try e.apply(.{ .market_tick = .{ .ts_ms = 1000, .recv_ms = 1000, .bid = d("100000"), .mark = d("100000") } });
     _ = try e.apply(.{ .reconcile_result = .{
         .ts_ms = 1000,
         .cash_usdt = d("100"),
@@ -522,17 +524,17 @@ test "journal failure degrades to exit_only until writes recover (AC-GO6)" {
     try testing.expect(!e.snapshot().journal_ok);
 
     // Fresh market data must not clear a broken audit journal by itself.
-    _ = try e.apply(.{ .market_tick = .{ .ts_ms = 2000, .bid = d("100000"), .mark = d("100000") } });
+    _ = try e.apply(.{ .market_tick = .{ .ts_ms = 2000, .recv_ms = 2000, .bid = d("100000"), .mark = d("100000") } });
     try testing.expectEqual(sm.RiskMode.exit_only, e.snapshot().risk_mode);
 
     _ = try e.apply(.{ .journal_status = .{ .ok = true } });
-    _ = try e.apply(.{ .market_tick = .{ .ts_ms = 3000, .bid = d("100000"), .mark = d("100000") } });
+    _ = try e.apply(.{ .market_tick = .{ .ts_ms = 3000, .recv_ms = 3000, .bid = d("100000"), .mark = d("100000") } });
     try testing.expectEqual(sm.RiskMode.normal, e.snapshot().risk_mode);
 }
 
 test "stale market data degrades to exit_only" {
     var e = testEngine();
-    _ = try e.apply(.{ .market_tick = .{ .ts_ms = 1000, .bid = d("100000"), .mark = d("100000") } });
+    _ = try e.apply(.{ .market_tick = .{ .ts_ms = 1000, .recv_ms = 1000, .bid = d("100000"), .mark = d("100000") } });
     _ = try e.apply(.{ .reconcile_result = .{
         .ts_ms = 1000,
         .cash_usdt = d("100"),
@@ -543,14 +545,35 @@ test "stale market data degrades to exit_only" {
     } });
     try testing.expectEqual(sm.RiskMode.normal, e.snapshot().risk_mode);
 
-    // 60 seconds later with no market data → stale → EXIT_ONLY
-    _ = try e.apply(.{ .clock_tick = .{ .ts_ms = 61_000 } });
+    // Market expires while the account remains fresh.
+    _ = try e.apply(.{ .clock_tick = .{ .ts_ms = 11_001 } });
     try testing.expectEqual(sm.RiskMode.exit_only, e.snapshot().risk_mode);
 
     // fresh tick + fresh account restores NORMAL
-    _ = try e.apply(.{ .account_update = .{ .ts_ms = 61_500, .cash_usdt = d("100"), .btc_total = d("0"), .btc_available = d("0") } });
-    _ = try e.apply(.{ .market_tick = .{ .ts_ms = 62_000, .bid = d("100000"), .mark = d("100000") } });
+    _ = try e.apply(.{ .account_update = .{ .ts_ms = 11_500, .cash_usdt = d("100"), .btc_total = d("0"), .btc_available = d("0") } });
+    _ = try e.apply(.{ .market_tick = .{ .ts_ms = 12_000, .recv_ms = 12_000, .bid = d("100000"), .mark = d("100000") } });
     try testing.expectEqual(sm.RiskMode.normal, e.snapshot().risk_mode);
+}
+
+test "local market receipt keeps stale exchange timestamp fresh" {
+    var e = try reconciledNormalEngine();
+    _ = try e.apply(.{ .market_tick = .{ .ts_ms = 1500, .recv_ms = 11_000, .bid = d("100000"), .mark = d("100000") } });
+    try testing.expectEqual(@as(i64, 11_000), e.snapshot().freshness.market_last_ms);
+    try testing.expectEqual(@as(i64, 11_000), e.snapshot().as_of_ms);
+    _ = try e.apply(.{ .clock_tick = .{ .ts_ms = 16_000 } });
+    try testing.expect(e.snapshot().freshness.marketFresh(16_000));
+    try testing.expectEqual(sm.RiskMode.normal, e.snapshot().risk_mode);
+}
+
+test "market receipt timeout degrades while account remains fresh" {
+    var e = try reconciledNormalEngine();
+    _ = try e.apply(.{ .market_tick = .{ .ts_ms = 1500, .recv_ms = 11_000, .bid = d("100000"), .mark = d("100000") } });
+    _ = try e.apply(.{ .clock_tick = .{ .ts_ms = 21_000 } });
+    try testing.expectEqual(sm.RiskMode.normal, e.snapshot().risk_mode);
+    _ = try e.apply(.{ .clock_tick = .{ .ts_ms = 21_001 } });
+    try testing.expect(!e.snapshot().freshness.marketFresh(21_001));
+    try testing.expect(e.snapshot().freshness.accountFresh(21_001));
+    try testing.expectEqual(sm.RiskMode.exit_only, e.snapshot().risk_mode);
 }
 
 test "operator exit_trigger moves normal to flattening" {
@@ -564,7 +587,7 @@ test "operator exit_trigger moves normal to flattening" {
         .hwm_from_db = d("100"),
         .clean = true,
     } });
-    _ = try e.apply(.{ .market_tick = .{ .ts_ms = 1100, .bid = d("100000"), .mark = d("100000") } });
+    _ = try e.apply(.{ .market_tick = .{ .ts_ms = 1100, .recv_ms = 1100, .bid = d("100000"), .mark = d("100000") } });
     try testing.expectEqual(sm.RiskMode.normal, e.snapshot().risk_mode);
     _ = try e.apply(.{ .risk_trigger = .exit_trigger });
     try testing.expectEqual(sm.RiskMode.flattening, e.snapshot().risk_mode);
@@ -580,12 +603,12 @@ test "drawdown breach forces flattening and HWM only rises reconciled" {
         .hwm_from_db = d("0"),
         .clean = true,
     } });
-    _ = try e.apply(.{ .market_tick = .{ .ts_ms = 1100, .bid = d("120000"), .mark = d("120000") } });
+    _ = try e.apply(.{ .market_tick = .{ .ts_ms = 1100, .recv_ms = 1100, .bid = d("120000"), .mark = d("120000") } });
     const hwm_at_peak = e.snapshot().high_watermark;
     try testing.expect(hwm_at_peak.gt(d("119"))); // ~119.82 after exit costs
 
     // price collapses 15% → drawdown > 10% → flattening
-    const r = try e.apply(.{ .market_tick = .{ .ts_ms = 1200, .bid = d("102000"), .mark = d("102000") } });
+    const r = try e.apply(.{ .market_tick = .{ .ts_ms = 1200, .recv_ms = 1200, .bid = d("102000"), .mark = d("102000") } });
     try testing.expectEqual(sm.RiskMode.flattening, e.snapshot().risk_mode);
     try testing.expect(r.boundary_hit);
     try testing.expect(e.snapshot().high_watermark.eql(hwm_at_peak)); // HWM did not fall
@@ -593,7 +616,7 @@ test "drawdown breach forces flattening and HWM only rises reconciled" {
 
 test "capital-flow reconcile preserves drawdown percentage" {
     var e = testEngine();
-    _ = try e.apply(.{ .market_tick = .{ .ts_ms = 1000, .bid = d("100000"), .mark = d("100000") } });
+    _ = try e.apply(.{ .market_tick = .{ .ts_ms = 1000, .recv_ms = 1000, .bid = d("100000"), .mark = d("100000") } });
     _ = try e.apply(.{ .reconcile_result = .{
         .ts_ms = 1100,
         .cash_usdt = d("100"),
@@ -630,7 +653,7 @@ test "capital-flow reconcile preserves drawdown percentage" {
 
 test "full withdrawal resets HWM instead of creating a false drawdown" {
     var e = testEngine();
-    _ = try e.apply(.{ .market_tick = .{ .ts_ms = 1000, .bid = d("100000"), .mark = d("100000") } });
+    _ = try e.apply(.{ .market_tick = .{ .ts_ms = 1000, .recv_ms = 1000, .bid = d("100000"), .mark = d("100000") } });
     _ = try e.apply(.{ .reconcile_result = .{
         .ts_ms = 1100,
         .cash_usdt = d("100"),
@@ -657,7 +680,7 @@ test "full withdrawal resets HWM instead of creating a false drawdown" {
 
 test "order ambiguity blocks normal mode" {
     var e = testEngine();
-    _ = try e.apply(.{ .market_tick = .{ .ts_ms = 1000, .bid = d("100000"), .mark = d("100000") } });
+    _ = try e.apply(.{ .market_tick = .{ .ts_ms = 1000, .recv_ms = 1000, .bid = d("100000"), .mark = d("100000") } });
     _ = try e.apply(.{ .reconcile_result = .{
         .ts_ms = 1000,
         .cash_usdt = d("100"),
@@ -675,11 +698,11 @@ test "order ambiguity blocks normal mode" {
 
 test "replay determinism: same messages, same final state" {
     const msgs = [_]Message{
-        .{ .market_tick = .{ .ts_ms = 1000, .bid = d("100000"), .mark = d("100050") } },
+        .{ .market_tick = .{ .ts_ms = 1000, .recv_ms = 1000, .bid = d("100000"), .mark = d("100050") } },
         .{ .reconcile_result = .{ .ts_ms = 1100, .cash_usdt = d("100"), .btc_total = d("0"), .btc_available = d("0"), .hwm_from_db = d("100"), .clean = true } },
-        .{ .market_tick = .{ .ts_ms = 1200, .bid = d("101000"), .mark = d("101020") } },
+        .{ .market_tick = .{ .ts_ms = 1200, .recv_ms = 1200, .bid = d("101000"), .mark = d("101020") } },
         .{ .account_update = .{ .ts_ms = 1300, .cash_usdt = d("50"), .btc_total = d("0.0005"), .btc_available = d("0.0005") } },
-        .{ .market_tick = .{ .ts_ms = 1400, .bid = d("99000"), .mark = d("99010") } },
+        .{ .market_tick = .{ .ts_ms = 1400, .recv_ms = 1400, .bid = d("99000"), .mark = d("99010") } },
         .{ .clock_tick = .{ .ts_ms = 5000 } },
     };
     var e1 = testEngine();
@@ -704,7 +727,7 @@ test "engine records silent mode transitions with their cause" {
     e.state.journal_ok = true;
     const t0: i64 = 1_000_000;
     _ = try e.apply(.{ .account_update = .{ .ts_ms = t0, .cash_usdt = Decimal.parse("100") catch unreachable, .btc_total = Decimal.zero, .btc_available = Decimal.zero } });
-    _ = try e.apply(.{ .market_tick = .{ .ts_ms = t0, .bid = Decimal.parse("100") catch unreachable, .mark = Decimal.parse("100") catch unreachable } });
+    _ = try e.apply(.{ .market_tick = .{ .ts_ms = t0, .recv_ms = t0, .bid = Decimal.parse("100") catch unreachable, .mark = Decimal.parse("100") catch unreachable } });
     try std.testing.expectEqual(sm.RiskMode.normal, e.state.risk_mode);
     _ = e.takeModeTransition(); // discard boot-time transitions, if any
 
@@ -713,7 +736,7 @@ test "engine records silent mode transitions with their cause" {
     try std.testing.expectEqual(sm.RiskMode.exit_only, e.state.risk_mode);
     // Fresh account + market: back to NORMAL before anyone drained.
     _ = try e.apply(.{ .account_update = .{ .ts_ms = t0 + 61_000, .cash_usdt = Decimal.parse("100") catch unreachable, .btc_total = Decimal.zero, .btc_available = Decimal.zero } });
-    _ = try e.apply(.{ .market_tick = .{ .ts_ms = t0 + 61_000, .bid = Decimal.parse("100") catch unreachable, .mark = Decimal.parse("100") catch unreachable } });
+    _ = try e.apply(.{ .market_tick = .{ .ts_ms = t0 + 61_000, .recv_ms = t0 + 61_000, .bid = Decimal.parse("100") catch unreachable, .mark = Decimal.parse("100") catch unreachable } });
     try std.testing.expectEqual(sm.RiskMode.normal, e.state.risk_mode);
 
     const t = e.takeModeTransition() orelse return error.TestExpectedTransition;
@@ -726,7 +749,7 @@ test "engine records silent mode transitions with their cause" {
 
 fn reconciledNormalEngine() !Engine {
     var e = testEngine();
-    _ = try e.apply(.{ .market_tick = .{ .ts_ms = 1000, .bid = d("100000"), .mark = d("100000") } });
+    _ = try e.apply(.{ .market_tick = .{ .ts_ms = 1000, .recv_ms = 1000, .bid = d("100000"), .mark = d("100000") } });
     _ = try e.apply(.{ .reconcile_result = .{
         .ts_ms = 1000,
         .cash_usdt = d("100"),
