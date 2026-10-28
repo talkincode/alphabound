@@ -84,7 +84,7 @@ test "AC-FD3 stale market forces EXIT_ONLY and admission rejects increase" {
         .fee_rate = d("0.001"),
         .slippage_rate = d("0.0005"),
     }, d("0.10"));
-    _ = try eng.apply(.{ .market_tick = .{ .ts_ms = 1000, .bid = d("100000"), .mark = d("100000") } });
+    _ = try eng.apply(.{ .market_tick = .{ .ts_ms = 1000, .recv_ms = 1000, .bid = d("100000"), .mark = d("100000") } });
     _ = try eng.apply(.{ .reconcile_result = .{
         .ts_ms = 1000,
         .cash_usdt = d("100"),
@@ -205,7 +205,7 @@ test "AC-FD10 fresh engine is fail-closed until reconcile (restart semantics)" {
     try testing.expect(blocked.verdict == .reject);
 
     // Only after clean reconcile + fresh market may risk increase resume.
-    _ = try eng.apply(.{ .market_tick = .{ .ts_ms = 1000, .bid = d("100000"), .mark = d("100000") } });
+    _ = try eng.apply(.{ .market_tick = .{ .ts_ms = 1000, .recv_ms = 1000, .bid = d("100000"), .mark = d("100000") } });
     _ = try eng.apply(.{ .reconcile_result = .{
         .ts_ms = 1000,
         .cash_usdt = d("100"),

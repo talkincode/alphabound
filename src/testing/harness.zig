@@ -94,10 +94,12 @@ pub const Harness = struct {
         self.refresh_calls += 1;
         if (self.before_refresh) |f| f(self);
         const tick_body = self.okx.getPublic("/api/v5/market/ticker?instId=BTC-USDT") catch return false;
+        const recv_ms = clock.SystemClock.clock().wallMs();
         defer self.gpa.free(tick_body);
         const ticker = okx_rest.parseTicker(self.gpa, tick_body) catch return false;
         _ = self.engine.apply(.{ .market_tick = .{
             .ts_ms = ticker.ts_ms,
+            .recv_ms = recv_ms,
             .bid = ticker.bid,
             .mark = ticker.last,
         } }) catch return false;

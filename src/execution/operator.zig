@@ -62,10 +62,12 @@ pub fn refreshBeforeAdmission(
     if (with_ticker) {
         const path = std.fmt.bufPrint(&path_buf, "/api/v5/market/ticker?instId={s}", .{cfg.instrument}) catch return;
         if (okx.getPublic(path)) |body| {
+            const recv_ms = nowMs();
             defer gpa.free(body);
             if (okx_rest.parseTicker(gpa, body)) |ticker| {
                 _ = engine.apply(.{ .market_tick = .{
                     .ts_ms = ticker.ts_ms,
+                    .recv_ms = recv_ms,
                     .bid = ticker.bid,
                     .mark = ticker.last,
                 } }) catch {};

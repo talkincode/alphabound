@@ -1412,16 +1412,18 @@ pub fn main(init: std.process.Init) !u8 {
 
         if (poller.takeTick()) |received| {
             if (received == .ok) {
-                const ticker = received.ok;
+                const ticker = received.ok.ticker;
+                const recv_ms = received.ok.recv_ms;
                 // Shadow uses a simulated book: keep account freshness aligned with
                 // market ticks so the risk mode does not spuriously enter EXIT_ONLY
                 // after account_ttl without private WS updates. Applied *before*
                 // the market tick so the tick's health check sees a fresh
                 // account and the mode does not round-trip through EXIT_ONLY.
+                // Uses local receipt time, the same clock freshness is judged on.
                 if (cfg.mode == .shadow) {
                     const s0 = engine.snapshot();
                     _ = engine.apply(.{ .account_update = .{
-                        .ts_ms = ticker.ts_ms,
+                        .ts_ms = recv_ms,
                         .cash_usdt = s0.cash_usdt,
                         .btc_total = s0.btc_total,
                         .btc_available = s0.btc_available,
@@ -1430,6 +1432,7 @@ pub fn main(init: std.process.Init) !u8 {
                 const lat_t0 = ab.clock.SystemClock.clock().monotonicNs();
                 _ = engine.apply(.{ .market_tick = .{
                     .ts_ms = ticker.ts_ms,
+                    .recv_ms = recv_ms,
                     .bid = ticker.bid,
                     .mark = ticker.last,
                 } }) catch continue;
