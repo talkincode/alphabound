@@ -1927,6 +1927,7 @@ let rvInd = { ma5: true, ma20: true, ema20: false, boll: false };
 try { const s = JSON.parse(localStorage.getItem("ab_rv_ind") || "null"); if (s && typeof s === "object") rvInd = Object.assign(rvInd, s); } catch (_) {}
 let rvSub = localStorage.getItem("ab_rv_sub") || "vol";
 let rvSelectedKey = null;      // decision key = payload.decision_id || event_id
+let reviewKeysByTime = new Map(); // K 线桶 time -> 桶内决策 key[]（按决策时间升序），供点击循环与「桶内 i/n」使用
 let rvActivePane = "decision";
 let rvChatPendingSince = 0;    // >0 → waiting for assistant/summary turn
 let rvChatLastTurnId = 0;      // newest turn id seen for selected decision at send time
@@ -3143,6 +3144,13 @@ function reviewFindByKey(key) {
   return reviewDecisionList().find(e => reviewKeyOf(e) === key) || null;
 }
 
+/** 该决策所在的 K 线桶 time；不在当前周期图上返回 null。 */
+function reviewBucketTimeOf(key) {
+  if (!key) return null;
+  for (const [t, keys] of reviewKeysByTime) if (keys.indexOf(key) >= 0) return t;
+  return null;
+}
+
 function updateReviewChart() {
   const meta = $("rv_meta");
   const payload = cachedCandlesPayload;
@@ -3185,9 +3193,10 @@ function updateReviewChart() {
   const closes = dedup.map(r => r.close);
   const barSec = RV_BAR_SEC[rvBar] || 900;
 
-  // markers from decisions (snap to bar bucket; keep only on-chart ones)
+  // markers from decisions: 先按 K 线桶归并，每个桶只出一个 marker
+  // （外观优先级 失败 ✕ > 拒绝 拒 > 调仓 R > 当前选中 > 持有；marker.id 优先取桶内当前选中者）。
   const decs = reviewDecisionList();
-  const markers = [];
+  const buckets = new Map(); // 桶 time -> [{ key, prio, m, isSel }]
   let onChart = 0;
   let prevTarget = null;
   for (const e of decs) {
@@ -3199,31 +3208,50 @@ function updateReviewChart() {
     const isSel = key === rvSelectedKey;
     if (snap != null) {
       onChart++;
-      let m;
+      let m, prio;
       const failed = (e.type || "") !== "AGENT_PROPOSAL_OK";
       const rejected = p.admission && p.admission.verdict && p.admission.verdict !== "APPROVE";
       const act = String(p.action || "").toUpperCase();
       if (failed) {
         m = { position: "aboveBar", shape: "square", color: "#f85149", text: "✕" };
+        prio = 5;
       } else if (rejected) {
         m = { position: "aboveBar", shape: "square", color: "#d29922", text: "拒" };
+        prio = 4;
       } else if (act === "REBALANCE") {
         const up = prevTarget == null || (target != null && target >= prevTarget);
         m = up
           ? { position: "belowBar", shape: "arrowUp", color: "#3fb950", text: target != null ? "R" + target : "R" }
           : { position: "aboveBar", shape: "arrowDown", color: "#f85149", text: target != null ? "R" + target : "R" };
+        prio = 3;
       } else {
         m = { position: "aboveBar", shape: "circle", color: isSel ? "#58a6ff" : "#8b949e", text: "" };
+        prio = isSel ? 2 : 1;
       }
-      m.time = snap;
-      m.id = key;
-      m.size = isSel ? 2 : 1;
-      if (isSel) m.color = "#58a6ff";
-      markers.push(m);
+      const item = { key: key, prio: prio, m: m, isSel: isSel };
+      const prev = buckets.get(snap);
+      if (prev) prev.push(item); else buckets.set(snap, [item]);
     }
     if ((e.type || "") === "AGENT_PROPOSAL_OK" && target != null && !isNaN(target)) prevTarget = target;
   }
+
+  const markers = [];
+  const keysByTime = new Map();
+  for (const [t, items] of buckets) {
+    keysByTime.set(t, items.map(it => it.key));
+    const sel = items.find(it => it.isSel) || null;
+    let rep = items[0];
+    for (const it of items) if (it.prio > rep.prio) rep = it;
+    const m = Object.assign({}, rep.m);
+    if (items.length > 1) m.text = (m.text || "") + "×" + items.length;
+    m.time = t;
+    m.id = sel ? sel.key : rep.key;
+    m.size = sel ? 2 : 1;
+    if (sel) m.color = "#58a6ff";
+    markers.push(m);
+  }
   markers.sort((a, b) => a.time - b.time);
+  reviewKeysByTime = keysByTime;
 
   // 选中决策的落点：数据写入后若不在可视范围内则居中到该 K 线。
   const centerKey = rvCenterKey;
@@ -3239,7 +3267,7 @@ function updateReviewChart() {
   // 但可视范围由 rvNeedFit 与上一次范围决定，轮询不再重置。
   const structSig = rvBar + "|" + rvSub + "|" + JSON.stringify(Object.entries(rvInd)) + "|" +
     (dedup.length ? dedup[0].time : "") + "|" + dedup.length + "|" +
-    markers.map(m => m.id + m.size).join(",");
+    markers.map(m => m.id + m.size + m.text).join(",");
   const lastCandleSig = dedup[dedup.length - 1].time + ":" + dedup[dedup.length - 1].close;
   const sig = structSig + "|" + lastCandleSig;
   if (sig !== rvLastSig) {
@@ -3309,7 +3337,8 @@ function applyReviewViewport(ts, n, times, prevRange, prevBars, centerTime) {
 
 function onReviewChartClick(param) {
   let key = param && param.hoveredObjectId;
-  if (!key && param && param.time != null) {
+  let bucket = key ? reviewBucketTimeOf(String(key)) : null;
+  if (bucket == null && param && param.time != null) {
     // fall back: nearest decision within one bar of the click
     const barSec = RV_BAR_SEC[rvBar] || 900;
     let best = null, bestD = Infinity;
@@ -3319,7 +3348,18 @@ function onReviewChartClick(param) {
       const d = Math.abs(t - param.time);
       if (d < bestD) { bestD = d; best = e; }
     }
-    if (best && bestD <= barSec) key = reviewKeyOf(best);
+    if (best && bestD <= barSec) {
+      key = reviewKeyOf(best);
+      bucket = reviewBucketTimeOf(String(key));
+    }
+  }
+  if (bucket != null) {
+    // 多决策桶：从当前选中位置继续循环到下一条；桶内无选中时先选中点到的那条
+    const keys = reviewKeysByTime.get(bucket) || [];
+    const at = keys.indexOf(rvSelectedKey || "");
+    const next = at >= 0 ? keys[(at + 1) % keys.length] : (key || keys[0]);
+    if (next) selectReviewDecision(String(next));
+    return;
   }
   if (key) selectReviewDecision(String(key));
 }
@@ -3332,6 +3372,7 @@ function selectReviewDecision(key) {
   rvLastSig = ""; // marker highlight redraw
   renderReviewSelection();
   updateReviewChart();
+  renderReviewSelect(); // 「桶内 i/n」
   try { updateAbChart(); } catch (err) { console.error("ab factor", err); }
   if (rvActivePane === "events") ensureReviewContext();
 }
@@ -3543,7 +3584,12 @@ function renderReviewSelect() {
   }
   if (sel.value !== (rvSelectedKey || "")) sel.value = rvSelectedKey || "";
   const c = $("rv_count");
-  if (c) c.textContent = decs.length ? ("共 " + decs.length + " 个决策点") : "暂无提案决策";
+  if (c) {
+    let note = decs.length ? ("共 " + decs.length + " 个决策点") : "暂无提案决策";
+    const keys = rvSelectedKey ? reviewKeysByTime.get(reviewBucketTimeOf(rvSelectedKey)) : null;
+    if (keys && keys.length > 1) note += " · 桶内 " + (keys.indexOf(rvSelectedKey) + 1) + "/" + keys.length;
+    c.textContent = note;
+  }
 }
 
 function stepReviewDecision(delta) {
