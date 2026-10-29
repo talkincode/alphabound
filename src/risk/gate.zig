@@ -10,6 +10,22 @@ const admission = @import("admission.zig");
 
 const Decimal = dec.Decimal;
 
+/// Text written to `AGENT_PROPOSAL_OK` payload `admission.verdict`.
+/// Periodic-review counters compare against these exact strings.
+/// `REDUCE` is only the reduced bucket; it is not also counted as approved.
+pub const verdict_approve: []const u8 = "APPROVE";
+pub const verdict_reduce: []const u8 = "REDUCE";
+pub const verdict_reject: []const u8 = "REJECT";
+
+/// Maps a kernel verdict onto the string persisted in the event payload.
+pub fn storedVerdictText(verdict: admission.Verdict) []const u8 {
+    return switch (verdict) {
+        .approve => verdict_approve,
+        .approve_reduced => verdict_reduce,
+        .reject => verdict_reject,
+    };
+}
+
 /// Shadow-path Risk Kernel admission (audit only — never places orders).
 pub const ShadowAdmission = struct {
     verdict_txt: []const u8,
@@ -83,29 +99,39 @@ pub fn shadowAdmitWith(
             .floor = Decimal.zero,
         };
     };
+    const verdict_txt = storedVerdictText(result.verdict);
     return switch (result.verdict) {
         .approve => |w| .{
-            .verdict_txt = "APPROVE",
+            .verdict_txt = verdict_txt,
             .reason_txt = "ok",
             .admitted_weight = w,
             .stress_equity = result.stress_equity,
             .floor = result.floor,
         },
         .approve_reduced => |w| .{
-            .verdict_txt = "REDUCE",
+            .verdict_txt = verdict_txt,
             .reason_txt = "reduced_to_boundary",
             .admitted_weight = w,
             .stress_equity = result.stress_equity,
             .floor = result.floor,
         },
         .reject => |r| .{
-            .verdict_txt = "REJECT",
+            .verdict_txt = verdict_txt,
             .reason_txt = r.text(),
             .admitted_weight = Decimal.zero,
             .stress_equity = result.stress_equity,
             .floor = result.floor,
         },
     };
+}
+
+test "stored admission verdict text is APPROVE, REDUCE, or REJECT" {
+    try std.testing.expectEqualStrings("APPROVE", verdict_approve);
+    try std.testing.expectEqualStrings("REDUCE", verdict_reduce);
+    try std.testing.expectEqualStrings("REJECT", verdict_reject);
+    try std.testing.expectEqualStrings(verdict_approve, storedVerdictText(.{ .approve = Decimal.zero }));
+    try std.testing.expectEqualStrings(verdict_reduce, storedVerdictText(.{ .approve_reduced = Decimal.zero }));
+    try std.testing.expectEqualStrings(verdict_reject, storedVerdictText(.{ .reject = .boundary_violated }));
 }
 
 pub fn exitView(snap: state.PortfolioState, now_ms: i64) admission.ExitView {

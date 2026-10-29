@@ -5237,6 +5237,17 @@ fn periodicReviewTimeoutMs(base_ms: u32, prompt_len: usize) u32 {
     return base_ms + extra;
 }
 
+/// Count `AGENT_PROPOSAL_OK` rows whose stored `admission.verdict` is `verdict`.
+/// `verdict` is `gate.verdict_approve`, `verdict_reduce`, or `verdict_reject`.
+fn admissionVerdictCountSql(comptime verdict: []const u8) [:0]const u8 {
+    if (std.mem.indexOfScalar(u8, verdict, '\'') != null) @compileError("admission verdict must not contain a quote");
+    return std.fmt.comptimePrint(
+        \\SELECT COUNT(*) FROM events
+        \\WHERE type = 'AGENT_PROPOSAL_OK' AND ts >= ?1 AND ts <= ?2
+        \\  AND json_extract(payload_json,'$.admission.verdict') = '{s}'
+    , .{verdict});
+}
+
 fn periodicCountRange(
     db: *ab.storage.Db,
     comptime sql: [:0]const u8,
@@ -5365,21 +5376,13 @@ fn collectPeriodicFacts(
         \\WHERE started_ts >= ?1 AND started_ts <= ?2 AND status LIKE 'error%'
     , ts_from, ts_to);
 
-    f.admitted = periodicCountRange(db,
-        \\SELECT COUNT(*) FROM events
-        \\WHERE type = 'AGENT_PROPOSAL_OK' AND ts >= ?1 AND ts <= ?2
-        \\  AND json_extract(payload_json,'$.admission.verdict') = 'approved'
-    , ts_from, ts_to);
-    f.reduced = periodicCountRange(db,
-        \\SELECT COUNT(*) FROM events
-        \\WHERE type = 'AGENT_PROPOSAL_OK' AND ts >= ?1 AND ts <= ?2
-        \\  AND json_extract(payload_json,'$.admission.verdict') = 'reduced'
-    , ts_from, ts_to);
-    f.rejected = periodicCountRange(db,
-        \\SELECT COUNT(*) FROM events
-        \\WHERE type = 'AGENT_PROPOSAL_OK' AND ts >= ?1 AND ts <= ?2
-        \\  AND json_extract(payload_json,'$.admission.verdict') = 'rejected'
-    , ts_from, ts_to);
+    // Gate persists APPROVE / REDUCE / REJECT (see gate.storedVerdictText).
+    // Past-tense lowercase (`approved` / `reduced` / `rejected`) matches nothing.
+    // REDUCE increments `reduced` only; it is not also counted as approved.
+    // A math-error verdict (`ERROR`) is none of the three buckets.
+    f.admitted = periodicCountRange(db, admissionVerdictCountSql(ab.gate.verdict_approve), ts_from, ts_to);
+    f.reduced = periodicCountRange(db, admissionVerdictCountSql(ab.gate.verdict_reduce), ts_from, ts_to);
+    f.rejected = periodicCountRange(db, admissionVerdictCountSql(ab.gate.verdict_reject), ts_from, ts_to);
     f.executed = periodicCountRange(db,
         \\SELECT COUNT(*) FROM events
         \\WHERE type = 'AGENT_PROPOSAL_OK' AND ts >= ?1 AND ts <= ?2
@@ -6717,6 +6720,95 @@ test "prior plans need current policy mode and bounded age and expose overdue re
     // Never revive an older scoped plan when the latest run has unknown policy.
     const mixed = [_]ab.storage.EventsRepo.ProposalRow{ rows[0], legacy[0] };
     try std.testing.expect(priorDecisionPlan(std.testing.allocator, &mixed, .live, start, &buf) == null);
+}
+
+test "periodic review admission counters match stored gate verdicts" {
+    var db = try ab.storage.Db.open(":memory:");
+    defer db.close();
+    var events = try ab.storage.EventsRepo.init(&db);
+    defer events.deinit();
+    var periodic_repo = try ab.storage.PeriodicReviewsRepo.init(&db);
+    defer periodic_repo.deinit();
+    var capital_flows_repo = try ab.storage.CapitalFlowsRepo.init(&db);
+    defer capital_flows_repo.deinit();
+    var mem_store = ab.memory.Store.init(std.testing.allocator);
+    defer mem_store.deinit();
+    var cfg = try ab.config.parse(std.testing.allocator, "");
+    defer cfg.deinit();
+    var engine = ab.state.Engine.init(
+        .{ .fee_rate = cfg.taker_fee_rate, .slippage_rate = cfg.slippage_rate },
+        cfg.max_drawdown,
+    );
+
+    const ts_from = "2026-10-24T14:13:54.000Z";
+    const ts_to = "2026-10-24T22:13:54.000Z";
+    const inside = "2026-10-24T18:00:00.000Z";
+    const outside = "2026-10-24T14:13:53.000Z";
+    const Row = struct {
+        id: []const u8,
+        ts: []const u8,
+        typ: []const u8,
+        action: []const u8,
+        verdict: []const u8,
+    };
+    // Two of each stored verdict, plus the old past-tense literals, a lowercase
+    // present-tense decoy, ERROR, an out-of-window APPROVE, and a same-payload
+    // RISK_ADMISSION. Only the six in-window stored verdicts may count.
+    const rows = [_]Row{
+        .{ .id = "a1", .ts = inside, .typ = "AGENT_PROPOSAL_OK", .action = "HOLD", .verdict = ab.gate.verdict_approve },
+        .{ .id = "a2", .ts = inside, .typ = "AGENT_PROPOSAL_OK", .action = "HOLD", .verdict = ab.gate.verdict_approve },
+        .{ .id = "r1", .ts = inside, .typ = "AGENT_PROPOSAL_OK", .action = "REBALANCE", .verdict = ab.gate.verdict_reduce },
+        .{ .id = "r2", .ts = inside, .typ = "AGENT_PROPOSAL_OK", .action = "REBALANCE", .verdict = ab.gate.verdict_reduce },
+        .{ .id = "j1", .ts = inside, .typ = "AGENT_PROPOSAL_OK", .action = "REBALANCE", .verdict = ab.gate.verdict_reject },
+        .{ .id = "j2", .ts = inside, .typ = "AGENT_PROPOSAL_OK", .action = "HOLD", .verdict = ab.gate.verdict_reject },
+        .{ .id = "d1", .ts = inside, .typ = "AGENT_PROPOSAL_OK", .action = "HOLD", .verdict = "approved" },
+        .{ .id = "d2", .ts = inside, .typ = "AGENT_PROPOSAL_OK", .action = "HOLD", .verdict = "reduced" },
+        .{ .id = "d3", .ts = inside, .typ = "AGENT_PROPOSAL_OK", .action = "HOLD", .verdict = "rejected" },
+        .{ .id = "d4", .ts = inside, .typ = "AGENT_PROPOSAL_OK", .action = "HOLD", .verdict = "approve" },
+        .{ .id = "e1", .ts = inside, .typ = "AGENT_PROPOSAL_OK", .action = "HOLD", .verdict = "ERROR" },
+        .{ .id = "o1", .ts = outside, .typ = "AGENT_PROPOSAL_OK", .action = "HOLD", .verdict = ab.gate.verdict_approve },
+        .{ .id = "x1", .ts = inside, .typ = "RISK_ADMISSION", .action = "HOLD", .verdict = ab.gate.verdict_approve },
+    };
+    for (rows) |row| {
+        var payload_buf: [160]u8 = undefined;
+        const payload = try std.fmt.bufPrint(
+            &payload_buf,
+            "{{\"action\":\"{s}\",\"admission\":{{\"verdict\":\"{s}\"}}}}",
+            .{ row.action, row.verdict },
+        );
+        try events.append(.{
+            .event_id = row.id,
+            .ts = row.ts,
+            .type = row.typ,
+            .source = "synthetic",
+            .severity = "INFO",
+            .payload_json = payload,
+        });
+    }
+
+    const facts = collectPeriodicFacts(
+        &db,
+        &periodic_repo,
+        &capital_flows_repo,
+        &mem_store,
+        &engine,
+        &cfg,
+        .short,
+        ts_from,
+        ts_to,
+        8 * 3_600_000,
+        ab.decimal.Decimal.zero,
+        ab.decimal.Decimal.zero,
+    );
+    try std.testing.expectEqual(@as(i64, 11), facts.proposals);
+    try std.testing.expectEqual(@as(i64, 2), facts.admitted);
+    try std.testing.expectEqual(@as(i64, 2), facts.reduced);
+    try std.testing.expectEqual(@as(i64, 2), facts.rejected);
+
+    var json_buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&json_buf);
+    try facts.writeJson(&w);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "\"admission\":{\"approved\":2,\"reduced\":2,\"rejected\":2}") != null);
 }
 
 test "version string sane" {
