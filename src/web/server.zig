@@ -306,7 +306,7 @@ pub fn handleReq(buf: []u8, req: RequestInfo, ctx: Context) Response {
     if (method != .GET) {
         return .{ .status = .method_not_allowed, .body = "{\"error\":\"method not allowed\"}" };
     }
-    if (std.mem.eql(u8, path, "/api/v1/state")) return renderState(buf, ctx);
+    if (std.mem.eql(u8, path, "/api/v1/state")) return renderState(buf, ctx, req.now_ms);
     if (std.mem.eql(u8, path, "/api/v1/events")) {
         const filter = EventFilter.fromTarget(req.target);
         if (filter.active()) return filterEventsJson(buf, ctx.events_json, filter);
@@ -843,7 +843,7 @@ fn finishPasskeyLogin(
     return .{ .status = .ok, .body = "{\"ok\":true}", .set_cookie = sc };
 }
 
-fn renderState(buf: []u8, ctx: Context) Response {
+fn renderState(buf: []u8, ctx: Context, now_ms: i64) Response {
     var w: std.Io.Writer = .fixed(buf);
     var s: std.json.Stringify = .{ .writer = &w };
     const snap = ctx.snapshot;
@@ -870,6 +870,19 @@ fn renderState(buf: []u8, ctx: Context) Response {
         s.write(snap.account_projected) catch break :render;
         s.objectField("ledger_ok") catch break :render;
         s.write(snap.ledger_ok) catch break :render;
+
+        // Market freshness is judged on the local receive clock; expose both
+        // the stamp and the effective TTL so jitter is visible without events.
+        s.objectField("market_last_ms") catch break :render;
+        s.write(snap.freshness.market_last_ms) catch break :render;
+        s.objectField("market_ttl_ms") catch break :render;
+        s.write(snap.freshness.market_ttl_ms) catch break :render;
+        s.objectField("market_age_ms") catch break :render;
+        const market_age_ms: i64 = if (now_ms > 0 and snap.freshness.market_last_ms > 0)
+            @max(@as(i64, 0), now_ms - snap.freshness.market_last_ms)
+        else
+            0;
+        s.write(market_age_ms) catch break :render;
 
         s.objectField("cash_usdt") catch break :render;
         s.write(decStr(&num_buf, snap.cash_usdt)) catch break :render;
@@ -2001,6 +2014,30 @@ test "state endpoint renders decimals as strings" {
     try testing.expect(!obj.get("foreign_pending").?.bool);
     try testing.expect(!obj.get("account_projected").?.bool);
     try testing.expect(obj.get("ledger_ok").?.bool);
+    // Freshness is judged on the local receive clock and exposed so a flapping
+    // risk mode can be diagnosed from the API (issue #65).
+    try testing.expectEqual(@as(i64, 0), obj.get("market_last_ms").?.integer);
+    try testing.expectEqual(@as(i64, 10_000), obj.get("market_ttl_ms").?.integer);
+    try testing.expectEqual(@as(i64, 0), obj.get("market_age_ms").?.integer);
+}
+
+test "state endpoint reports market age against the request clock" {
+    var buf: [4096]u8 = undefined;
+    var ctx = testCtx();
+    ctx.snapshot.freshness.market_last_ms = 1_786_264_260_000;
+    const req = RequestInfo{
+        .method = .GET,
+        .target = "/api/v1/state",
+        .now_ms = 1_786_264_261_250,
+    };
+    const resp = handleReq(&buf, req, ctx);
+    try testing.expectEqual(std.http.Status.ok, resp.status);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, resp.body, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try testing.expectEqual(@as(i64, 1_786_264_260_000), obj.get("market_last_ms").?.integer);
+    try testing.expectEqual(@as(i64, 1250), obj.get("market_age_ms").?.integer);
 }
 
 test "events endpoint concatenates recent lines" {

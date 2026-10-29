@@ -44,6 +44,7 @@
 | (评审)cancel-all 后 agent 永久被封 | cancel-all 之后执行 lane 重新跑一遍恢复;主循环在恢复未完成/账本不健康/存在外部挂单时周期性(10s/60s)重提恢复 | `exec_lane_tests.zig` `review: cancel-all after a blocked recovery …` |
 | (评审)`ledger_ok` 不自愈 | 任一次成功落库或恢复中的写探针(`probeWritable`)即恢复 | `review: a transient ledger write failure heals …` |
 | (评审)不确定 sCode 被当作拒绝 | `definitiveRejectionCode`:仅 51xxx 规则/余额类与网关预匹配拒绝为确定;50004/50013/51149/未识别码为 UNKNOWN | `classifyPlaceResponse never turns a timeout-class sCode …` |
+| (#65)风险模式 NORMAL↔EXIT_ONLY 抖动 | 行情新鲜度改按**本地接收时钟**判定(`Message.market_tick.seen_ms`,由 poller/operator 打戳),TTL 由轮询间隔派生(`FreshnessState.marketTtlFor`,三次轮询、下限 10s);`/api/v1/state` 暴露 `market_last_ms`/`market_ttl_ms`/`market_age_ms` | `market freshness uses local receipt time, not the venue timestamp`、`market ttl derives from the poll interval with a floor` |
 
 ## 订单账本与未决状态
 

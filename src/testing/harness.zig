@@ -98,6 +98,7 @@ pub const Harness = struct {
         const ticker = okx_rest.parseTicker(self.gpa, tick_body) catch return false;
         _ = self.engine.apply(.{ .market_tick = .{
             .ts_ms = ticker.ts_ms,
+            .seen_ms = clock.SystemClock.clock().wallMs(),
             .bid = ticker.bid,
             .mark = ticker.last,
         } }) catch return false;

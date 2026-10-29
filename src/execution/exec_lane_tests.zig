@@ -97,7 +97,7 @@ const Rig = struct {
         const tick = self.main_okx.getPublic("/api/v5/market/ticker?instId=BTC-USDT") catch return false;
         defer self.gpa.free(tick);
         const t = okx_rest.parseTicker(self.gpa, tick) catch return false;
-        _ = self.engine.apply(.{ .market_tick = .{ .ts_ms = t.ts_ms, .bid = t.bid, .mark = t.last } }) catch return false;
+        _ = self.engine.apply(.{ .market_tick = .{ .ts_ms = t.ts_ms, .seen_ms = wallMs(), .bid = t.bid, .mark = t.last } }) catch return false;
         switch (okx_rest.probeBalance(&self.main_okx, self.gpa, wallMs())) {
             .ok => |b| {
                 _ = self.engine.apply(.{ .reconcile_result = .{
@@ -124,7 +124,7 @@ const Rig = struct {
         const tick = self.main_okx.getPublic("/api/v5/market/ticker?instId=BTC-USDT") catch return;
         defer self.gpa.free(tick);
         if (okx_rest.parseTicker(self.gpa, tick)) |t| {
-            _ = self.engine.apply(.{ .market_tick = .{ .ts_ms = t.ts_ms, .bid = t.bid, .mark = t.last } }) catch {};
+            _ = self.engine.apply(.{ .market_tick = .{ .ts_ms = t.ts_ms, .seen_ms = wallMs(), .bid = t.bid, .mark = t.last } }) catch {};
         } else |_| {}
         _ = self.engine.drainInbox();
         _ = self.service.pump(self, reconcileThunk);
